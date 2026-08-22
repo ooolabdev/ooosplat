@@ -15,13 +15,13 @@ pub fn run_app() {
         .manage(commands::PipelineController::default())
         .invoke_handler(tauri::generate_handler![
             commands::check_engines,
+            commands::check_colmap_acceleration,
             commands::probe_and_plan,
             commands::start_pipeline,
             commands::cancel_pipeline,
             commands::export_ply,
             commands::get_project_overview,
             commands::set_projects_root,
-            commands::set_colmap_acceleration,
             commands::delete_project,
         ])
         .run(tauri::generate_context!())

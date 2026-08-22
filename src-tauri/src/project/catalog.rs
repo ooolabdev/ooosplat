@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use crate::{
     error::{Result, SplatError},
-    presets::ColmapAcceleration,
     project::{manager::atomic_write_json, ProjectMetadata, ProjectStatus, PROJECT_APP_ID},
     reconstruction::ply::inspect_gaussian_ply,
 };
@@ -19,8 +18,6 @@ use crate::{
 pub struct AppSettings {
     pub schema_version: u32,
     pub projects_root: PathBuf,
-    #[serde(default)]
-    pub colmap_acceleration: ColmapAcceleration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +58,6 @@ pub struct ProjectSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOverview {
     pub projects_root: PathBuf,
-    pub colmap_acceleration: ColmapAcceleration,
     pub projects: Vec<ProjectSummary>,
 }
 
@@ -94,7 +90,6 @@ pub async fn load_settings() -> Result<AppSettings> {
     Ok(AppSettings {
         schema_version: 1,
         projects_root: default_projects_root()?,
-        colmap_acceleration: ColmapAcceleration::default(),
     })
 }
 
@@ -106,21 +101,11 @@ async fn save_settings(settings: &AppSettings) -> Result<()> {
     atomic_write_json(&path, settings).await
 }
 
-/// 记住项目根目录，保留其它设置字段（避免覆盖 colmap_acceleration 等）。
+/// 记住项目根目录。
 pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
     crate::project::ProjectManager::validate_root(&root).await?;
     let mut settings = load_settings().await?;
     settings.projects_root = root;
-    save_settings(&settings).await?;
-    Ok(settings)
-}
-
-/// 记住 COLMAP CPU/GPU 加速选择，保留其它设置字段。
-pub async fn save_colmap_acceleration(
-    acceleration: ColmapAcceleration,
-) -> Result<AppSettings> {
-    let mut settings = load_settings().await?;
-    settings.colmap_acceleration = acceleration;
     save_settings(&settings).await?;
     Ok(settings)
 }
@@ -232,7 +217,6 @@ pub async fn get_overview() -> Result<ProjectOverview> {
     save_index(&index).await?;
     Ok(ProjectOverview {
         projects_root: settings.projects_root,
-        colmap_acceleration: settings.colmap_acceleration,
         projects: summaries,
     })
 }
@@ -350,22 +334,23 @@ mod tests {
         let value = AppSettings {
             schema_version: 1,
             projects_root: PathBuf::from("C:/项目 Root"),
-            colmap_acceleration: ColmapAcceleration::Cpu,
         };
         assert!(serde_json::to_string(&value)
             .unwrap()
             .contains("projectsRoot"));
-        assert!(serde_json::to_string(&value)
+        assert!(!serde_json::to_string(&value)
             .unwrap()
             .contains("colmapAcceleration"));
     }
 
     #[test]
-    fn legacy_settings_without_acceleration_parse_to_cpu() {
-        let json = r#"{"schemaVersion":1,"projectsRoot":"C:/旧目录"}"#;
+    fn legacy_acceleration_setting_is_ignored() {
+        let json = r#"{"schemaVersion":1,"projectsRoot":"C:/旧目录","colmapAcceleration":"gpu"}"#;
         let parsed: AppSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.colmap_acceleration, ColmapAcceleration::Cpu);
         assert_eq!(parsed.projects_root, PathBuf::from("C:/旧目录"));
+        assert!(!serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("colmapAcceleration"));
     }
 
     #[test]

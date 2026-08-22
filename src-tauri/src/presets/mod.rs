@@ -1,3 +1,3 @@
 pub mod quality;
 
-pub use quality::{ColmapAcceleration, Quality, QualityPreset};
+pub use quality::{Quality, QualityPreset};

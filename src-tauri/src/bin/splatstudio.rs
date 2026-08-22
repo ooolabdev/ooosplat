@@ -5,7 +5,7 @@ use ooo_splat::{
     engines::{ffmpeg::extract_uniform_frames, ffprobe::probe_video},
     error::{Result, SplatError},
     pipeline::runner::{default_engine_paths, PipelineRunner},
-    presets::{ColmapAcceleration, Quality},
+    presets::Quality,
     process::ProcessManager,
     video::{FrameSelectionStrategy, UniformRatioFrameSelection},
 };
@@ -47,9 +47,6 @@ enum Commands {
         projects_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
-        /// COLMAP feature/matching backend; defaults to the remembered setting.
-        #[arg(long, value_enum)]
-        acceleration: Option<ColmapAcceleration>,
     },
 }
 
@@ -108,15 +105,7 @@ async fn execute(cli: Cli) -> Result<()> {
             input,
             projects_root,
             quality,
-            acceleration,
         } => {
-            let use_gpu = match acceleration {
-                Some(value) => value.use_gpu(),
-                None => ooo_splat::project::catalog::load_settings()
-                    .await?
-                    .colmap_acceleration
-                    .use_gpu(),
-            };
             let runner = PipelineRunner::new(engines, |event| {
                 eprintln!(
                     "{:>6.2}% {:?}: {}",
@@ -126,14 +115,14 @@ async fn execute(cli: Cli) -> Result<()> {
             let result = match projects_root {
                 Some(root) => {
                     runner
-                        .generate_for_diagnostics(&input, quality, &root, use_gpu)
+                        .generate_for_diagnostics(&input, quality, &root)
                         .await?
                 }
                 None => {
                     let root = ooo_splat::project::catalog::load_settings()
                         .await?
                         .projects_root;
-                    runner.generate(&input, quality, &root, use_gpu).await?
+                    runner.generate(&input, quality, &root).await?
                 }
             };
             println!("{}", serde_json::to_string_pretty(&result)?);

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::engines::ColmapAccelerationStatus;
+
 use super::{progress::stage_progress_range, PipelineStage};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -10,6 +12,7 @@ pub enum EventKind {
     Progress,
     Log,
     Heartbeat,
+    Capability,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -46,6 +49,7 @@ pub struct PipelineEvent {
     pub total: Option<u64>,
     pub unit: Option<String>,
     pub elapsed_ms: u64,
+    pub acceleration: Option<ColmapAccelerationStatus>,
 }
 
 impl PipelineEvent {
@@ -67,6 +71,7 @@ impl PipelineEvent {
             total: None,
             unit: None,
             elapsed_ms: 0,
+            acceleration: None,
         }
     }
 }

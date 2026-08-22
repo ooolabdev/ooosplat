@@ -31,6 +31,12 @@
         "licenses/COLMAP-LICENSE.txt"
       ],
       "runtimePolicy": "CLI-only invocation; CUDA runtime bundled (cudart64_12/curand64_10/onnxruntime CUDA provider); GPU or CPU SIFT selected via --use_gpu",
+      "cudaCompatibility": {
+        "toolkitVersion": "12.9.1",
+        "architecturePolicy": "all-major",
+        "minimumWindowsDriver": "528.33",
+        "minimumComputeCapability": "5.0"
+      },
       "install": {
         "archiveName": "colmap-x64-windows-cuda.zip",
         "destination": "engines/colmap",

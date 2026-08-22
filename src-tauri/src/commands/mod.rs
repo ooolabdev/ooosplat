@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use serde::Serialize;
@@ -9,10 +10,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    engines::{ffprobe::probe_video, EnginePaths, EngineStatus},
+    engines::{
+        ffprobe::probe_video, health::check_colmap_acceleration as detect_colmap_acceleration,
+        ColmapAccelerationStatus, EnginePaths, EngineStatus,
+    },
     error::{Result, SplatError},
     pipeline::runner::{PipelineResult, PipelineRunner},
-    presets::{ColmapAcceleration, Quality},
+    presets::Quality,
     project::{
         catalog::{self, AppSettings, ProjectOverview},
         ProjectStatus,
@@ -39,6 +43,11 @@ fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
 #[tauri::command]
 pub async fn check_engines(app: tauri::AppHandle) -> Vec<EngineStatus> {
     paths_for_app(&app).check_all().await
+}
+
+#[tauri::command]
+pub async fn check_colmap_acceleration(app: tauri::AppHandle) -> ColmapAccelerationStatus {
+    detect_colmap_acceleration(&paths_for_app(&app)).await
 }
 
 #[tauri::command]
@@ -75,22 +84,15 @@ pub async fn set_projects_root(
 }
 
 #[tauri::command]
-pub async fn set_colmap_acceleration(
-    colmap_acceleration: ColmapAcceleration,
-) -> std::result::Result<AppSettings, SplatError> {
-    catalog::save_colmap_acceleration(colmap_acceleration).await
-}
-
-#[tauri::command]
 pub async fn start_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     path: String,
     quality: Quality,
     projects_root: String,
-    colmap_acceleration: ColmapAcceleration,
 ) -> std::result::Result<PipelineResult, SplatError> {
     let emitter = app.clone();
+    let started = Instant::now();
     let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
         let _ = emitter.emit("pipeline-event", event);
     }));
@@ -102,12 +104,7 @@ pub async fn start_pipeline(
         *active = Some(runner.clone());
     }
     let result = runner
-        .generate(
-            Path::new(&path),
-            quality,
-            Path::new(&projects_root),
-            colmap_acceleration.use_gpu(),
-        )
+        .generate(Path::new(&path), quality, Path::new(&projects_root))
         .await;
     if let Err(error) = &result {
         let stage = if matches!(error, SplatError::Cancelled) {
@@ -115,10 +112,9 @@ pub async fn start_pipeline(
         } else {
             crate::pipeline::PipelineStage::Failed
         };
-        let _ = app.emit(
-            "pipeline-event",
-            crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string()),
-        );
+        let mut event = crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string());
+        event.elapsed_ms = started.elapsed().as_millis() as u64;
+        let _ = app.emit("pipeline-event", event);
     }
     *state.active.lock().await = None;
     result

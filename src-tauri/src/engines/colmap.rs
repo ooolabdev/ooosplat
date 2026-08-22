@@ -50,23 +50,11 @@ pub async fn extract_features(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
-    use_gpu: bool,
+    gpu_index: Option<u32>,
 ) -> Result<()> {
     run_colmap(
         executable,
-        vec![
-            "feature_extractor".into(),
-            "--database_path".into(),
-            database.into(),
-            "--image_path".into(),
-            images.into(),
-            "--ImageReader.camera_model".into(),
-            "SIMPLE_RADIAL".into(),
-            "--ImageReader.single_camera".into(),
-            "1".into(),
-            "--FeatureExtraction.use_gpu".into(),
-            (if use_gpu { "1" } else { "0" }).into(),
-        ],
+        feature_extraction_args(database, images, gpu_index),
         database.parent().unwrap_or(images),
         log,
         manager,
@@ -81,25 +69,61 @@ pub async fn match_sequential(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
-    use_gpu: bool,
+    gpu_index: Option<u32>,
 ) -> Result<()> {
     run_colmap(
         executable,
-        vec![
-            "sequential_matcher".into(),
-            "--database_path".into(),
-            database.into(),
-            "--FeatureMatching.use_gpu".into(),
-            (if use_gpu { "1" } else { "0" }).into(),
-            "--SequentialMatching.overlap".into(),
-            "10".into(),
-        ],
+        sequential_matching_args(database, gpu_index),
         database.parent().unwrap_or(Path::new(".")),
         log,
         manager,
         observer,
     )
     .await
+}
+
+fn feature_extraction_args(
+    database: &Path,
+    images: &Path,
+    gpu_index: Option<u32>,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "feature_extractor".into(),
+        "--database_path".into(),
+        database.into(),
+        "--image_path".into(),
+        images.into(),
+        "--ImageReader.camera_model".into(),
+        "SIMPLE_RADIAL".into(),
+        "--ImageReader.single_camera".into(),
+        "1".into(),
+        "--FeatureExtraction.use_gpu".into(),
+        (if gpu_index.is_some() { "1" } else { "0" }).into(),
+    ];
+    if let Some(index) = gpu_index {
+        args.push("--FeatureExtraction.gpu_index".into());
+        args.push(index.to_string().into());
+    }
+    args
+}
+
+fn sequential_matching_args(database: &Path, gpu_index: Option<u32>) -> Vec<OsString> {
+    let mut args = vec![
+        "sequential_matcher".into(),
+        "--database_path".into(),
+        database.into(),
+        "--FeatureMatching.use_gpu".into(),
+        (if gpu_index.is_some() { "1" } else { "0" }).into(),
+    ];
+    if let Some(index) = gpu_index {
+        args.push("--FeatureMatching.gpu_index".into());
+        args.push(index.to_string().into());
+    }
+    args.extend([
+        OsString::from("--SequentialMatching.overlap"),
+        OsString::from("10"),
+    ]);
+    args
 }
 
 pub async fn map(
@@ -133,13 +157,57 @@ pub async fn map(
 
 #[cfg(test)]
 mod tests {
-    fn use_gpu_flag(use_gpu: bool) -> &'static str {
-        if use_gpu { "1" } else { "0" }
+    use super::*;
+
+    fn strings(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn gpu_flag_maps_cleanly_to_colmap_options() {
-        assert_eq!(use_gpu_flag(false), "0");
-        assert_eq!(use_gpu_flag(true), "1");
+    fn gpu_mode_sets_use_gpu_and_selected_index() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            Some(2),
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.use_gpu", "1"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.gpu_index", "2"]));
+
+        let matching = strings(sequential_matching_args(Path::new("database.db"), Some(2)));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.use_gpu", "1"]));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.gpu_index", "2"]));
+    }
+
+    #[test]
+    fn cpu_mode_disables_gpu_without_passing_an_index() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.use_gpu", "0"]));
+        assert!(!extraction
+            .iter()
+            .any(|arg| arg == "--FeatureExtraction.gpu_index"));
+
+        let matching = strings(sequential_matching_args(Path::new("database.db"), None));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.use_gpu", "0"]));
+        assert!(!matching
+            .iter()
+            .any(|arg| arg == "--FeatureMatching.gpu_index"));
     }
 }

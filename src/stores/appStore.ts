@@ -1,12 +1,12 @@
 import { create } from "zustand";
-import type { ColmapAcceleration, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, VideoInfo } from "../types/pipeline";
+import type { ColmapAccelerationStatus, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, VideoInfo } from "../types/pipeline";
 
 interface AppState {
   videoPath: string | null;
   projectsRoot: string;
   projects: ProjectSummary[];
   quality: Quality;
-  colmapAcceleration: ColmapAcceleration;
+  colmapAcceleration: ColmapAccelerationStatus | null;
   video: VideoInfo | null;
   plan: FramePlan | null;
   engines: EngineStatus[];
@@ -21,7 +21,7 @@ interface AppState {
   setProjectsRoot: (path: string) => void;
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
-  setColmapAcceleration: (acceleration: ColmapAcceleration) => void;
+  setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
   setAnalysis: (video: VideoInfo, plan: FramePlan) => void;
   setEngines: (engines: EngineStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
@@ -36,7 +36,7 @@ export const useAppStore = create<AppState>((set) => ({
   projectsRoot: "",
   projects: [],
   quality: "balanced",
-  colmapAcceleration: "cpu",
+  colmapAcceleration: null,
   video: null,
   plan: null,
   engines: [],
@@ -64,6 +64,7 @@ export const useAppStore = create<AppState>((set) => ({
       latestEvent: event,
       progress: Math.max(state.progress, Math.min(100, event.progress)),
       progressMessage: event.message,
+      colmapAcceleration: event.acceleration ?? state.colmapAcceleration,
     };
   }),
   setResult: (result) => set({ result }),

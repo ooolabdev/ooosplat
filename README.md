@@ -188,8 +188,8 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- plan "D:\Vid
 # 单独抽帧
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- extract "D:\Videos\orbit.mp4" "D:\Frames" --quality fast
 
-# 运行完整流水线（GPU 加速 COLMAP；省略 --acceleration 时使用已记住的设置）
-cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:\Videos\orbit.mp4" --projects-root "D:\Splat Projects" --quality balanced --acceleration gpu
+# 运行完整流水线（自动检测并选择 COLMAP GPU 或 CPU）
+cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:\Videos\orbit.mp4" --projects-root "D:\Splat Projects" --quality balanced
 ```
 
 开发或诊断时可以通过全局参数 `--engine-dir <路径>`，或环境变量 `OOOSPLAT_ENGINE_DIR`，覆盖默认引擎目录。
@@ -198,7 +198,7 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 ### 如何让 COLMAP 使用显卡？
 
-在“01 创建新任务”的“COLMAP 加速”中选择 GPU。要求机器装有 NVIDIA 显卡和对应驱动；应用启动时会检测驱动，未检测到时 GPU 选项会被禁用并自动回退到 CPU 模式。GPU 模式让特征提取与匹配由显卡加速，处理更快；CPU 模式兼容性最好。
+无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。
 
 ### 为什么任务在相机重建后停止？
 

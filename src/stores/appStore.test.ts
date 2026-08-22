@@ -17,12 +17,13 @@ const event = (sequence: number, progress: number): PipelineEvent => ({
   total: 500,
   unit: "张",
   elapsedMs: sequence * 100,
+  acceleration: null,
 });
 
 describe("app store", () => {
   beforeEach(() => {
     useAppStore.setState({
-      videoPath: null, projectsRoot: "", projects: [], quality: "balanced", video: null,
+      videoPath: null, projectsRoot: "", projects: [], quality: "balanced", colmapAcceleration: null, video: null,
       plan: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
@@ -50,5 +51,21 @@ describe("app store", () => {
     for (let index = 1; index <= 530; index += 1) useAppStore.getState().receiveEvent(event(index, index / 10));
     expect(useAppStore.getState().events).toHaveLength(500);
     expect(useAppStore.getState().events[0].sequence).toBe(31);
+  });
+
+  it("updates the automatic COLMAP acceleration status from pipeline events", () => {
+    useAppStore.getState().receiveEvent({
+      ...event(1, 0),
+      kind: "capability",
+      acceleration: {
+        backend: "gpu",
+        reasonCode: "gpuReady",
+        reason: "GPU ready",
+        device: { index: 0, name: "RTX 3060 Ti", driverVersion: "560.81", computeCapability: "8.6" },
+        requirements: { minimumDriverVersion: "528.33", minimumComputeCapability: "5.0" },
+      },
+    });
+    expect(useAppStore.getState().colmapAcceleration?.backend).toBe("gpu");
+    expect(useAppStore.getState().colmapAcceleration?.device?.index).toBe(0);
   });
 });

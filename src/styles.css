@@ -98,6 +98,15 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .quality-option strong { font-size: 13px; }
 .quality-option small { color: var(--muted); font-size: 11px; line-height: 1.5; }
 
+.acceleration-status { min-height: 64px; padding: 14px 0; display: grid; grid-template-columns: 25px minmax(0, 1fr); align-items: center; gap: 10px; color: #526078; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.acceleration-icon { width: 25px; height: 25px; display: grid; place-items: center; color: var(--muted); }
+.acceleration-status > span:last-child { min-width: 0; display: grid; gap: 5px; }
+.acceleration-status strong { color: var(--ink); font-size: 13px; }
+.acceleration-status small { overflow-wrap: anywhere; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.acceleration-status.gpu .acceleration-icon, .acceleration-status.gpu strong { color: var(--blue); }
+.acceleration-status.warning .acceleration-icon, .acceleration-status.warning strong { color: var(--amber); }
+.acceleration-status + .source-metrics { margin-top: 20px; }
+
 .source-metrics { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .source-metrics span { min-width: 0; padding: 13px 8px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
 .source-metrics span:first-child { padding-left: 0; }
