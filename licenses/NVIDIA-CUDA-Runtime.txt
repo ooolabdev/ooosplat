@@ -1,0 +1,31 @@
+NVIDIA CUDA Runtime — redistribution notice
+============================================
+
+OOOSplat bundles the following NVIDIA components as part of the COLMAP
+CUDA release asset (`colmap-x64-windows-cuda.zip`, release 4.0.4):
+
+  - cudart64_12.dll                     CUDA Runtime
+  - curand64_10.dll                     cuRAND
+  - onnxruntime_providers_cuda.dll      ONNX Runtime CUDA provider
+
+`cudart64_12.dll` and `curand64_10.dll` are CUDA Toolkit runtime
+libraries. Under the NVIDIA CUDA Toolkit End User License Agreement
+(EULA), "Attachment A" lists these runtime files as redistributable
+together with an application intended for systems with NVIDIA GPUs,
+provided the target files are not modified (uncompressing archives
+excepted). The full EULA text is available at:
+
+  https://docs.nvidia.com/cuda/eula/index.html
+
+`onnxruntime_providers_cuda.dll` is distributed under the ONNX Runtime
+license (MIT); it links NVIDIA CUDA libraries at runtime and is listed
+here for completeness.
+
+These files are bundled so COLMAP feature extraction and matching can
+use NVIDIA GPU acceleration when the user selects the GPU backend. A
+functioning NVIDIA display driver is still required on the end-user
+system.
+
+This notice is a redistribution statement and does not replace NVIDIA's
+End User License Agreement. NVIDIA product names and marks are owned by
+NVIDIA Corporation.

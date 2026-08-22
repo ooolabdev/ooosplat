@@ -6,10 +6,10 @@ import {
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview,
   onPipelineEvent, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
-  setProjectsRoot, startPipeline,
+  setColmapAcceleration, setProjectsRoot, startPipeline,
 } from "../lib/backend";
 import { useAppStore } from "../stores/appStore";
-import type { EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
+import type { ColmapAcceleration, EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
 
 const qualities: Array<{ value: Quality; label: string; description: string }> = [
   { value: "fast", label: "快速", description: "快速验证素材与拍摄路径" },
@@ -63,7 +63,7 @@ const readSavedNumber = (key: string, fallback: number) => {
 };
 
 function engineReady(engine: EngineStatus) {
-  return engine.canStart && (engine.kind !== "colmap" || engine.cpuOnly === true);
+  return engine.canStart;
 }
 
 function ProjectRow({ project, busy, onDelete }: { project: ProjectSummary; busy: boolean; onDelete: (project: ProjectSummary) => void }) {
@@ -101,6 +101,7 @@ export function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [showZoomControls, setShowZoomControls] = useState(false);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
+  const gpuAvailable = store.engines.find((engine) => engine.kind === "colmap")?.gpuAvailable === true;
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
@@ -109,13 +110,21 @@ export function App() {
     const overview = await getProjectOverview();
     store.setProjectsRoot(overview.projectsRoot);
     store.setProjects(overview.projects);
+    const gpuReady = store.engines.find((engine) => engine.kind === "colmap")?.gpuAvailable === true;
+    store.setColmapAcceleration(gpuReady ? overview.colmapAcceleration : "cpu");
   };
 
   useEffect(() => {
     void Promise.all([checkEngines(), getProjectOverview()])
-      .then(([engines, overview]) => { store.setEngines(engines); store.setProjectsRoot(overview.projectsRoot); store.setProjects(overview.projects); })
+      .then(([engines, overview]) => {
+        store.setEngines(engines);
+        store.setProjectsRoot(overview.projectsRoot);
+        store.setProjects(overview.projects);
+        const gpuReady = engines.find((engine) => engine.kind === "colmap")?.gpuAvailable === true;
+        store.setColmapAcceleration(gpuReady ? overview.colmapAcceleration : "cpu");
+      })
       .catch((error) => store.setError(messageOf(error)));
-  }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setError]);
+  }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setColmapAcceleration, store.setError]);
 
   useEffect(() => {
     let unlisten: undefined | (() => void);
@@ -180,11 +189,18 @@ export function App() {
     if (store.videoPath) await analyze(store.videoPath, quality);
   };
 
+  const chooseAcceleration = async (acceleration: ColmapAcceleration) => {
+    try {
+      const settings = await setColmapAcceleration(acceleration);
+      store.setColmapAcceleration(settings.colmapAcceleration);
+    } catch (error) { store.setError(messageOf(error)); }
+  };
+
   const generate = async () => {
     if (!store.videoPath || !store.plan || !store.projectsRoot) return;
     store.beginRun();
     try {
-      const result = await startPipeline(store.videoPath, store.quality, store.projectsRoot);
+      const result = await startPipeline(store.videoPath, store.quality, store.projectsRoot, store.colmapAcceleration);
       store.setResult(result);
       store.setPhase("completed");
     } catch (error) {
@@ -206,7 +222,7 @@ export function App() {
     <div className="interface-frame" style={{ "--ui-scale": uiScale / 100, "--ui-size": `${10000 / uiScale}%` } as CSSProperties}>
     <header className="topbar">
       <div className="brand-lockup"><span className="brand-mark"><Aperture size={17} /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / 0.1.0</span></div>
-      <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常` : "FFmpeg · COLMAP CPU · Brush 就绪"}</div>
+      <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常` : gpuAvailable ? "FFmpeg · COLMAP GPU · Brush 就绪" : "FFmpeg · COLMAP CPU · Brush 就绪"}</div>
     </header>
 
     <section className="workspace" ref={workspaceRef} style={{ "--left-pane-width": `${leftPanePercent}%` } as CSSProperties}>
@@ -235,6 +251,19 @@ export function App() {
               <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{quality.description}</small></span>
             </button>)}
           </div>
+        </div>
+
+        <div className="form-section">
+          <label className="field-label">COLMAP 加速</label>
+          <div className="quality-list" role="radiogroup">
+            <button type="button" role="radio" disabled={isRunning} aria-checked={store.colmapAcceleration === "cpu"} className={store.colmapAcceleration === "cpu" ? "quality-option selected" : "quality-option"} onClick={() => void chooseAcceleration("cpu")}>
+              <span className="radio-mark"><span /></span><span><strong>CPU</strong><small>兼容性优先，不需要 NVIDIA 显卡</small></span>
+            </button>
+            <button type="button" role="radio" disabled={isRunning || !gpuAvailable} aria-checked={store.colmapAcceleration === "gpu"} className={store.colmapAcceleration === "gpu" ? "quality-option selected" : "quality-option"} onClick={() => void chooseAcceleration("gpu")}>
+              <span className="radio-mark"><span /></span><span><strong>GPU</strong><small>{gpuAvailable ? "使用 NVIDIA 显卡加速特征提取与匹配" : "未检测到 NVIDIA 显卡驱动"}</small></span>
+            </button>
+          </div>
+          {!gpuAvailable && <p className="field-note">未检测到 NVIDIA 显卡驱动，已固定使用 CPU。</p>}
         </div>
 
         {store.video && store.plan && <div className="source-metrics">

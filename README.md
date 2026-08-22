@@ -1,12 +1,8 @@
 # OOOSplat
 
-[中文](README.md) | [English](README_EN.md)
-
-OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面应用。发布流程会将 FFmpeg、FFprobe、CPU 版 COLMAP 和 Brush 打包进安装程序，用户无需配置系统 `PATH` 或单独安装原生引擎。源码仓库不保存这些大型二进制文件，而是通过固定来源和 SHA-256 在构建前恢复。
+OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面应用。发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序，用户无需配置系统 `PATH` 或单独安装原生引擎。源码仓库不保存这些大型二进制文件，而是通过固定来源和 SHA-256 在构建前恢复。
 
 当前版本：**0.1.0**
-
-项目后续规划见 [OOOSplat Roadmap](ROADMAP.md)。
 
 > 当前交付目标是从视频生成并管理 `final.ply`。应用暂不包含 3D Viewer，生成结果需要使用其他支持 Gaussian Splatting PLY 的工具查看。
 
@@ -14,7 +10,8 @@ OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面
 
 - 从 MP4、MOV 视频创建 Gaussian Splatting 项目。
 - 自动完成视频分析、均匀抽帧、特征提取、顺序匹配、相机重建、Brush 训练和 PLY 发布。
-- FFmpeg、FFprobe、COLMAP CPU/no-CUDA 和 Brush 随安装包提供。
+- FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 随安装包提供。
+- COLMAP 特征提取与匹配可在 CPU 与 GPU 之间手动切换，选择会持久化。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
 - 原始进程输出完整写入项目的 `logs` 目录。
 - 支持取消任务，并通过 Windows Job Object 终止整个子进程树。
@@ -31,7 +28,7 @@ OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面
   │
   ├─ FFprobe：读取时长、分辨率、帧率和总帧数
   ├─ FFmpeg：按照质量档位均匀抽取画面
-  ├─ COLMAP：CPU 特征提取与顺序匹配
+  ├─ COLMAP：按所选后端（CPU 或 GPU）进行特征提取与顺序匹配
   ├─ COLMAP：增量重建并验证注册率和三维点
   ├─ Brush：使用可用 GPU 训练 Gaussian Splats
   └─ 校验 PLY 后原子发布为 final.ply
@@ -44,10 +41,11 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 - Windows 10 或 Windows 11，x64。
 - 支持 WebView2 Runtime。
 - Brush 训练需要可用的 GPU 图形后端，建议使用独立显卡。
+- COLMAP 的 GPU 加速模式需要 NVIDIA 显卡及对应驱动；没有 NVIDIA 显卡时应选择 CPU 模式。
 - 项目磁盘需要容纳源视频副本、抽帧图像、COLMAP 数据、Brush 中间文件和最终 PLY。长视频或精细档位可能占用大量空间。
 - 安装模式为整机安装，安装时可能需要管理员权限。
 
-COLMAP 在本项目中严格使用 CPU/no-CUDA 构建；Brush 训练仍会使用可用 GPU。
+COLMAP 使用 CUDA 构建，可在 CPU 与 GPU 之间手动切换；Brush 训练使用可用 GPU。
 
 ## 安装与使用
 
@@ -56,8 +54,9 @@ COLMAP 在本项目中严格使用 CPU/no-CUDA 构建；Brush 训练仍会使用
 3. 在“01 创建新任务”中选择输入视频。
 4. 选择项目根目录；程序会记住上次使用的位置。
 5. 选择“快速”“均衡”或“精细”档位。
-6. 点击“开始生成”，在左侧查看实时阶段、指标和日志。
-7. 完成后，在“02 历史任务”中查看项目路径、PLY 大小、Splat 数量、生成日期和耗时。
+6. 选择“COLMAP 加速”为 CPU 或 GPU；程序会记住上次选择。GPU 模式需要 NVIDIA 显卡和驱动。
+7. 点击“开始生成”，在左侧查看实时阶段、指标和日志。
+8. 完成后，在“02 历史任务”中查看项目路径、PLY 大小、Splat 数量、生成日期和耗时。
 
 使用提示：
 
@@ -108,10 +107,10 @@ COLMAP 在本项目中严格使用 CPU/no-CUDA 构建；Brush 训练仍会使用
 | 引擎 | 固定版本/构建 | 用途 |
 | --- | --- | --- |
 | FFmpeg / FFprobe | 8.1 系列 Windows x64 LGPL shared | 视频分析与抽帧 |
-| COLMAP | 4.0.4 发布资产，CPU/no-CUDA | 特征、匹配与相机重建 |
+| COLMAP | 4.0.4 发布资产，CUDA 构建 | 特征、匹配与相机重建（CPU/GPU 可选） |
 | Brush | v0.3.0 Windows x64 | Gaussian Splatting 训练与 PLY 导出 |
 
-详细来源、实际版本、下载与安装规则、压缩包哈希和可执行文件哈希记录在 [`engines/manifest.json`](engines/manifest.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 下载并恢复到本地。Release 打包前会运行校验；文件缺失、哈希变化、COLMAP 含 CUDA 运行库或 Brush CLI 参数不符合预期时，打包会被阻止。
+详细来源、实际版本、下载与安装规则、压缩包哈希和可执行文件哈希记录在 [`engines/manifest.json`](engines/manifest.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 下载并恢复到本地。Release 打包前会运行校验；文件缺失、哈希变化、COLMAP CUDA 运行时缺失或 Brush CLI 参数不符合预期时，打包会被阻止。
 
 第三方许可和通知位于 [`licenses/`](licenses/)：
 
@@ -151,7 +150,7 @@ cargo test --manifest-path src-tauri\Cargo.toml
 # Rust 静态检查
 cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 
-# 校验内置引擎版本、哈希和 CPU/no-CUDA 策略
+# 校验内置引擎版本、哈希和 COLMAP CUDA 运行时
 npm run verify:engines
 
 # 校验第一方许可、第三方通知及安装包资源映射
@@ -189,17 +188,17 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- plan "D:\Vid
 # 单独抽帧
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- extract "D:\Videos\orbit.mp4" "D:\Frames" --quality fast
 
-# 运行完整流水线
-cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:\Videos\orbit.mp4" --projects-root "D:\Splat Projects" --quality balanced
+# 运行完整流水线（GPU 加速 COLMAP；省略 --acceleration 时使用已记住的设置）
+cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:\Videos\orbit.mp4" --projects-root "D:\Splat Projects" --quality balanced --acceleration gpu
 ```
 
 开发或诊断时可以通过全局参数 `--engine-dir <路径>`，或环境变量 `OOOSPLAT_ENGINE_DIR`，覆盖默认引擎目录。
 
 ## 常见问题
 
-### 为什么 COLMAP 不使用显卡？
+### 如何让 COLMAP 使用显卡？
 
-为了降低安装和运行时依赖，OOOSplat 固定使用 COLMAP CPU/no-CUDA 构建。GPU 主要用于 Brush 训练。
+在“01 创建新任务”的“COLMAP 加速”中选择 GPU。要求机器装有 NVIDIA 显卡和对应驱动；应用启动时会检测驱动，未检测到时 GPU 选项会被禁用并自动回退到 CPU 模式。GPU 模式让特征提取与匹配由显卡加速，处理更快；CPU 模式兼容性最好。
 
 ### 为什么任务在相机重建后停止？
 
@@ -220,14 +219,6 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 - 前端：React 19、TypeScript、Vite、Zustand
 - 原生流水线：FFmpeg / FFprobe、COLMAP、Brush
 - Windows 进程管理：Job Object
-
-## 🤝 参与贡献
-
-欢迎参与贡献！
-
-无论是 Bug 修复、Linux/macOS 支持、UI 改进、文档，还是新的 Gaussian Splatting 功能，我们都欢迎你的帮助。
-
-请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解如何开始。
 
 ## 许可说明
 

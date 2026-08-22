@@ -21,6 +21,7 @@ pub fn run_app() {
             commands::export_ply,
             commands::get_project_overview,
             commands::set_projects_root,
+            commands::set_colmap_acceleration,
             commands::delete_project,
         ])
         .run(tauri::generate_context!())

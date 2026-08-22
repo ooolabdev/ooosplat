@@ -1,9 +1,10 @@
 export type Quality = "fast" | "balanced" | "high";
+export type ColmapAcceleration = "cpu" | "gpu";
 export type EngineKind = "ffmpeg" | "ffprobe" | "colmap" | "brush";
 export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed" | "cancelled";
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
-export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; detail: string; }
+export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; gpuAvailable: boolean | null; detail: string; }
 export interface VideoInfo { duration: number; width: number; height: number; fps: number; totalFrames: number; codec: string; rotation: number; }
 export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
 
@@ -58,4 +59,4 @@ export interface ProjectSummary {
   failureMessage: string | null;
 }
 
-export interface ProjectOverview { projectsRoot: string; projects: ProjectSummary[]; }
+export interface ProjectOverview { projectsRoot: string; colmapAcceleration: ColmapAcceleration; projects: ProjectSummary[]; }

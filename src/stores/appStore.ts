@@ -1,11 +1,12 @@
 import { create } from "zustand";
-import type { EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, VideoInfo } from "../types/pipeline";
+import type { ColmapAcceleration, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, VideoInfo } from "../types/pipeline";
 
 interface AppState {
   videoPath: string | null;
   projectsRoot: string;
   projects: ProjectSummary[];
   quality: Quality;
+  colmapAcceleration: ColmapAcceleration;
   video: VideoInfo | null;
   plan: FramePlan | null;
   engines: EngineStatus[];
@@ -20,6 +21,7 @@ interface AppState {
   setProjectsRoot: (path: string) => void;
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
+  setColmapAcceleration: (acceleration: ColmapAcceleration) => void;
   setAnalysis: (video: VideoInfo, plan: FramePlan) => void;
   setEngines: (engines: EngineStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
@@ -34,6 +36,7 @@ export const useAppStore = create<AppState>((set) => ({
   projectsRoot: "",
   projects: [],
   quality: "balanced",
+  colmapAcceleration: "cpu",
   video: null,
   plan: null,
   engines: [],
@@ -48,6 +51,7 @@ export const useAppStore = create<AppState>((set) => ({
   setProjectsRoot: (projectsRoot) => set({ projectsRoot }),
   setProjects: (projects) => set({ projects }),
   setQuality: (quality) => set({ quality, plan: null, result: null, error: null }),
+  setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
   setAnalysis: (video, plan) => set({ video, plan }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),

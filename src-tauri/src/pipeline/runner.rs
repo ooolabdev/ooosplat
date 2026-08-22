@@ -146,7 +146,7 @@ impl PipelineRunner {
         self.process_manager.cancel();
     }
 
-    pub async fn verify_pipeline_engines(&self) -> Result<()> {
+    pub async fn verify_pipeline_engines(&self, use_gpu: bool) -> Result<()> {
         let statuses = self.engines.check_all().await;
         for required in [
             EngineKind::Ffmpeg,
@@ -168,7 +168,7 @@ impl PipelineRunner {
                 });
             }
         }
-        engines::health::require_cpu_colmap(&self.engines).await?;
+        engines::health::require_colmap(&self.engines, use_gpu).await?;
         colmap::require_verified_cli(&self.engines.colmap)?;
         brush::require_verified_cli(&self.engines.brush)
     }
@@ -241,11 +241,13 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         projects_root: &Path,
+        use_gpu: bool,
     ) -> Result<PipelineResult> {
         self.generate_with_manager(
             input,
             quality,
             ProjectManager::with_root(projects_root.to_path_buf()),
+            use_gpu,
         )
         .await
     }
@@ -255,11 +257,13 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         projects_root: &Path,
+        use_gpu: bool,
     ) -> Result<PipelineResult> {
         self.generate_with_manager(
             input,
             quality,
             ProjectManager::for_diagnostics(projects_root.to_path_buf()),
+            use_gpu,
         )
         .await
     }
@@ -269,12 +273,13 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         project_manager: ProjectManager,
+        use_gpu: bool,
     ) -> Result<PipelineResult> {
-        self.verify_pipeline_engines().await?;
+        self.verify_pipeline_engines(use_gpu).await?;
         let (paths, mut metadata) = project_manager.create(input, quality).await?;
         let started = Instant::now();
         let result = self
-            .run_project(&project_manager, &paths, &mut metadata, quality)
+            .run_project(&project_manager, &paths, &mut metadata, quality, use_gpu)
             .await;
 
         if let Err(error) = &result {
@@ -307,6 +312,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         metadata: &mut ProjectMetadata,
         quality: Quality,
+        use_gpu: bool,
     ) -> Result<PipelineResult> {
         let mut state = PipelineStateFile::created(quality);
         let prepared = self
@@ -333,10 +339,11 @@ impl PipelineRunner {
         // moving any project data outside the project directory.
         let colmap_images = Path::new("../frames");
 
+        let backend_label = if use_gpu { "GPU" } else { "CPU" };
         self.events.stage(
             PipelineStage::ExtractingFeatures,
             0.0,
-            "COLMAP 正在使用 CPU 提取特征",
+            format!("COLMAP 正在使用 {backend_label} 提取特征"),
         );
         colmap::extract_features(
             &self.engines.colmap,
@@ -350,16 +357,24 @@ impl PipelineRunner {
                 Some(prepared.extracted_frames),
                 ObserverMode::BracketProgress,
             )),
+            use_gpu,
         )
         .await?;
         state.stage = PipelineStage::ExtractingFeatures;
         state.features_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
         self.events
-            .stage(PipelineStage::ExtractingFeatures, 1.0, "CPU 特征提取完成");
+            .stage(
+                PipelineStage::ExtractingFeatures,
+                1.0,
+                format!("{backend_label} 特征提取完成"),
+            );
 
-        self.events
-            .stage(PipelineStage::Matching, 0.0, "COLMAP 正在进行 CPU 顺序匹配");
+        self.events.stage(
+            PipelineStage::Matching,
+            0.0,
+            format!("COLMAP 正在进行 {backend_label} 顺序匹配"),
+        );
         colmap::match_sequential(
             &self.engines.colmap,
             &database,
@@ -371,6 +386,7 @@ impl PipelineRunner {
                 Some(prepared.extracted_frames),
                 ObserverMode::BracketProgress,
             )),
+            use_gpu,
         )
         .await?;
         state.stage = PipelineStage::Matching;

@@ -22,14 +22,24 @@ configure string can be inspected with `ffmpeg.exe -buildconf`.
 
 COLMAP
 ------
-Release: 4.0.4 Windows x64 no-CUDA asset
-Binary-reported version: 4.1.0.dev0, commit 5b76f53, without CUDA
+Release: 4.0.4 Windows x64 CUDA asset
+Binary-reported version: 4.1.0.dev0, commit 5b76f53, with CUDA
 License: BSD 3-Clause License
 SPDX identifier: BSD-3-Clause
 License text: licenses/COLMAP-LICENSE.txt
 Release source: https://github.com/colmap/colmap/releases/tag/4.0.4
 Commit source: https://github.com/colmap/colmap/tree/5b76f53
-Release archive: https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-nocuda.zip
+Release archive: https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-cuda.zip
+
+NVIDIA CUDA Runtime
+-------------------
+Components: cudart64_12.dll (CUDA Runtime), curand64_10.dll (cuRAND),
+            onnxruntime_providers_cuda.dll (ONNX Runtime CUDA provider)
+Origin: bundled inside the COLMAP 4.0.4 Windows x64 CUDA release asset
+License: NVIDIA CUDA Toolkit End User License Agreement — redistributable
+         runtime files (Attachment A), unmodified
+License text: licenses/NVIDIA-CUDA-Runtime.txt
+Upstream source: https://docs.nvidia.com/cuda/eula/index.html
 
 Brush
 -----

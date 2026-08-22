@@ -50,6 +50,7 @@ pub async fn extract_features(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    use_gpu: bool,
 ) -> Result<()> {
     run_colmap(
         executable,
@@ -64,7 +65,7 @@ pub async fn extract_features(
             "--ImageReader.single_camera".into(),
             "1".into(),
             "--FeatureExtraction.use_gpu".into(),
-            "0".into(),
+            (if use_gpu { "1" } else { "0" }).into(),
         ],
         database.parent().unwrap_or(images),
         log,
@@ -80,6 +81,7 @@ pub async fn match_sequential(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    use_gpu: bool,
 ) -> Result<()> {
     run_colmap(
         executable,
@@ -88,7 +90,7 @@ pub async fn match_sequential(
             "--database_path".into(),
             database.into(),
             "--FeatureMatching.use_gpu".into(),
-            "0".into(),
+            (if use_gpu { "1" } else { "0" }).into(),
             "--SequentialMatching.overlap".into(),
             "10".into(),
         ],
@@ -131,11 +133,13 @@ pub async fn map(
 
 #[cfg(test)]
 mod tests {
+    fn use_gpu_flag(use_gpu: bool) -> &'static str {
+        if use_gpu { "1" } else { "0" }
+    }
+
     #[test]
-    fn fixed_arguments_force_cpu_colmap() {
-        let feature = ["--FeatureExtraction.use_gpu", "0"];
-        let matching = ["--FeatureMatching.use_gpu", "0"];
-        assert_eq!(feature[1], "0");
-        assert_eq!(matching[1], "0");
+    fn gpu_flag_maps_cleanly_to_colmap_options() {
+        assert_eq!(use_gpu_flag(false), "0");
+        assert_eq!(use_gpu_flag(true), "1");
     }
 }

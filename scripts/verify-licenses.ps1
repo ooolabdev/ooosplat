@@ -60,6 +60,7 @@ $requiredFiles = @(
     "licenses/THIRD_PARTY_NOTICES.txt",
     "licenses/FFmpeg-LGPL-2.1.txt",
     "licenses/COLMAP-LICENSE.txt",
+    "licenses/NVIDIA-CUDA-Runtime.txt",
     "licenses/Brush-LICENSE.txt",
     "engines/manifest.json"
 )
@@ -86,7 +87,7 @@ $tauri = (Read-Utf8Text "src-tauri/tauri.conf.json") | ConvertFrom-Json
 Assert-True ($tauri.bundle.license -eq "Apache-2.0") "Tauri bundle license must be Apache-2.0."
 Assert-True ($tauri.bundle.licenseFile -eq "../LICENSE") "Tauri bundle licenseFile must point to ../LICENSE."
 $resourceNames = @($tauri.bundle.resources.PSObject.Properties.Name)
-foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../GENERATED_OUTPUTS.md", "../licenses/THIRD_PARTY_NOTICES.txt", "../licenses/FFmpeg-LGPL-2.1.txt", "../licenses/COLMAP-LICENSE.txt", "../licenses/Brush-LICENSE.txt") {
+foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../GENERATED_OUTPUTS.md", "../licenses/THIRD_PARTY_NOTICES.txt", "../licenses/FFmpeg-LGPL-2.1.txt", "../licenses/COLMAP-LICENSE.txt", "../licenses/NVIDIA-CUDA-Runtime.txt", "../licenses/Brush-LICENSE.txt") {
     Assert-True ($resourceNames -contains $resource) "Tauri resources are missing $resource."
 }
 

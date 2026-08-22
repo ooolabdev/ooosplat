@@ -62,6 +62,43 @@ impl FromStr for Quality {
     }
 }
 
+/// 决定 COLMAP 特征提取与顺序匹配使用的加速后端。
+/// CUDA build 同时包含 SIFT CPU 与 GPU 实现，切换只是 `--use_gpu 0/1`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ColmapAcceleration {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
+impl ColmapAcceleration {
+    pub const fn use_gpu(self) -> bool {
+        matches!(self, Self::Gpu)
+    }
+}
+
+impl fmt::Display for ColmapAcceleration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        })
+    }
+}
+
+impl FromStr for ColmapAcceleration {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            _ => Err(format!("unknown COLMAP acceleration: {value}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

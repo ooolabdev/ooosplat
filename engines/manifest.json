@@ -1,14 +1,14 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-14",
+  "generatedAt": "2026-08-21",
   "engines": [
     {
       "name": "FFmpeg / FFprobe",
       "requestedSeries": "8.1",
-      "actualVersion": "n8.1.2-34-g9b6c8969e0-20260812",
+      "actualVersion": "n8.1.2-44-g7c533d0f86-20260821",
       "distribution": "BtbN win64 LGPL shared 8.1",
       "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
-      "archiveSha256": "C0692B85D56F2995656406425C095700117DFD7A84F8CA5AF75EBF92ED08B8A9",
+      "archiveSha256": "134D6B5A73239F676F283CB745C8CEAE754450731FA07529DDC0AA19A2CA8152",
       "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
       "licenseFiles": [
         "licenses/FFmpeg-LGPL-2.1.txt"
@@ -23,16 +23,16 @@
     {
       "name": "COLMAP",
       "releaseTag": "4.0.4",
-      "actualVersion": "4.1.0.dev0, commit 5b76f53, 2026-04-27, without CUDA",
-      "sourceUrl": "https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-nocuda.zip",
-      "archiveSha256": "468B36B5C5ED16C86EF7D69BEC64B60043BA530AADDE9C9EF99EF20D5FCFCC1",
+      "actualVersion": "4.1.0.dev0, commit 5b76f53, 2026-04-27, with CUDA",
+      "sourceUrl": "https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-cuda.zip",
+      "archiveSha256": "F4496C3DD9FFCCFB4BFDA225401B738B545068302AB6487F5539B5B28861B143",
       "license": "BSD-3-Clause",
       "licenseFiles": [
         "licenses/COLMAP-LICENSE.txt"
       ],
-      "runtimePolicy": "CLI-only invocation; CPU SIFT and CPU matching; no CUDA/cuDNN runtime filenames",
+      "runtimePolicy": "CLI-only invocation; CUDA runtime bundled (cudart64_12/curand64_10/onnxruntime CUDA provider); GPU or CPU SIFT selected via --use_gpu",
       "install": {
-        "archiveName": "colmap-x64-windows-nocuda.zip",
+        "archiveName": "colmap-x64-windows-cuda.zip",
         "destination": "engines/colmap",
         "anchorFile": "colmap.exe",
         "rootFromAnchorParent": 1
@@ -56,9 +56,12 @@
     }
   ],
   "requiredFiles": [
-    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "DF1E981731DEFA2210DAC674E9CA7CC48BBE0AB8120A050B4BE25D4A1DD68BD8" },
-    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "D175E48003B3CDECC3EF6884DBBCE5A8EA4DE273069FF6FDC8FB533EE63E18E7" },
-    { "path": "engines/colmap/bin/colmap.exe", "sha256": "4358DF3C6CA10B1ED0E6F8CF1CBBEDBA637FA2559DB7AA59B34D84AA44515ADE" },
+    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "00D5996AE9E6DD4C5C11AB3040AE9CFBF78E0EC80492D8B5D2AF3559DAF41A0D" },
+    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "729402BBF566C6C616181D80ED8BEAD82F4858CD98058E347FBEE97DDE5C0EF9" },
+    { "path": "engines/colmap/bin/colmap.exe", "sha256": "41913EF963F725485B4D7A70AD5B3E8AD88CC4CEB4B48AAC0E5D1A6C61A6BD06" },
+    { "path": "engines/colmap/bin/cudart64_12.dll", "sha256": "760C38928BBE5759F7B31ED6692599EB7EC83CEDD5702E84C2B72028A89837E1" },
+    { "path": "engines/colmap/bin/curand64_10.dll", "sha256": "4D6D16C9941C4F7A7E49D5C43DF25D408A2A8503D8CC1EB9808E0E0C2CDE36D4" },
+    { "path": "engines/colmap/bin/onnxruntime_providers_cuda.dll", "sha256": "CE1C698CAE708FD4ED9AB36EDDF256213DF40779D0806D20F32132C5D422DA72" },
     { "path": "engines/brush/brush_app.exe", "sha256": "37E46CBF808B9983DD15A5F9A25328DBE43E7E06D53C4F59FBEAEB10E3A5B34A" }
   ]
 }

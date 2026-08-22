@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::Result,
+    error::{Result, SplatError},
     process::{ProcessManager, ProcessSpec},
 };
 
@@ -28,6 +28,7 @@ pub struct EngineStatus {
     pub can_start: bool,
     pub version: Option<String>,
     pub cpu_only: Option<bool>,
+    pub gpu_available: Option<bool>,
     pub detail: String,
 }
 
@@ -90,6 +91,7 @@ fn missing(kind: EngineKind, path: &Path) -> EngineStatus {
         can_start: false,
         version: None,
         cpu_only: None,
+        gpu_available: None,
         detail: format!("未找到 {}", path.display()),
     }
 }
@@ -123,6 +125,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
                 can_start: output.success,
                 version: first_line,
                 cpu_only: None,
+                gpu_available: None,
                 detail: if output.success {
                     "引擎可启动".into()
                 } else {
@@ -137,6 +140,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
             can_start: false,
             version: None,
             cpu_only: None,
+            gpu_available: None,
             detail: error.to_string(),
         },
     }
@@ -177,6 +181,7 @@ async fn check_colmap(path: &Path) -> EngineStatus {
                     can_start: false,
                     version: None,
                     cpu_only: None,
+                    gpu_available: None,
                     detail: error.to_string(),
                 }
             }
@@ -204,10 +209,11 @@ async fn check_colmap(path: &Path) -> EngineStatus {
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_owned());
+    let gpu_available = probe_gpu().await;
     let detail = match cpu_only {
         Some(true) => "三个必需命令可启动，帮助输出明确报告无 CUDA".into(),
-        Some(false) => "运行目录中发现 CUDA 运行时，拒绝将其标记为 CPU 版本".into(),
-        None => "命令可启动，但帮助输出未明确证明这是 CPU/no-CUDA 构建".into(),
+        Some(false) => "运行目录中发现 CUDA 运行时，支持 GPU 加速".into(),
+        None => "命令可启动，但帮助输出未明确证明是否包含 CUDA".into(),
     };
     EngineStatus {
         kind: EngineKind::Colmap,
@@ -216,6 +222,7 @@ async fn check_colmap(path: &Path) -> EngineStatus {
         can_start: successful,
         version: first_line,
         cpu_only,
+        gpu_available,
         detail,
     }
 }
@@ -236,11 +243,65 @@ fn runtime_contains_cuda(directory: &Path) -> bool {
     })
 }
 
-pub async fn require_cpu_colmap(paths: &EnginePaths) -> Result<()> {
+pub async fn require_colmap(paths: &EnginePaths, use_gpu: bool) -> Result<()> {
     let status = check_colmap(&paths.colmap).await;
-    if status.cpu_only == Some(true) && status.can_start {
-        Ok(())
-    } else {
-        Err(crate::error::SplatError::UnsupportedEngine(status.detail))
+    if !status.can_start {
+        return Err(SplatError::UnsupportedEngine(status.detail));
     }
+    if use_gpu {
+        if status.cpu_only == Some(true) {
+            return Err(SplatError::UnsupportedEngine(
+                "当前 COLMAP 为 CPU 构建，GPU 模式不可用".into(),
+            ));
+        }
+        if status.gpu_available == Some(false) {
+            return Err(SplatError::UnsupportedEngine(
+                "未检测到 NVIDIA 显卡驱动，GPU 模式不可用".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 探测 NVIDIA 显卡驱动是否可用（决定 GPU 模式是否可行）。
+/// 依次检查 System32 与 PATH 下的 nvidia-smi.exe；运行 `nvidia-smi -L`
+/// 成功且输出包含 "GPU" 视为可用。未找到或运行失败视为不可用。
+async fn probe_gpu() -> Option<bool> {
+    for candidate in nvidia_smi_candidates() {
+        if !candidate.is_file() {
+            continue;
+        }
+        let manager = ProcessManager::new();
+        let result = manager
+            .run(ProcessSpec {
+                executable: candidate,
+                args: vec![OsString::from("-L")],
+                working_directory: None,
+                log_path: None,
+                observer: None,
+            })
+            .await;
+        return match result {
+            Ok(output) if output.success => {
+                let combined = format!("{}\n{}", output.stdout, output.stderr);
+                Some(combined.to_ascii_lowercase().contains("gpu"))
+            }
+            _ => Some(false),
+        };
+    }
+    Some(false)
+}
+
+fn nvidia_smi_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    match std::env::var_os("SystemRoot") {
+        Some(root) => candidates.push(PathBuf::from(root).join("System32").join("nvidia-smi.exe")),
+        None => candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")),
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("nvidia-smi.exe"));
+        }
+    }
+    candidates
 }

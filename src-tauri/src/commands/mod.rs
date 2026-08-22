@@ -12,7 +12,7 @@ use crate::{
     engines::{ffprobe::probe_video, EnginePaths, EngineStatus},
     error::{Result, SplatError},
     pipeline::runner::{PipelineResult, PipelineRunner},
-    presets::Quality,
+    presets::{ColmapAcceleration, Quality},
     project::{
         catalog::{self, AppSettings, ProjectOverview},
         ProjectStatus,
@@ -75,12 +75,20 @@ pub async fn set_projects_root(
 }
 
 #[tauri::command]
+pub async fn set_colmap_acceleration(
+    colmap_acceleration: ColmapAcceleration,
+) -> std::result::Result<AppSettings, SplatError> {
+    catalog::save_colmap_acceleration(colmap_acceleration).await
+}
+
+#[tauri::command]
 pub async fn start_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     path: String,
     quality: Quality,
     projects_root: String,
+    colmap_acceleration: ColmapAcceleration,
 ) -> std::result::Result<PipelineResult, SplatError> {
     let emitter = app.clone();
     let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
@@ -94,7 +102,12 @@ pub async fn start_pipeline(
         *active = Some(runner.clone());
     }
     let result = runner
-        .generate(Path::new(&path), quality, Path::new(&projects_root))
+        .generate(
+            Path::new(&path),
+            quality,
+            Path::new(&projects_root),
+            colmap_acceleration.use_gpu(),
+        )
         .await;
     if let Err(error) = &result {
         let stage = if matches!(error, SplatError::Cancelled) {
