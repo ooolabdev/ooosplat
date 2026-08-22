@@ -2490,6 +2490,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

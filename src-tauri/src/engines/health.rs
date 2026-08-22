@@ -105,14 +105,75 @@ pub struct EnginePaths {
     pub brush: PathBuf,
 }
 
+fn find_in_path(cmd: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        {
+            let candidate_exe = dir.join(format!("{cmd}.exe"));
+            if candidate_exe.is_file() {
+                return Some(candidate_exe);
+            }
+        }
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_engine_path(
+    root: &Path,
+    subdir: &str,
+    candidates: &[&str],
+    system_cmd: &str,
+) -> PathBuf {
+    let engine_dir = root.join(subdir);
+    for rel in candidates {
+        let path = engine_dir.join(rel);
+        if path.is_file() {
+            return path;
+        }
+    }
+    if let Some(sys_path) = find_in_path(system_cmd) {
+        return sys_path;
+    }
+    engine_dir.join(candidates[0])
+}
+
 impl EnginePaths {
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        #[cfg(windows)]
+        let (ffmpeg_candidates, ffprobe_candidates, colmap_candidates, brush_candidates) = (
+            &["ffmpeg.exe", "bin/ffmpeg.exe"][..],
+            &["ffprobe.exe", "bin/ffprobe.exe"][..],
+            &["bin/colmap.exe", "colmap.exe"][..],
+            &["brush_app.exe", "brush.exe"][..],
+        );
+        #[cfg(not(windows))]
+        let (ffmpeg_candidates, ffprobe_candidates, colmap_candidates, brush_candidates) = (
+            &["ffmpeg", "bin/ffmpeg"][..],
+            &["ffprobe", "bin/ffprobe"][..],
+            &[
+                "bin/colmap",
+                "colmap",
+                "COLMAP.app/Contents/MacOS/colmap",
+            ][..],
+            &[
+                "brush_app",
+                "brush",
+                "brush-app-aarch64-apple-darwin/brush_app",
+                "brush-app-x86_64-apple-darwin/brush_app",
+            ][..],
+        );
+
         Self {
-            ffmpeg: root.join("ffmpeg").join("ffmpeg.exe"),
-            ffprobe: root.join("ffmpeg").join("ffprobe.exe"),
-            colmap: root.join("colmap").join("bin").join("colmap.exe"),
-            brush: root.join("brush").join("brush_app.exe"),
+            ffmpeg: resolve_engine_path(&root, "ffmpeg", ffmpeg_candidates, "ffmpeg"),
+            ffprobe: resolve_engine_path(&root, "ffmpeg", ffprobe_candidates, "ffprobe"),
+            colmap: resolve_engine_path(&root, "colmap", colmap_candidates, "colmap"),
+            brush: resolve_engine_path(&root, "brush", brush_candidates, "brush_app"),
             root,
         }
     }
@@ -293,9 +354,14 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
             requirements_or_default(engines_root),
         )
     } else if cpu_only != Some(false) {
+        #[cfg(target_os = "macos")]
+        let cpu_reason = "macOS 系统使用 CPU 模式进行特征提取与匹配".to_string();
+        #[cfg(not(target_os = "macos"))]
+        let cpu_reason = "内置 COLMAP 未检测到完整 CUDA 运行时，已使用 CPU".to_string();
+
         cpu_status(
             AccelerationReasonCode::ColmapCudaUnavailable,
-            "内置 COLMAP 未检测到完整 CUDA 运行时，已使用 CPU".into(),
+            cpu_reason,
             None,
             requirements_or_default(engines_root),
         )
@@ -640,13 +706,19 @@ fn parse_version(value: &str) -> Option<NumericVersion> {
 
 fn nvidia_smi_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    match std::env::var_os("SystemRoot") {
-        Some(root) => candidates.push(PathBuf::from(root).join("System32").join("nvidia-smi.exe")),
-        None => candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")),
+    #[cfg(windows)]
+    {
+        match std::env::var_os("SystemRoot") {
+            Some(root) => candidates.push(PathBuf::from(root).join("System32").join("nvidia-smi.exe")),
+            None => candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")),
+        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
+            #[cfg(windows)]
             candidates.push(dir.join("nvidia-smi.exe"));
+            #[cfg(not(windows))]
+            candidates.push(dir.join("nvidia-smi"));
         }
     }
     candidates
@@ -752,5 +824,37 @@ mod tests {
         assert!(!runtime_contains_cuda(directory.path()));
         std::fs::write(directory.path().join("onnxruntime_providers_cuda.dll"), []).unwrap();
         assert!(runtime_contains_cuda(directory.path()));
+    }
+
+    #[test]
+    fn resolves_engine_paths_across_platforms() {
+        let root = tempfile::tempdir().unwrap();
+        let ffmpeg_dir = root.path().join("ffmpeg");
+        let colmap_dir = root.path().join("colmap").join("bin");
+        let brush_dir = root.path().join("brush");
+        std::fs::create_dir_all(&ffmpeg_dir).unwrap();
+        std::fs::create_dir_all(&colmap_dir).unwrap();
+        std::fs::create_dir_all(&brush_dir).unwrap();
+
+        #[cfg(windows)]
+        {
+            std::fs::write(ffmpeg_dir.join("ffmpeg.exe"), []).unwrap();
+            std::fs::write(ffmpeg_dir.join("ffprobe.exe"), []).unwrap();
+            std::fs::write(colmap_dir.join("colmap.exe"), []).unwrap();
+            std::fs::write(brush_dir.join("brush_app.exe"), []).unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::write(ffmpeg_dir.join("ffmpeg"), []).unwrap();
+            std::fs::write(ffmpeg_dir.join("ffprobe"), []).unwrap();
+            std::fs::write(colmap_dir.join("colmap"), []).unwrap();
+            std::fs::write(brush_dir.join("brush_app"), []).unwrap();
+        }
+
+        let paths = EnginePaths::from_root(root.path());
+        assert!(paths.ffmpeg.is_file());
+        assert!(paths.ffprobe.is_file());
+        assert!(paths.colmap.is_file());
+        assert!(paths.brush.is_file());
     }
 }
