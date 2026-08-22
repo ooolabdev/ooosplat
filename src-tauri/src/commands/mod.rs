@@ -46,6 +46,14 @@ pub async fn check_engines(app: tauri::AppHandle) -> Vec<EngineStatus> {
 }
 
 #[tauri::command]
+pub async fn download_missing_engines(
+    app: tauri::AppHandle,
+) -> std::result::Result<Vec<EngineStatus>, SplatError> {
+    let paths = paths_for_app(&app);
+    crate::engines::downloader::download_and_install_missing(&app, &paths).await
+}
+
+#[tauri::command]
 pub async fn check_colmap_acceleration(app: tauri::AppHandle) -> ColmapAccelerationStatus {
     detect_colmap_acceleration(&paths_for_app(&app)).await
 }
@@ -152,4 +160,15 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
         return Err(SplatError::InvalidPath(destination));
     }
     Ok(tokio::fs::copy(source, destination).await?)
+}
+
+#[tauri::command]
+pub async fn read_ply_bytes(path: String) -> Result<Vec<u8>> {
+    let file_path = PathBuf::from(path);
+    if !file_path.is_file() {
+        return Err(SplatError::InvalidPath(file_path));
+    }
+    tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| SplatError::Process(format!("读取 PLY 文件失败: {e}")))
 }

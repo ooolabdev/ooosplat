@@ -1,18 +1,42 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox,
-  FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
-  Zap,
+  Aperture, Check, ChevronRight, CircleAlert, Clapperboard, Cpu, Download, FileBox,
+  FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RefreshCw, RotateCcw, Sparkles, Square, Trash2,
+  X, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
+import { SplatViewer } from "../components/SplatViewer";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview,
-  onPipelineEvent, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
-  setProjectsRoot, startPipeline,
+  cancelPipeline, checkEngines, confirmAndDeleteProject, downloadMissingEngines,
+  getProjectOverview, onEngineDownloadProgress, onPipelineEvent, probeAndPlan,
+  revealProject, selectProjectsRoot, selectVideo, setProjectsRoot, startPipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { useAppStore } from "../stores/appStore";
-import type { EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
+import type { EngineDownloadProgress, EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
+
+const engineDescriptions: Record<string, { label: string; role: string; hint: string }> = {
+  ffmpeg: {
+    label: "FFmpeg",
+    role: "视频抽帧提取",
+    hint: "macOS 可在终端执行 brew install ffmpeg，或将可执行文件放入 engines/ffmpeg/ 目录。",
+  },
+  ffprobe: {
+    label: "FFprobe",
+    role: "视频元数据与规格探测",
+    hint: "macOS 可在终端执行 brew install ffmpeg，或将可执行文件放入 engines/ffmpeg/ 目录。",
+  },
+  colmap: {
+    label: "COLMAP",
+    role: "特征提取、顺序匹配与相机轨迹重建",
+    hint: "macOS 可在终端执行 brew install colmap，或将可执行文件放入 engines/colmap/bin/ 目录。",
+  },
+  brush: {
+    label: "Brush",
+    role: "基于 GPU/Metal 的 3D 高斯泼溅模型训练",
+    hint: "请从 GitHub (ArthurBrussee/brush) Releases 下载对应 macOS 版本的 brush_app，放入 engines/brush/ 目录或加入系统 PATH。",
+  },
+};
 
 const qualities: Array<{ value: Quality; label: string; description: string }> = [
   { value: "fast", label: "快速", description: "快速验证素材与拍摄路径" },
@@ -69,7 +93,20 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-function ProjectRow({ project, busy, onDelete }: { project: ProjectSummary; busy: boolean; onDelete: (project: ProjectSummary) => void }) {
+const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+const revealLabel = isMac ? "在访达中显示" : "在资源管理器中显示";
+
+function ProjectRow({
+  project,
+  busy,
+  onDelete,
+  onPreview,
+}: {
+  project: ProjectSummary;
+  busy: boolean;
+  onDelete: (project: ProjectSummary) => void;
+  onPreview: (project: ProjectSummary) => void;
+}) {
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -88,7 +125,16 @@ function ProjectRow({ project, busy, onDelete }: { project: ProjectSummary; busy
       <div><dt>档位</dt><dd>{qualityLabel(project.quality)}</dd></div>
     </dl>
     <div className="project-actions">
-      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />在资源管理器中显示</button>
+      {project.status === "completed" && project.finalPly && (
+        <button
+          type="button"
+          style={{ color: "var(--blue)", fontWeight: 650 }}
+          onClick={() => onPreview(project)}
+        >
+          <Sparkles size={14} />3D 预览
+        </button>
+      )}
+      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />{revealLabel}</button>
       <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
     </div>
   </article>;
@@ -105,6 +151,11 @@ export function App() {
   const [uiScale, setUiScale] = useState(() => Math.min(140, Math.max(80, readSavedNumber("ooo-splat-ui-scale", 100))));
   const [isResizing, setIsResizing] = useState(false);
   const [showZoomControls, setShowZoomControls] = useState(false);
+  const [showEngineModal, setShowEngineModal] = useState(false);
+  const [isCheckingEngines, setIsCheckingEngines] = useState(false);
+  const [isDownloadingEngines, setIsDownloadingEngines] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<EngineDownloadProgress | null>(null);
+  const [previewProject, setPreviewProject] = useState<ProjectSummary | null>(null);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
@@ -115,6 +166,50 @@ export function App() {
     store.setProjectsRoot(overview.projectsRoot);
     store.setProjects(overview.projects);
   };
+
+  const refreshEngines = async () => {
+    setIsCheckingEngines(true);
+    try {
+      const engines = await checkEngines();
+      store.setEngines(engines);
+      store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+    } catch (error) {
+      store.setError(messageOf(error));
+    } finally {
+      setIsCheckingEngines(false);
+    }
+  };
+
+  const handleDownloadEngines = async () => {
+    setIsDownloadingEngines(true);
+    setDownloadProgress({
+      engine: "brush",
+      phase: "downloading",
+      percent: 0,
+      message: "准备下载适配当前系统的原生引擎...",
+    });
+    try {
+      const engines = await downloadMissingEngines();
+      store.setEngines(engines);
+      store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+      if (store.videoPath && !store.plan) {
+        await analyze(store.videoPath, store.quality);
+      }
+    } catch (error) {
+      store.setError(messageOf(error));
+    } finally {
+      setIsDownloadingEngines(false);
+      setDownloadProgress(null);
+    }
+  };
+
+  useEffect(() => {
+    let unlisten: undefined | (() => void);
+    void onEngineDownloadProgress((progress) => {
+      setDownloadProgress(progress);
+    }).then((fn) => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     void Promise.all([checkEngines(), getProjectOverview()])
@@ -233,12 +328,49 @@ export function App() {
     <div className="interface-frame" style={{ "--ui-scale": uiScale / 100, "--ui-size": `${10000 / uiScale}%` } as CSSProperties}>
     <header className="topbar">
       <div className="brand-lockup"><span className="brand-mark"><img src={appLogo} alt="" aria-hidden="true" /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / 0.2.0</span></div>
-      <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常` : "FFmpeg · COLMAP · Brush 就绪"}</div>
+      <button className="engine-summary" type="button" title="点击查看所有引擎状态与详细错误" onClick={() => setShowEngineModal(true)}>
+        <span className={missingEngines.length ? "status-light warning" : "status-light"} />
+        <span>{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常（点击查看）` : "FFmpeg · COLMAP · Brush 就绪"}</span>
+      </button>
     </header>
 
     <section className="workspace" ref={workspaceRef} style={{ "--left-pane-width": `${leftPanePercent}%` } as CSSProperties}>
       <section className="control-pane" aria-label="生成控制台">
         <div className="pane-header"><h1>01 创建新任务</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? "运行中" : "待命"}</span></div>
+
+        {(missingEngines.length > 0 || isDownloadingEngines) && (
+          <div className={isDownloadingEngines ? "engine-banner downloading" : "engine-banner"}>
+            <div className="engine-banner-content">
+              <div className="engine-banner-text">
+                {isDownloadingEngines ? (
+                  <>
+                    <LoaderCircle className="spin" size={16} />
+                    <span>{downloadProgress?.message || "正在下载并配置适配当前系统的引擎…"} ({Math.round(downloadProgress?.percent ?? 0)}%)</span>
+                  </>
+                ) : (
+                  <>
+                    <CircleAlert size={16} />
+                    <span>检测到 {missingEngines.length} 个引擎未就绪 ({missingEngines.map((e) => engineDescriptions[e.kind]?.label || e.kind).join(", ")})</span>
+                  </>
+                )}
+              </div>
+              <button
+                className="engine-download-btn"
+                type="button"
+                disabled={isDownloadingEngines}
+                onClick={() => void handleDownloadEngines()}
+              >
+                {isDownloadingEngines ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
+                {isDownloadingEngines ? "正在配置…" : "一键自动下载并配置"}
+              </button>
+            </div>
+            {isDownloadingEngines && (
+              <div className="engine-banner-bar">
+                <div className="engine-banner-fill" style={{ width: `${Math.max(5, downloadProgress?.percent ?? 0)}%` }} />
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="form-section">
           <label className="field-label">输入视频</label>
@@ -264,11 +396,11 @@ export function App() {
           </div>
         </div>
 
-        <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">
-          <span className="acceleration-icon">{store.colmapAcceleration?.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu"].includes(store.colmapAcceleration.reasonCode) ? <CircleAlert size={17} /> : store.colmapAcceleration ? <Cpu size={17} /> : <LoaderCircle className="spin" size={17} />}</span>
+        <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "colmapUnavailable", "colmapCudaUnavailable"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">
+          <span className="acceleration-icon">{store.colmapAcceleration?.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "colmapUnavailable", "colmapCudaUnavailable"].includes(store.colmapAcceleration.reasonCode) ? <CircleAlert size={17} /> : store.colmapAcceleration ? <Cpu size={17} /> : <LoaderCircle className="spin" size={17} />}</span>
           <span>
-            <strong>{store.colmapAcceleration == null ? "正在检测 COLMAP GPU 加速…" : store.colmapAcceleration.backend === "gpu" ? "COLMAP GPU 加速已开启" : "COLMAP 使用 CPU"}</strong>
-            <small>{store.colmapAcceleration == null ? "正在读取 NVIDIA 驱动与显卡能力" : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name} · 驱动 ${store.colmapAcceleration.device.driverVersion} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : `${store.colmapAcceleration.reason} · 最低要求：驱动 ${store.colmapAcceleration.requirements.minimumDriverVersion}，Compute Capability ${store.colmapAcceleration.requirements.minimumComputeCapability}`}</small>
+            <strong>{store.colmapAcceleration == null ? "正在检测 COLMAP 加速…" : store.colmapAcceleration.backend === "gpu" ? "COLMAP GPU 加速已开启" : "COLMAP 使用 CPU"}</strong>
+            <small>{store.colmapAcceleration == null ? "正在读取硬件加速能力" : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name} · 驱动 ${store.colmapAcceleration.device.driverVersion} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : ["driverTooOld", "computeCapabilityTooLow", "driverVersionUnknown", "computeCapabilityUnknown"].includes(store.colmapAcceleration.reasonCode) ? `${store.colmapAcceleration.reason} · 最低要求：驱动 ${store.colmapAcceleration.requirements.minimumDriverVersion}，Compute Capability ${store.colmapAcceleration.requirements.minimumComputeCapability}` : store.colmapAcceleration.reason}</small>
           </span>
         </div>
 
@@ -299,6 +431,35 @@ export function App() {
             {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.message}</p></div>)}
             <div ref={logEnd} />
           </div>
+          {store.phase === "completed" && store.result && (
+            <button
+              className="primary-action"
+              type="button"
+              style={{ marginTop: 12, background: "var(--blue)" }}
+              onClick={() => {
+                const res = store.result!;
+                setPreviewProject({
+                  id: res.projectId,
+                  name: basename(res.projectPath),
+                  status: "completed",
+                  projectPath: res.projectPath,
+                  finalPly: res.finalPly,
+                  fileSize: res.fileSize,
+                  splatCount: res.splatCount,
+                  createdAt: new Date().toISOString(),
+                  completedAt: res.completedAt,
+                  durationMs: res.durationMs,
+                  quality: store.quality,
+                  sourceName: basename(store.videoPath || "video"),
+                  registeredRatio: res.registeredRatio,
+                  points3d: res.points3d,
+                  failureMessage: null,
+                });
+              }}
+            >
+              <Sparkles size={16} />立即在应用内 3D 预览<ChevronRight size={16} />
+            </button>
+          )}
           {isRunning && <button className="cancel-action" type="button" onClick={() => void cancelPipeline()}><Square size={12} fill="currentColor" />取消任务并终止所有进程</button>}
         </section>}
 
@@ -338,8 +499,8 @@ export function App() {
 
         {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
 
-        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} onDelete={(item) => void removeProject(item)} />)}</div>}
-        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} onDelete={(item) => void removeProject(item)} onPreview={(item) => setPreviewProject(item)} />)}</div>}
+        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} onDelete={(item) => void removeProject(item)} onPreview={(item) => setPreviewProject(item)} />)}</div>}
       </section>
     </section>
     </div>
@@ -352,5 +513,92 @@ export function App() {
       </div>}
       <button className="zoom-trigger" type="button" aria-expanded={showZoomControls} onClick={() => setShowZoomControls((visible) => !visible)}>{uiScale}%</button>
     </aside>
+
+    {showEngineModal && (
+      <div className="engine-modal-backdrop" onClick={() => setShowEngineModal(false)}>
+        <div className="engine-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="engine-modal-header">
+            <h3><Cpu size={18} />内置引擎状态详情</h3>
+            <button
+              className="engine-modal-close"
+              type="button"
+              aria-label="关闭"
+              onClick={() => setShowEngineModal(false)}
+            >
+              <X size={18} />
+            </button>
+          </div>
+          <div className="engine-modal-body">
+            {store.engines.length === 0 ? (
+              <p style={{ color: "var(--muted)", textAlign: "center", padding: "20px 0" }}>正在检测本地引擎状态…</p>
+            ) : (
+              store.engines.map((engine) => {
+                const desc = engineDescriptions[engine.kind] ?? { label: engine.kind, role: "原生引擎", hint: "" };
+                const ready = engine.canStart;
+                return (
+                  <div key={engine.kind} className={ready ? "engine-card" : "engine-card error"}>
+                    <div className="engine-card-header">
+                      <span className="engine-card-title">
+                        {ready ? <Check size={16} color="var(--green)" /> : <CircleAlert size={16} color="var(--red)" />}
+                        {desc.label} <small style={{ fontWeight: 400, color: "var(--muted)", fontSize: 12 }}>({desc.role})</small>
+                      </span>
+                      <span className={ready ? "engine-badge ok" : "engine-badge err"}>
+                        {ready ? "就绪" : "异常"}
+                      </span>
+                    </div>
+                    <div className="engine-card-path" title={engine.path}>
+                      {engine.path}
+                    </div>
+                    <div className="engine-card-detail">
+                      {engine.detail || (ready ? "引擎已就绪并可正常调用" : "引擎文件缺失或无法启动")}
+                      {engine.version && <span style={{ display: "block", color: "var(--faint)", marginTop: 2 }}>版本: {engine.version}</span>}
+                    </div>
+                    {!ready && desc.hint && (
+                      <div className="engine-card-hint">
+                        💡 <strong>解决提示</strong>：{desc.hint}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <div className="engine-modal-footer">
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>
+              {missingEngines.length === 0 ? "全部 4 个引擎工作正常" : `当前有 ${missingEngines.length} 个引擎未就绪`}
+            </span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {missingEngines.length > 0 && (
+                <button
+                  className="engine-download-btn"
+                  type="button"
+                  disabled={isDownloadingEngines}
+                  onClick={() => void handleDownloadEngines()}
+                >
+                  {isDownloadingEngines ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
+                  {isDownloadingEngines ? "正在下载…" : "一键自动下载并配置"}
+                </button>
+              )}
+              <button
+                className="engine-refresh-btn"
+                type="button"
+                disabled={isCheckingEngines || isDownloadingEngines}
+                onClick={() => void refreshEngines()}
+              >
+                <RefreshCw size={14} className={isCheckingEngines ? "spin" : ""} />
+                {isCheckingEngines ? "正在检查…" : "重新检查"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {previewProject && (
+      <SplatViewer
+        project={previewProject}
+        onClose={() => setPreviewProject(null)}
+      />
+    )}
   </main>;
 }
