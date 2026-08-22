@@ -1,4 +1,5 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "build": { "beforeBuildCommand": "npm run build" },
   "bundle": { "active": false }
 }
