@@ -13,9 +13,6 @@ src-tauri/gen/
 .npm-cache/
 .tmp/
 
-# Internal AI-agent planning notes are not part of the product documentation.
-plan/
-
 # Downloaded archives, extraction caches, and local diagnostics are never committed.
 .cache/
 
