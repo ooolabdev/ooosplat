@@ -243,9 +243,6 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    if destination.exists() {
-        std::fs::remove_file(destination)?;
-    }
     std::fs::rename(source, destination)?;
     Ok(())
 }

@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面应用。发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序，用户无需配置系统 `PATH` 或单独安装原生引擎。源码仓库不保存这些大型二进制文件，而是通过固定来源和 SHA-256 在构建前恢复。
+OOOSplat 是一款面向 Windows 和 Ubuntu 的本地视频转 3D Gaussian Splatting 桌面应用。Windows 发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序；Ubuntu 开发版使用系统 FFmpeg/COLMAP，并通过固定来源和 SHA-256 安装 Brush。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
 
 当前版本：**0.2.0**
 
@@ -16,14 +16,14 @@ OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面
 
 - 从 MP4、MOV 视频创建 Gaussian Splatting 项目。
 - 自动完成视频分析、均匀抽帧、特征提取、顺序匹配、相机重建、Brush 训练和 PLY 发布。
-- FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 随安装包提供。
+- Windows 安装包内置 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush；Ubuntu 使用系统 FFmpeg/COLMAP 与固定版本的 Brush。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
 - 原始进程输出完整写入项目的 `logs` 目录。
-- 支持取消任务，并通过 Windows Job Object 终止整个子进程树。
+- 支持取消任务，并通过 Windows Job Object 或 Linux Unix process group 终止整个子进程树。
 - 支持自定义项目根目录，默认位置为 `Documents\SplatStudio\Projects`。
 - 自动记录已完成、失败、中断和取消的历史任务。
-- 可在资源管理器中定位 `final.ply`，或将整个项目移入 Windows 回收站。
+- 可在文件管理器中定位 `final.ply`，或将整个项目移入系统回收站。
 - 可拖动中央分界线调整左右面板宽度；右下角支持 80%–140% 整体界面缩放。
 - 支持中文、空格、长文件名和 UNC 项目路径。
 
@@ -52,6 +52,26 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 - 安装模式为整机安装，安装时可能需要管理员权限。
 
 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用 GPU 图形后端，二者的 GPU 检测与运行机制相互独立。
+
+### Ubuntu alpha
+
+- Ubuntu 24.04 LTS，x86_64。
+- NVIDIA GPU 和正常工作的专有驱动；首个 Linux 版本不支持 AMD、Intel 或 CPU-only Brush。
+- Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖。
+- 系统 `ffmpeg`、`ffprobe` 和 `colmap`；支持 Ubuntu 24.04 的 COLMAP 3.9 CLI，也支持 COLMAP 4.x CLI。
+- Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
+
+Ubuntu 依赖安装：
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential curl file ffmpeg colmap nvidia-utils-580 \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+```
+
+`nvidia-utils-580` 应替换为与已安装 NVIDIA 驱动匹配的软件包。安装前可先用 `nvidia-smi` 确认驱动工作。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU，Brush 仍使用 NVIDIA GPU。
 
 ## 安装与使用
 
@@ -140,6 +160,24 @@ npm run setup:engines
 npm run tauri -- dev
 ```
 
+### Ubuntu 开发
+
+安装上面的 Ubuntu 系统依赖、Node.js 和 Rust 后：
+
+```bash
+npm ci
+npm run setup:engines
+npm run verify:engines
+npm run verify:licenses
+npm run tauri -- dev
+```
+
+也可以在仓库根目录运行 `./scripts/start-app-linux.sh`，或使用 `npm run start:app:linux`。启动脚本会先校验本机引擎和许可映射，仅在源码更新时重新构建 Release 可执行文件。
+
+Linux `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 COLMAP 保持为系统软件包。Ubuntu alpha 生成不带安装包的本机可执行文件。
+
+Ubuntu 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush/NVIDIA 端到端验证仍需 NVIDIA 主机或自托管 runner。
+
 ### 测试与检查
 
 ```powershell
@@ -199,6 +237,8 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 开发或诊断时可以通过全局参数 `--engine-dir <路径>`，或环境变量 `OOOSPLAT_ENGINE_DIR`，覆盖默认引擎目录。
 
+Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLMAP` 和 `OOOSPLAT_BRUSH` 指定可执行文件；未指定时按仓库托管目录和系统 `PATH` 依次发现。
+
 ## 常见问题
 
 ### 如何让 COLMAP 使用显卡？
@@ -223,7 +263,7 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 - 后端：Rust、Tokio
 - 前端：React 19、TypeScript、Vite、Zustand
 - 原生流水线：FFmpeg / FFprobe、COLMAP、Brush
-- Windows 进程管理：Job Object
+- 进程树管理：Windows Job Object；Linux Unix process group
 
 ## 许可说明
 

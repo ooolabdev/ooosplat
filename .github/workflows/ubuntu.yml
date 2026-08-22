@@ -1,0 +1,69 @@
+name: Ubuntu
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential ffmpeg file \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend tests and build
+        run: |
+          npm test
+          npm run build
+
+      - name: Verify license metadata and mappings
+        run: npm run verify:licenses
+
+      - name: Rust formatting, tests, and clippy
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: FFmpeg CLI integration
+        run: |
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i testsrc=size=320x240:rate=10 -t 2 \
+            -c:v mpeg4 /tmp/ooosplat-ci.mp4
+          cargo run --manifest-path src-tauri/Cargo.toml --bin splatstudio -- \
+            probe /tmp/ooosplat-ci.mp4
+          cargo run --manifest-path src-tauri/Cargo.toml --bin splatstudio -- \
+            extract /tmp/ooosplat-ci.mp4 /tmp/ooosplat-ci-frames --quality fast
+          test "$(find /tmp/ooosplat-ci-frames -maxdepth 1 -name '*.jpg' | wc -l)" -gt 0
+
+      - name: Build unbundled Tauri application
+        run: npm run tauri -- build --debug --no-bundle

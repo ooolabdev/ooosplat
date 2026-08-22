@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::process::{ProcessManager, ProcessSpec};
+use crate::{
+    engines::colmap::{detect_cli_family, ColmapCliFamily},
+    process::{ProcessManager, ProcessSpec},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +30,8 @@ pub struct EngineStatus {
     pub version: Option<String>,
     pub cpu_only: Option<bool>,
     pub acceleration: Option<ColmapAccelerationStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colmap_cli_family: Option<ColmapCliFamily>,
     pub detail: String,
 }
 
@@ -108,32 +113,81 @@ pub struct EnginePaths {
 impl EnginePaths {
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        Self {
+        #[cfg(windows)]
+        let paths = Self {
             ffmpeg: root.join("ffmpeg").join("ffmpeg.exe"),
             ffprobe: root.join("ffmpeg").join("ffprobe.exe"),
             colmap: root.join("colmap").join("bin").join("colmap.exe"),
             brush: root.join("brush").join("brush_app.exe"),
+            root,
+        };
+        #[cfg(not(windows))]
+        let paths = Self {
+            ffmpeg: root.join("ffmpeg"),
+            ffprobe: root.join("ffprobe"),
+            colmap: root.join("colmap"),
+            brush: root.join("brush_app"),
+            root,
+        };
+        paths
+    }
+
+    fn from_candidates(root: PathBuf) -> Self {
+        let defaults = Self::from_root(root.clone());
+        Self {
+            ffmpeg: resolve_engine(
+                "OOOSPLAT_FFMPEG",
+                std::slice::from_ref(&defaults.ffmpeg),
+                "ffmpeg",
+            ),
+            ffprobe: resolve_engine(
+                "OOOSPLAT_FFPROBE",
+                std::slice::from_ref(&defaults.ffprobe),
+                "ffprobe",
+            ),
+            colmap: resolve_engine(
+                "OOOSPLAT_COLMAP",
+                std::slice::from_ref(&defaults.colmap),
+                "colmap",
+            ),
+            brush: resolve_engine(
+                "OOOSPLAT_BRUSH",
+                &[
+                    defaults.brush.clone(),
+                    root.join("linux").join("brush").join("brush_app"),
+                    root.join("brush").join("brush_app"),
+                ],
+                "brush_app",
+            ),
             root,
         }
     }
 
     pub fn discover(resource_dir: Option<&Path>) -> Self {
         if let Some(value) = std::env::var_os("OOOSPLAT_ENGINE_DIR") {
-            return Self::from_root(value);
+            return Self::from_candidates(value.into());
         }
 
         let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let candidates = [
+        let mut candidates = vec![
             resource_dir.map(|path| path.join("engines")),
             Some(current.join("engines")),
             Some(current.join("..").join("engines")),
         ];
+        if let Ok(executable) = std::env::current_exe() {
+            candidates.extend(
+                executable
+                    .ancestors()
+                    .skip(1)
+                    .map(|ancestor| Some(ancestor.join("engines"))),
+            );
+        }
         let root = candidates
             .into_iter()
             .flatten()
             .find(|path| path.is_dir())
             .unwrap_or_else(|| current.join("engines"));
-        Self::from_root(root)
+        Self::from_candidates(root)
     }
 
     pub async fn check_all(&self) -> Vec<EngineStatus> {
@@ -147,6 +201,25 @@ impl EnginePaths {
     }
 }
 
+fn resolve_engine(env_name: &str, managed: &[PathBuf], executable_name: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(env_name) {
+        return path.into();
+    }
+    managed
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .or_else(|| find_on_path(executable_name))
+        .unwrap_or_else(|| managed[0].clone())
+}
+
+fn find_on_path(executable_name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(executable_name))
+        .find(|candidate| candidate.is_file())
+}
+
 fn missing(kind: EngineKind, path: &Path) -> EngineStatus {
     EngineStatus {
         kind,
@@ -156,6 +229,7 @@ fn missing(kind: EngineKind, path: &Path) -> EngineStatus {
         version: None,
         cpu_only: None,
         acceleration: None,
+        colmap_cli_family: None,
         detail: format!("未找到 {}", path.display()),
     }
 }
@@ -190,6 +264,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
                 version: first_line,
                 cpu_only: None,
                 acceleration: None,
+                colmap_cli_family: None,
                 detail: if output.success {
                     "引擎可启动".into()
                 } else {
@@ -205,6 +280,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
             version: None,
             cpu_only: None,
             acceleration: None,
+            colmap_cli_family: None,
             detail: error.to_string(),
         },
     }
@@ -215,7 +291,7 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         let mut status = missing(EngineKind::Colmap, path);
         status.acceleration = Some(cpu_status(
             AccelerationReasonCode::ColmapUnavailable,
-            format!("未找到内置 COLMAP：{}", path.display()),
+            format!("未找到 COLMAP：{}", path.display()),
             None,
             requirements_or_default(engines_root),
         ));
@@ -223,12 +299,15 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     }
     let manager = ProcessManager::new();
     let mut help = String::new();
+    let mut feature_help = String::new();
+    let mut matching_help = String::new();
     let mut successful = true;
     for args in [
         vec!["feature_extractor", "-h"],
         vec!["sequential_matcher", "-h"],
         vec!["mapper", "-h"],
     ] {
+        let command_name = args[0];
         match manager
             .run(ProcessSpec {
                 executable: path.to_path_buf(),
@@ -241,8 +320,13 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         {
             Ok(output) => {
                 successful &= output.success;
-                help.push_str(&output.stdout);
-                help.push_str(&output.stderr);
+                let command_help = format!("{}\n{}", output.stdout, output.stderr);
+                match command_name {
+                    "feature_extractor" => feature_help = command_help.clone(),
+                    "sequential_matcher" => matching_help = command_help.clone(),
+                    _ => {}
+                }
+                help.push_str(&command_help);
             }
             Err(error) => {
                 return EngineStatus {
@@ -258,12 +342,15 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
                         None,
                         requirements_or_default(engines_root),
                     )),
+                    colmap_cli_family: None,
                     detail: error.to_string(),
                 }
             }
         }
     }
 
+    let cli_family = detect_cli_family(&feature_help, &matching_help);
+    successful &= cli_family.is_some();
     let lower = help.to_ascii_lowercase();
     let explicit_cpu = [
         "cuda: no",
@@ -302,10 +389,13 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     } else {
         detect_acceleration(engines_root).await
     };
+    let family_label = cli_family.map_or("不支持的 CLI", ColmapCliFamily::label);
     let detail = match cpu_only {
-        Some(true) => "三个必需命令可启动，帮助输出明确报告无 CUDA".into(),
-        Some(false) => format!("三个必需命令可启动；{}", acceleration.reason),
-        None => "命令可启动，但帮助输出未明确证明是否包含 CUDA".into(),
+        Some(true) => {
+            format!("三个必需命令可启动；{family_label}；帮助输出明确报告无 CUDA")
+        }
+        Some(false) => format!("{family_label}；{}", acceleration.reason),
+        None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
     };
     EngineStatus {
         kind: EngineKind::Colmap,
@@ -315,6 +405,7 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         version: first_line,
         cpu_only,
         acceleration: Some(acceleration),
+        colmap_cli_family: cli_family,
         detail,
     }
 }
@@ -640,13 +731,18 @@ fn parse_version(value: &str) -> Option<NumericVersion> {
 
 fn nvidia_smi_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    #[cfg(windows)]
     match std::env::var_os("SystemRoot") {
         Some(root) => candidates.push(PathBuf::from(root).join("System32").join("nvidia-smi.exe")),
         None => candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")),
     }
+    #[cfg(windows)]
+    let executable_name = "nvidia-smi.exe";
+    #[cfg(not(windows))]
+    let executable_name = "nvidia-smi";
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join("nvidia-smi.exe"));
+            candidates.push(dir.join(executable_name));
         }
     }
     candidates
@@ -658,6 +754,21 @@ mod tests {
 
     fn requirements() -> AccelerationRequirements {
         default_requirements()
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn finds_executable_on_path() {
+        assert!(find_on_path("cargo").is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_root_is_flat_and_discovery_can_fall_back_to_path() {
+        let paths = EnginePaths::from_root("/opt/ooosplat-engines");
+        assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
+        let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
+        assert!(discovered.ffmpeg.is_file());
     }
 
     fn device(index: u32, driver: &str, compute: &str) -> GpuDeviceInfo {

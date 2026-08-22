@@ -88,7 +88,7 @@ function ProjectRow({ project, busy, onDelete }: { project: ProjectSummary; busy
       <div><dt>档位</dt><dd>{qualityLabel(project.quality)}</dd></div>
     </dl>
     <div className="project-actions">
-      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />在资源管理器中显示</button>
+      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />在文件管理器中显示</button>
       <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
     </div>
   </article>;
@@ -250,7 +250,7 @@ export function App() {
         <div className="form-section">
           <label className="field-label">项目根目录</label>
           <button className="path-picker compact" type="button" disabled={isRunning} onClick={() => void chooseRoot()}>
-            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : "正在读取默认目录"}</strong><small>{store.projectsRoot || "Documents\\SplatStudio\\Projects"}</small></span><ChevronRight size={16} />
+            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : "正在读取默认目录"}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
           </button>
           <p className="field-note">每次生成会在此处创建独立项目文件夹，final.ply 直接保存在项目根部。</p>
         </div>
