@@ -494,7 +494,7 @@ impl PipelineRunner {
             None,
             true,
             format!(
-                "Brush GPU 训练开始 · {} iterations · 最大分辨率 {}",
+                "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {}",
                 preset.brush_iterations, preset.brush_max_resolution
             ),
             Some(0),

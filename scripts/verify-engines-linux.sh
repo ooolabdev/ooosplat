@@ -11,8 +11,6 @@ for engine in ffmpeg ffprobe colmap; do
     exit 1
   }
 done
-command -v nvidia-smi >/dev/null || { echo "Missing nvidia-smi / NVIDIA driver." >&2; exit 1; }
-nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >/dev/null
 
 brush="$managed_brush"
 if [[ ! -x "$brush" ]]; then
@@ -43,4 +41,4 @@ for flag in --total-steps --max-resolution --export-every --export-path --export
   grep -q -- "$flag" <<<"$brush_help" || { echo "Brush is missing $flag" >&2; exit 1; }
 done
 
-echo "Verified Ubuntu NVIDIA driver, system FFmpeg/FFprobe/COLMAP, and Brush v0.3.0."
+echo "Verified system FFmpeg/FFprobe/COLMAP and Brush v0.3.0. Brush selects its graphics backend at runtime."

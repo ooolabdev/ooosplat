@@ -58,7 +58,7 @@ The bundled COLMAP build supports both CPU and CUDA GPU execution. OOOSplat auto
 ### Ubuntu Alpha
 
 - Ubuntu 24.04 LTS, x86_64.
-- An NVIDIA GPU with a working proprietary driver. The first Linux version does not support AMD, Intel, or CPU-only Brush.
+- A graphics backend and driver supported by Brush. Brush officially supports AMD, Intel, and NVIDIA GPUs. Current end-to-end validation used NVIDIA; CPU-only software graphics backends remain unverified but are not artificially blocked by startup checks.
 - Node.js 22.12+, Rust stable, and the WebKitGTK development dependencies required by Tauri 2.
 - System `ffmpeg`, `ffprobe`, and `colmap`. Ubuntu 24.04's COLMAP 3.9 CLI and the COLMAP 4.x CLI are supported.
 - Brush v0.3.0 for Linux x86_64, installed and verified by `npm run setup:engines`.
@@ -68,12 +68,12 @@ Install Ubuntu dependencies with:
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential curl file ffmpeg colmap nvidia-utils-580 \
+  build-essential curl file ffmpeg colmap \
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
   libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 ```
 
-Replace `nvidia-utils-580` with the package matching the installed NVIDIA driver. Use `nvidia-smi` to confirm the driver works. Ubuntu 24.04's non-CUDA COLMAP package automatically uses the CPU, while Brush still uses the NVIDIA GPU.
+Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Ubuntu 24.04's non-CUDA COLMAP package automatically uses the CPU, while Brush selects an available graphics backend at runtime. Fully CPU-only software Vulkan has not yet been validated end to end.
 
 ## Installation and Use
 
@@ -178,7 +178,7 @@ From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:
 
 Linux engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and COLMAP remain system packages. The Ubuntu alpha produces a native unbundled executable.
 
-The Ubuntu CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush/NVIDIA end-to-end coverage still requires an NVIDIA or self-hosted runner.
+The Ubuntu CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
 
 ### Tests and Checks
 
@@ -245,7 +245,7 @@ On Linux, `OOOSPLAT_FFMPEG`, `OOOSPLAT_FFPROBE`, `OOOSPLAT_COLMAP`, and `OOOSPLA
 
 ### Why is COLMAP using the CPU instead of the GPU?
 
-OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush GPU availability is detected separately.
+OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush is independent of COLMAP and selects an available graphics backend at runtime.
 
 ### Why does a task stop after camera reconstruction?
 

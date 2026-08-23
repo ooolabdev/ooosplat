@@ -56,7 +56,7 @@ COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择�
 ### Ubuntu alpha
 
 - Ubuntu 24.04 LTS，x86_64。
-- NVIDIA GPU 和正常工作的专有驱动；首个 Linux 版本不支持 AMD、Intel 或 CPU-only Brush。
+- Brush 支持的图形后端和对应驱动；Brush 官方支持 AMD、Intel 和 NVIDIA GPU。当前端到端验证使用 NVIDIA GPU，CPU-only 软件图形后端尚未验证，但不会被启动检查人为阻止。
 - Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖。
 - 系统 `ffmpeg`、`ffprobe` 和 `colmap`；支持 Ubuntu 24.04 的 COLMAP 3.9 CLI，也支持 COLMAP 4.x CLI。
 - Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
@@ -66,12 +66,12 @@ Ubuntu 依赖安装：
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential curl file ffmpeg colmap nvidia-utils-580 \
+  build-essential curl file ffmpeg colmap \
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
   libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 ```
 
-`nvidia-utils-580` 应替换为与已安装 NVIDIA 驱动匹配的软件包。安装前可先用 `nvidia-smi` 确认驱动工作。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU，Brush 仍使用 NVIDIA GPU。
+请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU；Brush 会在运行时选择可用的图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
 ## 安装与使用
 
@@ -176,7 +176,7 @@ npm run tauri -- dev
 
 Linux `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 COLMAP 保持为系统软件包。Ubuntu alpha 生成不带安装包的本机可执行文件。
 
-Ubuntu 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush/NVIDIA 端到端验证仍需 NVIDIA 主机或自托管 runner。
+Ubuntu 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
 
 ### 测试与检查
 
@@ -243,7 +243,7 @@ Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLM
 
 ### 如何让 COLMAP 使用显卡？
 
-无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。
+无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
 
 ### 为什么任务在相机重建后停止？
 
