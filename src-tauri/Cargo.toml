@@ -1,7 +1,7 @@
 [package]
 name = "ooo-splat"
 version = "0.2.0"
-description = "Local video-to-Gaussian-Splatting pipeline for Windows and Ubuntu"
+description = "Local video-to-Gaussian-Splatting pipeline for Windows and Ubuntu 24.04 Alpha"
 authors = ["ooolabdev"]
 license = "Apache-2.0"
 repository = "https://github.com/ooolabdev/ooosplat"

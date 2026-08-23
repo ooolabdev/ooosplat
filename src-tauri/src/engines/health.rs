@@ -133,34 +133,45 @@ impl EnginePaths {
     }
 
     fn from_candidates(root: PathBuf) -> Self {
-        let defaults = Self::from_root(root.clone());
-        Self {
-            ffmpeg: resolve_engine(
-                "OOOSPLAT_FFMPEG",
-                std::slice::from_ref(&defaults.ffmpeg),
-                "ffmpeg",
-            ),
-            ffprobe: resolve_engine(
-                "OOOSPLAT_FFPROBE",
-                std::slice::from_ref(&defaults.ffprobe),
-                "ffprobe",
-            ),
-            colmap: resolve_engine(
-                "OOOSPLAT_COLMAP",
-                std::slice::from_ref(&defaults.colmap),
-                "colmap",
-            ),
-            brush: resolve_engine(
-                "OOOSPLAT_BRUSH",
-                &[
-                    defaults.brush.clone(),
-                    root.join("linux").join("brush").join("brush_app"),
-                    root.join("brush").join("brush_app"),
-                ],
-                "brush_app",
-            ),
-            root,
-        }
+        #[cfg(windows)]
+        let paths = {
+            // Windows releases are self-contained. Never let a missing bundled
+            // executable silently select an unrelated program from PATH.
+            Self::from_root(root)
+        };
+
+        #[cfg(not(windows))]
+        let paths = {
+            let defaults = Self::from_root(root.clone());
+            Self {
+                ffmpeg: resolve_engine(
+                    "OOOSPLAT_FFMPEG",
+                    std::slice::from_ref(&defaults.ffmpeg),
+                    "ffmpeg",
+                ),
+                ffprobe: resolve_engine(
+                    "OOOSPLAT_FFPROBE",
+                    std::slice::from_ref(&defaults.ffprobe),
+                    "ffprobe",
+                ),
+                colmap: resolve_engine(
+                    "OOOSPLAT_COLMAP",
+                    std::slice::from_ref(&defaults.colmap),
+                    "colmap",
+                ),
+                brush: resolve_engine(
+                    "OOOSPLAT_BRUSH",
+                    &[
+                        defaults.brush.clone(),
+                        root.join("linux").join("brush").join("brush_app"),
+                        root.join("brush").join("brush_app"),
+                    ],
+                    "brush_app",
+                ),
+                root,
+            }
+        };
+        paths
     }
 
     pub fn discover(resource_dir: Option<&Path>) -> Self {
@@ -201,6 +212,7 @@ impl EnginePaths {
     }
 }
 
+#[cfg(not(windows))]
 fn resolve_engine(env_name: &str, managed: &[PathBuf], executable_name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(env_name) {
         return path.into();
@@ -213,6 +225,7 @@ fn resolve_engine(env_name: &str, managed: &[PathBuf], executable_name: &str) ->
         .unwrap_or_else(|| managed[0].clone())
 }
 
+#[cfg(not(windows))]
 fn find_on_path(executable_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -769,6 +782,20 @@ mod tests {
         assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
         let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
         assert!(discovered.ffmpeg.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_stay_inside_the_managed_root() {
+        let root = PathBuf::from(r"Z:\missing\ooosplat-engines");
+        let paths = EnginePaths::from_candidates(root.clone());
+        assert_eq!(paths.ffmpeg, root.join("ffmpeg").join("ffmpeg.exe"));
+        assert_eq!(paths.ffprobe, root.join("ffmpeg").join("ffprobe.exe"));
+        assert_eq!(
+            paths.colmap,
+            root.join("colmap").join("bin").join("colmap.exe")
+        );
+        assert_eq!(paths.brush, root.join("brush").join("brush_app.exe"));
     }
 
     fn device(index: u32, driver: &str, compute: &str) -> GpuDeviceInfo {

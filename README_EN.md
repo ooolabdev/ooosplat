@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat is a local Windows and Ubuntu desktop application that converts video into 3D Gaussian Splatting projects. Windows releases bundle FFmpeg, FFprobe, a CUDA-enabled COLMAP build, and Brush. The Ubuntu development build uses system FFmpeg/COLMAP and installs Brush from a pinned, SHA-256-verified source. The React interface calls the local Rust backend directly; no remote service or localhost API is required.
+OOOSplat is a local desktop application that converts video into 3D Gaussian Splatting projects. Windows releases bundle FFmpeg, FFprobe, a CUDA-enabled COLMAP build, and Brush. Linux support is currently limited to an Ubuntu 24.04 LTS x86_64 Alpha that uses system FFmpeg/FFprobe/CPU COLMAP and installs Brush from a pinned, SHA-256-verified source. The React interface calls the local Rust backend directly; no remote service or localhost API is required.
 
 Current version: **0.2.0**
 
@@ -53,14 +53,16 @@ The task stops when COLMAP registers fewer than 50% of the input images. A 50%â€
 - Enough disk space for a source-video copy, extracted frames, COLMAP data, Brush intermediate files, and the final PLY. Long videos and higher quality presets can require substantial space.
 - The installer uses a per-machine installation and may require administrator privileges.
 
-The bundled COLMAP build supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available GPU graphics backend; its GPU detection and runtime are independent of COLMAP.
+The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available graphics backend; its GPU detection and runtime are independent of COLMAP.
 
-### Ubuntu Alpha
+### Ubuntu 24.04 Alpha (x86_64 only)
+
+> This Alpha delivers a native executable built from source for Ubuntu 24.04 only. It does not include a Linux installer and does not claim support for Ubuntu 22.04, other Linux distributions, or production deployment.
 
 - Ubuntu 24.04 LTS, x86_64.
 - A graphics backend and driver supported by Brush. Brush officially supports AMD, Intel, and NVIDIA GPUs. Current end-to-end validation used NVIDIA; CPU-only software graphics backends remain unverified but are not artificially blocked by startup checks.
 - Node.js 22.12+, Rust stable, and the WebKitGTK development dependencies required by Tauri 2.
-- System `ffmpeg`, `ffprobe`, and `colmap`. Ubuntu 24.04's COLMAP 3.9 CLI and the COLMAP 4.x CLI are supported.
+- Ubuntu 24.04 system `ffmpeg`, `ffprobe`, and CPU-only `colmap` (COLMAP 3.9 from the Ubuntu repository).
 - Brush v0.3.0 for Linux x86_64, installed and verified by `npm run setup:engines`.
 
 Install Ubuntu dependencies with:
@@ -162,7 +164,7 @@ npm run setup:engines
 npm run tauri -- dev
 ```
 
-### Ubuntu Development
+### Ubuntu 24.04 Alpha Development
 
 After installing the Ubuntu system dependencies, Node.js, and Rust:
 
@@ -176,9 +178,9 @@ npm run tauri -- dev
 
 From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:linux`) verifies the local engines and license mappings, rebuilds the release executable only when the sources changed, and starts OOOSplat.
 
-Linux engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and COLMAP remain system packages. The Ubuntu alpha produces a native unbundled executable.
+Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. It produces only an unbundled native x86_64 executable.
 
-The Ubuntu CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
+The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
 
 ### Tests and Checks
 

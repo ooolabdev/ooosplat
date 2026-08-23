@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat 是一款面向 Windows 和 Ubuntu 的本地视频转 3D Gaussian Splatting 桌面应用。Windows 发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序；Ubuntu 开发版使用系统 FFmpeg/COLMAP，并通过固定来源和 SHA-256 安装 Brush。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
+OOOSplat 是一款本地视频转 3D Gaussian Splatting 桌面应用。Windows 发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供，使用系统 FFmpeg/FFprobe/COLMAP CPU，并通过固定来源和 SHA-256 安装 Brush。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
 
 当前版本：**0.2.0**
 
@@ -51,14 +51,16 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 - 项目磁盘需要容纳源视频副本、抽帧图像、COLMAP 数据、Brush 中间文件和最终 PLY。长视频或精细档位可能占用大量空间。
 - 安装模式为整机安装，安装时可能需要管理员权限。
 
-COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用 GPU 图形后端，二者的 GPU 检测与运行机制相互独立。
+Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用图形后端，二者的 GPU 检测与运行机制相互独立。
 
-### Ubuntu alpha
+### Ubuntu 24.04 Alpha（仅限 x86_64）
+
+> 本 Alpha 仅交付可从源码构建的 Ubuntu 24.04 本机可执行文件，不包含 Linux 安装包，也不声明支持 Ubuntu 22.04、其他 Linux 发行版或生产环境部署。
 
 - Ubuntu 24.04 LTS，x86_64。
 - Brush 支持的图形后端和对应驱动；Brush 官方支持 AMD、Intel 和 NVIDIA GPU。当前端到端验证使用 NVIDIA GPU，CPU-only 软件图形后端尚未验证，但不会被启动检查人为阻止。
 - Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖。
-- 系统 `ffmpeg`、`ffprobe` 和 `colmap`；支持 Ubuntu 24.04 的 COLMAP 3.9 CLI，也支持 COLMAP 4.x CLI。
+- Ubuntu 24.04 系统 `ffmpeg`、`ffprobe` 和 CPU 版 `colmap`（仓库版本为 COLMAP 3.9）。
 - Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
 
 Ubuntu 依赖安装：
@@ -160,7 +162,7 @@ npm run setup:engines
 npm run tauri -- dev
 ```
 
-### Ubuntu 开发
+### Ubuntu 24.04 Alpha 开发
 
 安装上面的 Ubuntu 系统依赖、Node.js 和 Rust 后：
 
@@ -174,9 +176,9 @@ npm run tauri -- dev
 
 也可以在仓库根目录运行 `./scripts/start-app-linux.sh`，或使用 `npm run start:app:linux`。启动脚本会先校验本机引擎和许可映射，仅在源码更新时重新构建 Release 可执行文件。
 
-Linux `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 COLMAP 保持为系统软件包。Ubuntu alpha 生成不带安装包的本机可执行文件。
+Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。该流程只生成不带安装包的 x86_64 本机可执行文件。
 
-Ubuntu 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
+Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
 
 ### 测试与检查
 

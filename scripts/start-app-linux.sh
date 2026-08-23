@@ -27,7 +27,9 @@ if [[ ! -x "$binary" || ! -x "$bundled_brush" ]]; then
 else
   build_inputs=(
     "$workspace/src"
+    "$workspace/assets"
     "$workspace/src-tauri/src"
+    "$workspace/src-tauri/icons"
     "$workspace/src-tauri/Cargo.toml"
     "$workspace/src-tauri/Cargo.lock"
     "$workspace/src-tauri/tauri.conf.json"

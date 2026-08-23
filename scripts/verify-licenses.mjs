@@ -113,11 +113,24 @@ for (const engine of manifest.engines) {
 
 const linuxManifest = JSON.parse(readText("engines/manifest.linux.json"));
 assert(linuxManifest.schemaVersion >= 2, "Linux engine manifest schemaVersion must include license mappings.");
+assert(linuxManifest.brush?.version === "0.3.0", "Linux Brush version is incorrect.");
+assert(
+  linuxManifest.brush?.sourceUrl ===
+    "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz",
+  "Linux Brush release archive is incorrect.",
+);
 assert(linuxManifest.brush?.license === "Apache-2.0", "Linux Brush license identifier is incorrect.");
 assert(
   linuxManifest.brush?.licenseFiles?.length === 1 && linuxManifest.brush.licenseFiles[0] === "licenses/Brush-LICENSE.txt",
   "Linux Brush license file mapping is incorrect.",
 );
+for (const marker of [
+  "Ubuntu 24.04 Alpha, Linux x86_64 release archive",
+  "brush-app-x86_64-unknown-linux-gnu.tar.xz",
+  "engines/manifest.linux.json",
+]) {
+  assertContains(thirdParty, marker, "THIRD_PARTY_NOTICES.txt");
+}
 
 const ffmpegLicense = readText("licenses/FFmpeg-LGPL-2.1.txt");
 assertContains(ffmpegLicense, "GNU LESSER GENERAL PUBLIC LICENSE", "FFmpeg license");
@@ -154,4 +167,4 @@ for (const term of [
   assertContains(outputs, term, "Generated outputs policy");
 }
 
-console.log("Verified OOOSplat license metadata, 3 direct engine notices, and the Linux Brush mapping.");
+console.log("Verified OOOSplat license metadata and Windows/Linux notices for 3 direct engines.");
