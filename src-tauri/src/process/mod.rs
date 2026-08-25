@@ -180,10 +180,6 @@ impl ProcessManager {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        #[cfg(unix)]
-        {
-            command.process_group(0);
-        }
 
         let mut child = command.spawn().map_err(|error| SplatError::EngineStart {
             engine: spec.executable.display().to_string(),
@@ -270,13 +266,6 @@ impl ProcessManager {
             _ = self.cancellation.cancelled() => {
                 #[cfg(windows)]
                 job.terminate();
-                #[cfg(unix)]
-                {
-                    let pgid = process_id as i32;
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
-                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 finished.store(true, Ordering::Relaxed);

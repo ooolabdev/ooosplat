@@ -32,7 +32,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "app", "dmg"],
+    "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -41,7 +41,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "category": "GraphicsAndDesign",
     "license": "Apache-2.0",
     "licenseFile": "../LICENSE",
     "resources": {
@@ -62,10 +61,6 @@
         "installMode": "perMachine",
         "compression": "bzip2"
       }
-    },
-    "macOS": {
-      "frameworks": [],
-      "minimumSystemVersion": "11.0"
     }
   }
 }
