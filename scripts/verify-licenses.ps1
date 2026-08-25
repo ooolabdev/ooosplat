@@ -62,7 +62,8 @@ $requiredFiles = @(
     "licenses/COLMAP-LICENSE.txt",
     "licenses/NVIDIA-CUDA-Runtime.txt",
     "licenses/Brush-LICENSE.txt",
-    "engines/manifest.json"
+    "engines/manifest.json",
+    "engines/manifest.linux.json"
 )
 
 foreach ($relativePath in $requiredFiles) {
@@ -126,6 +127,17 @@ foreach ($engine in $manifest.engines) {
     Assert-Contains $thirdParty $expected.File "THIRD_PARTY_NOTICES.txt"
 }
 
+$linuxManifest = (Read-Utf8Text "engines/manifest.linux.json") | ConvertFrom-Json
+Assert-True ($linuxManifest.schemaVersion -ge 2) "Linux engine manifest schemaVersion must include license mappings."
+Assert-True ($linuxManifest.brush.version -eq "0.3.0") "Linux Brush version is incorrect."
+Assert-True ($linuxManifest.brush.sourceUrl -eq "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz") "Linux Brush release archive is incorrect."
+Assert-True ($linuxManifest.brush.license -eq "Apache-2.0") "Linux Brush license identifier is incorrect."
+Assert-True (@($linuxManifest.brush.licenseFiles).Count -eq 1) "Linux Brush must map to one direct license file."
+Assert-True ($linuxManifest.brush.licenseFiles[0] -eq "licenses/Brush-LICENSE.txt") "Linux Brush license file mapping is incorrect."
+foreach ($marker in "Ubuntu 24.04 Alpha, Linux x86_64 release archive", "brush-app-x86_64-unknown-linux-gnu.tar.xz", "engines/manifest.linux.json") {
+    Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
+}
+
 $ffmpegLicense = Read-Utf8Text "licenses/FFmpeg-LGPL-2.1.txt"
 Assert-Contains $ffmpegLicense "GNU LESSER GENERAL PUBLIC LICENSE" "FFmpeg license"
 Assert-Contains $ffmpegLicense "Version 2.1, February 1999" "FFmpeg license"
@@ -151,4 +163,4 @@ foreach ($term in "final.ply", "Apache License 2.0", "General Public License (GP
     Assert-Contains $outputs $term "Generated outputs policy"
 }
 
-Write-Host "Verified OOOSplat license metadata and 3 direct engine notices."
+Write-Host "Verified OOOSplat license metadata and Windows/Linux notices for 3 direct engines."

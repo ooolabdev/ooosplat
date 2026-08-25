@@ -64,7 +64,7 @@ pub struct ProjectOverview {
 fn app_data_root() -> Result<PathBuf> {
     dirs::data_local_dir()
         .map(|v| v.join("SplatStudio"))
-        .ok_or_else(|| SplatError::Process("无法定位 LOCALAPPDATA 目录".into()))
+        .ok_or_else(|| SplatError::Process("无法定位本机应用数据目录".into()))
 }
 fn settings_path() -> Result<PathBuf> {
     Ok(app_data_root()?.join("settings.json"))

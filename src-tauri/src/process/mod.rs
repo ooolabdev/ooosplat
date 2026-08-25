@@ -20,6 +20,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SplatError};
 
+#[cfg(unix)]
+fn signal_process_group(process_id: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // The child is made the leader of a new process group before spawn, so a
+    // negative PID targets it and every descendant that stays in that group.
+    let result = unsafe { libc::kill(-(process_id as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
 #[cfg(windows)]
 mod windows_job {
     use std::{io, mem::size_of, ptr};
@@ -181,6 +198,12 @@ impl ProcessManager {
             command.creation_flags(CREATE_NO_WINDOW);
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+
         let mut child = command.spawn().map_err(|error| SplatError::EngineStart {
             engine: spec.executable.display().to_string(),
             detail: error.to_string(),
@@ -266,8 +289,23 @@ impl ProcessManager {
             _ = self.cancellation.cancelled() => {
                 #[cfg(windows)]
                 job.terminate();
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                #[cfg(unix)]
+                {
+                    let _ = signal_process_group(process_id, libc::SIGTERM);
+                    if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+                        let _ = signal_process_group(process_id, libc::SIGKILL);
+                        let _ = child.wait().await;
+                    } else {
+                        // The direct child can exit while a descendant ignores SIGTERM.
+                        // The process-group ID remains usable until the last member exits.
+                        let _ = signal_process_group(process_id, libc::SIGKILL);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
                 finished.store(true, Ordering::Relaxed);
                 stdout_task.abort();
                 stderr_task.abort();
@@ -398,5 +436,46 @@ mod tests {
         let disk = tokio::fs::read_to_string(log_path).await.unwrap();
         assert!(disk.contains("frame=2"));
         assert!(disk.contains("warning line"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_descendant_processes() {
+        let descendant_pid = Arc::new(std::sync::Mutex::new(None::<u32>));
+        let observer: ProcessObserver = {
+            let descendant_pid = descendant_pid.clone();
+            Arc::new(move |update| {
+                if let ProcessUpdate::Line { line, .. } = update {
+                    if let Ok(pid) = line.parse() {
+                        *descendant_pid.lock().unwrap() = Some(pid);
+                    }
+                }
+            })
+        };
+        let manager = ProcessManager::new();
+        let running_manager = manager.clone();
+        let run = tokio::spawn(async move {
+            running_manager
+                .run(ProcessSpec {
+                    executable: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".into(), "sleep 30 & echo $!; wait".into()],
+                    working_directory: None,
+                    log_path: None,
+                    observer: Some(observer),
+                })
+                .await
+        });
+
+        for _ in 0..50 {
+            if descendant_pid.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = descendant_pid.lock().unwrap().expect("descendant PID");
+        manager.cancel();
+        assert!(matches!(run.await.unwrap(), Err(SplatError::Cancelled)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
     }
 }

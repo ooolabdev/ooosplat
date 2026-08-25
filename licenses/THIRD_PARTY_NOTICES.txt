@@ -1,10 +1,10 @@
 OOOSplat — Third-party notices
 ================================
 
-This notice indexes the three native engines directly distributed with
-OOOSplat. Each component remains subject to its own license. This direct
-component list is not represented as a complete audit of transitive
-dependencies such as Qt, Boost, Ceres, or their dependencies.
+This notice indexes the three native engines directly distributed with or
+downloaded by OOOSplat. Each component remains subject to its own license.
+This direct component list is not represented as a complete audit of
+transitive dependencies such as Qt, Boost, Ceres, or their dependencies.
 
 FFmpeg / FFprobe
 ----------------
@@ -43,13 +43,15 @@ Upstream source: https://docs.nvidia.com/cuda/eula/index.html
 
 Brush
 -----
-Version: v0.3.0 Windows x64
+Version: v0.3.0
 License: Apache License 2.0
 SPDX identifier: Apache-2.0
 License text: licenses/Brush-LICENSE.txt
 Upstream source: https://github.com/ArthurBrussee/brush/tree/v0.3.0
-Release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
+Windows x64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
+Ubuntu 24.04 Alpha, Linux x86_64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz
 
 Exact archive and executable SHA-256 values are recorded in
-engines/manifest.json. This notice does not modify any component license.
+engines/manifest.json for Windows and engines/manifest.linux.json for the
+Ubuntu 24.04 Alpha. This notice does not modify any component license.
 Third-party product names and marks belong to their respective owners.

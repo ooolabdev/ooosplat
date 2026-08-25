@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面应用。发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序，用户无需配置系统 `PATH` 或单独安装原生引擎。源码仓库不保存这些大型二进制文件，而是通过固定来源和 SHA-256 在构建前恢复。
+OOOSplat 是一款本地视频转 3D Gaussian Splatting 桌面应用。Windows 发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供，使用系统 FFmpeg/FFprobe/COLMAP CPU，并通过固定来源和 SHA-256 安装 Brush。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
 
 当前版本：**0.2.0**
 
@@ -16,14 +16,14 @@ OOOSplat 是一款面向 Windows 的本地视频转 3D Gaussian Splatting 桌面
 
 - 从 MP4、MOV 视频创建 Gaussian Splatting 项目。
 - 自动完成视频分析、均匀抽帧、特征提取、顺序匹配、相机重建、Brush 训练和 PLY 发布。
-- FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 随安装包提供。
+- Windows 安装包内置 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush；Ubuntu 使用系统 FFmpeg/COLMAP 与固定版本的 Brush。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
 - 原始进程输出完整写入项目的 `logs` 目录。
-- 支持取消任务，并通过 Windows Job Object 终止整个子进程树。
+- 支持取消任务，并通过 Windows Job Object 或 Linux Unix process group 终止整个子进程树。
 - 支持自定义项目根目录，默认位置为 `Documents\SplatStudio\Projects`。
 - 自动记录已完成、失败、中断和取消的历史任务。
-- 可在资源管理器中定位 `final.ply`，或将整个项目移入 Windows 回收站。
+- 可在文件管理器中定位 `final.ply`，或将整个项目移入系统回收站。
 - 可拖动中央分界线调整左右面板宽度；右下角支持 80%–140% 整体界面缩放。
 - 支持中文、空格、长文件名和 UNC 项目路径。
 
@@ -51,7 +51,29 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 - 项目磁盘需要容纳源视频副本、抽帧图像、COLMAP 数据、Brush 中间文件和最终 PLY。长视频或精细档位可能占用大量空间。
 - 安装模式为整机安装，安装时可能需要管理员权限。
 
-COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用 GPU 图形后端，二者的 GPU 检测与运行机制相互独立。
+Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用图形后端，二者的 GPU 检测与运行机制相互独立。
+
+### Ubuntu 24.04 Alpha（仅限 x86_64）
+
+> 本 Alpha 仅交付可从源码构建的 Ubuntu 24.04 本机可执行文件，不包含 Linux 安装包，也不声明支持 Ubuntu 22.04、其他 Linux 发行版或生产环境部署。
+
+- Ubuntu 24.04 LTS，x86_64。
+- Brush 支持的图形后端和对应驱动；Brush 官方支持 AMD、Intel 和 NVIDIA GPU。当前端到端验证使用 NVIDIA GPU，CPU-only 软件图形后端尚未验证，但不会被启动检查人为阻止。
+- Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖。
+- Ubuntu 24.04 系统 `ffmpeg`、`ffprobe` 和 CPU 版 `colmap`（仓库版本为 COLMAP 3.9）。
+- Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
+
+Ubuntu 依赖安装：
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential curl file ffmpeg colmap \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+```
+
+请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU；Brush 会在运行时选择可用的图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
 ## 安装与使用
 
@@ -140,6 +162,24 @@ npm run setup:engines
 npm run tauri -- dev
 ```
 
+### Ubuntu 24.04 Alpha 开发
+
+安装上面的 Ubuntu 系统依赖、Node.js 和 Rust 后：
+
+```bash
+npm ci
+npm run setup:engines
+npm run verify:engines
+npm run verify:licenses
+npm run tauri -- dev
+```
+
+也可以在仓库根目录运行 `./scripts/start-app-linux.sh`，或使用 `npm run start:app:linux`。启动脚本会先校验本机引擎和许可映射，仅在源码更新时重新构建 Release 可执行文件。
+
+Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。该流程只生成不带安装包的 x86_64 本机可执行文件。
+
+Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
+
 ### 测试与检查
 
 ```powershell
@@ -199,11 +239,13 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 开发或诊断时可以通过全局参数 `--engine-dir <路径>`，或环境变量 `OOOSPLAT_ENGINE_DIR`，覆盖默认引擎目录。
 
+Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLMAP` 和 `OOOSPLAT_BRUSH` 指定可执行文件；未指定时按仓库托管目录和系统 `PATH` 依次发现。
+
 ## 常见问题
 
 ### 如何让 COLMAP 使用显卡？
 
-无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。
+无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
 
 ### 为什么任务在相机重建后停止？
 
@@ -223,7 +265,7 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 - 后端：Rust、Tokio
 - 前端：React 19、TypeScript、Vite、Zustand
 - 原生流水线：FFmpeg / FFprobe、COLMAP、Brush
-- Windows 进程管理：Job Object
+- 进程树管理：Windows Job Object；Linux Unix process group
 
 ## 许可说明
 

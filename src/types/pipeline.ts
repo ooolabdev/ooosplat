@@ -18,7 +18,7 @@ export interface ColmapAccelerationStatus {
   device: GpuDeviceInfo | null;
   requirements: AccelerationRequirements;
 }
-export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; detail: string; }
+export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; colmapCliFamily?: "legacy39" | "modern4"; detail: string; }
 export interface VideoInfo { duration: number; width: number; height: number; fps: number; totalFrames: number; codec: string; rotation: number; }
 export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
 

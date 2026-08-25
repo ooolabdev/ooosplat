@@ -18,8 +18,13 @@
 | P0 | macOS 版本 | 为 Apple Silicon Mac 提供完整的 OOOSplat 桌面应用与内置引擎工作流。 | [#4 Add macOS support](https://github.com/ooolabdev/ooosplat/issues/4) |
 | P1 | 支持输入图片序列 | 允许用户以有序图片集作为重建输入，而不必先制作视频文件。 | 待创建 |
 | P1 | CUDA 加速版本 | 为受支持的 NVIDIA GPU 提供可选的 CUDA 重建流水线，同时保留 CPU 路径。 | [#6 Add CUDA-accelerated pipeline for NVIDIA GPUs](https://github.com/ooolabdev/ooosplat/issues/6)；相关用户反馈 [#2](https://github.com/ooolabdev/ooosplat/issues/2) 已关闭 |
-| P2 | Linux 版本 | 为目标 Linux 发行版提供完整的 OOOSplat 桌面应用与内置引擎工作流。 | [#5 Add Linux support](https://github.com/ooolabdev/ooosplat/issues/5) |
 | P3 | 全景视频支持 | 探索将全景视频作为输入并生成可用 Gaussian Splatting 结果的工作流。 | 待创建 |
+
+## 已完成
+
+| 状态 | 事项 | 交付 | GitHub Issue |
+| --- | --- | --- | --- |
+| 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供从源码构建的无安装包桌面应用和 CLI，使用系统 FFmpeg/FFprobe/CPU COLMAP 与固定版本 Brush；不代表支持其他 Linux 发行版。 | [#5 Add Linux support](https://github.com/ooolabdev/ooosplat/issues/5)，由 [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) 交付 |
 
 ## 跟踪与贡献
 

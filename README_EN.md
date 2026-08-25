@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat is a local Windows desktop application that converts video into 3D Gaussian Splatting projects. Its release package bundles FFmpeg, FFprobe, a CUDA-enabled COLMAP build, and Brush, so users do not need to configure the system `PATH` or install native engines separately. Large engine binaries are not stored in the source repository; the build setup restores them from pinned sources and verifies their SHA-256 hashes.
+OOOSplat is a local desktop application that converts video into 3D Gaussian Splatting projects. Windows releases bundle FFmpeg, FFprobe, a CUDA-enabled COLMAP build, and Brush. Linux support is currently limited to an Ubuntu 24.04 LTS x86_64 Alpha that uses system FFmpeg/FFprobe/CPU COLMAP and installs Brush from a pinned, SHA-256-verified source. The React interface calls the local Rust backend directly; no remote service or localhost API is required.
 
 Current version: **0.2.0**
 
@@ -18,14 +18,14 @@ See the [OOOSplat Roadmap](ROADMAP.md) for planned work.
 
 - Create Gaussian Splatting projects from MP4 and MOV videos.
 - Automatically run video analysis, uniform frame extraction, feature extraction, sequential matching, camera reconstruction, Brush training, and PLY publishing.
-- Bundle FFmpeg, FFprobe, COLMAP (CUDA build), and Brush with the installer.
+- Bundle FFmpeg, FFprobe, COLMAP (CUDA build), and Brush on Windows; use system FFmpeg/COLMAP and pinned Brush on Ubuntu.
 - Automatically check the bundled CUDA runtime, NVIDIA driver version, and GPU Compute Capability. COLMAP uses GPU acceleration for feature extraction and matching when the requirements are met, and otherwise falls back to CPU.
 - Show processing stages, engine output, key counters, elapsed time, and up to 500 UI log entries in real time.
 - Write complete raw process output to the project `logs` directory.
-- Cancel tasks and terminate the full child-process tree with a Windows Job Object.
+- Cancel tasks and terminate the full child-process tree with a Windows Job Object or Linux Unix process group.
 - Choose a custom projects root, defaulting to `Documents\SplatStudio\Projects`.
 - Track completed, failed, interrupted, and cancelled tasks.
-- Reveal `final.ply` in File Explorer or move the complete project to the Windows Recycle Bin.
+- Reveal `final.ply` in the platform file manager or move the complete project to the system trash.
 - Resize the left and right panels by dragging the divider, and scale the full interface from 80% to 140%.
 - Support Chinese characters, spaces, long file names, and UNC project paths.
 
@@ -53,7 +53,29 @@ The task stops when COLMAP registers fewer than 50% of the input images. A 50%‚Ä
 - Enough disk space for a source-video copy, extracted frames, COLMAP data, Brush intermediate files, and the final PLY. Long videos and higher quality presets can require substantial space.
 - The installer uses a per-machine installation and may require administrator privileges.
 
-The bundled COLMAP build supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available GPU graphics backend; its GPU detection and runtime are independent of COLMAP.
+The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available graphics backend; its GPU detection and runtime are independent of COLMAP.
+
+### Ubuntu 24.04 Alpha (x86_64 only)
+
+> This Alpha delivers a native executable built from source for Ubuntu 24.04 only. It does not include a Linux installer and does not claim support for Ubuntu 22.04, other Linux distributions, or production deployment.
+
+- Ubuntu 24.04 LTS, x86_64.
+- A graphics backend and driver supported by Brush. Brush officially supports AMD, Intel, and NVIDIA GPUs. Current end-to-end validation used NVIDIA; CPU-only software graphics backends remain unverified but are not artificially blocked by startup checks.
+- Node.js 22.12+, Rust stable, and the WebKitGTK development dependencies required by Tauri 2.
+- Ubuntu 24.04 system `ffmpeg`, `ffprobe`, and CPU-only `colmap` (COLMAP 3.9 from the Ubuntu repository).
+- Brush v0.3.0 for Linux x86_64, installed and verified by `npm run setup:engines`.
+
+Install Ubuntu dependencies with:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential curl file ffmpeg colmap \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+```
+
+Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Ubuntu 24.04's non-CUDA COLMAP package automatically uses the CPU, while Brush selects an available graphics backend at runtime. Fully CPU-only software Vulkan has not yet been validated end to end.
 
 ## Installation and Use
 
@@ -142,6 +164,24 @@ npm run setup:engines
 npm run tauri -- dev
 ```
 
+### Ubuntu 24.04 Alpha Development
+
+After installing the Ubuntu system dependencies, Node.js, and Rust:
+
+```bash
+npm ci
+npm run setup:engines
+npm run verify:engines
+npm run verify:licenses
+npm run tauri -- dev
+```
+
+From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:linux`) verifies the local engines and license mappings, rebuilds the release executable only when the sources changed, and starts OOOSplat.
+
+Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. It produces only an unbundled native x86_64 executable.
+
+The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
+
 ### Tests and Checks
 
 ```powershell
@@ -201,11 +241,13 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 For development or diagnostics, use the global `--engine-dir <path>` argument or the `OOOSPLAT_ENGINE_DIR` environment variable to override the default engine directory.
 
+On Linux, `OOOSPLAT_FFMPEG`, `OOOSPLAT_FFPROBE`, `OOOSPLAT_COLMAP`, and `OOOSPLAT_BRUSH` can override individual executables. Otherwise, OOOSplat searches managed repository locations and the system `PATH`.
+
 ## FAQ
 
 ### Why is COLMAP using the CPU instead of the GPU?
 
-OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush GPU availability is detected separately.
+OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush is independent of COLMAP and selects an available graphics backend at runtime.
 
 ### Why does a task stop after camera reconstruction?
 
@@ -225,7 +267,7 @@ Not yet. This release provides generation, project management, and File Explorer
 - Backend: Rust and Tokio
 - Frontend: React 19, TypeScript, Vite, and Zustand
 - Native pipeline: FFmpeg / FFprobe, COLMAP, and Brush
-- Windows process management: Job Object
+- Process-tree management: Windows Job Object; Linux Unix process group
 
 ## ü§ù Contributing
 
