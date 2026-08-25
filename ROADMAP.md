@@ -24,7 +24,7 @@
 
 | 状态 | 事项 | 交付 | GitHub Issue |
 | --- | --- | --- | --- |
-| 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供从源码构建的无安装包桌面应用和 CLI，使用系统 FFmpeg/FFprobe/CPU COLMAP 与固定版本 Brush；不代表支持其他 Linux 发行版。 | [#5 Add Linux support](https://github.com/ooolabdev/ooosplat/issues/5)，由 [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) 交付 |
+| 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供 `.deb` 桌面安装包和 CLI，使用系统 FFmpeg/FFprobe/CPU COLMAP 与安装包内固定版本 Brush；不代表支持其他 Linux 发行版。 | [#5 Add Linux support](https://github.com/ooolabdev/ooosplat/issues/5)，由 [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) 交付 |
 
 ## 跟踪与贡献
 

@@ -1,5 +1,22 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "build": { "beforeBuildCommand": "npm run build" },
-  "bundle": { "active": false }
+  "build": {
+    "beforeBuildCommand": "npm run verify:engines && npm run verify:licenses && npm run build"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "resources": {
+      "../engines/manifest.linux.json": "engines/manifest.linux.json",
+      "../engines/linux/brush/": "engines/linux/brush/"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["ffmpeg", "colmap"],
+        "recommends": ["libvulkan1", "mesa-vulkan-drivers"],
+        "section": "graphics",
+        "priority": "optional"
+      }
+    }
+  }
 }

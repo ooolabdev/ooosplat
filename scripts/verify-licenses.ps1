@@ -95,6 +95,16 @@ foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../G
 
 $tauriWindows = (Read-Utf8Text "src-tauri/tauri.windows.conf.json") | ConvertFrom-Json
 Assert-True (@($tauriWindows.bundle.resources.PSObject.Properties.Name) -contains "../engines/manifest.json") "Windows Tauri resources are missing the Windows engine manifest."
+$tauriLinux = (Read-Utf8Text "src-tauri/tauri.linux.conf.json") | ConvertFrom-Json
+Assert-True ($tauriLinux.bundle.active -eq $true) "Linux Tauri bundling must be enabled."
+Assert-True (@($tauriLinux.bundle.targets) -contains "deb") "Linux Tauri targets must include deb."
+$linuxResources = @($tauriLinux.bundle.resources.PSObject.Properties.Name)
+foreach ($resource in "../engines/manifest.linux.json", "../engines/linux/brush/") {
+    Assert-True ($linuxResources -contains $resource) "Linux Tauri resources are missing $resource."
+}
+foreach ($dependency in "ffmpeg", "colmap") {
+    Assert-True (@($tauriLinux.bundle.linux.deb.depends) -contains $dependency) "Linux DEB dependencies are missing $dependency."
+}
 $tauriMacos = (Read-Utf8Text "src-tauri/tauri.macos.conf.json") | ConvertFrom-Json
 Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "15.0") "macOS bundle must target macOS 15.0."
 $macosResources = @($tauriMacos.bundle.resources.PSObject.Properties.Name)

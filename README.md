@@ -64,11 +64,11 @@ Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行�
 
 ### Ubuntu 24.04 Alpha（仅限 x86_64）
 
-> 本 Alpha 仅交付可从源码构建的 Ubuntu 24.04 本机可执行文件，不包含 Linux 安装包，也不声明支持 Ubuntu 22.04、其他 Linux 发行版或生产环境部署。
+> 本 Alpha 交付由 Ubuntu 24.04 构建的 x86_64 `.deb` 安装包；不声明支持 Ubuntu 22.04、其他 Linux 发行版或生产环境部署。
 
 - Ubuntu 24.04 LTS，x86_64。
 - Brush 支持的图形后端和对应驱动；Brush 官方支持 AMD、Intel 和 NVIDIA GPU。当前端到端验证使用 NVIDIA GPU，CPU-only 软件图形后端尚未验证，但不会被启动检查人为阻止。
-- Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖。
+- 从源码构建需要 Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖；安装 `.deb` 的用户不需要这些开发工具。
 - Ubuntu 24.04 系统 `ffmpeg`、`ffprobe` 和 CPU 版 `colmap`（仓库版本为 COLMAP 3.9）。
 - Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
 
@@ -84,9 +84,17 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU；Brush 会在运行时选择可用的图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
+从 GitHub Actions 下载 `OOOSplat-Ubuntu-24.04-x86_64-alpha` Artifact 后，可执行：
+
+```bash
+sudo apt install ./OOOSplat_0.2.0_amd64.deb
+```
+
+`.deb` 会通过 Ubuntu 包管理器安装 FFmpeg、FFprobe 和 CPU 版 COLMAP；固定版本 Brush 已包含在安装包中。
+
 ## 安装与使用
 
-1. Windows 运行 `OOOSplat_0.2.0_x64-setup.exe`；Apple Silicon Mac 打开未签名 Alpha DMG 并将 OOOSplat 拖入“应用程序”。
+1. Windows 运行 `OOOSplat_0.2.0_x64-setup.exe`；Apple Silicon Mac 打开未签名 Alpha DMG 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat_0.2.0_amd64.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常。
 3. 在“01 创建新任务”中选择输入视频。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -185,9 +193,9 @@ npm run tauri -- dev
 
 也可以在仓库根目录运行 `./scripts/start-app-linux.sh`，或使用 `npm run start:app:linux`。启动脚本会先校验本机引擎和许可映射，仅在源码更新时重新构建 Release 可执行文件。
 
-Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。该流程只生成不带安装包的 x86_64 本机可执行文件。
+Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。Tauri 将 Brush 作为资源打入 x86_64 `.deb`，并在 Debian 依赖中声明 FFmpeg 和 COLMAP。
 
-Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
+Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成、`.deb` 构建、包结构校验并上传安装包与 SHA-256；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
 
 ### macOS 15+ Apple Silicon Alpha 开发
 

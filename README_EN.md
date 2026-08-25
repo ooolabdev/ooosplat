@@ -66,11 +66,11 @@ The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OO
 
 ### Ubuntu 24.04 Alpha (x86_64 only)
 
-> This Alpha delivers a native executable built from source for Ubuntu 24.04 only. It does not include a Linux installer and does not claim support for Ubuntu 22.04, other Linux distributions, or production deployment.
+> This Alpha delivers an x86_64 `.deb` package built on Ubuntu 24.04. It does not claim support for Ubuntu 22.04, other Linux distributions, or production deployment.
 
 - Ubuntu 24.04 LTS, x86_64.
 - A graphics backend and driver supported by Brush. Brush officially supports AMD, Intel, and NVIDIA GPUs. Current end-to-end validation used NVIDIA; CPU-only software graphics backends remain unverified but are not artificially blocked by startup checks.
-- Node.js 22.12+, Rust stable, and the WebKitGTK development dependencies required by Tauri 2.
+- Source builds require Node.js 22.12+, Rust stable, and Tauri 2's WebKitGTK development dependencies; `.deb` users do not need these development tools.
 - Ubuntu 24.04 system `ffmpeg`, `ffprobe`, and CPU-only `colmap` (COLMAP 3.9 from the Ubuntu repository).
 - Brush v0.3.0 for Linux x86_64, installed and verified by `npm run setup:engines`.
 
@@ -86,9 +86,17 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Ubuntu 24.04's non-CUDA COLMAP package automatically uses the CPU, while Brush selects an available graphics backend at runtime. Fully CPU-only software Vulkan has not yet been validated end to end.
 
+After downloading the `OOOSplat-Ubuntu-24.04-x86_64-alpha` Artifact from GitHub Actions, install it with:
+
+```bash
+sudo apt install ./OOOSplat_0.2.0_amd64.deb
+```
+
+The `.deb` installs FFmpeg, FFprobe, and CPU COLMAP through Ubuntu's package manager; the pinned Brush runtime is included in the package.
+
 ## Installation and Use
 
-1. On Windows, run `OOOSplat_0.2.0_x64-setup.exe`. On an Apple Silicon Mac, open the unsigned Alpha DMG and drag OOOSplat into Applications.
+1. On Windows, run `OOOSplat_0.2.0_x64-setup.exe`. On an Apple Silicon Mac, open the unsigned Alpha DMG and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat_0.2.0_amd64.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy.
 3. Select an input video under “01 Create New Task.”
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -187,9 +195,9 @@ npm run tauri -- dev
 
 From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:linux`) verifies the local engines and license mappings, rebuilds the release executable only when the sources changed, and starts OOOSplat.
 
-Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. It produces only an unbundled native x86_64 executable.
+Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. Tauri embeds Brush in the x86_64 `.deb` and declares FFmpeg and COLMAP as Debian dependencies.
 
-The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
+The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, `.deb` creation, package validation, and upload of the installer plus SHA-256. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
 
 ### macOS 15+ Apple Silicon Alpha Development
 

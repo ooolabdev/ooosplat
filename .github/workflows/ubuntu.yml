@@ -11,7 +11,7 @@ permissions:
 jobs:
   test-and-build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential ffmpeg file \
+            build-essential colmap curl ffmpeg file libvulkan1 mesa-vulkan-drivers \
             libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 
@@ -48,6 +48,11 @@ jobs:
       - name: Verify license metadata and mappings
         run: npm run verify:licenses
 
+      - name: Install and verify bundled Brush
+        run: |
+          npm run setup:engines
+          npm run verify:engines
+
       - name: Rust formatting, tests, and clippy
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
@@ -65,5 +70,38 @@ jobs:
             extract /tmp/ooosplat-ci.mp4 /tmp/ooosplat-ci-frames --quality fast
           test "$(find /tmp/ooosplat-ci-frames -maxdepth 1 -name '*.jpg' | wc -l)" -gt 0
 
-      - name: Build unbundled Tauri application
-        run: npm run tauri -- build --debug --no-bundle
+      - name: Build Ubuntu DEB package
+        run: npm run tauri -- build --bundles deb
+
+      - name: Verify Ubuntu DEB package
+        run: |
+          package="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$package"
+          test -s "$package"
+          test "$(dpkg-deb --field "$package" Architecture)" = "amd64"
+          test "$(dpkg-deb --field "$package" Version)" = "0.2.0"
+          dependencies="$(dpkg-deb --field "$package" Depends)"
+          grep -Eq '(^|, )ffmpeg([ ,]|$)' <<<"$dependencies"
+          grep -Eq '(^|, )colmap([ ,]|$)' <<<"$dependencies"
+          extracted="$(mktemp -d)"
+          trap 'rm -rf -- "$extracted"' EXIT
+          dpkg-deb --extract "$package" "$extracted"
+          test -n "$(find "$extracted" -type f -name ooo-splat -perm -111 -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/linux/brush/brush_app' -perm -111 -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/manifest.linux.json' -print -quit)"
+          dpkg-deb --info "$package"
+
+      - name: Package downloadable files
+        run: |
+          package="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          mkdir -p dist-artifacts
+          cp "$package" dist-artifacts/OOOSplat_0.2.0_amd64.deb
+          (cd dist-artifacts && sha256sum OOOSplat_0.2.0_amd64.deb > SHA256SUMS.txt)
+
+      - name: Upload Ubuntu installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: OOOSplat-Ubuntu-24.04-x86_64-alpha
+          path: dist-artifacts/
+          if-no-files-found: error
+          retention-days: 14
