@@ -18,10 +18,17 @@ while IFS= read -r formula; do
   runtime_formulae+=("$formula")
 done < <(node -e 'for (const item of require(process.argv[1]).buildEnvironment.runtimeFormulae) console.log(item)' "$manifest")
 
-export HOMEBREW_NO_AUTO_UPDATE=1
-export HOMEBREW_NO_INSTALL_FROM_API=1
+# Keep the Homebrew executable and Formula DSL in sync before checking out the
+# pinned homebrew/core revision. Runner images can ship an older Homebrew with
+# newer or locally modified formula files, which makes valid formula DSL fail.
+unset HOMEBREW_NO_AUTO_UPDATE HOMEBREW_NO_INSTALL_FROM_API
 brew tap --force homebrew/core
 core_repository="$(brew --repo homebrew/core)"
+brew update-reset "$(brew --repository)" "$core_repository"
+brew update --force
+
+export HOMEBREW_NO_AUTO_UPDATE=1
+export HOMEBREW_NO_INSTALL_FROM_API=1
 git -C "$core_repository" fetch origin "$core_commit" --depth=1
 # GitHub's macOS runner image can contain tracked Homebrew formula changes
 # (for example Formula/r/rustup.rb). The runner is disposable, so discard
