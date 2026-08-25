@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { ColmapAccelerationStatus, EngineDownloadProgress, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectOverview, ProjectSummary, Quality, VideoInfo } from "../types/pipeline";
+import type { ColmapAccelerationStatus, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectOverview, ProjectSummary, Quality, VideoInfo } from "../types/pipeline";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -19,8 +19,6 @@ export async function selectProjectsRoot(current: string): Promise<string | null
 }
 
 export async function checkEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("check_engines") : []; }
-export async function downloadMissingEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("download_missing_engines") : []; }
-export async function onEngineDownloadProgress(handler: (event: EngineDownloadProgress) => void): Promise<UnlistenFn> { return listen<EngineDownloadProgress>("engine-download-progress", ({ payload }) => handler(payload)); }
 export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus> { return invoke("check_colmap_acceleration"); }
 export async function probeAndPlan(path: string, quality: Quality): Promise<{ video: VideoInfo; plan: FramePlan }> { return invoke("probe_and_plan", { path, quality }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
@@ -50,9 +48,4 @@ export async function exportPly(result: PipelineResult): Promise<string | null> 
   if (!destination) return null;
   await invoke("export_ply", { sourcePath: result.finalPly, destinationPath: destination });
   return destination;
-}
-
-export async function readPlyBytes(path: string): Promise<Uint8Array> {
-  const bytes = await invoke<number[] | Uint8Array>("read_ply_bytes", { path });
-  return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 }

@@ -19,7 +19,6 @@ export interface ColmapAccelerationStatus {
   requirements: AccelerationRequirements;
 }
 export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; detail: string; }
-export interface EngineDownloadProgress { engine: EngineKind; phase: "downloading" | "extracting" | "ready" | "failed"; percent: number; message: string; }
 export interface VideoInfo { duration: number; width: number; height: number; fps: number; totalFrames: number; codec: string; rotation: number; }
 export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
 
