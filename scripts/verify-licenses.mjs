@@ -151,6 +151,7 @@ assert(macosManifest.architecture === "arm64", "macOS engine manifest must be Ap
 assert(macosManifest.minimumSystemVersion === "11.0", "macOS engine manifest must target macOS 11.0.");
 assert(/^[A-F0-9]{40}$/.test(macosManifest.buildEnvironment?.homebrewCoreCommit), "macOS Homebrew/core build commit is not pinned.");
 assert(macosManifest.buildEnvironment?.runner === "macos-15", "macOS engine runner must be pinned to macos-15.");
+assert(macosManifest.buildEnvironment?.buildTransitiveRuntimeDependenciesFromSource === true, "macOS transitive runtime dependencies must be built from source.");
 assert(macosManifest.engines?.length === 3, "macOS manifest must contain the three direct engines.");
 for (const engine of macosManifest.engines) {
   const expected = expectedEngines.get(engine.name);

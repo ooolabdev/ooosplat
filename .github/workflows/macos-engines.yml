@@ -13,6 +13,9 @@ jobs:
   build-engines:
     runs-on: macos-15
     timeout-minutes: 360
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
 
     steps:
       - name: Check out source
@@ -23,6 +26,15 @@ jobs:
         with:
           node-version: 24
           cache: npm
+
+      - name: Restore macOS build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            .cache/ccache
+            .cache/macos-engine-build/sources
+          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
 
       - name: Install pinned build prerequisites
         run: bash scripts/setup-macos-build-deps.sh
@@ -38,6 +50,7 @@ jobs:
             dist-engines/*.tar.xz
             dist-engines/*.sha256
           if-no-files-found: error
+          retention-days: 14
 
       - name: Publish immutable engine release assets
         if: startsWith(github.ref, 'refs/tags/engines-macos-arm64-v')

@@ -30,19 +30,30 @@ version_le() {
   (( left_major < right_major || (left_major == right_major && left_minor <= right_minor) ))
 }
 
+mach_o_validation_failed=0
 while IFS= read -r file_path; do
-  file "$file_path" | grep -q 'arm64' || { echo "Non-arm64 Mach-O: $file_path" >&2; exit 1; }
+  if ! file "$file_path" | grep -q 'arm64'; then
+    echo "Non-arm64 Mach-O: $file_path" >&2
+    mach_o_validation_failed=1
+    continue
+  fi
   # The first line is the inspected file's own absolute path. Only dependency
   # lines are relevant when checking whether the runtime is relocatable.
   if otool -L "$file_path" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/|/private/tmp|/var/folders' >/dev/null; then
     echo "Non-relocatable dependency in $file_path" >&2
     otool -L "$file_path" >&2
-    exit 1
+    mach_o_validation_failed=1
   fi
   minos="$(vtool -show-build "$file_path" 2>/dev/null | awk '/minos/ { print $2; exit }')"
-  [[ -n "$minos" ]] || { echo "Cannot read deployment target from $file_path" >&2; exit 1; }
-  version_le "$minos" "11.0" || { echo "$file_path requires macOS $minos (maximum allowed is 11.0)." >&2; exit 1; }
+  if [[ -z "$minos" ]]; then
+    echo "Cannot read deployment target from $file_path" >&2
+    mach_o_validation_failed=1
+  elif ! version_le "$minos" "11.0"; then
+    echo "$file_path requires macOS $minos (maximum allowed is 11.0)." >&2
+    mach_o_validation_failed=1
+  fi
 done < <(find "$runtime/bin" "$runtime/lib" -type f -print)
+(( mach_o_validation_failed == 0 )) || exit 1
 
 for target in "$runtime/bin"/* "$runtime/lib"/*; do
   [[ -f "$target" ]] || continue

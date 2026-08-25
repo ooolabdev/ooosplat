@@ -67,9 +67,12 @@ tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
     --disable-ffplay \
     --disable-doc \
     --disable-debug \
+    --disable-autodetect \
     --enable-ffmpeg \
     --enable-ffprobe \
-    --extra-ldflags=-Wl,-headerpad_max_install_names \
+    --extra-cflags="-mmacosx-version-min=$deployment_target" \
+    --extra-cxxflags="-mmacosx-version-min=$deployment_target" \
+    --extra-ldflags="-mmacosx-version-min=$deployment_target -Wl,-headerpad_max_install_names" \
     --install-name-dir=@rpath
   make -j"$jobs"
   make install

@@ -7,10 +7,12 @@
   "buildEnvironment": {
     "runner": "macos-15",
     "homebrewCoreCommit": "67A856E0A75FE0E5A822AE2D5A53538403AED8AE",
+    "buildTransitiveRuntimeDependenciesFromSource": true,
     "buildTools": [
       "cmake",
       "ninja",
-      "pkg-config"
+      "pkg-config",
+      "ccache"
     ],
     "runtimeFormulae": [
       "boost",

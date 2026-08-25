@@ -8,10 +8,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: macos-alpha-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-and-build:
     runs-on: macos-15
     timeout-minutes: 360
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
 
     steps:
       - name: Check out source
@@ -38,6 +45,15 @@ jobs:
           npm run build
           npm run verify:licenses
 
+      - name: Restore macOS build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            .cache/ccache
+            .cache/macos-engine-build/sources
+          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
+
       - name: Install engine build prerequisites
         run: bash scripts/setup-macos-build-deps.sh
 
@@ -58,17 +74,31 @@ jobs:
       - name: Verify packaged engine resources
         run: |
           app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$app"
+          test -n "$dmg"
+          plist="$app/Contents/Info.plist"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+          test -x "$app/Contents/MacOS/$executable"
           for engine in ffmpeg ffprobe colmap brush_app; do
             test -x "$app/Contents/Resources/engines/macos/arm64/bin/$engine"
+            file "$app/Contents/Resources/engines/macos/arm64/bin/$engine" | grep -q arm64
           done
+          hdiutil verify "$dmg"
+
+      - name: Package downloadable files
+        run: |
+          app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          mkdir -p dist-artifacts
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist-artifacts/OOOSplat_0.2.0_arm64.app.zip
+          cp "$dmg" dist-artifacts/OOOSplat_0.2.0_arm64.dmg
+          (cd dist-artifacts && shasum -a 256 OOOSplat_0.2.0_arm64.app.zip OOOSplat_0.2.0_arm64.dmg > SHA256SUMS.txt)
 
       - name: Upload unsigned macOS Alpha
         uses: actions/upload-artifact@v7
         with:
           name: OOOSplat-macOS-arm64-unsigned-alpha
-          path: |
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/dmg/*.dmg
+          path: dist-artifacts/
           if-no-files-found: error
           retention-days: 14

@@ -155,6 +155,7 @@ Assert-True ($macosManifest.architecture -eq "arm64") "macOS engine manifest mus
 Assert-True ($macosManifest.minimumSystemVersion -eq "11.0") "macOS engine manifest must target macOS 11.0."
 Assert-True ($macosManifest.buildEnvironment.homebrewCoreCommit -match '^[A-F0-9]{40}$') "macOS Homebrew/core build commit is not pinned."
 Assert-True ($macosManifest.buildEnvironment.runner -eq "macos-15") "macOS engine runner must be pinned to macos-15."
+Assert-True ($macosManifest.buildEnvironment.buildTransitiveRuntimeDependenciesFromSource -eq $true) "macOS transitive runtime dependencies must be built from source."
 Assert-True ($macosManifest.engines.Count -eq 3) "macOS manifest must contain the three direct engines."
 foreach ($engine in $macosManifest.engines) {
     Assert-True ($expectedEngines.ContainsKey($engine.name)) "Unexpected macOS engine: $($engine.name)"
