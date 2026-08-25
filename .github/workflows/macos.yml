@@ -71,3 +71,4 @@ jobs:
             src-tauri/target/release/bundle/macos/*.app
             src-tauri/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
+          retention-days: 14

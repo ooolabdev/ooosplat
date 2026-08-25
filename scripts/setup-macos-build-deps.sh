@@ -23,6 +23,9 @@ export HOMEBREW_NO_INSTALL_FROM_API=1
 brew tap --force homebrew/core
 core_repository="$(brew --repo homebrew/core)"
 git -C "$core_repository" fetch origin "$core_commit" --depth=1
-git -C "$core_repository" checkout --detach "$core_commit"
+# GitHub's macOS runner image can contain tracked Homebrew formula changes
+# (for example Formula/r/rustup.rb). The runner is disposable, so discard
+# those image-local changes before pinning homebrew/core for reproducibility.
+git -C "$core_repository" checkout --force --detach "$core_commit"
 brew install "${build_tools[@]}"
 MACOSX_DEPLOYMENT_TARGET=11.0 brew install --build-from-source "${runtime_formulae[@]}"
