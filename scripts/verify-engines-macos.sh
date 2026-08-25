@@ -32,7 +32,9 @@ version_le() {
 
 while IFS= read -r file_path; do
   file "$file_path" | grep -q 'arm64' || { echo "Non-arm64 Mach-O: $file_path" >&2; exit 1; }
-  if otool -L "$file_path" | grep -E '/opt/homebrew|/usr/local|/Users/|/private/tmp|/var/folders' >/dev/null; then
+  # The first line is the inspected file's own absolute path. Only dependency
+  # lines are relevant when checking whether the runtime is relocatable.
+  if otool -L "$file_path" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/|/private/tmp|/var/folders' >/dev/null; then
     echo "Non-relocatable dependency in $file_path" >&2
     otool -L "$file_path" >&2
     exit 1
