@@ -7,14 +7,14 @@
       "requestedSeries": "8.1",
       "actualVersion": "n8.1.2-44-g7c533d0f86-20260821",
       "distribution": "BtbN win64 LGPL shared 8.1",
-      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
-      "archiveSha256": "134D6B5A73239F676F283CB745C8CEAE754450731FA07529DDC0AA19A2CA8152",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
+      "archiveSha256": "e30201900132c0e3da178c63c7dac65aa0a0dcd971779546ae964b86b47bd499",
       "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
       "licenseFiles": [
         "licenses/FFmpeg-LGPL-2.1.txt"
       ],
       "install": {
-        "archiveName": "ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip",
+        "archiveName": "ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
         "destination": "engines/ffmpeg",
         "anchorFile": "ffmpeg.exe",
         "rootFromAnchorParent": 0
