@@ -82,6 +82,11 @@ done
 
 mkdir -p "$build/colmap-source" "$build/colmap"
 tar -xzf "$colmap_archive" -C "$build/colmap-source" --strip-components=1
+libomp_prefix="$(brew --prefix libomp)"
+[[ -f "$libomp_prefix/lib/libomp.dylib" ]] || {
+  echo "Homebrew libomp runtime was not found at $libomp_prefix/lib/libomp.dylib" >&2
+  exit 1
+}
 cmake -S "$build/colmap-source" -B "$build/colmap" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$stage" \
@@ -91,6 +96,11 @@ cmake -S "$build/colmap-source" -B "$build/colmap" -G Ninja \
   -DCMAKE_INSTALL_RPATH='@executable_path/../lib' \
   -DCMAKE_EXE_LINKER_FLAGS='-Wl,-headerpad_max_install_names' \
   -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-headerpad_max_install_names' \
+  -DOpenMP_C_FLAGS="-Xpreprocessor -fopenmp -I$libomp_prefix/include" \
+  -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I$libomp_prefix/include" \
+  -DOpenMP_C_LIB_NAMES=omp \
+  -DOpenMP_CXX_LIB_NAMES=omp \
+  -DOpenMP_omp_LIBRARY="$libomp_prefix/lib/libomp.dylib" \
   -DGUI_ENABLED=OFF \
   -DCUDA_ENABLED=OFF \
   -DONNX_ENABLED=OFF \
