@@ -13,6 +13,7 @@ done
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime="$workspace/engines/macos/arm64"
 manifest="$workspace/engines/manifest.macos.json"
+minimum_system_version="$(node -e 'process.stdout.write(require(process.argv[1]).minimumSystemVersion)' "$manifest")"
 
 for relative in bin/ffmpeg bin/ffprobe bin/colmap bin/brush_app SHA256SUMS BUILD-INFO.json BUNDLED-COMPONENTS.json; do
   [[ -f "$runtime/$relative" ]] || { echo "Missing macOS runtime file: $relative" >&2; exit 1; }
@@ -48,8 +49,8 @@ while IFS= read -r file_path; do
   if [[ -z "$minos" ]]; then
     echo "Cannot read deployment target from $file_path" >&2
     mach_o_validation_failed=1
-  elif ! version_le "$minos" "11.0"; then
-    echo "$file_path requires macOS $minos (maximum allowed is 11.0)." >&2
+  elif ! version_le "$minos" "$minimum_system_version"; then
+    echo "$file_path requires macOS $minos (maximum allowed is $minimum_system_version)." >&2
     mach_o_validation_failed=1
   fi
 done < <(find "$runtime/bin" "$runtime/lib" -type f -print)
@@ -98,7 +99,7 @@ done
 node -e '
 const fs=require("fs"), path=require("path");
 const m=require(process.argv[1]), b=require(process.argv[2]), c=require(process.argv[3]);
-if (m.architecture!=="arm64" || m.minimumSystemVersion!=="11.0" || b.minimumSystemVersion!=="11.0" || !Array.isArray(c.components)) process.exit(1);
+if (m.architecture!=="arm64" || m.minimumSystemVersion!=="15.0" || b.minimumSystemVersion!==m.minimumSystemVersion || !Array.isArray(c.components)) process.exit(1);
 const covered=new Set(c.components.flatMap(component=>component.files));
 for (const file of fs.readdirSync(path.join(process.argv[4],"lib"))) if (!covered.has(`lib/${file}`)) throw new Error(`Missing license inventory for lib/${file}`);
 for (const license of c.sourceLicenseFiles||[]) if (!fs.existsSync(path.join(process.argv[4],license))) throw new Error(`Missing source license ${license}`);

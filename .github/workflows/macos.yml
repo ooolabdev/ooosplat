@@ -1,4 +1,4 @@
-name: macOS 11+ Apple Silicon Alpha
+name: macOS 15+ Apple Silicon Alpha
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     env:
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
       CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
 
     steps:
@@ -46,7 +46,7 @@ jobs:
           npm run verify:licenses
 
       - name: Restore macOS build caches
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/Library/Caches/Homebrew

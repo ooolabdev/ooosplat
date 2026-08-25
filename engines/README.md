@@ -3,7 +3,7 @@
 Native binaries are not stored in Git. Exact upstream URLs, archive hashes,
 installation rules, reported versions, and executable hashes are pinned in
 `manifest.json` (Windows), `manifest.linux.json` (Ubuntu 24.04 Alpha,
-x86_64 only), and `manifest.macos.json` (macOS 11+ Apple Silicon Alpha).
+x86_64 only), and `manifest.macos.json` (macOS 15+ Apple Silicon Alpha).
 
 Restore the local release inputs before development or packaging:
 

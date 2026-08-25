@@ -1,4 +1,4 @@
-name: macOS arm64 engine runtime
+name: macOS 15+ arm64 engine runtime
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     env:
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
       CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
 
     steps:
@@ -28,7 +28,7 @@ jobs:
           cache: npm
 
       - name: Restore macOS build caches
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/Library/Caches/Homebrew

@@ -96,7 +96,7 @@ foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../G
 $tauriWindows = (Read-Utf8Text "src-tauri/tauri.windows.conf.json") | ConvertFrom-Json
 Assert-True (@($tauriWindows.bundle.resources.PSObject.Properties.Name) -contains "../engines/manifest.json") "Windows Tauri resources are missing the Windows engine manifest."
 $tauriMacos = (Read-Utf8Text "src-tauri/tauri.macos.conf.json") | ConvertFrom-Json
-Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "11.0") "macOS bundle must target macOS 11.0."
+Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "15.0") "macOS bundle must target macOS 15.0."
 $macosResources = @($tauriMacos.bundle.resources.PSObject.Properties.Name)
 foreach ($resource in "../engines/manifest.macos.json", "../engines/macos/arm64/") {
     Assert-True ($macosResources -contains $resource) "macOS Tauri resources are missing $resource."
@@ -152,10 +152,10 @@ $macosManifest = (Read-Utf8Text "engines/manifest.macos.json") | ConvertFrom-Jso
 Assert-True ($macosManifest.schemaVersion -ge 1) "macOS engine manifest schemaVersion is missing."
 Assert-True ($macosManifest.platform -eq "macos") "macOS engine manifest platform is incorrect."
 Assert-True ($macosManifest.architecture -eq "arm64") "macOS engine manifest must be Apple arm64 only."
-Assert-True ($macosManifest.minimumSystemVersion -eq "11.0") "macOS engine manifest must target macOS 11.0."
+Assert-True ($macosManifest.minimumSystemVersion -eq "15.0") "macOS engine manifest must target macOS 15.0."
 Assert-True ($macosManifest.buildEnvironment.homebrewCoreCommit -match '^[A-F0-9]{40}$') "macOS Homebrew/core build commit is not pinned."
 Assert-True ($macosManifest.buildEnvironment.runner -eq "macos-15") "macOS engine runner must be pinned to macos-15."
-Assert-True ($macosManifest.buildEnvironment.buildTransitiveRuntimeDependenciesFromSource -eq $true) "macOS transitive runtime dependencies must be built from source."
+Assert-True ($macosManifest.buildEnvironment.usePinnedHomebrewBottles -eq $true) "macOS build dependencies must use pinned Homebrew bottles."
 Assert-True ($macosManifest.engines.Count -eq 3) "macOS manifest must contain the three direct engines."
 foreach ($engine in $macosManifest.engines) {
     Assert-True ($expectedEngines.ContainsKey($engine.name)) "Unexpected macOS engine: $($engine.name)"
@@ -164,7 +164,7 @@ foreach ($engine in $macosManifest.engines) {
     Assert-True (@($engine.licenseFiles).Count -eq 1 -and $engine.licenseFiles[0] -eq $expected.File) "$($engine.name) macOS license mapping is incorrect."
     Assert-True ($engine.sourceSha256 -match '^[A-F0-9]{64}$') "$($engine.name) macOS source SHA-256 is invalid."
 }
-foreach ($marker in "macOS 11+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COLMAP 4.0.4 macOS arm64 CPU CLI-only", "brush-app-aarch64-apple-darwin.tar.xz", "engines/manifest.macos.json") {
+foreach ($marker in "macOS 15+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COLMAP 4.0.4 macOS arm64 CPU CLI-only", "brush-app-aarch64-apple-darwin.tar.xz", "engines/manifest.macos.json") {
     Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
 }
 

@@ -20,7 +20,7 @@ Upstream source: https://ffmpeg.org/download.html
 Build source and scripts: https://github.com/BtbN/FFmpeg-Builds
 Release archive: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip
 
-macOS 11+ Apple Silicon arm64 distribution: OOOSplat-built FFmpeg and
+macOS 15+ Apple Silicon arm64 distribution: OOOSplat-built FFmpeg and
 FFprobe 8.1.2 shared executables. The build uses the unmodified release source
 archive https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, disables GPL and
 nonfree components, and is packaged with its required shared libraries. The
@@ -68,7 +68,7 @@ License text: licenses/Brush-LICENSE.txt
 Upstream source: https://github.com/ArthurBrussee/brush/tree/v0.3.0
 Windows x64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
 Ubuntu 24.04 Alpha, Linux x86_64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz
-macOS 11+ Apple Silicon arm64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz
+macOS 15+ Apple Silicon arm64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz
 
 Exact archive and executable SHA-256 values are recorded in
 engines/manifest.json for Windows, engines/manifest.linux.json for the Ubuntu

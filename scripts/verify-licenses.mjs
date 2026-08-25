@@ -93,7 +93,7 @@ assert(
   "Windows Tauri resources are missing the Windows engine manifest.",
 );
 const tauriMacos = JSON.parse(readText("src-tauri/tauri.macos.conf.json"));
-assert(tauriMacos.bundle?.macOS?.minimumSystemVersion === "11.0", "macOS bundle must target macOS 11.0.");
+assert(tauriMacos.bundle?.macOS?.minimumSystemVersion === "15.0", "macOS bundle must target macOS 15.0.");
 for (const resource of ["../engines/manifest.macos.json", "../engines/macos/arm64/"]) {
   assert(Object.hasOwn(tauriMacos.bundle?.resources ?? {}, resource), `macOS Tauri resources are missing ${resource}.`);
 }
@@ -148,10 +148,10 @@ const macosManifest = JSON.parse(readText("engines/manifest.macos.json"));
 assert(macosManifest.schemaVersion >= 1, "macOS engine manifest schemaVersion is missing.");
 assert(macosManifest.platform === "macos", "macOS engine manifest platform is incorrect.");
 assert(macosManifest.architecture === "arm64", "macOS engine manifest must be Apple arm64 only.");
-assert(macosManifest.minimumSystemVersion === "11.0", "macOS engine manifest must target macOS 11.0.");
+assert(macosManifest.minimumSystemVersion === "15.0", "macOS engine manifest must target macOS 15.0.");
 assert(/^[A-F0-9]{40}$/.test(macosManifest.buildEnvironment?.homebrewCoreCommit), "macOS Homebrew/core build commit is not pinned.");
 assert(macosManifest.buildEnvironment?.runner === "macos-15", "macOS engine runner must be pinned to macos-15.");
-assert(macosManifest.buildEnvironment?.buildTransitiveRuntimeDependenciesFromSource === true, "macOS transitive runtime dependencies must be built from source.");
+assert(macosManifest.buildEnvironment?.usePinnedHomebrewBottles === true, "macOS build dependencies must use pinned Homebrew bottles.");
 assert(macosManifest.engines?.length === 3, "macOS manifest must contain the three direct engines.");
 for (const engine of macosManifest.engines) {
   const expected = expectedEngines.get(engine.name);
@@ -161,7 +161,7 @@ for (const engine of macosManifest.engines) {
   assert(/^[A-F0-9]{64}$/.test(engine.sourceSha256), `${engine.name} macOS source SHA-256 is invalid.`);
 }
 for (const marker of [
-  "macOS 11+ Apple Silicon arm64",
+  "macOS 15+ Apple Silicon arm64",
   "ffmpeg-8.1.2.tar.xz",
   "COLMAP 4.0.4 macOS arm64 CPU CLI-only",
   "brush-app-aarch64-apple-darwin.tar.xz",

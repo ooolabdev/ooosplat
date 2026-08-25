@@ -18,7 +18,7 @@ build="$cache/build"
 stage="$cache/stage/ooosplat-engines-macos-arm64"
 output="$workspace/dist-engines"
 jobs="${OOOSPLAT_BUILD_JOBS:-$(sysctl -n hw.logicalcpu)}"
-deployment_target="11.0"
+deployment_target="15.0"
 
 read_manifest() {
   node -e 'const m=require(process.argv[1]); let v=m; for (const key of process.argv[2].split(".")) v=v[key]; process.stdout.write(String(v));' "$manifest" "$1"

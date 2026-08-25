@@ -29,7 +29,6 @@ brew update --force
 
 export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_INSTALL_FROM_API=1
-export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
 git -C "$core_repository" fetch origin "$core_commit" --depth=1
 # GitHub's macOS runner image can contain tracked Homebrew formula changes
 # (for example Formula/r/rustup.rb). The runner is disposable, so discard
@@ -38,30 +37,8 @@ git -C "$core_repository" checkout --force --detach "$core_commit"
 brew install "${build_tools[@]}"
 ccache --set-config=max_size=2G
 
-# `brew install --build-from-source` only applies to formulae explicitly named
-# on the command line; dependencies still use host-version bottles. Build the
-# complete required/recommended runtime dependency graph from source so every
-# dylib can retain the declared macOS 11 deployment target.
-source_formulae=()
-append_unique_formula() {
-  local candidate="$1" existing
-  for existing in "${source_formulae[@]}"; do
-    [[ "$existing" == "$candidate" ]] && return
-  done
-  source_formulae+=("$candidate")
-}
-while IFS= read -r formula; do
-  [[ -n "$formula" ]] && append_unique_formula "$formula"
-done < <(brew deps --union --topological --full-name "${runtime_formulae[@]}")
-for formula in "${runtime_formulae[@]}"; do
-  append_unique_formula "$formula"
-done
-
-for formula in "${source_formulae[@]}"; do
-  echo "Building macOS 11 dependency from source: $formula"
-  if brew list --versions "$formula" >/dev/null 2>&1; then
-    MACOSX_DEPLOYMENT_TARGET=11.0 brew reinstall --build-from-source "$formula"
-  else
-    MACOSX_DEPLOYMENT_TARGET=11.0 brew install --build-from-source "$formula"
-  fi
-done
+# The macOS Alpha targets the same macOS 15 generation as the pinned runner,
+# so pinned arm64 bottles are valid build inputs. Runtime dylibs are copied into
+# the application and rewritten to @rpath by build-engines-macos.sh; end users
+# do not need Homebrew or access to the system PATH.
+brew install "${runtime_formulae[@]}"

@@ -53,7 +53,7 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 
 Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用图形后端，二者的 GPU 检测与运行机制相互独立。
 
-### macOS 11+ Alpha（仅限 Apple Silicon）
+### macOS 15+ Alpha（仅限 Apple Silicon）
 
 > 当前交付为未签名、未公证的 `.app`/`.dmg` Alpha，仅支持 M1 或更新的 Apple Silicon Mac，不支持 Intel Mac 或 Universal Binary。
 
@@ -189,7 +189,7 @@ Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/
 
 Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
 
-### macOS 11+ Apple Silicon Alpha 开发
+### macOS 15+ Apple Silicon Alpha 开发
 
 在 Apple Silicon Mac 上安装 Node.js、Rust 和 Xcode Command Line Tools 后：
 

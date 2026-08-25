@@ -3,11 +3,11 @@
   "generatedAt": "2026-08-25",
   "platform": "macos",
   "architecture": "arm64",
-  "minimumSystemVersion": "11.0",
+  "minimumSystemVersion": "15.0",
   "buildEnvironment": {
     "runner": "macos-15",
     "homebrewCoreCommit": "67A856E0A75FE0E5A822AE2D5A53538403AED8AE",
-    "buildTransitiveRuntimeDependenciesFromSource": true,
+    "usePinnedHomebrewBottles": true,
     "buildTools": [
       "cmake",
       "ninja",
@@ -59,7 +59,7 @@
       "version": "0.3.0",
       "sourceUrl": "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz",
       "sourceSha256": "65B2631398C839BE3C1D4D7160FE2326389DEC87830AAC0710985E6690A1048C",
-      "buildPolicy": "Official Apple arm64 release; rebuild tag v0.3.0 from source if its deployment target exceeds macOS 11.0",
+      "buildPolicy": "Official Apple arm64 release; rebuild tag v0.3.0 from source if its deployment target exceeds macOS 15.0",
       "license": "Apache-2.0",
       "licenseFiles": ["licenses/Brush-LICENSE.txt"]
     }

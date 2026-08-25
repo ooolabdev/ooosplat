@@ -55,7 +55,7 @@ The task stops when COLMAP registers fewer than 50% of the input images. A 50%â€
 
 The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available graphics backend; its GPU detection and runtime are independent of COLMAP.
 
-### macOS 11+ Alpha (Apple Silicon only)
+### macOS 15+ Alpha (Apple Silicon only)
 
 > The current deliverable is an unsigned, unnotarized `.app`/`.dmg` Alpha for M1 or newer Apple Silicon Macs. Intel Macs and Universal Binaries are not supported.
 
@@ -191,7 +191,7 @@ Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linu
 
 The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
 
-### macOS 11+ Apple Silicon Alpha Development
+### macOS 15+ Apple Silicon Alpha Development
 
 On an Apple Silicon Mac with Node.js, Rust, and Xcode Command Line Tools:
 
