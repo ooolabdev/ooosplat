@@ -102,7 +102,7 @@ const m=require(process.argv[1]), b=require(process.argv[2]), c=require(process.
 if (m.architecture!=="arm64" || m.minimumSystemVersion!=="15.0" || b.minimumSystemVersion!==m.minimumSystemVersion || !Array.isArray(c.components)) process.exit(1);
 const covered=new Set(c.components.flatMap(component=>component.files));
 for (const file of fs.readdirSync(path.join(process.argv[4],"lib"))) if (!covered.has(`lib/${file}`)) throw new Error(`Missing license inventory for lib/${file}`);
-for (const license of c.sourceLicenseFiles||[]) if (!fs.existsSync(path.join(process.argv[4],license))) throw new Error(`Missing source license ${license}`);
+for (const license of c.sourceLicenseFiles||[]) if (!fs.existsSync(path.join(process.argv[4],"licenses",license))) throw new Error(`Missing source license ${license}`);
 if ((c.sourceLicenseFiles||[]).length < 6) throw new Error("Incomplete COLMAP source license inventory");
 ' "$manifest" "$runtime/BUILD-INFO.json" "$runtime/BUNDLED-COMPONENTS.json" "$runtime"
 echo "Verified bundled Apple Silicon FFmpeg/FFprobe, CPU COLMAP, and Brush without PATH fallback."
