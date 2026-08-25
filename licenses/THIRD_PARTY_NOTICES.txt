@@ -3,8 +3,11 @@ OOOSplat — Third-party notices
 
 This notice indexes the three native engines directly distributed with or
 downloaded by OOOSplat. Each component remains subject to its own license.
-This direct component list is not represented as a complete audit of
-transitive dependencies such as Qt, Boost, Ceres, or their dependencies.
+For the macOS runtime, BUNDLED-COMPONENTS.json is generated from the dylibs
+actually copied into the release and records their Homebrew formula, declared
+license, homepage, and packaged files. Release verification rejects an
+unmapped dylib. Windows and Linux transitive dependency auditing remains
+separate from this direct component notice.
 
 FFmpeg / FFprobe
 ----------------
@@ -16,6 +19,13 @@ License text: licenses/FFmpeg-LGPL-2.1.txt
 Upstream source: https://ffmpeg.org/download.html
 Build source and scripts: https://github.com/BtbN/FFmpeg-Builds
 Release archive: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip
+
+macOS 11+ Apple Silicon arm64 distribution: OOOSplat-built FFmpeg and
+FFprobe 8.1.2 shared executables. The build uses the unmodified release source
+archive https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz, disables GPL and
+nonfree components, and is packaged with its required shared libraries. The
+source archive SHA-256 and build policy are recorded in
+engines/manifest.macos.json. Homebrew is not a runtime dependency.
 
 The selected shared build disables GPL and nonfree components. The complete
 configure string can be inspected with `ffmpeg.exe -buildconf`.
@@ -30,6 +40,14 @@ License text: licenses/COLMAP-LICENSE.txt
 Release source: https://github.com/colmap/colmap/releases/tag/4.0.4
 Commit source: https://github.com/colmap/colmap/tree/5b76f53
 Release archive: https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-cuda.zip
+
+COLMAP 4.0.4 macOS arm64 CPU CLI-only distribution: built by OOOSplat from
+https://github.com/colmap/colmap/archive/refs/tags/4.0.4.tar.gz with CUDA, GUI,
+tests, and nonessential OpenGL support disabled. Required redistributable
+libraries are included and relocated inside the application; Homebrew is used
+only on the build runner and is not required by users. Direct build details
+are emitted in BUILD-INFO.json; the exact dylib inventory is emitted in
+BUNDLED-COMPONENTS.json and indexed by engines/manifest.macos.json.
 
 NVIDIA CUDA Runtime
 -------------------
@@ -50,8 +68,10 @@ License text: licenses/Brush-LICENSE.txt
 Upstream source: https://github.com/ArthurBrussee/brush/tree/v0.3.0
 Windows x64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
 Ubuntu 24.04 Alpha, Linux x86_64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz
+macOS 11+ Apple Silicon arm64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz
 
 Exact archive and executable SHA-256 values are recorded in
-engines/manifest.json for Windows and engines/manifest.linux.json for the
-Ubuntu 24.04 Alpha. This notice does not modify any component license.
+engines/manifest.json for Windows, engines/manifest.linux.json for the Ubuntu
+24.04 Alpha, and engines/manifest.macos.json for Apple Silicon macOS. This
+notice does not modify any component license.
 Third-party product names and marks belong to their respective owners.

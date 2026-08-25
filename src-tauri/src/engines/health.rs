@@ -46,6 +46,7 @@ pub enum ColmapBackend {
 #[serde(rename_all = "camelCase")]
 pub enum AccelerationReasonCode {
     GpuReady,
+    MacOsCpuOnly,
     ColmapUnavailable,
     ColmapCudaUnavailable,
     RequirementsUnavailable,
@@ -121,7 +122,15 @@ impl EnginePaths {
             brush: root.join("brush").join("brush_app.exe"),
             root,
         };
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let paths = Self {
+            ffmpeg: root.join("bin").join("ffmpeg"),
+            ffprobe: root.join("bin").join("ffprobe"),
+            colmap: root.join("bin").join("colmap"),
+            brush: root.join("bin").join("brush_app"),
+            root,
+        };
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         let paths = Self {
             ffmpeg: root.join("ffmpeg"),
             ffprobe: root.join("ffprobe"),
@@ -140,7 +149,14 @@ impl EnginePaths {
             Self::from_root(root)
         };
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let paths = {
+            // macOS releases are self-contained. Homebrew and PATH are build-time
+            // conveniences only and must never become end-user dependencies.
+            Self::from_root(root)
+        };
+
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         let paths = {
             let defaults = Self::from_root(root.clone());
             Self {
@@ -180,12 +196,27 @@ impl EnginePaths {
         }
 
         let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut candidates = vec![
+        let candidates = vec![
             resource_dir.map(|path| path.join("engines")),
             Some(current.join("engines")),
             Some(current.join("..").join("engines")),
         ];
+        #[cfg(target_os = "macos")]
+        let mut candidates = candidates
+            .into_iter()
+            .map(|candidate| candidate.map(|path| path.join("macos").join("arm64")))
+            .collect::<Vec<_>>();
+        #[cfg(not(target_os = "macos"))]
+        let mut candidates = candidates;
         if let Ok(executable) = std::env::current_exe() {
+            #[cfg(target_os = "macos")]
+            candidates.extend(
+                executable
+                    .ancestors()
+                    .skip(1)
+                    .map(|ancestor| Some(ancestor.join("engines").join("macos").join("arm64"))),
+            );
+            #[cfg(not(target_os = "macos"))]
             candidates.extend(
                 executable
                     .ancestors()
@@ -193,11 +224,16 @@ impl EnginePaths {
                     .map(|ancestor| Some(ancestor.join("engines"))),
             );
         }
+        let fallback = if cfg!(target_os = "macos") {
+            current.join("engines").join("macos").join("arm64")
+        } else {
+            current.join("engines")
+        };
         let root = candidates
             .into_iter()
             .flatten()
             .find(|path| path.is_dir())
-            .unwrap_or_else(|| current.join("engines"));
+            .unwrap_or(fallback);
         Self::from_candidates(root)
     }
 
@@ -212,7 +248,7 @@ impl EnginePaths {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn resolve_engine(env_name: &str, managed: &[PathBuf], executable_name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(env_name) {
         return path.into();
@@ -225,7 +261,7 @@ fn resolve_engine(env_name: &str, managed: &[PathBuf], executable_name: &str) ->
         .unwrap_or_else(|| managed[0].clone())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn find_on_path(executable_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -364,22 +400,27 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
 
     let cli_family = detect_cli_family(&feature_help, &matching_help);
     successful &= cli_family.is_some();
-    let lower = help.to_ascii_lowercase();
-    let explicit_cpu = [
-        "cuda: no",
-        "cuda support: no",
-        "without cuda",
-        "no cuda support",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    let bundled_cuda = path.parent().is_some_and(runtime_contains_cuda);
-    let cpu_only = if bundled_cuda {
-        Some(false)
-    } else if explicit_cpu {
-        Some(true)
-    } else {
-        None
+    #[cfg(target_os = "macos")]
+    let cpu_only = Some(true);
+    #[cfg(not(target_os = "macos"))]
+    let cpu_only = {
+        let lower = help.to_ascii_lowercase();
+        let explicit_cpu = [
+            "cuda: no",
+            "cuda support: no",
+            "without cuda",
+            "no cuda support",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        let bundled_cuda = path.parent().is_some_and(runtime_contains_cuda);
+        if bundled_cuda {
+            Some(false)
+        } else if explicit_cpu {
+            Some(true)
+        } else {
+            None
+        }
     };
     let first_line = help
         .lines()
@@ -389,6 +430,13 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         cpu_status(
             AccelerationReasonCode::ColmapUnavailable,
             "COLMAP 必需命令无法正常启动，不能启用 GPU 加速".into(),
+            None,
+            requirements_or_default(engines_root),
+        )
+    } else if cfg!(target_os = "macos") {
+        cpu_status(
+            AccelerationReasonCode::MacOsCpuOnly,
+            "macOS Alpha 当前内置 COLMAP CPU 构建；Brush 仍会使用可用的 Metal 后端".into(),
             None,
             requirements_or_default(engines_root),
         )
@@ -403,6 +451,9 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         detect_acceleration(engines_root).await
     };
     let family_label = cli_family.map_or("不支持的 CLI", ColmapCliFamily::label);
+    #[cfg(target_os = "macos")]
+    let detail = format!("三个必需命令可启动；{family_label}；macOS arm64 CPU-only 构建");
+    #[cfg(not(target_os = "macos"))]
     let detail = match cpu_only {
         Some(true) => {
             format!("三个必需命令可启动；{family_label}；帮助输出明确报告无 CUDA")
@@ -423,12 +474,14 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn runtime_contains_cuda(directory: &Path) -> bool {
     let mut found = [false; 3];
     scan_cuda_runtime(directory, &mut found);
     found.into_iter().all(|present| present)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 3]) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -769,19 +822,30 @@ mod tests {
         default_requirements()
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
     fn finds_executable_on_path() {
         assert!(find_on_path("cargo").is_some());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
     fn linux_root_is_flat_and_discovery_can_fall_back_to_path() {
         let paths = EnginePaths::from_root("/opt/ooosplat-engines");
         assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
         let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
         assert!(discovered.ffmpeg.is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_candidates_stay_inside_the_managed_arm64_root() {
+        let root = PathBuf::from("/missing/ooosplat-engines/macos/arm64");
+        let paths = EnginePaths::from_candidates(root.clone());
+        assert_eq!(paths.ffmpeg, root.join("bin").join("ffmpeg"));
+        assert_eq!(paths.ffprobe, root.join("bin").join("ffprobe"));
+        assert_eq!(paths.colmap, root.join("bin").join("colmap"));
+        assert_eq!(paths.brush, root.join("bin").join("brush_app"));
     }
 
     #[cfg(windows)]

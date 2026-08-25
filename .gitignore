@@ -24,3 +24,4 @@ engines/colmap/**
 engines/brush/**
 !engines/brush/README.md
 engines/linux/brush/**
+engines/macos/arm64/**

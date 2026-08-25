@@ -63,7 +63,8 @@ $requiredFiles = @(
     "licenses/NVIDIA-CUDA-Runtime.txt",
     "licenses/Brush-LICENSE.txt",
     "engines/manifest.json",
-    "engines/manifest.linux.json"
+    "engines/manifest.linux.json",
+    "engines/manifest.macos.json"
 )
 
 foreach ($relativePath in $requiredFiles) {
@@ -90,6 +91,15 @@ Assert-True ($tauri.bundle.licenseFile -eq "../LICENSE") "Tauri bundle licenseFi
 $resourceNames = @($tauri.bundle.resources.PSObject.Properties.Name)
 foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../GENERATED_OUTPUTS.md", "../licenses/THIRD_PARTY_NOTICES.txt", "../licenses/FFmpeg-LGPL-2.1.txt", "../licenses/COLMAP-LICENSE.txt", "../licenses/NVIDIA-CUDA-Runtime.txt", "../licenses/Brush-LICENSE.txt") {
     Assert-True ($resourceNames -contains $resource) "Tauri resources are missing $resource."
+}
+
+$tauriWindows = (Read-Utf8Text "src-tauri/tauri.windows.conf.json") | ConvertFrom-Json
+Assert-True (@($tauriWindows.bundle.resources.PSObject.Properties.Name) -contains "../engines/manifest.json") "Windows Tauri resources are missing the Windows engine manifest."
+$tauriMacos = (Read-Utf8Text "src-tauri/tauri.macos.conf.json") | ConvertFrom-Json
+Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "11.0") "macOS bundle must target macOS 11.0."
+$macosResources = @($tauriMacos.bundle.resources.PSObject.Properties.Name)
+foreach ($resource in "../engines/manifest.macos.json", "../engines/macos/arm64/") {
+    Assert-True ($macosResources -contains $resource) "macOS Tauri resources are missing $resource."
 }
 
 $manifest = (Read-Utf8Text "engines/manifest.json") | ConvertFrom-Json
@@ -138,6 +148,25 @@ foreach ($marker in "Ubuntu 24.04 Alpha, Linux x86_64 release archive", "brush-a
     Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
 }
 
+$macosManifest = (Read-Utf8Text "engines/manifest.macos.json") | ConvertFrom-Json
+Assert-True ($macosManifest.schemaVersion -ge 1) "macOS engine manifest schemaVersion is missing."
+Assert-True ($macosManifest.platform -eq "macos") "macOS engine manifest platform is incorrect."
+Assert-True ($macosManifest.architecture -eq "arm64") "macOS engine manifest must be Apple arm64 only."
+Assert-True ($macosManifest.minimumSystemVersion -eq "11.0") "macOS engine manifest must target macOS 11.0."
+Assert-True ($macosManifest.buildEnvironment.homebrewCoreCommit -match '^[A-F0-9]{40}$') "macOS Homebrew/core build commit is not pinned."
+Assert-True ($macosManifest.buildEnvironment.runner -eq "macos-15") "macOS engine runner must be pinned to macos-15."
+Assert-True ($macosManifest.engines.Count -eq 3) "macOS manifest must contain the three direct engines."
+foreach ($engine in $macosManifest.engines) {
+    Assert-True ($expectedEngines.ContainsKey($engine.name)) "Unexpected macOS engine: $($engine.name)"
+    $expected = $expectedEngines[$engine.name]
+    Assert-True ($engine.license -eq $expected.License) "$($engine.name) macOS license identifier is incorrect."
+    Assert-True (@($engine.licenseFiles).Count -eq 1 -and $engine.licenseFiles[0] -eq $expected.File) "$($engine.name) macOS license mapping is incorrect."
+    Assert-True ($engine.sourceSha256 -match '^[A-F0-9]{64}$') "$($engine.name) macOS source SHA-256 is invalid."
+}
+foreach ($marker in "macOS 11+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COLMAP 4.0.4 macOS arm64 CPU CLI-only", "brush-app-aarch64-apple-darwin.tar.xz", "engines/manifest.macos.json") {
+    Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
+}
+
 $ffmpegLicense = Read-Utf8Text "licenses/FFmpeg-LGPL-2.1.txt"
 Assert-Contains $ffmpegLicense "GNU LESSER GENERAL PUBLIC LICENSE" "FFmpeg license"
 Assert-Contains $ffmpegLicense "Version 2.1, February 1999" "FFmpeg license"
@@ -163,4 +192,4 @@ foreach ($term in "final.ply", "Apache License 2.0", "General Public License (GP
     Assert-Contains $outputs $term "Generated outputs policy"
 }
 
-Write-Host "Verified OOOSplat license metadata and Windows/Linux notices for 3 direct engines."
+Write-Host "Verified OOOSplat license metadata and Windows/Linux/macOS notices for 3 direct engines."

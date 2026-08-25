@@ -1,0 +1,73 @@
+name: macOS 11+ Apple Silicon Alpha
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend and license checks
+        run: |
+          npm test
+          npm run build
+          npm run verify:licenses
+
+      - name: Install engine build prerequisites
+        run: bash scripts/setup-macos-build-deps.sh
+
+      - name: Build and verify bundled arm64 engines
+        run: npm run build:engines:macos
+
+      - name: Rust formatting, tests, and clippy
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build unsigned app and DMG
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: npm run tauri -- build --bundles app,dmg
+
+      - name: Verify packaged engine resources
+        run: |
+          app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          for engine in ffmpeg ffprobe colmap brush_app; do
+            test -x "$app/Contents/Resources/engines/macos/arm64/bin/$engine"
+          done
+
+      - name: Upload unsigned macOS Alpha
+        uses: actions/upload-artifact@v7
+        with:
+          name: OOOSplat-macOS-arm64-unsigned-alpha
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

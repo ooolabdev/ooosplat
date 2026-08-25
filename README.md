@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat 是一款本地视频转 3D Gaussian Splatting 桌面应用。Windows 发布流程会将 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush 打包进安装程序；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供，使用系统 FFmpeg/FFprobe/COLMAP CPU，并通过固定来源和 SHA-256 安装 Brush。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
+OOOSplat 是一款本地视频转 3D Gaussian Splatting 桌面应用。Windows 和 Apple Silicon macOS Alpha 均随应用内置 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
 
 当前版本：**0.2.0**
 
@@ -16,11 +16,11 @@ OOOSplat 是一款本地视频转 3D Gaussian Splatting 桌面应用。Windows �
 
 - 从 MP4、MOV 视频创建 Gaussian Splatting 项目。
 - 自动完成视频分析、均匀抽帧、特征提取、顺序匹配、相机重建、Brush 训练和 PLY 发布。
-- Windows 安装包内置 FFmpeg、FFprobe、COLMAP（CUDA 构建）和 Brush；Ubuntu 使用系统 FFmpeg/COLMAP 与固定版本的 Brush。
+- Windows 安装包内置 CUDA 版 COLMAP；macOS Alpha 内置 arm64 CPU 版 COLMAP；Ubuntu 使用系统 CPU 版 COLMAP。三个平台均使用固定并校验的 FFmpeg/Brush 方案。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
 - 原始进程输出完整写入项目的 `logs` 目录。
-- 支持取消任务，并通过 Windows Job Object 或 Linux Unix process group 终止整个子进程树。
+- 支持取消任务，并通过 Windows Job Object 或 Unix process group 终止整个子进程树。
 - 支持自定义项目根目录，默认位置为 `Documents\SplatStudio\Projects`。
 - 自动记录已完成、失败、中断和取消的历史任务。
 - 可在文件管理器中定位 `final.ply`，或将整个项目移入系统回收站。
@@ -53,6 +53,15 @@ COLMAP 注册图像比例低于 50% 时任务停止；50%–80% 时给出质量�
 
 Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行前会自动选择可用后端；Brush 训练使用可用图形后端，二者的 GPU 检测与运行机制相互独立。
 
+### macOS 11+ Alpha（仅限 Apple Silicon）
+
+> 当前交付为未签名、未公证的 `.app`/`.dmg` Alpha，仅支持 M1 或更新的 Apple Silicon Mac，不支持 Intel Mac 或 Universal Binary。
+
+- 内置原生 arm64 FFmpeg 8.1.2、独立 FFprobe、COLMAP 4.0.4 CPU CLI-only 和 Brush v0.3.0。
+- 用户不需要安装 Homebrew，也不会回退到 Homebrew 或系统 `PATH` 中的同名程序。
+- COLMAP 固定使用 CPU；Brush 独立选择可用的 Metal 图形后端，界面会明确显示该原因。
+- 首次打开未签名版本时，macOS Gatekeeper 可能阻止启动。请在 Finder 中右键应用并选择“打开”；正式版本将在后续接入 Apple 签名和公证。
+
 ### Ubuntu 24.04 Alpha（仅限 x86_64）
 
 > 本 Alpha 仅交付可从源码构建的 Ubuntu 24.04 本机可执行文件，不包含 Linux 安装包，也不声明支持 Ubuntu 22.04、其他 Linux 发行版或生产环境部署。
@@ -77,7 +86,7 @@ sudo apt install -y \
 
 ## 安装与使用
 
-1. 运行 `OOOSplat_0.2.0_x64-setup.exe` 完成安装。
+1. Windows 运行 `OOOSplat_0.2.0_x64-setup.exe`；Apple Silicon Mac 打开未签名 Alpha DMG 并将 OOOSplat 拖入“应用程序”。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常。
 3. 在“01 创建新任务”中选择输入视频。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -133,11 +142,11 @@ sudo apt install -y \
 
 | 引擎 | 固定版本/构建 | 用途 |
 | --- | --- | --- |
-| FFmpeg / FFprobe | 8.1 系列 Windows x64 LGPL shared | 视频分析与抽帧 |
-| COLMAP | 4.0.4 发布资产，CUDA 构建 | 自动选择 CPU/CUDA GPU 完成特征与匹配，并执行相机重建 |
-| Brush | v0.3.0 Windows x64 | Gaussian Splatting 训练与 PLY 导出 |
+| FFmpeg / FFprobe | Windows x64 8.1 LGPL shared；macOS arm64 8.1.2 LGPL shared | 视频分析与抽帧 |
+| COLMAP | Windows 4.0.4 CUDA；macOS arm64 4.0.4 CPU CLI-only | 特征、匹配和相机重建 |
+| Brush | v0.3.0 Windows x64 / macOS arm64 | Gaussian Splatting 训练与 PLY 导出 |
 
-详细来源、实际版本、下载与安装规则、压缩包哈希和可执行文件哈希记录在 [`engines/manifest.json`](engines/manifest.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 下载并恢复到本地。Release 打包前会运行校验；文件缺失、哈希变化、COLMAP CUDA 运行时缺失或 Brush CLI 参数不符合预期时，打包会被阻止。
+Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/manifest.json`](engines/manifest.json)、[`engines/manifest.linux.json`](engines/manifest.linux.json) 和 [`engines/manifest.macos.json`](engines/manifest.macos.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 恢复本地运行时。Release 打包前会校验来源、哈希、架构、动态库闭包和 Brush CLI 参数。
 
 第三方许可和通知位于 [`licenses/`](licenses/)：
 
@@ -179,6 +188,20 @@ npm run tauri -- dev
 Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。该流程只生成不带安装包的 x86_64 本机可执行文件。
 
 Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成和无安装包 Tauri 构建；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
+
+### macOS 11+ Apple Silicon Alpha 开发
+
+在 Apple Silicon Mac 上安装 Node.js、Rust 和 Xcode Command Line Tools 后：
+
+```bash
+npm ci
+npm run setup:engines
+npm run verify:engines
+npm run verify:licenses
+npm run tauri -- dev
+```
+
+`setup:engines` 从同仓库的固定 GitHub Release 下载完整 arm64 运行时；Homebrew 只用于维护者先执行 `npm run setup:build-deps:macos`，再执行 `npm run build:engines:macos` 重建引擎。`.github/workflows/macos.yml` 构建未签名应用和 DMG，`.github/workflows/macos-engines.yml` 生成并发布锁定的引擎归档。
 
 ### 测试与检查
 

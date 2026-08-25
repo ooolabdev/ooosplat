@@ -44,7 +44,6 @@
     "license": "Apache-2.0",
     "licenseFile": "../LICENSE",
     "resources": {
-      "../engines/": "engines/",
       "../licenses/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
       "../licenses/FFmpeg-LGPL-2.1.txt": "licenses/FFmpeg-LGPL-2.1.txt",
       "../licenses/COLMAP-LICENSE.txt": "licenses/COLMAP-LICENSE.txt",

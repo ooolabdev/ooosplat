@@ -6,7 +6,7 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
-OOOSplat is a local desktop application that converts video into 3D Gaussian Splatting projects. Windows releases bundle FFmpeg, FFprobe, a CUDA-enabled COLMAP build, and Brush. Linux support is currently limited to an Ubuntu 24.04 LTS x86_64 Alpha that uses system FFmpeg/FFprobe/CPU COLMAP and installs Brush from a pinned, SHA-256-verified source. The React interface calls the local Rust backend directly; no remote service or localhost API is required.
+OOOSplat is a local desktop application that converts video into 3D Gaussian Splatting projects. Windows and the Apple Silicon macOS Alpha bundle FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. The React interface calls the local Rust backend directly; no remote service or localhost API is required.
 
 Current version: **0.2.0**
 
@@ -18,11 +18,11 @@ See the [OOOSplat Roadmap](ROADMAP.md) for planned work.
 
 - Create Gaussian Splatting projects from MP4 and MOV videos.
 - Automatically run video analysis, uniform frame extraction, feature extraction, sequential matching, camera reconstruction, Brush training, and PLY publishing.
-- Bundle FFmpeg, FFprobe, COLMAP (CUDA build), and Brush on Windows; use system FFmpeg/COLMAP and pinned Brush on Ubuntu.
+- Bundle CUDA-enabled COLMAP on Windows and arm64 CPU-only COLMAP on macOS; Ubuntu uses its system CPU COLMAP. FFmpeg and Brush follow pinned, verified platform policies.
 - Automatically check the bundled CUDA runtime, NVIDIA driver version, and GPU Compute Capability. COLMAP uses GPU acceleration for feature extraction and matching when the requirements are met, and otherwise falls back to CPU.
 - Show processing stages, engine output, key counters, elapsed time, and up to 500 UI log entries in real time.
 - Write complete raw process output to the project `logs` directory.
-- Cancel tasks and terminate the full child-process tree with a Windows Job Object or Linux Unix process group.
+- Cancel tasks and terminate the full child-process tree with a Windows Job Object or Unix process group.
 - Choose a custom projects root, defaulting to `Documents\SplatStudio\Projects`.
 - Track completed, failed, interrupted, and cancelled tasks.
 - Reveal `final.ply` in the platform file manager or move the complete project to the system trash.
@@ -55,6 +55,15 @@ The task stops when COLMAP registers fewer than 50% of the input images. A 50%�
 
 The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available graphics backend; its GPU detection and runtime are independent of COLMAP.
 
+### macOS 11+ Alpha (Apple Silicon only)
+
+> The current deliverable is an unsigned, unnotarized `.app`/`.dmg` Alpha for M1 or newer Apple Silicon Macs. Intel Macs and Universal Binaries are not supported.
+
+- Bundles native arm64 FFmpeg 8.1.2, a real standalone FFprobe, COLMAP 4.0.4 CPU CLI-only, and Brush v0.3.0.
+- Users do not install Homebrew, and OOOSplat never falls back to a Homebrew or system `PATH` engine.
+- COLMAP always uses CPU in this Alpha. Brush independently selects an available Metal graphics backend, and the UI explains this distinction.
+- Gatekeeper may block the unsigned Alpha on first launch. In Finder, right-click the app and choose Open. Signing and notarization are planned for a later production release.
+
 ### Ubuntu 24.04 Alpha (x86_64 only)
 
 > This Alpha delivers a native executable built from source for Ubuntu 24.04 only. It does not include a Linux installer and does not claim support for Ubuntu 22.04, other Linux distributions, or production deployment.
@@ -79,7 +88,7 @@ Install a working Vulkan driver for the graphics adapter, such as the proprietar
 
 ## Installation and Use
 
-1. Run `OOOSplat_0.2.0_x64-setup.exe`.
+1. On Windows, run `OOOSplat_0.2.0_x64-setup.exe`. On an Apple Silicon Mac, open the unsigned Alpha DMG and drag OOOSplat into Applications.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy.
 3. Select an input video under “01 Create New Task.”
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -135,11 +144,11 @@ Application settings and the project index are stored in:
 
 | Engine | Pinned version/build | Purpose |
 | --- | --- | --- |
-| FFmpeg / FFprobe | 8.1 series, Windows x64 LGPL shared | Video analysis and frame extraction |
-| COLMAP | 4.0.4 release asset, CUDA build | Automatically select CPU/CUDA GPU for features and matching, then perform camera reconstruction |
-| Brush | v0.3.0, Windows x64 | Gaussian Splatting training and PLY export |
+| FFmpeg / FFprobe | Windows x64 8.1 LGPL shared; macOS arm64 8.1.2 LGPL shared | Video analysis and frame extraction |
+| COLMAP | Windows 4.0.4 CUDA; macOS arm64 4.0.4 CPU CLI-only | Feature extraction, matching, and camera reconstruction |
+| Brush | v0.3.0 for Windows x64 / macOS arm64 | Gaussian Splatting training and PLY export |
 
-Sources, exact versions, download and installation rules, archive hashes, and executable hashes are recorded in [`engines/manifest.json`](engines/manifest.json). Large engine files are not committed to Git; developers restore them with `npm run setup:engines`. Release builds verify the runtimes and stop if files are missing or modified, if the COLMAP CUDA runtime is incomplete, or if the Brush CLI does not expose the expected arguments.
+Windows, Ubuntu, and macOS source and integrity policies are recorded in [`engines/manifest.json`](engines/manifest.json), [`engines/manifest.linux.json`](engines/manifest.linux.json), and [`engines/manifest.macos.json`](engines/manifest.macos.json). Large engine files are not committed to Git; developers restore them with `npm run setup:engines`. Release builds verify sources, hashes, architecture, the dynamic-library closure, and Brush CLI compatibility.
 
 Third-party licenses and notices are in [`licenses/`](licenses/):
 
@@ -181,6 +190,20 @@ From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:
 Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. It produces only an unbundled native x86_64 executable.
 
 The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, and an unbundled Tauri build. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
+
+### macOS 11+ Apple Silicon Alpha Development
+
+On an Apple Silicon Mac with Node.js, Rust, and Xcode Command Line Tools:
+
+```bash
+npm ci
+npm run setup:engines
+npm run verify:engines
+npm run verify:licenses
+npm run tauri -- dev
+```
+
+`setup:engines` downloads the complete arm64 runtime from a pinned Release in this repository. Homebrew is used only when maintainers run `npm run setup:build-deps:macos` and then `npm run build:engines:macos` to rebuild that runtime. `.github/workflows/macos.yml` builds the unsigned app and DMG; `.github/workflows/macos-engines.yml` builds and publishes the locked engine archive.
 
 ### Tests and Checks
 

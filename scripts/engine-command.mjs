@@ -14,6 +14,9 @@ if (process.platform === "win32") {
 } else if (process.platform === "linux") {
   command = "bash";
   args = [`scripts/${action}-engines-linux.sh`];
+} else if (process.platform === "darwin") {
+  command = "bash";
+  args = [`scripts/${action}-engines-macos.sh`];
 } else {
   console.error(`Unsupported platform: ${process.platform}`);
   process.exit(1);

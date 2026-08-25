@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-25",
+  "platform": "macos",
+  "architecture": "arm64",
+  "minimumSystemVersion": "11.0",
+  "buildEnvironment": {
+    "runner": "macos-15",
+    "homebrewCoreCommit": "67A856E0A75FE0E5A822AE2D5A53538403AED8AE",
+    "buildTools": [
+      "cmake",
+      "ninja",
+      "pkg-config"
+    ],
+    "runtimeFormulae": [
+      "boost",
+      "eigen",
+      "freeimage",
+      "metis",
+      "glog",
+      "sqlite",
+      "suite-sparse",
+      "ceres-solver",
+      "openimageio",
+      "libomp"
+    ]
+  },
+  "distribution": {
+    "tag": "engines-macos-arm64-v0.2.0",
+    "archiveName": "ooosplat-engines-macos-arm64-v0.2.0.tar.xz",
+    "sourceUrl": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.2.0/ooosplat-engines-macos-arm64-v0.2.0.tar.xz",
+    "archiveSha256File": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.2.0/ooosplat-engines-macos-arm64-v0.2.0.tar.xz.sha256",
+    "destination": "engines/macos/arm64",
+    "integrityFile": "SHA256SUMS"
+  },
+  "engines": [
+    {
+      "name": "FFmpeg / FFprobe",
+      "version": "8.1.2",
+      "sourceUrl": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+      "sourceSha256": "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A74D97B524C",
+      "buildPolicy": "Apple arm64 LGPL shared; GPL and nonfree disabled; ffplay disabled",
+      "license": "LGPL-2.1-or-later",
+      "licenseFiles": ["licenses/FFmpeg-LGPL-2.1.txt"]
+    },
+    {
+      "name": "COLMAP",
+      "version": "4.0.4",
+      "sourceUrl": "https://github.com/colmap/colmap/archive/refs/tags/4.0.4.tar.gz",
+      "sourceSha256": "200309ABCA2A3EE05970B1F8A48D545FC71F435DFFE6764A8040F9F6F364DA32",
+      "buildPolicy": "Apple arm64 CPU CLI-only; CUDA, GUI, tests, and OpenGL disabled",
+      "license": "BSD-3-Clause",
+      "licenseFiles": ["licenses/COLMAP-LICENSE.txt"]
+    },
+    {
+      "name": "Brush",
+      "version": "0.3.0",
+      "sourceUrl": "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz",
+      "sourceSha256": "65B2631398C839BE3C1D4D7160FE2326389DEC87830AAC0710985E6690A1048C",
+      "buildPolicy": "Official Apple arm64 release; rebuild tag v0.3.0 from source if its deployment target exceeds macOS 11.0",
+      "license": "Apache-2.0",
+      "licenseFiles": ["licenses/Brush-LICENSE.txt"]
+    }
+  ],
+  "requiredFiles": [
+    "bin/ffmpeg",
+    "bin/ffprobe",
+    "bin/colmap",
+    "bin/brush_app",
+    "SHA256SUMS",
+    "BUILD-INFO.json",
+    "BUNDLED-COMPONENTS.json"
+  ]
+}
