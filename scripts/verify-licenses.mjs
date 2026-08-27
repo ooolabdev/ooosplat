@@ -111,6 +111,15 @@ for (const engine of manifest.engines) {
   assertContains(thirdParty, expected.file, "THIRD_PARTY_NOTICES.txt");
 }
 
+const windowsFfmpeg = manifest.engines.find((engine) => engine.name === "FFmpeg / FFprobe");
+assert(windowsFfmpeg, "Windows FFmpeg manifest entry is missing.");
+assert(
+  !windowsFfmpeg.sourceUrl?.includes("/latest/"),
+  "Windows FFmpeg source URL must reference an immutable release asset, not /latest/.",
+);
+assertContains(thirdParty, windowsFfmpeg.actualVersion, "THIRD_PARTY_NOTICES.txt");
+assertContains(thirdParty, windowsFfmpeg.sourceUrl, "THIRD_PARTY_NOTICES.txt");
+
 const linuxManifest = JSON.parse(readText("engines/manifest.linux.json"));
 assert(linuxManifest.schemaVersion >= 2, "Linux engine manifest schemaVersion must include license mappings.");
 assert(linuxManifest.brush?.version === "0.3.0", "Linux Brush version is incorrect.");

@@ -127,6 +127,12 @@ foreach ($engine in $manifest.engines) {
     Assert-Contains $thirdParty $expected.File "THIRD_PARTY_NOTICES.txt"
 }
 
+$windowsFfmpeg = @($manifest.engines | Where-Object { $_.name -eq "FFmpeg / FFprobe" })
+Assert-True ($windowsFfmpeg.Count -eq 1) "Windows FFmpeg manifest entry is missing or duplicated."
+Assert-True (-not $windowsFfmpeg[0].sourceUrl.Contains("/latest/")) "Windows FFmpeg source URL must reference an immutable release asset, not /latest/."
+Assert-Contains $thirdParty $windowsFfmpeg[0].actualVersion "THIRD_PARTY_NOTICES.txt"
+Assert-Contains $thirdParty $windowsFfmpeg[0].sourceUrl "THIRD_PARTY_NOTICES.txt"
+
 $linuxManifest = (Read-Utf8Text "engines/manifest.linux.json") | ConvertFrom-Json
 Assert-True ($linuxManifest.schemaVersion -ge 2) "Linux engine manifest schemaVersion must include license mappings."
 Assert-True ($linuxManifest.brush.version -eq "0.3.0") "Linux Brush version is incorrect."
