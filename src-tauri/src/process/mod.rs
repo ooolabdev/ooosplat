@@ -475,7 +475,44 @@ mod tests {
         let pid = descendant_pid.lock().unwrap().expect("descendant PID");
         manager.cancel();
         assert!(matches!(run.await.unwrap(), Err(SplatError::Cancelled)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+
+        let mut terminated = false;
+        for _ in 0..150 {
+            if descendant_is_terminated(pid) {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            terminated,
+            "descendant {pid} was still running after cancellation"
+        );
+    }
+
+    /// A killed descendant is reparented to PID 1, and PID 1 does not reap in every
+    /// container, so the process can linger as a zombie with its `/proc` entry intact.
+    /// The entry being gone and the entry being a zombie both mean the process stopped
+    /// running, which is what cancellation has to guarantee.
+    #[cfg(target_os = "linux")]
+    fn descendant_is_terminated(pid: u32) -> bool {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return true;
+        };
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .map(|state| state.trim_start().starts_with('Z'))
+            .unwrap_or(true)
+    }
+
+    /// Unix targets without `/proc` reap orphans through PID 1, so a terminated
+    /// descendant disappears outright rather than lingering as a visible zombie.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn descendant_is_terminated(pid: u32) -> bool {
+        // SAFETY: signal 0 only runs the existence and permission checks for the PID
+        // and delivers nothing, so no process state is observed or modified.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        !alive
     }
 }
