@@ -30,11 +30,15 @@ use crate::{
         ply::inspect_gaussian_ply,
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
-    video::{FramePlan, FrameSelectionStrategy, UniformRatioFrameSelection, VideoInfo},
+    video::{
+        create_image_plan, list_images, validate_image_sequence, FramePlan, FrameSelectionStrategy,
+        UniformRatioFrameSelection, VideoInfo,
+    },
 };
 
 pub struct PreparedFrames {
-    pub video: VideoInfo,
+    /// Video metadata when the input is a video; `None` for image sequences.
+    pub video: Option<VideoInfo>,
     pub plan: FramePlan,
     pub extracted_frames: u64,
 }
@@ -217,6 +221,9 @@ impl PipelineRunner {
         output: &Path,
         logs: Option<&Path>,
     ) -> Result<PreparedFrames> {
+        if input.is_dir() {
+            return self.prepare_image_frames(input, quality, output, logs).await;
+        }
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
         let video = probe_video(
@@ -267,9 +274,83 @@ impl PipelineRunner {
             format!("已提取 {extracted_frames} 帧"),
         );
         Ok(PreparedFrames {
-            video,
+            video: Some(video),
             plan,
             extracted_frames,
+        })
+    }
+
+    /// Prepare frames from a folder of images instead of a video.
+    ///
+    /// Skips FFprobe/FFmpeg entirely: the user's ordered image set is copied
+    /// (renamed to zero-padded `frame_%05d` for a stable COLMAP sort) into
+    /// `output` (i.e. `work/frames/`), then the rest of the pipeline continues
+    /// unchanged. `sampling_fps` in the plan is informational only (0.0).
+    async fn prepare_image_frames(
+        &self,
+        input: &Path,
+        quality: Quality,
+        output: &Path,
+        _logs: Option<&Path>,
+    ) -> Result<PreparedFrames> {
+        validate_image_sequence(input)?;
+        self.events
+            .stage(PipelineStage::ProbingVideo, 0.0, "正在读取图片序列");
+        let images = list_images(input)?;
+        let count = images.len() as u64;
+        self.events.stage(
+            PipelineStage::ProbingVideo,
+            1.0,
+            format!("读取到 {count} 张图片"),
+        );
+
+        self.events
+            .stage(PipelineStage::PlanningFrames, 0.0, "正在规划图片序列");
+        let plan = create_image_plan(count, &quality.preset());
+        self.events.stage(
+            PipelineStage::PlanningFrames,
+            1.0,
+            format!("共 {count} 张图片"),
+        );
+
+        self.events
+            .stage(PipelineStage::ExtractingFrames, 0.0, "正在整理图片序列");
+        tokio::fs::create_dir_all(output).await?;
+        let mut extracted = 0_u64;
+        let total = images.len();
+        for (index, path) in images.iter().enumerate() {
+            let extension = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("jpg")
+                .to_ascii_lowercase();
+            let destination = output.join(format!("frame_{index:05}.{extension}"));
+            tokio::fs::copy(path, &destination).await?;
+            extracted += 1;
+            if extracted % 25 == 0 || extracted == count {
+                self.events.send(
+                    PipelineStage::ExtractingFrames,
+                    Some(PipelineEngine::Ffmpeg),
+                    EventKind::Progress,
+                    EventLevel::Info,
+                    Some(extracted as f32 / total as f32),
+                    false,
+                    format!("已整理 {extracted} 帧"),
+                    Some(extracted),
+                    Some(count),
+                    Some("张"),
+                );
+            }
+        }
+        self.events.stage(
+            PipelineStage::ExtractingFrames,
+            1.0,
+            format!("已整理 {extracted} 帧"),
+        );
+        Ok(PreparedFrames {
+            video: None,
+            plan,
+            extracted_frames: extracted,
         })
     }
 
@@ -362,8 +443,9 @@ impl PipelineRunner {
                 Some(&paths.logs),
             )
             .await?;
-        let source_duration_seconds = prepared.video.duration;
-        state.video = Some(prepared.video);
+        let is_image_sequence = prepared.video.is_none();
+        let source_duration_seconds = prepared.video.as_ref().map(|v| v.duration).unwrap_or(0.0);
+        state.video = prepared.video;
         let mut frames = FrameState::from(&prepared.plan);
         frames.extracted_frames = Some(prepared.extracted_frames);
         state.frames = Some(frames);
@@ -410,53 +492,131 @@ impl PipelineRunner {
             format!("{backend_label} 特征提取完成"),
         );
 
+        let vocab_tree = self.engines.vocab_tree();
+        let use_vocab_tree = vocab_tree.is_file();
+        let matcher_label = if is_image_sequence {
+            if use_vocab_tree { "词汇树" } else { "穷举" }
+        } else {
+            if use_vocab_tree { "顺序+环路" } else { "顺序" }
+        };
         self.events.stage(
             PipelineStage::Matching,
             0.0,
-            format!("COLMAP 正在进行 {backend_label} 顺序匹配"),
+            format!("COLMAP 正在进行 {backend_label} {matcher_label}匹配"),
         );
-        colmap::match_sequential(
-            &self.engines.colmap,
-            &database,
-            colmap_log.clone(),
-            &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::Matching,
-                PipelineEngine::Colmap,
-                Some(prepared.extracted_frames),
-                ObserverMode::BracketProgress,
-            )),
-            gpu_index,
-        )
-        .await?;
+        // Image sequences: vocab-tree matching when a tree is bundled (robust to
+        // an unordered photo set); otherwise full pairwise matching. Videos:
+        // sequential matching, plus loop detection when a tree is bundled so the
+        // orbit's first/last-frame cycle closes (the usual cause of a low
+        // registration ratio). All commands exist on the 3.x and 4.x families.
+        let observer = self.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            Some(prepared.extracted_frames),
+            ObserverMode::BracketProgress,
+        );
+        if is_image_sequence {
+            if use_vocab_tree {
+                colmap::match_vocab_tree(
+                    &self.engines.colmap,
+                    &database,
+                    &vocab_tree,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    Some(observer),
+                    gpu_index,
+                )
+                .await?;
+            } else {
+                colmap::match_exhaustive(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    Some(observer),
+                    gpu_index,
+                )
+                .await?;
+            }
+        } else if use_vocab_tree {
+            colmap::match_sequential_loop(
+                &self.engines.colmap,
+                &database,
+                &vocab_tree,
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(observer),
+                gpu_index,
+            )
+            .await?;
+        } else {
+            colmap::match_sequential(
+                &self.engines.colmap,
+                &database,
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(observer),
+                gpu_index,
+            )
+            .await?;
+        }
         state.stage = PipelineStage::Matching;
         state.matching_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
-        self.events
-            .stage(PipelineStage::Matching, 1.0, "顺序匹配完成");
+        self.events.stage(
+            PipelineStage::Matching,
+            1.0,
+            format!("{matcher_label}匹配完成"),
+        );
 
-        self.events
-            .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
-        colmap::map(
+        let use_global_mapper = colmap::detect_global_mapper(
             &self.engines.colmap,
-            &database,
-            colmap_images,
-            &sparse,
-            colmap_log,
             &self.process_manager,
-            Some(self.process_observer(
-                PipelineStage::Reconstructing,
-                PipelineEngine::Colmap,
-                Some(prepared.extracted_frames),
-                ObserverMode::Mapper,
-            )),
         )
         .await?;
+        let mapper_label = if use_global_mapper { "全局(GLOMAP)" } else { "增量" };
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            0.0,
+            format!("正在{mapper_label}重建相机轨迹"),
+        );
+        let observer = self.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            Some(prepared.extracted_frames),
+            ObserverMode::Mapper,
+        );
+        if use_global_mapper {
+            colmap::map_global(
+                &self.engines.colmap,
+                &database,
+                colmap_images,
+                &sparse,
+                colmap_log,
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?;
+        } else {
+            colmap::map(
+                &self.engines.colmap,
+                &database,
+                colmap_images,
+                &sparse,
+                colmap_log,
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?;
+        }
         state.stage = PipelineStage::Reconstructing;
         state.reconstruction_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
-        self.events
-            .stage(PipelineStage::Reconstructing, 1.0, "增量重建完成");
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            1.0,
+            format!("{mapper_label}重建完成"),
+        );
 
         self.events.stage(
             PipelineStage::ValidatingReconstruction,

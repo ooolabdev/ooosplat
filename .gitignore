@@ -25,3 +25,6 @@ engines/brush/**
 !engines/brush/README.md
 engines/linux/brush/**
 engines/macos/arm64/**
+
+# Collected Windows installer artifacts (large) are never committed.
+dist-artifacts/

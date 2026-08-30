@@ -22,7 +22,7 @@ interface AppState {
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
-  setAnalysis: (video: VideoInfo, plan: FramePlan) => void;
+  setAnalysis: (video: VideoInfo | null, plan: FramePlan) => void;
   setEngines: (engines: EngineStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
   beginRun: () => void;

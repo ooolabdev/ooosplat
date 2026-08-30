@@ -70,13 +70,25 @@ impl ProjectManager {
         source_video: &Path,
         quality: Quality,
     ) -> Result<(ProjectPaths, ProjectMetadata)> {
-        validate_video_path(source_video)?;
+        let is_image_dir = source_video.is_dir();
+        if is_image_dir {
+            crate::video::validate_image_sequence(source_video)?;
+        } else {
+            validate_video_path(source_video)?;
+        }
         Self::validate_root(&self.projects_root).await?;
         let id = Uuid::new_v4();
-        let stem = source_video
-            .file_stem()
-            .and_then(|v| v.to_str())
-            .unwrap_or("project");
+        let stem = if is_image_dir {
+            source_video
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("images")
+        } else {
+            source_video
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .unwrap_or("project")
+        };
         let base = format!(
             "{}_{}",
             Local::now().format("%Y%m%d-%H%M%S"),
@@ -92,13 +104,24 @@ impl ProjectManager {
         for directory in [&source, &frames, &colmap, &brush, &logs] {
             tokio::fs::create_dir_all(directory).await?;
         }
-        let extension = source_video
-            .extension()
-            .and_then(|v| v.to_str())
-            .unwrap_or("mp4")
-            .to_ascii_lowercase();
-        let stored_source = source.join(format!("input.{extension}"));
-        tokio::fs::copy(source_video, &stored_source).await?;
+        let stored_source = if is_image_dir {
+            let images_dir = source.join("images");
+            tokio::fs::create_dir_all(&images_dir).await?;
+            for path in crate::video::list_images(source_video)? {
+                let dest = images_dir.join(path.file_name().unwrap());
+                tokio::fs::copy(&path, &dest).await?;
+            }
+            images_dir
+        } else {
+            let extension = source_video
+                .extension()
+                .and_then(|v| v.to_str())
+                .unwrap_or("mp4")
+                .to_ascii_lowercase();
+            let stored = source.join(format!("input.{extension}"));
+            tokio::fs::copy(source_video, &stored).await?;
+            stored
+        };
         let now = Utc::now();
         let metadata = ProjectMetadata {
             schema_version: crate::project::metadata::schema_version(),
