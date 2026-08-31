@@ -32,7 +32,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
     },
-    /// Extract uniformly sampled JPEGs with FFmpeg.
+    /// Extract uniformly sampled frames and, for alpha video, COLMAP masks.
     Extract {
         input: PathBuf,
         output: PathBuf,
@@ -89,17 +89,37 @@ async fn execute(cli: Cli) -> Result<()> {
             ensure_engine(&engines.ffmpeg)?;
             let video = probe_video(&engines.ffprobe, &input, None).await?;
             let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
-            let count = extract_uniform_frames(
+            let masks = output
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("masks");
+            let extraction = extract_uniform_frames(
                 &engines.ffmpeg,
                 &input,
                 &output,
+                &masks,
                 &plan,
+                video.has_alpha,
                 None,
                 &ProcessManager::new(),
                 None,
             )
             .await?;
-            println!("extracted {count} frames to {}", output.display());
+            if extraction.has_alpha {
+                println!(
+                    "extracted {} RGBA frames to {} and {} masks to {}",
+                    extraction.frame_count,
+                    output.display(),
+                    extraction.mask_count,
+                    masks.display()
+                );
+            } else {
+                println!(
+                    "extracted {} frames to {}",
+                    extraction.frame_count,
+                    output.display()
+                );
+            }
         }
         Commands::Generate {
             input,

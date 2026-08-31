@@ -20,7 +20,7 @@ pub async fn probe_video(
             OsString::from("-v"), OsString::from("error"),
             OsString::from("-select_streams"), OsString::from("v:0"),
             OsString::from("-show_entries"),
-            OsString::from("stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,codec_name:stream_tags=rotate:stream_side_data=rotation:format=duration"),
+            OsString::from("stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,codec_name,pix_fmt:stream_tags=rotate:stream_side_data=rotation:format=duration"),
             OsString::from("-of"), OsString::from("json"),
             input.as_os_str().to_owned(),
         ],

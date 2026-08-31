@@ -12,8 +12,10 @@ use serde::Serialize;
 
 use crate::{
     engines::{
-        brush, colmap, ffmpeg::extract_uniform_frames, ffprobe::probe_video, EngineKind,
-        EnginePaths,
+        brush, colmap,
+        ffmpeg::{extract_uniform_frames, FrameImageFormat},
+        ffprobe::probe_video,
+        EngineKind, EnginePaths,
     },
     error::{Result, SplatError},
     pipeline::{
@@ -37,6 +39,9 @@ pub struct PreparedFrames {
     pub video: VideoInfo,
     pub plan: FramePlan,
     pub extracted_frames: u64,
+    pub image_format: FrameImageFormat,
+    pub mask_count: u64,
+    pub has_alpha: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +220,7 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         output: &Path,
+        masks: &Path,
         logs: Option<&Path>,
     ) -> Result<PreparedFrames> {
         self.events
@@ -225,14 +231,19 @@ impl PipelineRunner {
             logs.map(|path| path.join("ffprobe.log")),
         )
         .await?;
-        self.events.stage(
-            PipelineStage::ProbingVideo,
-            1.0,
+        let probe_message = if video.has_alpha {
+            format!(
+                "视频 {:.1} 秒 · {:.2} FPS · {}×{} · 检测到 Alpha 通道（{}）",
+                video.duration, video.fps, video.width, video.height, video.pixel_format
+            )
+        } else {
             format!(
                 "视频 {:.1} 秒 · {:.2} FPS · {}×{}",
                 video.duration, video.fps, video.width, video.height
-            ),
-        );
+            )
+        };
+        self.events
+            .stage(PipelineStage::ProbingVideo, 1.0, probe_message);
 
         self.events
             .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
@@ -243,19 +254,28 @@ impl PipelineRunner {
             format!("预计提取 {} 帧", plan.estimated_frames),
         );
 
-        self.events
-            .stage(PipelineStage::ExtractingFrames, 0.0, "FFmpeg 开始提取画面");
+        self.events.stage(
+            PipelineStage::ExtractingFrames,
+            0.0,
+            if video.has_alpha {
+                "FFmpeg 正在同步提取透明 PNG 画面与 COLMAP Mask"
+            } else {
+                "FFmpeg 开始提取画面"
+            },
+        );
         let observer = self.process_observer(
             PipelineStage::ExtractingFrames,
             PipelineEngine::Ffmpeg,
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
-        let extracted_frames = extract_uniform_frames(
+        let extraction = extract_uniform_frames(
             &self.engines.ffmpeg,
             input,
             output,
+            masks,
             &plan,
+            video.has_alpha,
             logs.map(|path| path.join("ffmpeg.log")),
             &self.process_manager,
             Some(observer),
@@ -264,12 +284,22 @@ impl PipelineRunner {
         self.events.stage(
             PipelineStage::ExtractingFrames,
             1.0,
-            format!("已提取 {extracted_frames} 帧"),
+            if extraction.has_alpha {
+                format!(
+                    "已提取 {} 张透明 PNG 和 {} 张 Mask",
+                    extraction.frame_count, extraction.mask_count
+                )
+            } else {
+                format!("已提取 {} 帧", extraction.frame_count)
+            },
         );
         Ok(PreparedFrames {
             video,
             plan,
-            extracted_frames,
+            extracted_frames: extraction.frame_count,
+            image_format: extraction.image_format,
+            mask_count: extraction.mask_count,
+            has_alpha: extraction.has_alpha,
         })
     }
 
@@ -359,6 +389,7 @@ impl PipelineRunner {
                 &metadata.source_path,
                 quality,
                 &paths.frames,
+                &paths.masks,
                 Some(&paths.logs),
             )
             .await?;
@@ -366,6 +397,9 @@ impl PipelineRunner {
         state.video = Some(prepared.video);
         let mut frames = FrameState::from(&prepared.plan);
         frames.extracted_frames = Some(prepared.extracted_frames);
+        frames.image_format = Some(prepared.image_format.as_str().into());
+        frames.mask_count = Some(prepared.mask_count);
+        frames.has_alpha = prepared.has_alpha;
         state.frames = Some(frames);
         state.stage = PipelineStage::ExtractingFrames;
         project_manager.write_state(&paths.state, &state).await?;
@@ -378,6 +412,7 @@ impl PipelineRunner {
         // ASCII-only relative path preserves Unicode/UNC project roots without
         // moving any project data outside the project directory.
         let colmap_images = Path::new("../frames");
+        let colmap_masks = prepared.has_alpha.then_some(Path::new("../masks"));
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
         let gpu_index = acceleration.gpu_index();
@@ -390,6 +425,7 @@ impl PipelineRunner {
             &self.engines.colmap,
             &database,
             colmap_images,
+            colmap_masks,
             colmap_log.clone(),
             &self.process_manager,
             Some(self.process_observer(

@@ -40,7 +40,7 @@ impl ReconstructionValidator {
                 )));
             }
         }
-        let input_images = count_jpegs(frames)?;
+        let input_images = count_input_images(frames)?;
         let registered_images = read_colmap_count(&images)?;
         let points_3d = read_colmap_count(&points)?;
         if input_images == 0 || registered_images == 0 || points_3d == 0 {
@@ -66,14 +66,15 @@ impl ReconstructionValidator {
     }
 }
 
-fn count_jpegs(directory: &Path) -> Result<u64> {
+fn count_input_images(directory: &Path) -> Result<u64> {
     let mut count = 0;
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
-        {
+        if path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("png")
+        }) {
             count += 1;
         }
     }
@@ -96,6 +97,16 @@ mod tests {
         assert_eq!(classify(0.8), ReconstructionQuality::Good);
         assert_eq!(classify(0.5), ReconstructionQuality::Warning);
         assert_eq!(classify(0.499), ReconstructionQuality::Failed);
+    }
+
+    #[test]
+    fn counts_jpeg_and_png_input_images() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(temporary.path().join("frame_1.jpg"), b"jpg").unwrap();
+        std::fs::write(temporary.path().join("frame_2.jpeg"), b"jpeg").unwrap();
+        std::fs::write(temporary.path().join("frame_3.png"), b"png").unwrap();
+        std::fs::write(temporary.path().join("notes.txt"), b"text").unwrap();
+        assert_eq!(count_input_images(temporary.path()).unwrap(), 3);
     }
 
     fn classify(ratio: f64) -> ReconstructionQuality {

@@ -12,6 +12,10 @@ pub struct VideoInfo {
     pub total_frames: u64,
     pub codec: String,
     pub rotation: i32,
+    #[serde(default)]
+    pub pixel_format: String,
+    #[serde(default)]
+    pub has_alpha: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +30,7 @@ struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
     codec_name: Option<String>,
+    pix_fmt: Option<String>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     nb_frames: Option<String>,
@@ -104,6 +109,7 @@ pub fn parse_ffprobe_json(json: &str) -> Result<VideoInfo> {
         })
         .unwrap_or(0);
 
+    let pixel_format = stream.pix_fmt.clone().unwrap_or_default();
     Ok(VideoInfo {
         duration,
         width,
@@ -115,7 +121,36 @@ pub fn parse_ffprobe_json(json: &str) -> Result<VideoInfo> {
             .clone()
             .unwrap_or_else(|| "unknown".into()),
         rotation,
+        has_alpha: pixel_format_has_alpha(&pixel_format),
+        pixel_format,
     })
+}
+
+/// Mirrors FFmpeg's AV_PIX_FMT_FLAG_ALPHA for pixel formats that can be
+/// emitted by the bundled decoders. FFprobe reports the decoder output format,
+/// so this detects transparency by content rather than by file extension.
+fn pixel_format_has_alpha(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.starts_with("yuva")
+        || value.starts_with("gbrap")
+        || value.starts_with("rgba")
+        || value.starts_with("bgra")
+        || value.starts_with("rgbaf")
+        || value.starts_with("yaf")
+        || matches!(
+            value.as_str(),
+            "pal8"
+                | "argb"
+                | "abgr"
+                | "ya8"
+                | "ya16be"
+                | "ya16le"
+                | "ayuv"
+                | "uyva"
+                | "vuya"
+                | "ayuv64be"
+                | "ayuv64le"
+        )
 }
 
 fn parse_positive_f64(value: &str) -> Option<f64> {
@@ -146,6 +181,7 @@ mod tests {
             "width": 1920,
             "height": 1080,
             "codec_name": "h264",
+            "pix_fmt": "yuv420p",
             "avg_frame_rate": "30000/1001",
             "r_frame_rate": "30/1",
             "nb_frames": "1798",
@@ -157,6 +193,8 @@ mod tests {
         assert!((info.fps - 29.970_029).abs() < 0.000_1);
         assert_eq!(info.total_frames, 1798);
         assert_eq!(info.rotation, -90);
+        assert_eq!(info.pixel_format, "yuv420p");
+        assert!(!info.has_alpha);
     }
 
     #[test]
@@ -180,5 +218,39 @@ mod tests {
         let error =
             parse_ffprobe_json(r#"{"streams": [], "format": {"duration": "10"}}"#).unwrap_err();
         assert!(error.to_string().contains("没有视频轨道"));
+    }
+
+    #[test]
+    fn detects_common_alpha_pixel_formats() {
+        for format in [
+            "argb",
+            "rgba",
+            "yuva444p10le",
+            "gbrap12le",
+            "rgba64le",
+            "pal8",
+        ] {
+            assert!(pixel_format_has_alpha(format), "{format}");
+        }
+        for format in ["yuv420p", "rgb24", "gbrp10le", "nv12", ""] {
+            assert!(!pixel_format_has_alpha(format), "{format}");
+        }
+    }
+
+    #[test]
+    fn old_probe_documents_default_to_opaque() {
+        let json = r#"{
+          "streams": [{
+            "width": 1280,
+            "height": 720,
+            "codec_name": "h264",
+            "avg_frame_rate": "30/1",
+            "nb_frames": "300"
+          }],
+          "format": {"duration": "10"}
+        }"#;
+        let info = parse_ffprobe_json(json).unwrap();
+        assert_eq!(info.pixel_format, "");
+        assert!(!info.has_alpha);
     }
 }

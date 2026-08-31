@@ -42,6 +42,8 @@ mod tests {
             total_frames: 1800,
             codec: "h264".into(),
             rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
         }
     }
 

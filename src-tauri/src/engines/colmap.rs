@@ -131,10 +131,12 @@ async fn run_colmap(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_features(
     executable: &Path,
     database: &Path,
     images: &Path,
+    masks: Option<&Path>,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -146,6 +148,7 @@ pub async fn extract_features(
         feature_extraction_args(
             database,
             images,
+            masks,
             gpu_index,
             use_gpu_option,
             gpu_index_option,
@@ -181,6 +184,7 @@ pub async fn match_sequential(
 fn feature_extraction_args(
     database: &Path,
     images: &Path,
+    masks: Option<&Path>,
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
@@ -201,6 +205,10 @@ fn feature_extraction_args(
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
+    }
+    if let Some(masks) = masks {
+        args.push("--ImageReader.mask_path".into());
+        args.push(masks.into());
     }
     args
 }
@@ -273,6 +281,7 @@ mod tests {
         let extraction = strings(feature_extraction_args(
             Path::new("database.db"),
             Path::new("frames"),
+            None,
             Some(2),
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
@@ -303,6 +312,7 @@ mod tests {
         let extraction = strings(feature_extraction_args(
             Path::new("database.db"),
             Path::new("frames"),
+            None,
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
@@ -346,6 +356,7 @@ mod tests {
         let extraction = strings(feature_extraction_args(
             Path::new("database.db"),
             Path::new("frames"),
+            None,
             Some(0),
             "--SiftExtraction.use_gpu",
             "--SiftExtraction.gpu_index",
@@ -356,5 +367,20 @@ mod tests {
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--SiftExtraction.gpu_index", "0"]));
+    }
+
+    #[test]
+    fn transparent_input_passes_the_colmap_mask_root() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            Some(Path::new("../masks")),
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
     }
 }
