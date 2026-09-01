@@ -218,12 +218,12 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    let source = source
+    let source_wide = source
         .as_os_str()
         .encode_wide()
         .chain(iter::once(0))
         .collect::<Vec<_>>();
-    let destination = destination
+    let destination_wide = destination
         .as_os_str()
         .encode_wide()
         .chain(iter::once(0))
@@ -231,16 +231,57 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
     // SAFETY: Both paths are owned, NUL-terminated UTF-16 buffers that remain live for the call.
     let result = unsafe {
         MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
-    if result == 0 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(())
+    if result != 0 {
+        return Ok(());
     }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::CrossesDevices {
+        copy_replace_for_encrypted_directory(source, destination)
+    } else {
+        Err(error.into())
+    }
+}
+
+#[cfg(windows)]
+fn copy_replace_for_encrypted_directory(source: &Path, destination: &Path) -> Result<()> {
+    let backup = destination.with_extension("json.bak");
+
+    if backup.exists() {
+        std::fs::remove_file(&backup)?;
+    }
+    if destination.exists() {
+        std::fs::copy(destination, &backup)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&backup)?
+            .sync_all()?;
+    }
+
+    let replacement = (|| -> std::io::Result<()> {
+        std::fs::copy(source, destination)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(destination)?
+            .sync_all()?;
+        std::fs::remove_file(source)?;
+        Ok(())
+    })();
+
+    if let Err(error) = replacement {
+        if backup.is_file() {
+            let _ = std::fs::copy(&backup, destination);
+        }
+        return Err(error.into());
+    }
+    if backup.is_file() {
+        std::fs::remove_file(backup)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -284,6 +325,24 @@ mod tests {
             serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
         assert_eq!(value["value"], 2);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_replacement_keeps_latest_data_and_cleans_temporary_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("settings.json.tmp");
+        let destination = temporary.path().join("settings.json");
+        let backup = temporary.path().join("settings.json.bak");
+        std::fs::write(&source, br#"{"value":2}"#).unwrap();
+        std::fs::write(&destination, br#"{"value":1}"#).unwrap();
+
+        copy_replace_for_encrypted_directory(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), br#"{"value":2}"#);
+        assert!(!source.exists());
+        assert!(!backup.exists());
+    }
+
     #[tokio::test]
     async fn creates_self_contained_unicode_project() {
         let temporary = tempfile::tempdir().unwrap();
