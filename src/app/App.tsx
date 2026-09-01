@@ -8,7 +8,7 @@ import appLogo from "../../assets/app-icon.svg";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview,
-  onPipelineEvent, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
+  onPipelineEvent, probeAndPlan, revealProject, selectImageFolder, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, setTelemetryConsent,
 } from "../lib/backend";
@@ -233,6 +233,11 @@ export function App() {
     if (selected) { store.setVideoPath(selected); await analyze(selected, store.quality); }
   };
 
+  const chooseImageFolder = async () => {
+    const selected = await selectImageFolder();
+    if (selected) { store.setVideoPath(selected); await analyze(selected, store.quality); }
+  };
+
   const chooseRoot = async () => {
     const selected = await selectProjectsRoot(store.projectsRoot);
     if (!selected) return;
@@ -367,9 +372,12 @@ export function App() {
         <div className="pane-header"><h1>01 创建新任务</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? "运行中" : "待命"}</span></div>
 
         <div className="form-section">
-          <label className="field-label">输入视频</label>
+          <label className="field-label">输入素材</label>
           <button className="path-picker" type="button" disabled={isRunning} onClick={() => void chooseVideo()}>
-            <Clapperboard size={18} /><span><strong>{store.videoPath ? basename(store.videoPath) : "选择 MP4 或 MOV 视频"}</strong><small>{store.videoPath ?? "从本机选择环绕拍摄素材"}</small></span><FolderOpen size={16} />
+            <Clapperboard size={18} /><span><strong>{store.video ? basename(store.videoPath ?? "") : "选择视频"}</strong><small>MP4 或 MOV 环绕视频</small></span><FolderOpen size={16} />
+          </button>
+          <button className="path-picker" type="button" disabled={isRunning} onClick={() => void chooseImageFolder()}>
+            <FileBox size={18} /><span><strong>{store.videoPath && !store.video ? basename(store.videoPath) : "选择图片文件夹"}</strong><small>有序图片序列作为重建输入</small></span><FolderOpen size={16} />
           </button>
         </div>
 
@@ -398,11 +406,15 @@ export function App() {
           </span>
         </div>
 
-        {store.video && store.plan && <div className="source-metrics">
+        {store.plan && (store.video ? <div className="source-metrics">
           <span><small>时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
           <span><small>分辨率</small><b>{store.video.width} × {store.video.height}</b></span>
           <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
-        </div>}
+        </div> : <div className="source-metrics">
+          <span><small>图片数量</small><b>{store.plan.estimatedFrames.toLocaleString()} 张</b></span>
+          <span><small>输入类型</small><b>图片序列</b></span>
+          <span><small>预计帧数</small><b>全部保留</b></span>
+        </div>)}
 
         {!isRunning && <button className="primary-action" type="button" disabled={!store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
           {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}

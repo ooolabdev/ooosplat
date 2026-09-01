@@ -141,6 +141,13 @@ impl EnginePaths {
         paths
     }
 
+    /// Optional COLMAP vocabulary tree used for `vocab_tree_matcher` and for
+    /// `sequential_matcher` loop detection. When absent those features are
+    /// skipped and OOOSplat falls back to the existing matchers.
+    pub fn vocab_tree(&self) -> PathBuf {
+        self.root.join("vocab_tree.bin")
+    }
+
     fn from_candidates(root: PathBuf) -> Self {
         #[cfg(windows)]
         let paths = {
