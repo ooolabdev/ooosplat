@@ -67,6 +67,8 @@ pub struct GpuDeviceInfo {
     pub name: String,
     pub driver_version: String,
     pub compute_capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,7 +749,7 @@ async fn probe_gpu_devices() -> std::result::Result<Vec<GpuDeviceInfo>, ProbeErr
         manager.run(ProcessSpec {
             executable: candidate,
             args: vec![
-                OsString::from("--query-gpu=index,name,driver_version,compute_cap"),
+                OsString::from("--query-gpu=index,name,driver_version,compute_cap,memory.total"),
                 OsString::from("--format=csv,noheader,nounits"),
             ],
             working_directory: None,
@@ -768,7 +770,7 @@ fn parse_nvidia_smi_csv(output: &str) -> std::result::Result<Vec<GpuDeviceInfo>,
     let mut devices = Vec::new();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
-        if fields.len() < 4 {
+        if fields.len() < 5 {
             return Err(ProbeError::InvalidOutput);
         }
         let index = fields[0]
@@ -776,9 +778,10 @@ fn parse_nvidia_smi_csv(output: &str) -> std::result::Result<Vec<GpuDeviceInfo>,
             .map_err(|_| ProbeError::InvalidOutput)?;
         devices.push(GpuDeviceInfo {
             index,
-            name: fields[1..fields.len() - 2].join(", "),
-            driver_version: fields[fields.len() - 2].to_string(),
-            compute_capability: fields[fields.len() - 1].to_string(),
+            name: fields[1..fields.len() - 3].join(", "),
+            driver_version: fields[fields.len() - 3].to_string(),
+            compute_capability: fields[fields.len() - 2].to_string(),
+            total_memory_mb: fields[fields.len() - 1].parse().ok(),
         });
     }
     if devices.is_empty() {
@@ -868,18 +871,20 @@ mod tests {
             name: format!("GPU {index}"),
             driver_version: driver.into(),
             compute_capability: compute.into(),
+            total_memory_mb: Some(8_192),
         }
     }
 
     #[test]
     fn parses_nvidia_smi_csv() {
         let devices = parse_nvidia_smi_csv(
-            "0, NVIDIA GeForce RTX 3060 Ti, 560.81, 8.6\n1, NVIDIA RTX 4090, 560.81, 8.9\n",
+            "0, NVIDIA GeForce RTX 3060 Ti, 560.81, 8.6, 8192\n1, NVIDIA RTX 4090, 560.81, 8.9, 24564\n",
         )
         .unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].name, "NVIDIA GeForce RTX 3060 Ti");
         assert_eq!(devices[1].compute_capability, "8.9");
+        assert_eq!(devices[0].total_memory_mb, Some(8_192));
     }
 
     #[test]

@@ -16,7 +16,10 @@ use crate::{
         ColmapAccelerationStatus, EnginePaths, EngineStatus,
     },
     error::{Result, SplatError},
-    pipeline::runner::{PipelineResult, PipelineRunner},
+    pipeline::{
+        estimate::{estimate_runtime, RuntimeEstimate},
+        runner::{PipelineResult, PipelineRunner},
+    },
     presets::Quality,
     project::{
         catalog::{self, AppSettings, ProjectOverview},
@@ -107,6 +110,7 @@ pub struct GaussianVideoExportResult {
 pub struct ProbeAndPlan {
     video: VideoInfo,
     plan: FramePlan,
+    estimate: RuntimeEstimate,
 }
 
 fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
@@ -129,9 +133,21 @@ pub async fn probe_and_plan(
     path: String,
     quality: Quality,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
-    let video = probe_video(&paths_for_app(&app).ffprobe, &PathBuf::from(path), None).await?;
+    let engine_paths = paths_for_app(&app);
+    let video = probe_video(&engine_paths.ffprobe, &PathBuf::from(path), None).await?;
     let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
-    Ok(ProbeAndPlan { video, plan })
+    let acceleration = detect_colmap_acceleration(&engine_paths).await;
+    let total_vram_mb = acceleration
+        .device
+        .as_ref()
+        .and_then(|device| device.total_memory_mb);
+    let samples = catalog::runtime_samples().await;
+    let estimate = estimate_runtime(&video, &plan, quality, total_vram_mb, &samples);
+    Ok(ProbeAndPlan {
+        video,
+        plan,
+        estimate,
+    })
 }
 
 #[tauri::command]
@@ -202,6 +218,57 @@ pub async fn start_pipeline(
     let result = runner
         .generate(Path::new(&path), quality, Path::new(&projects_root))
         .await;
+    match &result {
+        Ok(output) => telemetry_session.generation_completed(
+            output.duration_ms,
+            output.input_images,
+            output.source_duration_seconds,
+        ),
+        Err(error) => telemetry_session.generation_failed(error),
+    }
+    if let Err(error) = &result {
+        let stage = if matches!(error, SplatError::Cancelled) {
+            crate::pipeline::PipelineStage::Cancelled
+        } else {
+            crate::pipeline::PipelineStage::Failed
+        };
+        let mut event = crate::pipeline::PipelineEvent::mapped(stage, 1.0, error.to_string());
+        event.elapsed_ms = started.elapsed().as_millis() as u64;
+        let _ = app.emit("pipeline-event", event);
+    }
+    *state.active.lock().await = None;
+    result
+}
+
+#[tauri::command]
+pub async fn resume_pipeline(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    project_id: String,
+) -> std::result::Result<PipelineResult, SplatError> {
+    let project_id = parse_project_id(&project_id)?;
+    let (_, metadata) = catalog::load_registered_project(project_id).await?;
+    let emitter = app.clone();
+    let started = Instant::now();
+    let telemetry_session = Arc::new(PipelineTelemetrySession::new(
+        telemetry.inner().clone(),
+        metadata.quality,
+    ));
+    let event_telemetry = telemetry_session.clone();
+    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
+        event_telemetry.observe(&event);
+        let _ = emitter.emit("pipeline-event", event);
+    }));
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() {
+            return Err(SplatError::Process("已有任务正在运行".into()));
+        }
+        *active = Some(runner.clone());
+    }
+    telemetry_session.generation_started();
+    let result = runner.resume(project_id).await;
     match &result {
         Ok(output) => telemetry_session.generation_completed(
             output.duration_ms,

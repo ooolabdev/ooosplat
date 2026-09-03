@@ -84,14 +84,14 @@ async fn matching_gpu_options(
     executable: &Path,
     manager: &ProcessManager,
 ) -> Result<(&'static str, &'static str)> {
-    let help = command_help(executable, "sequential_matcher", manager).await?;
+    let help = command_help(executable, "exhaustive_matcher", manager).await?;
     if help.contains("--FeatureMatching.use_gpu") {
         Ok(("--FeatureMatching.use_gpu", "--FeatureMatching.gpu_index"))
     } else if help.contains("--SiftMatching.use_gpu") {
         Ok(("--SiftMatching.use_gpu", "--SiftMatching.gpu_index"))
     } else {
         Err(SplatError::UnsupportedEngine(
-            "COLMAP sequential_matcher 不支持已知的 SIFT GPU 参数".into(),
+            "COLMAP exhaustive_matcher 不支持已知的 SIFT GPU 参数".into(),
         ))
     }
 }
@@ -158,7 +158,7 @@ pub async fn extract_features(
     .await
 }
 
-pub async fn match_sequential(
+pub async fn match_exhaustive(
     executable: &Path,
     database: &Path,
     log: PathBuf,
@@ -169,7 +169,7 @@ pub async fn match_sequential(
     let (use_gpu_option, gpu_index_option) = matching_gpu_options(executable, manager).await?;
     run_colmap(
         executable,
-        sequential_matching_args(database, gpu_index, use_gpu_option, gpu_index_option),
+        exhaustive_matching_args(database, gpu_index, use_gpu_option, gpu_index_option),
         database.parent().unwrap_or(Path::new(".")),
         log,
         manager,
@@ -205,14 +205,14 @@ fn feature_extraction_args(
     args
 }
 
-fn sequential_matching_args(
+fn exhaustive_matching_args(
     database: &Path,
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
 ) -> Vec<OsString> {
     let mut args = vec![
-        "sequential_matcher".into(),
+        "exhaustive_matcher".into(),
         "--database_path".into(),
         database.into(),
         use_gpu_option.into(),
@@ -223,13 +223,25 @@ fn sequential_matching_args(
         args.push(index.to_string().into());
     }
     args.extend([
-        OsString::from("--SequentialMatching.overlap"),
-        OsString::from("10"),
+        OsString::from("--FeatureMatching.guided_matching"),
+        OsString::from("1"),
     ]);
     args
 }
 
 pub async fn map(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    map_incremental(executable, database, images, output, log, manager, observer).await
+}
+
+pub async fn map_incremental(
     executable: &Path,
     database: &Path,
     images: &Path,
@@ -250,6 +262,56 @@ pub async fn map(
             "--output_path".into(),
             output.into(),
         ],
+        database.parent().unwrap_or(output),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn map_global(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let help = command_help(executable, "global_mapper", manager).await?;
+    if !help.contains("--GlobalMapper.gp_use_gpu") {
+        return Err(SplatError::UnsupportedEngine(
+            "当前 COLMAP 不包含 Global Mapper".into(),
+        ));
+    }
+    tokio::fs::create_dir_all(output).await?;
+    let mut args = vec![
+        "global_mapper".into(),
+        "--database_path".into(),
+        database.into(),
+        "--image_path".into(),
+        images.into(),
+        "--output_path".into(),
+        output.into(),
+        "--GlobalMapper.gp_use_gpu".into(),
+        (if gpu_index.is_some() { "1" } else { "0" }).into(),
+        "--GlobalMapper.ba_ceres_use_gpu".into(),
+        (if gpu_index.is_some() { "1" } else { "0" }).into(),
+    ];
+    if let Some(index) = gpu_index {
+        args.extend([
+            "--GlobalMapper.gp_gpu_index".into(),
+            index.to_string().into(),
+            "--GlobalMapper.ba_ceres_gpu_index".into(),
+            index.to_string().into(),
+        ]);
+    }
+    run_colmap(
+        executable,
+        args,
         database.parent().unwrap_or(output),
         log,
         manager,
@@ -284,7 +346,7 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--FeatureExtraction.gpu_index", "2"]));
 
-        let matching = strings(sequential_matching_args(
+        let matching = strings(exhaustive_matching_args(
             Path::new("database.db"),
             Some(2),
             "--FeatureMatching.use_gpu",
@@ -296,6 +358,9 @@ mod tests {
         assert!(matching
             .windows(2)
             .any(|pair| pair == ["--FeatureMatching.gpu_index", "2"]));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.guided_matching", "1"]));
     }
 
     #[test]
@@ -314,7 +379,7 @@ mod tests {
             .iter()
             .any(|arg| arg == "--FeatureExtraction.gpu_index"));
 
-        let matching = strings(sequential_matching_args(
+        let matching = strings(exhaustive_matching_args(
             Path::new("database.db"),
             None,
             "--FeatureMatching.use_gpu",

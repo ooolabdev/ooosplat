@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ColmapAccelerationStatus, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, VideoInfo } from "../types/pipeline";
+import type { ColmapAccelerationStatus, EngineStatus, FramePlan, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, VideoInfo } from "../types/pipeline";
 
 interface AppState {
   videoPath: string | null;
@@ -9,6 +9,7 @@ interface AppState {
   colmapAcceleration: ColmapAccelerationStatus | null;
   video: VideoInfo | null;
   plan: FramePlan | null;
+  estimate: RuntimeEstimate | null;
   engines: EngineStatus[];
   phase: RunPhase;
   progress: number;
@@ -22,7 +23,7 @@ interface AppState {
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
-  setAnalysis: (video: VideoInfo, plan: FramePlan) => void;
+  setAnalysis: (video: VideoInfo, plan: FramePlan, estimate: RuntimeEstimate) => void;
   setEngines: (engines: EngineStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
   beginRun: () => void;
@@ -39,6 +40,7 @@ export const useAppStore = create<AppState>((set) => ({
   colmapAcceleration: null,
   video: null,
   plan: null,
+  estimate: null,
   engines: [],
   phase: "idle",
   progress: 0,
@@ -47,12 +49,12 @@ export const useAppStore = create<AppState>((set) => ({
   events: [],
   result: null,
   error: null,
-  setVideoPath: (videoPath) => set({ videoPath, video: null, plan: null, result: null, error: null, progress: 0, phase: "idle" }),
+  setVideoPath: (videoPath) => set({ videoPath, video: null, plan: null, estimate: null, result: null, error: null, progress: 0, phase: "idle" }),
   setProjectsRoot: (projectsRoot) => set({ projectsRoot }),
   setProjects: (projects) => set({ projects }),
-  setQuality: (quality) => set({ quality, plan: null, result: null, error: null }),
+  setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null }),
   setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
-  setAnalysis: (video, plan) => set({ video, plan }),
+  setAnalysis: (video, plan, estimate) => set({ video, plan, estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
   beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, events: [], result: null, error: null }),

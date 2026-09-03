@@ -112,12 +112,13 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .acceleration-status.warning .acceleration-icon, .acceleration-status.warning strong { color: var(--amber); }
 .acceleration-status + .source-metrics { margin-top: 20px; }
 
-.source-metrics { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.source-metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .source-metrics span { min-width: 0; padding: 13px 8px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
 .source-metrics span:first-child { padding-left: 0; }
 .source-metrics span:last-child { border-right: 0; }
 .source-metrics small, .process-metrics small { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
 .source-metrics b, .process-metrics b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 12px/1.25 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.source-metrics em { color: var(--faint); font: 400 9px/1.2 "Cascadia Mono", monospace; white-space: nowrap; }
 .primary-action { width: 100%; height: 48px; margin-top: 20px; padding: 0 15px; display: flex; align-items: center; justify-content: center; gap: 9px; color: white; background: var(--blue); border: 0; cursor: pointer; font-size: 13px; font-weight: 700; transition: background 150ms; }
 .primary-action:hover:not(:disabled) { background: var(--blue-dark); }
 
@@ -127,7 +128,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
 .mono { font: 650 13px/1 "Cascadia Mono", monospace; }
 .current-message { min-height: 20px; margin: 14px 0 0; color: #455064; font-size: 12px; line-height: 1.55; }
-.process-metrics { margin-top: 13px; display: grid; grid-template-columns: .8fr 1.2fr .8fr; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.process-metrics { margin-top: 13px; display: grid; grid-template-columns: .8fr 1.2fr .8fr .9fr; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .process-metrics span { min-width: 0; padding: 11px 10px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
 .process-metrics span:first-child { padding-left: 0; }
 .process-metrics span:last-child { border: 0; }
@@ -191,6 +192,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-actions button { padding: 4px 0; display: flex; align-items: center; gap: 5px; color: #536078; background: transparent; border: 0; cursor: pointer; font-size: 10px; }
 .project-actions button:hover:not(:disabled) { color: var(--blue); }
 .project-actions .preview-link { color: var(--blue); font-weight: 700; }
+.project-actions .resume-link { color: var(--blue); font-weight: 700; }
 .project-actions .danger-link:hover:not(:disabled) { color: var(--red); }
 
 .preview-mode { background: #e7ebf1; }

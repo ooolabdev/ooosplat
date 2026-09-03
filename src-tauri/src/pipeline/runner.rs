@@ -23,7 +23,7 @@ use crate::{
     presets::Quality,
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
-        FrameState, PipelineStateFile, ProjectManager, ProjectMetadata, ProjectOutput,
+        catalog, FrameState, PipelineStateFile, ProjectManager, ProjectMetadata, ProjectOutput,
         ProjectPaths, ProjectStatus,
     },
     reconstruction::{
@@ -310,15 +310,57 @@ impl PipelineRunner {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
         let (paths, mut metadata) = project_manager.create(input, quality).await?;
+        let state = PipelineStateFile::created(quality);
+        self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
+            .await
+    }
+
+    pub async fn resume(&self, project_id: uuid::Uuid) -> Result<PipelineResult> {
+        let acceleration = self.verify_pipeline_engines().await?;
+        self.events.acceleration(acceleration.clone());
+        let (project, mut metadata) = catalog::load_registered_project(project_id).await?;
+        if metadata.status == ProjectStatus::Completed || project.join("final.ply").is_file() {
+            return Err(SplatError::Process("该项目已经完成，无需继续".into()));
+        }
+        if !metadata.source_path.is_file() {
+            return Err(SplatError::Process("项目源视频缺失，无法继续".into()));
+        }
+        let paths = ProjectPaths::existing(project_id, project.clone());
+        let project_manager = ProjectManager::with_root(
+            project
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| project.clone()),
+        );
+        let state = project_manager.read_state(&paths.state).await?;
+        if state.preset != metadata.quality {
+            return Err(SplatError::Process(
+                "项目档位与检查点不一致，无法安全继续".into(),
+            ));
+        }
+        self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
+            .await
+    }
+
+    async fn execute_project(
+        &self,
+        project_manager: ProjectManager,
+        paths: ProjectPaths,
+        metadata: &mut ProjectMetadata,
+        state: PipelineStateFile,
+        acceleration: &crate::engines::ColmapAccelerationStatus,
+    ) -> Result<PipelineResult> {
         let started = Instant::now();
+        let previous_duration = metadata.duration_ms.unwrap_or(0);
+        metadata.status = ProjectStatus::Running;
+        metadata.started_at = Some(Utc::now());
+        metadata.completed_at = None;
+        metadata.failure_message = None;
+        project_manager
+            .write_metadata(&paths.metadata, metadata)
+            .await?;
         let result = self
-            .run_project(
-                &project_manager,
-                &paths,
-                &mut metadata,
-                quality,
-                &acceleration,
-            )
+            .run_project(&project_manager, &paths, metadata, state, acceleration)
             .await;
 
         if let Err(error) = &result {
@@ -329,12 +371,16 @@ impl PipelineRunner {
                 ProjectStatus::Failed
             };
             metadata.completed_at = Some(Utc::now());
-            metadata.duration_ms = Some(started.elapsed().as_millis() as u64);
+            metadata.duration_ms =
+                Some(previous_duration.saturating_add(started.elapsed().as_millis() as u64));
             metadata.failure_message = Some(error.to_string());
             let _ = project_manager
-                .write_metadata(&paths.metadata, &metadata)
+                .write_metadata(&paths.metadata, metadata)
                 .await;
-            let mut state = PipelineStateFile::created(quality);
+            let mut state = project_manager
+                .read_state(&paths.state)
+                .await
+                .unwrap_or_else(|_| PipelineStateFile::created(metadata.quality));
             state.stage = if cancelled {
                 PipelineStage::Cancelled
             } else {
@@ -350,25 +396,45 @@ impl PipelineRunner {
         project_manager: &ProjectManager,
         paths: &ProjectPaths,
         metadata: &mut ProjectMetadata,
-        quality: Quality,
+        mut state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
-        let mut state = PipelineStateFile::created(quality);
-        let prepared = self
-            .prepare_frames(
-                &metadata.source_path,
-                quality,
-                &paths.frames,
-                Some(&paths.logs),
-            )
-            .await?;
-        let source_duration_seconds = prepared.video.duration;
-        state.video = Some(prepared.video);
-        let mut frames = FrameState::from(&prepared.plan);
-        frames.extracted_frames = Some(prepared.extracted_frames);
-        state.frames = Some(frames);
-        state.stage = PipelineStage::ExtractingFrames;
+        let quality = metadata.quality;
+        normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
+        let prepared =
+            if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    1.0,
+                    format!("已复用 {} 帧检查点", prepared.extracted_frames),
+                );
+                prepared
+            } else {
+                reset_directory(&paths.frames).await?;
+                reset_directory(&paths.colmap).await?;
+                reset_directory(&paths.brush).await?;
+                let prepared = self
+                    .prepare_frames(
+                        &metadata.source_path,
+                        quality,
+                        &paths.frames,
+                        Some(&paths.logs),
+                    )
+                    .await?;
+                state.video = Some(prepared.video.clone());
+                let mut frames = FrameState::from(&prepared.plan);
+                frames.extracted_frames = Some(prepared.extracted_frames);
+                state.frames = Some(frames);
+                state.features_complete = false;
+                state.matching_complete = false;
+                state.reconstruction_complete = false;
+                state.brush_complete = false;
+                state.stage = PipelineStage::ExtractingFrames;
+                project_manager.write_state(&paths.state, &state).await?;
+                prepared
+            };
+        let source_duration_seconds = prepared.video.duration;
 
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
@@ -381,82 +447,195 @@ impl PipelineRunner {
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
         let gpu_index = acceleration.gpu_index();
-        self.events.stage(
-            PipelineStage::ExtractingFeatures,
-            0.0,
-            format!("COLMAP 正在使用 {backend_label} 提取特征"),
-        );
-        colmap::extract_features(
-            &self.engines.colmap,
-            &database,
-            colmap_images,
-            colmap_log.clone(),
-            &self.process_manager,
-            Some(self.process_observer(
+        if state.features_complete {
+            self.events.stage(
                 PipelineStage::ExtractingFeatures,
-                PipelineEngine::Colmap,
-                Some(prepared.extracted_frames),
-                ObserverMode::BracketProgress,
-            )),
-            gpu_index,
-        )
-        .await?;
-        state.stage = PipelineStage::ExtractingFeatures;
-        state.features_complete = true;
-        project_manager.write_state(&paths.state, &state).await?;
-        self.events.stage(
-            PipelineStage::ExtractingFeatures,
-            1.0,
-            format!("{backend_label} 特征提取完成"),
-        );
+                1.0,
+                "已复用特征提取检查点",
+            );
+        } else {
+            reset_directory(&paths.colmap).await?;
+            self.events.stage(
+                PipelineStage::ExtractingFeatures,
+                0.0,
+                format!("COLMAP 正在使用 {backend_label} 提取特征"),
+            );
+            colmap::extract_features(
+                &self.engines.colmap,
+                &database,
+                colmap_images,
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(prepared.extracted_frames),
+                    ObserverMode::BracketProgress,
+                )),
+                gpu_index,
+            )
+            .await?;
+            state.stage = PipelineStage::ExtractingFeatures;
+            state.features_complete = true;
+            project_manager.write_state(&paths.state, &state).await?;
+            self.events.stage(
+                PipelineStage::ExtractingFeatures,
+                1.0,
+                format!("{backend_label} 特征提取完成"),
+            );
+        }
 
-        self.events.stage(
-            PipelineStage::Matching,
-            0.0,
-            format!("COLMAP 正在进行 {backend_label} 顺序匹配"),
-        );
-        colmap::match_sequential(
-            &self.engines.colmap,
-            &database,
-            colmap_log.clone(),
-            &self.process_manager,
-            Some(self.process_observer(
+        if state.matching_complete {
+            self.events
+                .stage(PipelineStage::Matching, 1.0, "已复用跨视角匹配检查点");
+        } else {
+            self.events.stage(
                 PipelineStage::Matching,
-                PipelineEngine::Colmap,
-                Some(prepared.extracted_frames),
-                ObserverMode::BracketProgress,
-            )),
-            gpu_index,
-        )
-        .await?;
-        state.stage = PipelineStage::Matching;
-        state.matching_complete = true;
-        project_manager.write_state(&paths.state, &state).await?;
-        self.events
-            .stage(PipelineStage::Matching, 1.0, "顺序匹配完成");
+                0.0,
+                format!("COLMAP 正在进行 {backend_label} 跨视角匹配"),
+            );
+            colmap::match_exhaustive(
+                &self.engines.colmap,
+                &database,
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Matching,
+                    PipelineEngine::Colmap,
+                    Some(prepared.extracted_frames),
+                    ObserverMode::BracketProgress,
+                )),
+                gpu_index,
+            )
+            .await?;
+            state.stage = PipelineStage::Matching;
+            state.matching_complete = true;
+            state.matching_strategy_version = 1;
+            project_manager.write_state(&paths.state, &state).await?;
+            self.events
+                .stage(PipelineStage::Matching, 1.0, "跨视角匹配完成");
+        }
 
-        self.events
-            .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
-        colmap::map(
-            &self.engines.colmap,
-            &database,
-            colmap_images,
-            &sparse,
-            colmap_log,
-            &self.process_manager,
-            Some(self.process_observer(
+        if state.reconstruction_complete {
+            self.events
+                .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
+        } else {
+            reset_directory(&sparse).await?;
+            let global_sparse = sparse.join("global");
+            self.events.stage(
                 PipelineStage::Reconstructing,
-                PipelineEngine::Colmap,
-                Some(prepared.extracted_frames),
-                ObserverMode::Mapper,
-            )),
-        )
-        .await?;
-        state.stage = PipelineStage::Reconstructing;
-        state.reconstruction_complete = true;
-        project_manager.write_state(&paths.state, &state).await?;
-        self.events
-            .stage(PipelineStage::Reconstructing, 1.0, "增量重建完成");
+                0.0,
+                "正在使用 Global Mapper 快速重建相机轨迹",
+            );
+            let global_result = colmap::map_global(
+                &self.engines.colmap,
+                &database,
+                colmap_images,
+                &global_sparse,
+                colmap_log.clone(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Reconstructing,
+                    PipelineEngine::Colmap,
+                    Some(prepared.extracted_frames),
+                    ObserverMode::Mapper,
+                )),
+                gpu_index,
+            )
+            .await;
+
+            let global_report = match global_result {
+                Ok(()) => best_sparse_model(&paths.frames, &global_sparse).ok(),
+                Err(SplatError::Cancelled) => return Err(SplatError::Cancelled),
+                Err(error) => {
+                    self.events.send(
+                        PipelineStage::Reconstructing,
+                        Some(PipelineEngine::Colmap),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        None,
+                        false,
+                        format!("Global Mapper 不可用，将回退增量重建：{error}"),
+                        None,
+                        None,
+                        None,
+                    );
+                    None
+                }
+            };
+            let global_is_good = global_report
+                .as_ref()
+                .is_some_and(|(_, report)| report.quality == ReconstructionQuality::Good);
+            if !global_is_good {
+                if let Some((_, report)) = &global_report {
+                    self.events.send(
+                        PipelineStage::Reconstructing,
+                        Some(PipelineEngine::Colmap),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        None,
+                        false,
+                        format!(
+                            "Global Mapper 注册率 {:.1}%，正在回退增量重建",
+                            report.registered_ratio * 100.0
+                        ),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                let incremental_sparse = sparse.join("incremental");
+                self.events.stage(
+                    PipelineStage::Reconstructing,
+                    0.05,
+                    "正在使用增量 Mapper 进行稳健回退",
+                );
+                let incremental_result = colmap::map_incremental(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    &incremental_sparse,
+                    colmap_log,
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::Reconstructing,
+                        PipelineEngine::Colmap,
+                        Some(prepared.extracted_frames),
+                        ObserverMode::Mapper,
+                    )),
+                )
+                .await;
+                if let Err(error) = incremental_result {
+                    if matches!(error, SplatError::Cancelled) || global_report.is_none() {
+                        return Err(error);
+                    }
+                    self.events.send(
+                        PipelineStage::Reconstructing,
+                        Some(PipelineEngine::Colmap),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        None,
+                        false,
+                        "增量重建失败，继续使用可用的 Global Mapper 结果",
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+            state.stage = PipelineStage::Reconstructing;
+            state.reconstruction_complete = true;
+            project_manager.write_state(&paths.state, &state).await?;
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                1.0,
+                if global_is_good {
+                    "Global Mapper 快速重建完成"
+                } else {
+                    "相机轨迹重建完成"
+                },
+            );
+        }
 
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
@@ -472,7 +651,7 @@ impl PipelineRunner {
                 report.registered_ratio * 100.0
             )));
         }
-        let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
+        let mut warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 80%，结果质量可能受影响",
                 report.registered_ratio * 100.0
@@ -487,43 +666,101 @@ impl PipelineRunner {
             ),
         );
 
-        let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
-        let preset = quality.preset();
-        self.events.send(
-            PipelineStage::TrainingSplats,
-            Some(PipelineEngine::Brush),
-            EventKind::Stage,
-            EventLevel::Info,
-            None,
-            true,
-            format!(
-                "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {}",
-                preset.brush_iterations, preset.brush_max_resolution
-            ),
-            Some(0),
-            Some(preset.brush_iterations as u64),
-            Some("iterations"),
-        );
-        let candidate = brush::train(
-            &self.engines.brush,
-            &dataset,
-            &paths.brush,
-            preset,
-            paths.logs.join("brush.log"),
-            &self.process_manager,
-            Some(self.process_observer(
+        let total_vram_mb = acceleration
+            .device
+            .as_ref()
+            .and_then(|device| device.total_memory_mb);
+        let preset = quality.preset().for_vram_mb(total_vram_mb);
+        let candidate = if state.brush_complete {
+            self.events.stage(
+                PipelineStage::TrainingSplats,
+                1.0,
+                "已复用 Brush 训练检查点",
+            );
+            brush_candidate(&paths.brush)
+                .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失，无法继续发布".into()))?
+        } else {
+            reset_directory(&paths.brush).await?;
+            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            self.events.send(
+                PipelineStage::TrainingSplats,
+                Some(PipelineEngine::Brush),
+                EventKind::Stage,
+                EventLevel::Info,
+                None,
+                true,
+                format!(
+                    "Brush 训练开始 · {} iterations · 最大分辨率 {} · 最多 {} Splats · SH {}",
+                    preset.brush_iterations,
+                    preset.brush_max_resolution,
+                    preset.brush_max_splats,
+                    preset.brush_sh_degree
+                ),
+                Some(0),
+                Some(preset.brush_iterations as u64),
+                Some("iterations"),
+            );
+            let observer = self.process_observer(
                 PipelineStage::TrainingSplats,
                 PipelineEngine::Brush,
                 Some(preset.brush_iterations as u64),
                 ObserverMode::Brush,
-            )),
-        )
-        .await?;
-        state.stage = PipelineStage::TrainingSplats;
-        state.brush_complete = true;
-        project_manager.write_state(&paths.state, &state).await?;
-        self.events
-            .stage(PipelineStage::TrainingSplats, 1.0, "Brush 训练完成");
+            );
+            let first_attempt = brush::train(
+                &self.engines.brush,
+                &dataset,
+                &paths.brush,
+                preset,
+                paths.logs.join("brush.log"),
+                &self.process_manager,
+                Some(observer.clone()),
+            )
+            .await;
+            let candidate = match first_attempt {
+                Ok(candidate) => candidate,
+                Err(error) if brush::is_out_of_memory(&error) => {
+                    let retry = preset.degraded_for_oom();
+                    warning = Some(match warning {
+                        Some(existing) => {
+                            format!("{existing}；训练曾遇到显存不足，已自动降低分辨率和 Splat 上限")
+                        }
+                        None => "训练曾遇到显存不足，已自动降低分辨率和 Splat 上限".into(),
+                    });
+                    self.events.send(
+                        PipelineStage::TrainingSplats,
+                        Some(PipelineEngine::Brush),
+                        EventKind::Stage,
+                        EventLevel::Warning,
+                        None,
+                        true,
+                        format!(
+                            "显存不足，自动重试 · 最大分辨率 {} · 最多 {} Splats",
+                            retry.brush_max_resolution, retry.brush_max_splats
+                        ),
+                        Some(0),
+                        Some(retry.brush_iterations as u64),
+                        Some("iterations"),
+                    );
+                    brush::train(
+                        &self.engines.brush,
+                        &dataset,
+                        &paths.brush,
+                        retry,
+                        paths.logs.join("brush.log"),
+                        &self.process_manager,
+                        Some(observer),
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            };
+            state.stage = PipelineStage::TrainingSplats;
+            state.brush_complete = true;
+            project_manager.write_state(&paths.state, &state).await?;
+            self.events
+                .stage(PipelineStage::TrainingSplats, 1.0, "Brush 训练完成");
+            candidate
+        };
 
         self.events
             .stage(PipelineStage::Exporting, 0.0, "正在校验并发布 final.ply");
@@ -534,10 +771,12 @@ impl PipelineRunner {
         project_manager.write_state(&paths.state, &state).await?;
 
         let completed_at = Utc::now();
-        let duration_ms = metadata
-            .started_at
-            .map(|started| (completed_at - started).num_milliseconds().max(0) as u64)
-            .unwrap_or(0);
+        let duration_ms = metadata.duration_ms.unwrap_or(0).saturating_add(
+            metadata
+                .started_at
+                .map(|started| (completed_at - started).num_milliseconds().max(0) as u64)
+                .unwrap_or(0),
+        );
         metadata.status = ProjectStatus::Completed;
         metadata.completed_at = Some(completed_at);
         metadata.duration_ms = Some(duration_ms);
@@ -751,13 +990,122 @@ fn format_duration(milliseconds: u64) -> String {
     )
 }
 
+fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
+    if state.brush_complete {
+        PipelineStage::TrainingSplats
+    } else if state.reconstruction_complete {
+        PipelineStage::Reconstructing
+    } else if state.matching_complete {
+        PipelineStage::Matching
+    } else if state.features_complete {
+        PipelineStage::ExtractingFeatures
+    } else if state
+        .frames
+        .as_ref()
+        .and_then(|frames| frames.extracted_frames)
+        .is_some_and(|count| count > 0)
+    {
+        PipelineStage::ExtractingFrames
+    } else {
+        PipelineStage::Created
+    }
+}
+
+async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFile) -> Result<()> {
+    let frames_complete = prepared_frames_from_checkpoint(paths, state)
+        .await?
+        .is_some();
+    if !frames_complete {
+        state.video = None;
+        state.frames = None;
+    }
+
+    state.features_complete =
+        frames_complete && state.features_complete && paths.colmap.join("database.db").is_file();
+    state.matching_complete =
+        state.features_complete && state.matching_complete && state.matching_strategy_version == 1;
+    state.reconstruction_complete = state.matching_complete
+        && state.reconstruction_complete
+        && best_sparse_model(&paths.frames, &paths.colmap.join("sparse")).is_ok();
+    state.brush_complete = state.reconstruction_complete
+        && state.brush_complete
+        && brush_candidate(&paths.brush)
+            .and_then(|path| inspect_gaussian_ply(&path).ok())
+            .is_some();
+    state.stage = checkpoint_stage(state);
+    Ok(())
+}
+
+async fn prepared_frames_from_checkpoint(
+    paths: &ProjectPaths,
+    state: &PipelineStateFile,
+) -> Result<Option<PreparedFrames>> {
+    let Some(video) = state.video.clone() else {
+        return Ok(None);
+    };
+    let Some(frames) = state.frames.as_ref() else {
+        return Ok(None);
+    };
+    let Some(extracted_frames) = frames.extracted_frames.filter(|count| *count > 0) else {
+        return Ok(None);
+    };
+    let mut actual_frames = 0;
+    if paths.frames.is_dir() {
+        let mut entries = tokio::fs::read_dir(&paths.frames).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
+            {
+                actual_frames += 1;
+            }
+        }
+    }
+    if actual_frames != extracted_frames {
+        return Ok(None);
+    }
+    Ok(Some(PreparedFrames {
+        video,
+        plan: FramePlan {
+            retention_ratio: frames.retention_ratio,
+            sampling_fps: frames.sampling_fps,
+            estimated_frames: frames.estimated_frames,
+        },
+        extracted_frames,
+    }))
+}
+
+fn brush_candidate(root: &Path) -> Option<PathBuf> {
+    [root.join("final.ply.tmp"), root.join("final.ply.tmp.ply")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+async fn reset_directory(path: &Path) -> Result<()> {
+    if path.exists() {
+        tokio::fs::remove_dir_all(path).await?;
+    }
+    tokio::fs::create_dir_all(path).await?;
+    Ok(())
+}
+
 fn best_sparse_model(frames: &Path, sparse: &Path) -> Result<(PathBuf, ReconstructionReport)> {
     let mut best: Option<(PathBuf, ReconstructionReport)> = None;
+    let mut candidates = vec![sparse.to_path_buf()];
     for entry in std::fs::read_dir(sparse)? {
         let path = entry?.path();
-        if !path.is_dir() {
-            continue;
+        if path.is_dir() {
+            candidates.push(path.clone());
+            for nested in std::fs::read_dir(path)? {
+                let nested = nested?.path();
+                if nested.is_dir() {
+                    candidates.push(nested);
+                }
+            }
         }
+    }
+    for path in candidates {
         if let Ok(report) = ReconstructionValidator::validate(frames, &path) {
             if best
                 .as_ref()
@@ -807,6 +1155,68 @@ mod tests {
     fn parses_ffmpeg_progress() {
         assert_eq!(parse_ffmpeg_frame("frame=127"), Some(127));
         assert_eq!(parse_ffmpeg_frame("progress=continue"), None);
+    }
+
+    #[test]
+    fn reports_the_latest_durable_checkpoint_instead_of_terminal_status() {
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.stage = PipelineStage::Cancelled;
+        assert_eq!(checkpoint_stage(&state), PipelineStage::Created);
+
+        state.frames = Some(FrameState {
+            retention_ratio: 0.5,
+            sampling_fps: 15.0,
+            estimated_frames: 100,
+            extracted_frames: Some(100),
+        });
+        state.features_complete = true;
+        state.matching_complete = true;
+        assert_eq!(checkpoint_stage(&state), PipelineStage::Matching);
+
+        state.reconstruction_complete = true;
+        state.brush_complete = true;
+        assert_eq!(checkpoint_stage(&state), PipelineStage::TrainingSplats);
+    }
+
+    #[tokio::test]
+    async fn frame_checkpoint_requires_every_recorded_frame() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::write(paths.frames.join("frame_000001.jpg"), b"one")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.frames.join("frame_000002.jpg"), b"two")
+            .await
+            .unwrap();
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.video = Some(VideoInfo {
+            duration: 1.0,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: 0,
+        });
+        state.frames = Some(FrameState {
+            retention_ratio: 0.5,
+            sampling_fps: 15.0,
+            estimated_frames: 2,
+            extracted_frames: Some(2),
+        });
+
+        assert!(prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .is_some());
+        tokio::fs::remove_file(paths.frames.join("frame_000002.jpg"))
+            .await
+            .unwrap();
+        assert!(prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

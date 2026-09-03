@@ -147,6 +147,8 @@ pub struct PipelineStateFile {
     pub frames: Option<FrameState>,
     pub features_complete: bool,
     pub matching_complete: bool,
+    #[serde(default)]
+    pub matching_strategy_version: u32,
     pub reconstruction_complete: bool,
     pub brush_complete: bool,
 }
@@ -160,6 +162,7 @@ impl PipelineStateFile {
             frames: None,
             features_complete: false,
             matching_complete: false,
+            matching_strategy_version: 1,
             reconstruction_complete: false,
             brush_complete: false,
         }

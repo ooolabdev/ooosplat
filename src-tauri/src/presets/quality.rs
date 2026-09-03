@@ -12,30 +12,93 @@ pub enum Quality {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QualityPreset {
-    pub frame_retention_ratio: f64,
+    pub target_sampling_fps: f64,
+    pub minimum_frames: u64,
+    pub maximum_frames: u64,
     pub brush_iterations: usize,
     pub brush_max_resolution: u32,
+    pub brush_max_splats: u32,
+    pub brush_sh_degree: u8,
 }
 
 impl Quality {
     pub const fn preset(self) -> QualityPreset {
         match self {
             Self::Fast => QualityPreset {
-                frame_retention_ratio: 0.30,
-                brush_iterations: 8_000,
-                brush_max_resolution: 1_200,
+                target_sampling_fps: 3.0,
+                minimum_frames: 48,
+                maximum_frames: 120,
+                brush_iterations: 6_000,
+                brush_max_resolution: 960,
+                brush_max_splats: 600_000,
+                brush_sh_degree: 2,
             },
             Self::Balanced => QualityPreset {
-                frame_retention_ratio: 0.50,
-                brush_iterations: 15_000,
-                brush_max_resolution: 1_600,
+                target_sampling_fps: 5.0,
+                minimum_frames: 72,
+                maximum_frames: 240,
+                brush_iterations: 10_000,
+                brush_max_resolution: 1_200,
+                brush_max_splats: 1_000_000,
+                brush_sh_degree: 3,
             },
             Self::High => QualityPreset {
-                frame_retention_ratio: 1.00,
-                brush_iterations: 30_000,
-                brush_max_resolution: 2_000,
+                target_sampling_fps: 8.0,
+                minimum_frames: 120,
+                maximum_frames: 400,
+                brush_iterations: 15_000,
+                brush_max_resolution: 1_600,
+                brush_max_splats: 1_500_000,
+                brush_sh_degree: 3,
             },
         }
+    }
+}
+
+impl QualityPreset {
+    /// Keeps enough headroom for the desktop compositor and WebGPU allocations on
+    /// small laptop GPUs. Unknown/non-NVIDIA devices use the conservative 8 GB tier.
+    pub const fn for_vram_mb(mut self, total_vram_mb: Option<u64>) -> Self {
+        let vram = match total_vram_mb {
+            Some(value) => value,
+            None => 8_192,
+        };
+        if vram <= 6_500 {
+            self.brush_max_resolution = if self.brush_max_resolution > 960 {
+                960
+            } else {
+                self.brush_max_resolution
+            };
+            self.brush_max_splats = if self.brush_max_splats > 600_000 {
+                600_000
+            } else {
+                self.brush_max_splats
+            };
+        } else if vram <= 9_000 {
+            self.brush_max_resolution = if self.brush_max_resolution > 1_200 {
+                1_200
+            } else {
+                self.brush_max_resolution
+            };
+            self.brush_max_splats = if self.brush_max_splats > 1_000_000 {
+                1_000_000
+            } else {
+                self.brush_max_splats
+            };
+        }
+        self
+    }
+
+    pub const fn degraded_for_oom(mut self) -> Self {
+        self.brush_max_resolution = self.brush_max_resolution * 3 / 4;
+        if self.brush_max_resolution < 720 {
+            self.brush_max_resolution = 720;
+        }
+        self.brush_max_splats /= 2;
+        if self.brush_max_splats < 300_000 {
+            self.brush_max_splats = 300_000;
+        }
+        self
     }
 }
 
@@ -68,11 +131,22 @@ mod tests {
 
     #[test]
     fn presets_are_centralized_and_exact() {
-        assert_eq!(Quality::Fast.preset().frame_retention_ratio, 0.30);
-        assert_eq!(Quality::Balanced.preset().frame_retention_ratio, 0.50);
-        assert_eq!(Quality::High.preset().frame_retention_ratio, 1.00);
-        assert_eq!(Quality::Fast.preset().brush_iterations, 8_000);
-        assert_eq!(Quality::Balanced.preset().brush_max_resolution, 1_600);
+        assert_eq!(Quality::Fast.preset().target_sampling_fps, 3.0);
+        assert_eq!(Quality::Balanced.preset().maximum_frames, 240);
+        assert_eq!(Quality::High.preset().minimum_frames, 120);
+        assert_eq!(Quality::Fast.preset().brush_iterations, 6_000);
+        assert_eq!(Quality::Balanced.preset().brush_max_resolution, 1_200);
+        assert_eq!(Quality::High.preset().brush_max_splats, 1_500_000);
+    }
+
+    #[test]
+    fn small_vram_profile_caps_expensive_brush_settings() {
+        let preset = Quality::High.preset().for_vram_mb(Some(8_151));
+        assert_eq!(preset.brush_max_resolution, 1_200);
+        assert_eq!(preset.brush_max_splats, 1_000_000);
+        let retry = preset.degraded_for_oom();
+        assert_eq!(retry.brush_max_resolution, 900);
+        assert_eq!(retry.brush_max_splats, 500_000);
     }
 
     #[test]

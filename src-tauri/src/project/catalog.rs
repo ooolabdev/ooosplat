@@ -9,9 +9,51 @@ use uuid::Uuid;
 
 use crate::{
     error::{Result, SplatError},
+    pipeline::estimate::RuntimeSample,
     project::{manager::atomic_write_json, ProjectMetadata, ProjectStatus, PROJECT_APP_ID},
     reconstruction::ply::inspect_gaussian_ply,
 };
+
+pub async fn runtime_samples() -> Vec<RuntimeSample> {
+    let Ok(index) = load_index().await else {
+        return Vec::new();
+    };
+    let mut samples = Vec::new();
+    for item in index.projects.into_iter().rev().take(20) {
+        let Ok(metadata_bytes) = tokio::fs::read(item.path.join("project.json")).await else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<ProjectMetadata>(&metadata_bytes) else {
+            continue;
+        };
+        let Some(duration_ms) = metadata
+            .duration_ms
+            .filter(|_| metadata.status == ProjectStatus::Completed)
+        else {
+            continue;
+        };
+        let Ok(state_bytes) = tokio::fs::read(item.path.join("state.json")).await else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_slice::<crate::project::PipelineStateFile>(&state_bytes)
+        else {
+            continue;
+        };
+        let (Some(video), Some(frames)) = (state.video, state.frames) else {
+            continue;
+        };
+        let Some(extracted_frames) = frames.extracted_frames.filter(|count| *count > 0) else {
+            continue;
+        };
+        samples.push(RuntimeSample {
+            video,
+            quality: metadata.quality,
+            extracted_frames,
+            duration_ms,
+        });
+    }
+    samples
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

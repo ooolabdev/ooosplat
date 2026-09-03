@@ -24,7 +24,7 @@ describe("app store", () => {
   beforeEach(() => {
     useAppStore.setState({
       videoPath: null, projectsRoot: "", projects: [], quality: "balanced", colmapAcceleration: null, video: null,
-      plan: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
+      plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
   });
@@ -34,10 +34,14 @@ describe("app store", () => {
   });
 
   it("invalidates a plan when quality changes", () => {
-    useAppStore.setState({ plan: { retentionRatio: 0.5, samplingFps: 15, estimatedFrames: 900 } });
+    useAppStore.setState({
+      plan: { retentionRatio: 0.5, samplingFps: 15, estimatedFrames: 900 },
+      estimate: { estimatedMs: 100_000, lowerBoundMs: 60_000, upperBoundMs: 160_000, confidence: "low", sampleCount: 1, basis: "test" },
+    });
     useAppStore.getState().setQuality("high");
     expect(useAppStore.getState().quality).toBe("high");
     expect(useAppStore.getState().plan).toBeNull();
+    expect(useAppStore.getState().estimate).toBeNull();
   });
 
   it("keeps progress monotonic and ignores stale sequenced events", () => {

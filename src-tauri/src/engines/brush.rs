@@ -39,6 +39,10 @@ pub async fn train(
                 preset.brush_iterations.to_string().into(),
                 OsString::from("--max-resolution"),
                 preset.brush_max_resolution.to_string().into(),
+                OsString::from("--max-splats"),
+                preset.brush_max_splats.to_string().into(),
+                OsString::from("--sh-degree"),
+                preset.brush_sh_degree.to_string().into(),
                 OsString::from("--export-every"),
                 preset.brush_iterations.to_string().into(),
                 OsString::from("--export-path"),
@@ -53,9 +57,10 @@ pub async fn train(
         })
         .await?;
     if !output.success {
+        let detail = process_error_detail(&output.stdout, &output.stderr);
         return Err(SplatError::Process(format!(
-            "Brush 退出码 {:?}",
-            output.exit_code
+            "Brush 退出码 {:?}：{detail}",
+            output.exit_code,
         )));
     }
     let candidate = if candidate.is_file() {
@@ -75,4 +80,46 @@ pub async fn train(
         )));
     }
     Ok(candidate)
+}
+
+fn process_error_detail(stdout: &str, stderr: &str) -> String {
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("未提供错误详情")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+pub fn is_out_of_memory(error: &SplatError) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    [
+        "out of memory",
+        "outofmemory",
+        "buffer too big",
+        "buffertoobig",
+        "allocation failed",
+        "device lost",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_common_webgpu_oom_messages() {
+        assert!(is_out_of_memory(&SplatError::Process(
+            "Brush: BufferTooBig while allocating".into()
+        )));
+        assert!(!is_out_of_memory(&SplatError::Process(
+            "invalid dataset".into()
+        )));
+    }
 }
