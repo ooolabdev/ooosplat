@@ -23,7 +23,7 @@ See the [OOOSplat Roadmap](ROADMAP.md) for planned work.
 ## Why OOOSplat
 
 - **One-click Gaussian generation**: Select an input video, project directory, and quality preset. OOOSplat then runs FFmpeg frame extraction, COLMAP camera reconstruction, Brush training, and `final.ply` publishing without manual engine setup or command-line orchestration.
-- **Security and data control**: Source media, frames, reconstruction data, models, and logs stay in the local project directory by default and do not need to be uploaded to the cloud. Non-destructive transforms and exports preserve the original `final.ply`.
+- **Security and privacy protection**: Source media, extracted frames, camera reconstruction data, Gaussian models, and logs stay in the user-selected local project directory by default. The core generation workflow runs on the user's machine, so original videos, images, and models do not need to be uploaded to third-party reconstruction or training platforms. This reduces exposure risks during network transfer, cloud retention, and unauthorized access. Non-destructive transforms and exports preserve the original `final.ply`, keeping project data under the user's control.
 - **Fully local compute**: Reconstruction and training run on the user's own machine without remote compute services. COLMAP automatically uses a compatible local NVIDIA GPU when available and falls back to CPU otherwise, keeping both processing and data under the user's control.
 
 ## Interface Preview
