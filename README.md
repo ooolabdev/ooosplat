@@ -6,6 +6,10 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
+<p align="center">
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.3.0"><strong>⬇️ 下载 OOOSplat 0.3.0（Windows / macOS / Ubuntu）</strong></a>
+</p>
+
 OOOSplat 是一款将普通环绕拍摄视频一键转换为 3D Gaussian Splatting 的本地桌面应用。选择视频、项目目录和质量档位后，应用会自动完成抽帧、相机重建、训练与 PLY 发布，并可直接预览、调整和导出结果。
 
 Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。

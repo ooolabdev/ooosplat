@@ -6,6 +6,10 @@
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
 
+<p align="center">
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.3.0"><strong>⬇️ Download OOOSplat 0.3.0 for Windows, macOS, or Ubuntu</strong></a>
+</p>
+
 OOOSplat is a local desktop application that turns an ordinary orbit video into a 3D Gaussian Splatting project in one workflow. Choose a video, project directory, and quality preset, and OOOSplat automatically handles frame extraction, camera reconstruction, training, PLY publishing, preview, adjustment, and export.
 
 Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly, with no remote service or localhost API required.
