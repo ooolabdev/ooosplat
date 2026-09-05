@@ -18,6 +18,7 @@ pub struct ProjectPaths {
     pub output: PathBuf,
     pub work: PathBuf,
     pub frames: PathBuf,
+    pub masks: PathBuf,
     pub colmap: PathBuf,
     pub brush: PathBuf,
     pub logs: PathBuf,
@@ -86,6 +87,7 @@ impl ProjectManager {
         let source = project.join("source");
         let work = project.join("work");
         let frames = work.join("frames");
+        let masks = work.join("masks");
         let colmap = work.join("colmap");
         let brush = work.join("brush");
         let logs = project.join("logs");
@@ -135,6 +137,7 @@ impl ProjectManager {
                 output: project,
                 work,
                 frames,
+                masks,
                 colmap,
                 brush,
                 logs,

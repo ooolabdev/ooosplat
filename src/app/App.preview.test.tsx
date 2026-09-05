@@ -122,6 +122,43 @@ describe("App preview workspace", () => {
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
   });
 
+  it("shows automatic mask extraction when the selected video has alpha", async () => {
+    act(() => useAppStore.setState({
+      video: {
+        duration: 10,
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        totalFrames: 300,
+        codec: "prores",
+        rotation: 0,
+        pixelFormat: "yuva444p10le",
+        hasAlpha: true,
+      },
+      plan: { retentionRatio: 0.5, samplingFps: 15, estimatedFrames: 150 },
+    }));
+    await flush();
+
+    expect(container.textContent).toContain("检测到 Alpha 通道");
+    expect(container.textContent).toContain("将自动提取透明画面和 COLMAP Mask");
+
+    act(() => useAppStore.setState({
+      video: {
+        duration: 10,
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        totalFrames: 300,
+        codec: "h264",
+        rotation: 0,
+        pixelFormat: "yuv420p",
+        hasAlpha: false,
+      },
+    }));
+    await flush();
+    expect(container.textContent).not.toContain("将自动提取透明画面和 COLMAP Mask");
+  });
+
   it("shows only the task panes until a completed project is opened", async () => {
     expect(container.textContent).toContain("01 创建新任务");
     expect(container.textContent).toContain("02 历史任务");

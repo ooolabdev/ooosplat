@@ -125,6 +125,12 @@ pub struct FrameState {
     pub sampling_fps: f64,
     pub estimated_frames: u64,
     pub extracted_frames: Option<u64>,
+    #[serde(default)]
+    pub image_format: Option<String>,
+    #[serde(default)]
+    pub mask_count: Option<u64>,
+    #[serde(default)]
+    pub has_alpha: bool,
 }
 
 impl From<&FramePlan> for FrameState {
@@ -134,6 +140,9 @@ impl From<&FramePlan> for FrameState {
             sampling_fps: plan.sampling_fps,
             estimated_frames: plan.estimated_frames,
             extracted_frames: None,
+            image_format: None,
+            mask_count: None,
+            has_alpha: false,
         }
     }
 }
@@ -174,6 +183,32 @@ mod tests {
         let json = serde_json::to_string(&PipelineStateFile::created(Quality::Balanced)).unwrap();
         assert!(json.contains("\"preset\":\"balanced\""));
         assert!(!json.contains("targetFrames"));
+    }
+
+    #[test]
+    fn old_pipeline_state_defaults_transparency_fields() {
+        let json = r#"{
+          "stage":"extractingFrames",
+          "preset":"balanced",
+          "video":{
+            "duration":10.0,"width":1920,"height":1080,"fps":30.0,
+            "totalFrames":300,"codec":"h264","rotation":0
+          },
+          "frames":{
+            "retentionRatio":0.5,"samplingFps":15.0,"estimatedFrames":150,
+            "extractedFrames":150
+          },
+          "featuresComplete":false,"matchingComplete":false,
+          "reconstructionComplete":false,"brushComplete":false
+        }"#;
+        let state: PipelineStateFile = serde_json::from_str(json).unwrap();
+        let video = state.video.unwrap();
+        assert_eq!(video.pixel_format, "");
+        assert!(!video.has_alpha);
+        let frames = state.frames.unwrap();
+        assert_eq!(frames.image_format, None);
+        assert_eq!(frames.mask_count, None);
+        assert!(!frames.has_alpha);
     }
 
     #[test]

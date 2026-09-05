@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox,
+  Blend, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox,
   Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
   Settings2, Zap,
 } from "lucide-react";
@@ -402,6 +402,11 @@ export function App() {
           <span><small>时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
           <span><small>分辨率</small><b>{store.video.width} × {store.video.height}</b></span>
           <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
+        </div>}
+
+        {store.video?.hasAlpha && <div className="alpha-source-status" role="status">
+          <Blend size={17} />
+          <span><strong>检测到 Alpha 通道</strong><small>将自动提取透明画面和 COLMAP Mask · {store.video.pixelFormat || "Alpha"}</small></span>
         </div>}
 
         {!isRunning && <button className="primary-action" type="button" disabled={!store.videoPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
