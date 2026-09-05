@@ -1119,6 +1119,99 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn transparent_frame_checkpoint_requires_matching_masks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.masks).await.unwrap();
+        tokio::fs::write(paths.frames.join("frame_000001.png"), b"rgba")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.masks.join("frame_000001.png.png"), b"mask")
+            .await
+            .unwrap();
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.video = Some(VideoInfo {
+            duration: 1.0,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "prores".into(),
+            rotation: 0,
+            pixel_format: "yuva444p10le".into(),
+            has_alpha: true,
+        });
+        state.frames = Some(FrameState {
+            retention_ratio: 0.5,
+            sampling_fps: 15.0,
+            estimated_frames: 1,
+            extracted_frames: Some(1),
+            image_format: Some("png".into()),
+            mask_count: Some(1),
+            has_alpha: true,
+        });
+
+        let prepared = prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prepared.has_alpha);
+        assert_eq!(prepared.mask_count, 1);
+
+        tokio::fs::remove_file(paths.masks.join("frame_000001.png.png"))
+            .await
+            .unwrap();
+        assert!(prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_colmap_database_downgrades_the_feature_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.frames.join("frame_000001.jpg"), b"jpeg")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"")
+            .await
+            .unwrap();
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.video = Some(VideoInfo {
+            duration: 1.0,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        });
+        state.frames = Some(FrameState {
+            retention_ratio: 0.5,
+            sampling_fps: 15.0,
+            estimated_frames: 1,
+            extracted_frames: Some(1),
+            image_format: Some("jpeg".into()),
+            mask_count: Some(0),
+            has_alpha: false,
+        });
+        state.features_complete = true;
+        state.matching_complete = true;
+
+        normalize_checkpoints(&paths, &mut state).await.unwrap();
+
+        assert!(!state.features_complete);
+        assert!(!state.matching_complete);
+        assert_eq!(state.stage, PipelineStage::ExtractingFrames);
+    }
+
     #[test]
     fn parses_colmap_file_progress() {
         assert_eq!(

@@ -83,7 +83,7 @@ describe("App preview workspace", () => {
     useGaussianTransformStore.getState().close();
     useAppStore.setState({
       videoPath: null, projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null,
-      video: null, plan: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
+      video: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
     mocks.prepareGaussianPreview.mockReset();
@@ -177,6 +177,36 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id);
+  });
+
+  it("shows the estimated total generation time after video analysis", async () => {
+    act(() => useAppStore.setState({
+      video: {
+        duration: 10,
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        totalFrames: 300,
+        codec: "h264",
+        rotation: 0,
+        pixelFormat: "yuv420p",
+        hasAlpha: false,
+      },
+      plan: { retentionRatio: 0.5, samplingFps: 15, estimatedFrames: 150 },
+      estimate: {
+        estimatedMs: 120_000,
+        lowerBoundMs: 60_000,
+        upperBoundMs: 180_000,
+        confidence: "medium",
+        sampleCount: 3,
+        basis: "本机历史任务校准",
+      },
+    }));
+    await flush();
+
+    expect(container.textContent).toContain("预计生成");
+    expect(container.textContent).toContain("约 2 分 0 秒");
+    expect(container.querySelector('[title="本机历史任务校准"]')).not.toBeNull();
   });
 
   it("shows only the task panes until a completed project is opened", async () => {

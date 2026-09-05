@@ -16,7 +16,10 @@ use crate::{
         ColmapAccelerationStatus, EnginePaths, EngineStatus,
     },
     error::{Result, SplatError},
-    pipeline::runner::{PipelineResult, PipelineRunner},
+    pipeline::{
+        estimate::{estimate_runtime, RuntimeEstimate},
+        runner::{PipelineResult, PipelineRunner},
+    },
     presets::Quality,
     project::{
         catalog::{self, AppSettings, ProjectOverview},
@@ -107,6 +110,7 @@ pub struct GaussianVideoExportResult {
 pub struct ProbeAndPlan {
     video: VideoInfo,
     plan: FramePlan,
+    estimate: RuntimeEstimate,
 }
 
 fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
@@ -129,9 +133,16 @@ pub async fn probe_and_plan(
     path: String,
     quality: Quality,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
-    let video = probe_video(&paths_for_app(&app).ffprobe, &PathBuf::from(path), None).await?;
+    let engine_paths = paths_for_app(&app);
+    let video = probe_video(&engine_paths.ffprobe, &PathBuf::from(path), None).await?;
     let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
-    Ok(ProbeAndPlan { video, plan })
+    let samples = catalog::runtime_samples().await;
+    let estimate = estimate_runtime(&video, &plan, quality, &samples);
+    Ok(ProbeAndPlan {
+        video,
+        plan,
+        estimate,
+    })
 }
 
 #[tauri::command]

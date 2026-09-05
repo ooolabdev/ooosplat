@@ -13,6 +13,7 @@ import {
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
+import { projectRuntime } from "../lib/runtimeEstimate";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
@@ -131,6 +132,10 @@ export function App() {
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
+  const projectedTiming = useMemo(
+    () => projectRuntime(store.estimate, store.progress, liveElapsedMs, isRunning),
+    [isRunning, liveElapsedMs, store.estimate, store.progress],
+  );
 
   const refreshProjects = async () => {
     const overview = await getProjectOverview();
@@ -224,7 +229,7 @@ export function App() {
     store.setError(null);
     try {
       const result = await probeAndPlan(path, quality);
-      store.setAnalysis(result.video, result.plan);
+      store.setAnalysis(result.video, result.plan, result.estimate);
       store.setPhase("idle");
     } catch (error) {
       store.setError(messageOf(error));
@@ -420,7 +425,7 @@ export function App() {
           <span className="acceleration-icon">{store.colmapAcceleration?.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? <CircleAlert size={17} /> : store.colmapAcceleration ? <Cpu size={17} /> : <LoaderCircle className="spin" size={17} />}</span>
           <span>
             <strong>{store.colmapAcceleration == null ? "正在检测 COLMAP GPU 加速…" : store.colmapAcceleration.backend === "gpu" ? "COLMAP GPU 加速已开启" : "COLMAP 使用 CPU"}</strong>
-            <small>{store.colmapAcceleration == null ? "正在读取 COLMAP 加速能力" : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name} · 驱动 ${store.colmapAcceleration.device.driverVersion} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? store.colmapAcceleration.reason : `${store.colmapAcceleration.reason} · 最低要求：驱动 ${store.colmapAcceleration.requirements.minimumDriverVersion}，Compute Capability ${store.colmapAcceleration.requirements.minimumComputeCapability}`}</small>
+            <small>{store.colmapAcceleration == null ? "正在读取 COLMAP 加速能力" : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name}${store.colmapAcceleration.device.totalMemoryMb ? ` · ${(store.colmapAcceleration.device.totalMemoryMb / 1024).toFixed(1)} GB 显存` : ""} · 驱动 ${store.colmapAcceleration.device.driverVersion} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? store.colmapAcceleration.reason : `${store.colmapAcceleration.reason} · 最低要求：驱动 ${store.colmapAcceleration.requirements.minimumDriverVersion}，Compute Capability ${store.colmapAcceleration.requirements.minimumComputeCapability}`}</small>
           </span>
         </div>
 
@@ -428,6 +433,7 @@ export function App() {
           <span><small>时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
           <span><small>分辨率</small><b>{store.video.width} × {store.video.height}</b></span>
           <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
+          <span title={store.estimate?.basis}><small>预计生成</small><b>{store.estimate ? `约 ${formatDuration(store.estimate.estimatedMs)}` : "分析中"}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
         </div>}
 
         {store.video?.hasAlpha && <div className="alpha-source-status" role="status">
@@ -447,6 +453,7 @@ export function App() {
             <span><small>当前阶段</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
             <span><small>进度</small><b>{store.latestEvent?.current != null ? `${store.latestEvent.current.toLocaleString()}${store.latestEvent.total ? ` / ${store.latestEvent.total.toLocaleString()}` : ""}` : "持续运行"}</b></span>
             <span><small>总耗时</small><b>{formatDuration(liveElapsedMs)}</b></span>
+            <span><small>预计剩余</small><b>{projectedTiming ? formatDuration(projectedTiming.remainingMs) : "校准中"}</b></span>
           </div>
           <ol className="stage-timeline">
             {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || store.phase === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{label}</b>{index === activeStageIndex && isRunning && <small>{store.latestEvent?.indeterminate ? "运行中" : `${(store.latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}

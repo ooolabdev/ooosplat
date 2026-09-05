@@ -9,7 +9,7 @@ export type AccelerationReasonCode =
   | "nvidiaSmiNotFound" | "probeFailed" | "probeTimeout" | "noNvidiaGpu"
   | "driverVersionUnknown" | "driverTooOld" | "computeCapabilityUnknown"
   | "computeCapabilityTooLow";
-export interface GpuDeviceInfo { index: number; name: string; driverVersion: string; computeCapability: string; }
+export interface GpuDeviceInfo { index: number; name: string; driverVersion: string; computeCapability: string; totalMemoryMb?: number; }
 export interface AccelerationRequirements { minimumDriverVersion: string; minimumComputeCapability: string; }
 export interface ColmapAccelerationStatus {
   backend: ColmapBackend;
@@ -31,6 +31,14 @@ export interface VideoInfo {
   hasAlpha: boolean;
 }
 export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
+export interface RuntimeEstimate {
+  estimatedMs: number;
+  lowerBoundMs: number;
+  upperBoundMs: number;
+  confidence: "low" | "medium" | "high";
+  sampleCount: number;
+  basis: string;
+}
 
 export interface PipelineEvent {
   sequence: number;
