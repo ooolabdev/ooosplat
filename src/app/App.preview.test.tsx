@@ -10,6 +10,7 @@ import type { ProjectSummary } from "../types/pipeline";
 const mocks = vi.hoisted(() => ({
   prepareGaussianPreview: vi.fn(),
   releaseGaussianPreview: vi.fn(),
+  resumePipeline: vi.fn(),
   getProjectOverview: vi.fn(),
   initializeTelemetry: vi.fn(),
   setTelemetryConsent: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock("../lib/backend", () => ({
   prepareGaussianPreview: mocks.prepareGaussianPreview,
   probeAndPlan: vi.fn(),
   releaseGaussianPreview: mocks.releaseGaussianPreview,
+  resumePipeline: mocks.resumePipeline,
   revealProject: vi.fn(),
   selectProjectsRoot: vi.fn(),
   selectVideo: vi.fn(),
@@ -86,6 +88,13 @@ describe("App preview workspace", () => {
     });
     mocks.prepareGaussianPreview.mockReset();
     mocks.releaseGaussianPreview.mockReset().mockResolvedValue(undefined);
+    mocks.resumePipeline.mockReset().mockResolvedValue({
+      projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly,
+      fileSize: project.fileSize, splatCount: project.splatCount, inputImages: 100,
+      registeredImages: 90, registeredRatio: 0.9, points3d: 10_000,
+      durationMs: project.durationMs, completedAt: project.completedAt, warning: null,
+      logsDirectory: `${project.projectPath}\\logs`,
+    });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [project] });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
     mocks.setTelemetryConsent.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
@@ -157,6 +166,17 @@ describe("App preview workspace", () => {
     }));
     await flush();
     expect(container.textContent).not.toContain("将自动提取透明画面和 COLMAP Mask");
+  });
+
+  it("offers to continue an unfinished project from its checkpoint", async () => {
+    const unfinished = { ...project, status: "cancelled" as const, finalPly: null, completedAt: null };
+    await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
+
+    const resumeButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "继续任务");
+    await act(async () => { resumeButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id);
   });
 
   it("shows only the task panes until a completed project is opened", async () => {

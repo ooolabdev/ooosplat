@@ -25,6 +25,27 @@ pub struct ProjectPaths {
     pub state: PathBuf,
 }
 
+impl ProjectPaths {
+    pub fn existing(id: Uuid, project: PathBuf) -> Self {
+        let source = project.join("source");
+        let work = project.join("work");
+        Self {
+            id,
+            metadata: project.join("project.json"),
+            output: project.clone(),
+            frames: work.join("frames"),
+            masks: work.join("masks"),
+            colmap: work.join("colmap"),
+            brush: work.join("brush"),
+            logs: project.join("logs"),
+            state: project.join("state.json"),
+            project,
+            source,
+            work,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectManager {
     projects_root: PathBuf,
@@ -149,6 +170,9 @@ impl ProjectManager {
 
     pub async fn write_state(&self, path: &Path, state: &PipelineStateFile) -> Result<()> {
         atomic_write_json(path, state).await
+    }
+    pub async fn read_state(&self, path: &Path) -> Result<PipelineStateFile> {
+        Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)
     }
     pub async fn write_metadata(&self, path: &Path, metadata: &ProjectMetadata) -> Result<()> {
         atomic_write_json(path, metadata).await

@@ -164,7 +164,7 @@ async fn ensure_clean_output(frames: &Path, masks: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn validate_extraction(
+pub(crate) async fn validate_extraction(
     frames: &Path,
     masks: &Path,
     has_alpha: bool,

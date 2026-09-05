@@ -10,7 +10,7 @@ import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview,
   onPipelineEvent, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
-  initializeTelemetry, setTelemetryConsent,
+  initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { useAppStore } from "../stores/appStore";
@@ -75,7 +75,7 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-function ProjectRow({ project, busy, previewing, previewDisabled, onPreview, onDelete }: { project: ProjectSummary; busy: boolean; previewing: boolean; previewDisabled: boolean; onPreview: (project: ProjectSummary) => void; onDelete: (project: ProjectSummary) => void }) {
+function ProjectRow({ project, busy, previewing, previewDisabled, onPreview, onResume, onDelete }: { project: ProjectSummary; busy: boolean; previewing: boolean; previewDisabled: boolean; onPreview: (project: ProjectSummary) => void; onResume: (project: ProjectSummary) => void; onDelete: (project: ProjectSummary) => void }) {
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
@@ -94,6 +94,7 @@ function ProjectRow({ project, busy, previewing, previewDisabled, onPreview, onD
     </dl>
     <div className="project-actions">
       {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={() => onPreview(project)}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? "正在打开" : "预览"}</button>}
+      {project.status !== "completed" && <button className="resume-link" type="button" disabled={busy} onClick={() => onResume(project)}><Play size={14} fill="currentColor" />继续任务</button>}
       <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />在文件管理器中显示</button>
       <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
     </div>
@@ -113,6 +114,7 @@ export function App() {
   const previewReleasePromises = useRef(new Map<string, Promise<void>>());
   const releasedPreviewProjects = useRef(new Set<string>());
   const runStartedAt = useRef<number | null>(null);
+  const runElapsedOffset = useRef(0);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
   const [leftPanePercent, setLeftPanePercent] = useState(() => Math.min(68, Math.max(32, readSavedNumber("ooo-splat-left-pane", 44))));
   const [uiScale, setUiScale] = useState(() => Math.min(140, Math.max(80, readSavedNumber("ooo-splat-ui-scale", 100))));
@@ -158,7 +160,7 @@ export function App() {
     void onPipelineEvent((event) => {
       store.receiveEvent(event);
       if (["completed", "failed", "cancelled"].includes(event.stage)) {
-        setLiveElapsedMs(event.elapsedMs);
+        setLiveElapsedMs(runElapsedOffset.current + event.elapsedMs);
       }
     }).then((fn) => { unlisten = fn; });
     return () => unlisten?.();
@@ -168,7 +170,9 @@ export function App() {
 
   useEffect(() => {
     if (!isRunning || runStartedAt.current == null) return;
-    return startElapsedTicker(runStartedAt.current, setLiveElapsedMs);
+    return startElapsedTicker(runStartedAt.current, (elapsed) => {
+      setLiveElapsedMs(runElapsedOffset.current + elapsed);
+    });
   }, [isRunning]);
 
   useEffect(() => {
@@ -250,6 +254,7 @@ export function App() {
 
   const generate = async () => {
     if (!store.videoPath || !store.plan || !store.projectsRoot) return;
+    runElapsedOffset.current = 0;
     runStartedAt.current = Date.now();
     setLiveElapsedMs(0);
     store.beginRun();
@@ -268,6 +273,27 @@ export function App() {
       store.setPhase(message.includes("取消") ? "cancelled" : "failed");
     } finally {
       try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
+    }
+  };
+
+  const resume = async (project: ProjectSummary) => {
+    runElapsedOffset.current = project.durationMs ?? 0;
+    runStartedAt.current = Date.now();
+    setLiveElapsedMs(runElapsedOffset.current);
+    store.beginRun();
+    try {
+      const result = await resumePipeline(project.id);
+      setLiveElapsedMs((current) => Math.max(current, result.durationMs));
+      store.setResult(result);
+      store.setPhase("completed");
+    } catch (error) {
+      const backendElapsed = useAppStore.getState().latestEvent?.elapsedMs ?? 0;
+      setLiveElapsedMs(runElapsedOffset.current + backendElapsed);
+      const message = messageOf(error);
+      store.setError(message);
+      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+    } finally {
+      try { await refreshProjects(); } catch { /* the project remains on disk */ }
     }
   };
 
@@ -469,8 +495,8 @@ export function App() {
 
         {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
 
-        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId !== null} onPreview={(item) => void previewProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
-        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled onPreview={() => undefined} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId !== null} onPreview={(item) => void previewProject(item)} onResume={() => undefined} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled onPreview={() => undefined} onResume={(item) => void resume(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
       </section>
     </section>
     </div>
