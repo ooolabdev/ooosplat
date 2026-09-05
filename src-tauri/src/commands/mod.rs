@@ -461,9 +461,9 @@ pub async fn begin_gaussian_video_export(
     let (root, _, _) = catalog::registered_final_ply_for_project(project_id).await?;
 
     let active = state.active.lock().await;
-    if !active
+    if active
         .as_ref()
-        .is_some_and(|session| session.project_id == project_id)
+        .is_none_or(|session| session.project_id != project_id)
     {
         return Err(SplatError::Process(
             "该项目当前未在 OOOSplat 预览中打开，无法导出视频。".into(),

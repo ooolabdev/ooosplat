@@ -834,7 +834,15 @@ mod tests {
         let paths = EnginePaths::from_root("/opt/ooosplat-engines");
         assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
         let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
-        assert!(discovered.ffmpeg.is_file());
+        // FFmpeg is not installed on every contributor machine or CI runner, so assert
+        // the resolver contract instead of requiring the binary: an explicit override
+        // wins, then PATH, and otherwise the managed path is kept so engine health can
+        // report the exact file it expected.
+        let expected = std::env::var_os("OOOSPLAT_FFMPEG")
+            .map(PathBuf::from)
+            .or_else(|| find_on_path("ffmpeg"))
+            .unwrap_or_else(|| PathBuf::from("/missing/engines/ffmpeg"));
+        assert_eq!(discovered.ffmpeg, expected);
     }
 
     #[cfg(target_os = "macos")]
