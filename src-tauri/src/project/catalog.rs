@@ -32,21 +32,14 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
         else {
             continue;
         };
-        let Ok(state_bytes) = tokio::fs::read(item.path.join("state.json")).await else {
-            continue;
-        };
-        let Ok(state) = serde_json::from_slice::<crate::project::PipelineStateFile>(&state_bytes)
-        else {
-            continue;
-        };
-        let (Some(video), Some(frames)) = (state.video, state.frames) else {
-            continue;
-        };
-        let Some(extracted_frames) = frames.extracted_frames.filter(|count| *count > 0) else {
+        let state_bytes = tokio::fs::read(item.path.join("state.json")).await.ok();
+        let Some(extracted_frames) = runtime_sample_frame_count(
+            state_bytes.as_deref(),
+            metadata.output.as_ref().map(|output| output.input_images),
+        ) else {
             continue;
         };
         samples.push(RuntimeSample {
-            video,
             quality: metadata.quality,
             extracted_frames,
             duration_ms,
@@ -56,6 +49,21 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
         }
     }
     samples
+}
+
+fn runtime_sample_frame_count(
+    state_bytes: Option<&[u8]>,
+    output_frames: Option<u64>,
+) -> Option<u64> {
+    state_bytes
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|state| {
+            state
+                .pointer("/frames/extractedFrames")
+                .and_then(|value| value.as_u64())
+        })
+        .or(output_frames)
+        .filter(|count| *count > 0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +443,21 @@ mod tests {
         assert!(!serde_json::to_string(&parsed)
             .unwrap()
             .contains("colmapAcceleration"));
+    }
+
+    #[test]
+    fn runtime_samples_fall_back_to_project_output_for_legacy_state() {
+        let legacy_state = br#"{"stage":"completed"}"#;
+        assert_eq!(
+            runtime_sample_frame_count(Some(legacy_state), Some(533)),
+            Some(533)
+        );
+        let current_state = br#"{"frames":{"extractedFrames":320}}"#;
+        assert_eq!(
+            runtime_sample_frame_count(Some(current_state), Some(533)),
+            Some(320)
+        );
+        assert_eq!(runtime_sample_frame_count(None, Some(0)), None);
     }
 
     #[test]

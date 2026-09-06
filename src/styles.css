@@ -132,7 +132,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
 .mono { font: 650 13px/1 "Cascadia Mono", monospace; }
 .current-message { min-height: 20px; margin: 14px 0 0; color: #455064; font-size: 12px; line-height: 1.55; }
-.process-metrics { margin-top: 13px; display: grid; grid-template-columns: .8fr 1.2fr .8fr .9fr; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.process-metrics { margin-top: 13px; display: grid; grid-template-columns: .8fr 1.2fr .8fr; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .process-metrics span { min-width: 0; padding: 11px 10px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
 .process-metrics span:first-child { padding-left: 0; }
 .process-metrics span:last-child { border: 0; }
@@ -157,6 +157,41 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .log-line.warning p { color: #ffd68e; }
 .log-line.error p { color: #ffaaa1; }
 .cancel-action { margin-top: 12px; padding: 8px 0; display: flex; align-items: center; gap: 7px; color: var(--red); background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.cancellation-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(19, 26, 39, .54);
+  backdrop-filter: blur(3px);
+}
+.cancellation-status {
+  width: min(420px, calc(100vw - 48px));
+  min-height: 112px;
+  padding: 24px 26px;
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 17px;
+  align-items: center;
+  color: var(--ink);
+  background: rgba(248, 249, 251, .96);
+  border: 1px solid var(--line-dark);
+  box-shadow: 0 20px 54px rgba(10, 17, 29, .24);
+}
+.cancellation-spinner {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  color: var(--blue);
+  background: #edf2ff;
+  border: 1px solid #c8d6ff;
+  border-radius: 50%;
+}
+.cancellation-status strong { display: block; margin-bottom: 7px; font-size: 15px; }
+.cancellation-status p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
 .inline-error button { color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
 

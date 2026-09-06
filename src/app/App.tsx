@@ -7,19 +7,19 @@ import {
 import appLogo from "../../assets/app-icon.svg";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, getProjectOverview,
+  cancelPipeline, checkEngines, confirmAndDeleteProject, estimateProjectRuntime, getProjectOverview,
   onPipelineEvent, probeAndPlan, revealProject, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
-import { projectRuntime } from "../lib/runtimeEstimate";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
+const CANCELLATION_OVERLAY_DELAY_MS = 300;
 
 const qualities: Array<{ value: Quality; label: string; description: string }> = [
   { value: "fast", label: "快速", description: "快速验证素材与拍摄路径" },
@@ -116,7 +116,10 @@ export function App() {
   const releasedPreviewProjects = useRef(new Set<string>());
   const runStartedAt = useRef<number | null>(null);
   const runElapsedOffset = useRef(0);
+  const cancellationOverlayTimer = useRef<number | null>(null);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
+  const [isCancellationRequested, setIsCancellationRequested] = useState(false);
+  const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
   const [leftPanePercent, setLeftPanePercent] = useState(() => Math.min(68, Math.max(32, readSavedNumber("ooo-splat-left-pane", 44))));
   const [uiScale, setUiScale] = useState(() => Math.min(140, Math.max(80, readSavedNumber("ooo-splat-ui-scale", 100))));
   const [isResizing, setIsResizing] = useState(false);
@@ -132,10 +135,20 @@ export function App() {
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
-  const projectedTiming = useMemo(
-    () => projectRuntime(store.estimate, store.progress, liveElapsedMs, isRunning),
-    [isRunning, liveElapsedMs, store.estimate, store.progress],
-  );
+  const liveProgressLabel = store.latestEvent?.unit === "estimated_progress" && store.latestEvent.stageProgress != null
+    ? `估算 ${store.latestEvent.stageProgress.toFixed(0)}%`
+    : store.latestEvent?.current != null
+      ? `${store.latestEvent.current.toLocaleString()}${store.latestEvent.total ? ` / ${store.latestEvent.total.toLocaleString()}` : ""}`
+      : "持续运行";
+
+  const clearCancellationFeedback = useCallback(() => {
+    if (cancellationOverlayTimer.current != null) {
+      window.clearTimeout(cancellationOverlayTimer.current);
+      cancellationOverlayTimer.current = null;
+    }
+    setIsCancellationRequested(false);
+    setShowCancellationOverlay(false);
+  }, []);
 
   const refreshProjects = async () => {
     const overview = await getProjectOverview();
@@ -179,6 +192,14 @@ export function App() {
       setLiveElapsedMs(runElapsedOffset.current + elapsed);
     });
   }, [isRunning]);
+
+  useEffect(() => {
+    if (!isRunning) clearCancellationFeedback();
+  }, [clearCancellationFeedback, isRunning]);
+
+  useEffect(() => () => {
+    if (cancellationOverlayTimer.current != null) window.clearTimeout(cancellationOverlayTimer.current);
+  }, []);
 
   useEffect(() => {
     try { window.localStorage.setItem("ooo-splat-left-pane", leftPanePercent.toFixed(1)); } catch { /* optional preference */ }
@@ -257,8 +278,24 @@ export function App() {
     if (store.videoPath) await analyze(store.videoPath, quality);
   };
 
+  const requestCancellation = async () => {
+    if (!isRunning || isCancellationRequested) return;
+    setIsCancellationRequested(true);
+    cancellationOverlayTimer.current = window.setTimeout(() => {
+      cancellationOverlayTimer.current = null;
+      setShowCancellationOverlay(true);
+    }, CANCELLATION_OVERLAY_DELAY_MS);
+    try {
+      await cancelPipeline();
+    } catch (error) {
+      clearCancellationFeedback();
+      store.setError(`无法终止任务：${messageOf(error)}`);
+    }
+  };
+
   const generate = async () => {
     if (!store.videoPath || !store.plan || !store.projectsRoot) return;
+    clearCancellationFeedback();
     runElapsedOffset.current = 0;
     runStartedAt.current = Date.now();
     setLiveElapsedMs(0);
@@ -282,9 +319,15 @@ export function App() {
   };
 
   const resume = async (project: ProjectSummary) => {
+    clearCancellationFeedback();
     runElapsedOffset.current = project.durationMs ?? 0;
     runStartedAt.current = Date.now();
     setLiveElapsedMs(runElapsedOffset.current);
+    try {
+      store.setEstimate(await estimateProjectRuntime(project.id));
+    } catch {
+      store.setEstimate(null);
+    }
     store.beginRun();
     try {
       const result = await resumePipeline(project.id);
@@ -430,10 +473,10 @@ export function App() {
         </div>
 
         {store.video && store.plan && <div className="source-metrics">
-          <span><small>时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
+          <span><small>素材时长</small><b>{formatVideoDuration(store.video.duration)}</b></span>
           <span><small>分辨率</small><b>{store.video.width} × {store.video.height}</b></span>
           <span><small>预计帧数</small><b>约 {store.plan.estimatedFrames.toLocaleString()}</b></span>
-          <span title={store.estimate?.basis}><small>预计生成</small><b>{store.estimate ? `约 ${formatDuration(store.estimate.estimatedMs)}` : "分析中"}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
+          <span title={store.estimate?.basis}><small>预计时长</small><b>{store.estimate ? `约 ${formatDuration(store.estimate.estimatedMs)}` : "分析中"}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
         </div>}
 
         {store.video?.hasAlpha && <div className="alpha-source-status" role="status">
@@ -451,9 +494,8 @@ export function App() {
           <p className="current-message">{store.progressMessage || "正在准备任务"}</p>
           <div className="process-metrics">
             <span><small>当前阶段</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
-            <span><small>进度</small><b>{store.latestEvent?.current != null ? `${store.latestEvent.current.toLocaleString()}${store.latestEvent.total ? ` / ${store.latestEvent.total.toLocaleString()}` : ""}` : "持续运行"}</b></span>
+            <span><small>进度</small><b>{liveProgressLabel}</b></span>
             <span><small>总耗时</small><b>{formatDuration(liveElapsedMs)}</b></span>
-            <span><small>预计剩余</small><b>{projectedTiming ? formatDuration(projectedTiming.remainingMs) : "校准中"}</b></span>
           </div>
           <ol className="stage-timeline">
             {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || store.phase === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{label}</b>{index === activeStageIndex && isRunning && <small>{store.latestEvent?.indeterminate ? "运行中" : `${(store.latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}
@@ -463,7 +505,7 @@ export function App() {
             {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.message}</p></div>)}
             <div ref={logEnd} />
           </div>
-          {isRunning && <button className="cancel-action" type="button" onClick={() => void cancelPipeline()}><Square size={12} fill="currentColor" />取消任务并终止所有进程</button>}
+          {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? "正在终止任务" : "取消任务并终止所有进程"}</button>}
         </section>}
 
         {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{store.error}</span><button type="button" onClick={() => store.setError(null)}>关闭</button></div>}
@@ -516,6 +558,15 @@ export function App() {
       </div>}
       <button className="zoom-trigger" type="button" aria-expanded={showZoomControls} onClick={() => setShowZoomControls((visible) => !visible)}>{uiScale}%</button>
     </aside>
+    {showCancellationOverlay && isRunning && <div className="cancellation-backdrop" role="dialog" aria-modal="true" aria-labelledby="cancellation-title" aria-describedby="cancellation-description">
+      <div className="cancellation-status" aria-live="assertive" aria-busy="true">
+        <span className="cancellation-spinner" aria-hidden="true"><LoaderCircle className="spin" size={26} /></span>
+        <div>
+          <strong id="cancellation-title">正在终止任务</strong>
+          <p id="cancellation-description">正在关闭当前阶段及其子进程，请稍候。完成后此窗口会自动关闭。</p>
+        </div>
+      </div>
+    </div>}
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
     {telemetryPreferences && privacySettingsOpen && <TelemetryPreferences mode="settings" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} onClose={() => setPrivacySettingsOpen(false)} />}
   </main>;

@@ -8,6 +8,8 @@ import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { ProjectSummary } from "../types/pipeline";
 
 const mocks = vi.hoisted(() => ({
+  cancelPipeline: vi.fn(),
+  estimateProjectRuntime: vi.fn(),
   prepareGaussianPreview: vi.fn(),
   releaseGaussianPreview: vi.fn(),
   resumePipeline: vi.fn(),
@@ -18,9 +20,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../lib/backend", () => ({
-  cancelPipeline: vi.fn(),
+  cancelPipeline: mocks.cancelPipeline,
   checkEngines: vi.fn().mockResolvedValue([]),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
+  estimateProjectRuntime: mocks.estimateProjectRuntime,
   getProjectOverview: mocks.getProjectOverview,
   initializeTelemetry: mocks.initializeTelemetry,
   onPipelineEvent: vi.fn().mockResolvedValue(() => undefined),
@@ -87,6 +90,15 @@ describe("App preview workspace", () => {
       latestEvent: null, events: [], result: null, error: null,
     });
     mocks.prepareGaussianPreview.mockReset();
+    mocks.cancelPipeline.mockReset().mockResolvedValue(undefined);
+    mocks.estimateProjectRuntime.mockReset().mockResolvedValue({
+      estimatedMs: 4_000_000,
+      lowerBoundMs: 3_000_000,
+      upperBoundMs: 5_000_000,
+      confidence: "medium",
+      sampleCount: 3,
+      basis: "按同档位历史任务校准",
+    });
     mocks.releaseGaussianPreview.mockReset().mockResolvedValue(undefined);
     mocks.resumePipeline.mockReset().mockResolvedValue({
       projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly,
@@ -177,6 +189,25 @@ describe("App preview workspace", () => {
     await flush();
 
     expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id);
+    expect(mocks.estimateProjectRuntime).toHaveBeenCalledWith(project.id);
+  });
+
+  it("blocks the interface while a slow cancellation is still terminating processes", async () => {
+    act(() => useAppStore.setState({ phase: "running" }));
+    await flush();
+
+    const cancelButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "取消任务并终止所有进程");
+    await act(async () => { cancelButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    expect(mocks.cancelPipeline).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".cancellation-backdrop")).toBeNull();
+
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 350)); });
+    expect(container.querySelector(".cancellation-backdrop")).not.toBeNull();
+    expect(container.textContent).toContain("正在关闭当前阶段及其子进程");
+
+    act(() => useAppStore.setState({ phase: "cancelled" }));
+    await flush();
+    expect(container.querySelector(".cancellation-backdrop")).toBeNull();
   });
 
   it("shows the estimated total generation time after video analysis", async () => {
@@ -204,9 +235,38 @@ describe("App preview workspace", () => {
     }));
     await flush();
 
-    expect(container.textContent).toContain("预计生成");
+    expect(container.textContent).toContain("预计时长");
     expect(container.textContent).toContain("约 2 分 0 秒");
     expect(container.querySelector('[title="本机历史任务校准"]')).not.toBeNull();
+  });
+
+  it("labels Brush heartbeat progress as an estimate", async () => {
+    act(() => useAppStore.setState({
+      phase: "running",
+      progress: 79,
+      progressMessage: "Brush 训练中 · 估算进度 50%",
+      latestEvent: {
+        sequence: 7,
+        timestamp: new Date().toISOString(),
+        kind: "heartbeat",
+        level: "info",
+        stage: "TrainingSplats",
+        engine: "brush",
+        progress: 79,
+        stageProgress: 50,
+        indeterminate: false,
+        message: "Brush 训练中 · 估算进度 50%",
+        current: null,
+        total: 15_000,
+        unit: "estimated_progress",
+        elapsedMs: 120_000,
+        acceleration: null,
+      },
+    }));
+    await flush();
+
+    expect(container.textContent).toContain("估算 50%");
+    expect(container.textContent).not.toContain("15,000 / 15,000");
   });
 
   it("shows only the task panes until a completed project is opened", async () => {

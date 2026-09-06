@@ -19,8 +19,8 @@ use crate::{
     },
     error::{Result, SplatError},
     pipeline::{
-        progress::stage_progress_range, EventKind, EventLevel, PipelineEngine, PipelineEvent,
-        PipelineStage,
+        estimate::estimate_calibrated_brush_stage_ms, progress::stage_progress_range, EventKind,
+        EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     presets::Quality,
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
@@ -622,6 +622,13 @@ impl PipelineRunner {
         } else {
             reset_directory(&paths.brush).await?;
             let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let runtime_samples = catalog::runtime_samples().await;
+            let estimated_brush_duration_ms = estimate_calibrated_brush_stage_ms(
+                &prepared.video,
+                &prepared.plan,
+                quality,
+                &runtime_samples,
+            );
             self.events.send(
                 PipelineStage::TrainingSplats,
                 Some(PipelineEngine::Brush),
@@ -630,8 +637,10 @@ impl PipelineRunner {
                 None,
                 true,
                 format!(
-                    "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {}",
-                    preset.brush_iterations, preset.brush_max_resolution
+                    "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {} · 预计约 {}",
+                    preset.brush_iterations,
+                    preset.brush_max_resolution,
+                    format_duration(estimated_brush_duration_ms)
                 ),
                 Some(0),
                 Some(preset.brush_iterations as u64),
@@ -648,7 +657,9 @@ impl PipelineRunner {
                     PipelineStage::TrainingSplats,
                     PipelineEngine::Brush,
                     Some(preset.brush_iterations as u64),
-                    ObserverMode::Brush,
+                    ObserverMode::Brush {
+                        estimated_duration_ms: estimated_brush_duration_ms,
+                    },
                 )),
             )
             .await?;
@@ -725,6 +736,7 @@ impl PipelineRunner {
     ) -> ProcessObserver {
         let events = self.events.clone();
         let mapper_count = Arc::new(AtomicU64::new(0));
+        let brush_progress_basis_points = Arc::new(AtomicU64::new(0));
         Arc::new(move |update| match update {
             ProcessUpdate::Started { process_id } => events.send(
                 stage,
@@ -738,19 +750,32 @@ impl PipelineRunner {
                 expected_total,
                 None,
             ),
-            ProcessUpdate::Heartbeat { elapsed_ms } if mode == ObserverMode::Brush => events.send(
-                stage,
-                Some(engine),
-                EventKind::Heartbeat,
-                EventLevel::Info,
-                None,
-                true,
-                format!("Brush 正在运行 · 已用时 {}", format_duration(elapsed_ms)),
-                None,
-                expected_total,
-                Some("iterations"),
-            ),
-            ProcessUpdate::Heartbeat { .. } => {}
+            ProcessUpdate::Heartbeat { elapsed_ms } => {
+                if let ObserverMode::Brush {
+                    estimated_duration_ms,
+                } = mode
+                {
+                    let progress = estimated_brush_progress(elapsed_ms, estimated_duration_ms);
+                    brush_progress_basis_points
+                        .store((progress * 10_000.0).round() as u64, Ordering::Relaxed);
+                    events.send(
+                        stage,
+                        Some(engine),
+                        EventKind::Heartbeat,
+                        EventLevel::Info,
+                        Some(progress),
+                        false,
+                        format!(
+                            "Brush 训练中 · 估算进度 {:.0}% · 已用时 {}",
+                            progress * 100.0,
+                            format_duration(elapsed_ms)
+                        ),
+                        None,
+                        expected_total,
+                        Some("estimated_progress"),
+                    );
+                }
+            }
             ProcessUpdate::Line { stream: _, line } => {
                 if line.is_empty() {
                     return;
@@ -771,7 +796,7 @@ impl PipelineRunner {
                     ObserverMode::Mapper => {
                         parse_mapper_progress(&line, &mapper_count, expected_total)
                     }
-                    ObserverMode::Brush => None,
+                    ObserverMode::Brush { .. } => None,
                 };
                 if let Some((current, total, message)) = parsed {
                     let progress = total
@@ -789,7 +814,22 @@ impl PipelineRunner {
                         total,
                         Some("张"),
                     );
-                } else if mode == ObserverMode::Brush || is_useful_line(&line) {
+                } else if matches!(mode, ObserverMode::Brush { .. }) {
+                    let progress =
+                        brush_progress_basis_points.load(Ordering::Relaxed) as f32 / 10_000.0;
+                    events.send(
+                        stage,
+                        Some(engine),
+                        EventKind::Log,
+                        EventLevel::Info,
+                        Some(progress),
+                        progress == 0.0,
+                        friendly_engine_line(&line),
+                        None,
+                        expected_total,
+                        Some("estimated_progress"),
+                    );
+                } else if is_useful_line(&line) {
                     events.send(
                         stage,
                         Some(engine),
@@ -813,7 +853,16 @@ enum ObserverMode {
     Ffmpeg,
     BracketProgress,
     Mapper,
-    Brush,
+    Brush { estimated_duration_ms: u64 },
+}
+
+fn estimated_brush_progress(elapsed_ms: u64, estimated_duration_ms: u64) -> f32 {
+    const MAX_PROGRESS_BEFORE_COMPLETION: f64 = 0.95;
+    if estimated_duration_ms == 0 {
+        return 0.0;
+    }
+    ((elapsed_ms as f64 / estimated_duration_ms as f64) * MAX_PROGRESS_BEFORE_COMPLETION)
+        .clamp(0.0, MAX_PROGRESS_BEFORE_COMPLETION) as f32
 }
 
 fn parse_ffmpeg_frame(line: &str) -> Option<u64> {
@@ -1234,6 +1283,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value.0, 86);
+    }
+
+    #[test]
+    fn brush_estimated_progress_advances_and_stops_at_ninety_five_percent() {
+        assert_eq!(estimated_brush_progress(0, 100_000), 0.0);
+        assert!((estimated_brush_progress(50_000, 100_000) - 0.475).abs() < f32::EPSILON);
+        assert!((estimated_brush_progress(100_000, 100_000) - 0.95).abs() < f32::EPSILON);
+        assert!((estimated_brush_progress(500_000, 100_000) - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn brush_estimated_progress_handles_an_invalid_duration() {
+        assert_eq!(estimated_brush_progress(10_000, 0), 0.0);
     }
 
     #[test]

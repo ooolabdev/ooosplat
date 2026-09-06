@@ -24,7 +24,7 @@ use crate::{
     project::{
         catalog::{self, AppSettings, ProjectOverview},
         manager::atomic_write_json,
-        GaussianTransform, ProjectStatus,
+        GaussianTransform, PipelineStateFile, ProjectStatus,
     },
     reconstruction::{ply::inspect_gaussian_ply, splat_transform::export_transformed_ply},
     telemetry::{PipelineTelemetrySession, TelemetryPreferences, TelemetryService},
@@ -143,6 +143,66 @@ pub async fn probe_and_plan(
         plan,
         estimate,
     })
+}
+
+fn resume_checkpoint_fraction(state: &PipelineStateFile) -> (f64, &'static str) {
+    if state.brush_complete {
+        (0.98, "结果发布")
+    } else if state.reconstruction_complete {
+        (0.60, "Brush 训练")
+    } else if state.matching_complete {
+        (0.45, "相机重建")
+    } else if state.features_complete {
+        (0.32, "顺序匹配")
+    } else if state
+        .frames
+        .as_ref()
+        .and_then(|frames| frames.extracted_frames)
+        .is_some_and(|count| count > 0)
+    {
+        (0.20, "特征提取")
+    } else {
+        (0.0, "画面提取")
+    }
+}
+
+#[tauri::command]
+pub async fn estimate_project_runtime(
+    app: tauri::AppHandle,
+    project_id: Uuid,
+) -> Result<RuntimeEstimate> {
+    let (project, metadata) = catalog::load_registered_project(project_id).await?;
+    let state_bytes = tokio::fs::read(project.join("state.json")).await?;
+    let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
+    let video = match state.video.clone() {
+        Some(video) => video,
+        None => probe_video(&paths_for_app(&app).ffprobe, &metadata.source_path, None).await?,
+    };
+    let plan = match state.frames.as_ref() {
+        Some(frames) => FramePlan {
+            retention_ratio: frames.retention_ratio,
+            sampling_fps: frames.sampling_fps,
+            estimated_frames: frames
+                .extracted_frames
+                .unwrap_or(frames.estimated_frames)
+                .max(1),
+        },
+        None => UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset()),
+    };
+    let samples = catalog::runtime_samples().await;
+    let mut estimate = estimate_runtime(&video, &plan, metadata.quality, &samples);
+    let previous_duration = metadata.duration_ms.unwrap_or(0);
+    let (completed_fraction, next_stage) = resume_checkpoint_fraction(&state);
+    let remaining_fraction = 1.0 - completed_fraction;
+    let remaining = |total: u64| ((total as f64 * remaining_fraction).round() as u64).max(1_000);
+    estimate.estimated_ms = previous_duration.saturating_add(remaining(estimate.estimated_ms));
+    estimate.lower_bound_ms = previous_duration.saturating_add(remaining(estimate.lower_bound_ms));
+    estimate.upper_bound_ms = previous_duration.saturating_add(remaining(estimate.upper_bound_ms));
+    estimate.basis = format!(
+        "{}；已计入此前耗时，预计从{next_stage}阶段继续",
+        estimate.basis
+    );
+    Ok(estimate)
 }
 
 #[tauri::command]

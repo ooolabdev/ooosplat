@@ -20,6 +20,7 @@ pub fn run_app() {
             commands::check_engines,
             commands::check_colmap_acceleration,
             commands::probe_and_plan,
+            commands::estimate_project_runtime,
             commands::start_pipeline,
             commands::resume_pipeline,
             commands::cancel_pipeline,

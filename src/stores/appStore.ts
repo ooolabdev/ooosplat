@@ -24,6 +24,7 @@ interface AppState {
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
   setAnalysis: (video: VideoInfo, plan: FramePlan, estimate: RuntimeEstimate) => void;
+  setEstimate: (estimate: RuntimeEstimate | null) => void;
   setEngines: (engines: EngineStatus[]) => void;
   setPhase: (phase: RunPhase) => void;
   beginRun: () => void;
@@ -55,6 +56,7 @@ export const useAppStore = create<AppState>((set) => ({
   setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null }),
   setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
   setAnalysis: (video, plan, estimate) => set({ video, plan, estimate }),
+  setEstimate: (estimate) => set({ estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
   beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, events: [], result: null, error: null }),
