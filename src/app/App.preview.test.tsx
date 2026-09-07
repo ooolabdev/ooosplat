@@ -86,6 +86,9 @@ describe("App preview workspace", () => {
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    // jsdom does not implement scrollIntoView, and starting a run renders the live log,
+    // whose auto-scroll effect then calls it.
+    Element.prototype.scrollIntoView = vi.fn();
     if (!window.requestAnimationFrame) {
       window.requestAnimationFrame = (callback) => window.setTimeout(() => callback(performance.now()), 0);
       window.cancelAnimationFrame = (handle) => window.clearTimeout(handle);

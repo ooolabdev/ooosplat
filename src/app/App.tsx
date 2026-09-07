@@ -187,7 +187,11 @@ export function App() {
     return () => unlisten?.();
   }, [store.receiveEvent]);
 
-  useEffect(() => { logEnd.current?.scrollIntoView({ block: "nearest" }); }, [store.events.length]);
+  // The log keeps only the most recent 500 events, so its length stops changing once a run
+  // passes that many while new lines keep arriving. Depend on the array itself, which
+  // receiveEvent replaces on every event, or auto-scroll stops on exactly the long runs
+  // that need it.
+  useEffect(() => { logEnd.current?.scrollIntoView({ block: "nearest" }); }, [store.events]);
 
   useEffect(() => {
     if (!isRunning || runStartedAt.current == null) return;
