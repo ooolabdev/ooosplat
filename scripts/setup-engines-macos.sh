@@ -54,6 +54,13 @@ runtime_root="$temporary/ooosplat-engines-macos-arm64"
 
 staged="$temporary/runtime"
 mv "$runtime_root" "$staged"
+# The destination contains a tracked placeholder README so a fresh clone has the
+# resource directory before engines are installed. Preserve it across the
+# all-at-once runtime replacement; otherwise setup leaves the worktree dirty by
+# deleting a tracked file.
+if [[ -f "$destination/README.md" ]]; then
+  cp "$destination/README.md" "$staged/README.md"
+fi
 rm -rf -- "$destination"
 mv "$staged" "$destination"
 
