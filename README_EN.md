@@ -193,7 +193,30 @@ Application settings and the project index are stored in:
 ```text
 %LOCALAPPDATA%\SplatStudio\settings.json
 %LOCALAPPDATA%\SplatStudio\project-index.json
+%LOCALAPPDATA%\SplatStudio\telemetry.json
 ```
+
+## Anonymous Usage Statistics
+
+OOOSplat collects anonymous usage statistics by default to track stability and per-stage timings. Turn it off at any time under **Settings -> Privacy** in the top right; nothing is sent once it is off.
+
+What is sent:
+
+| Field | Description |
+| --- | --- |
+| Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
+| App version, OS, CPU architecture | For example `0.4.0` / `windows` / `x86_64` |
+| Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
+| Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
+| Stage and total durations | Milliseconds |
+| Frame count and video duration | Bucketed values, not raw counts |
+| Failing stage and error code | Enumerated values such as `colmap_mapper_failed`; no raw error text |
+
+What is never sent: any source media, including videos, images, and PLY files; file names, paths, and project names; logs and command output; user names or any personal information.
+
+Statistics are sent to `https://www.ooolab.cn/api/telemetry/event`. This is the application's only outbound network request; frame extraction, reconstruction, and training all run locally.
+
+The preference and the install ID are stored in `%LOCALAPPDATA%\SplatStudio\telemetry.json`. Deleting that file generates a new random install ID on the next launch.
 
 ## Bundled Engines
 

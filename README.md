@@ -193,7 +193,30 @@ sudo apt install ./OOOSplat-0.4.0-x64-linux.deb
 ```text
 %LOCALAPPDATA%\SplatStudio\settings.json
 %LOCALAPPDATA%\SplatStudio\project-index.json
+%LOCALAPPDATA%\SplatStudio\telemetry.json
 ```
+
+## 匿名使用统计
+
+OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗时。可在右上角 **设置 → 隐私** 中随时关闭，关闭后不再发送任何请求。
+
+会发送的内容：
+
+| 字段 | 说明 |
+| --- | --- |
+| 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.4.0` / `windows` / `x86_64` |
+| 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
+| 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
+| 阶段耗时与总耗时 | 毫秒 |
+| 帧数与视频时长 | 分桶值，不是原始数量 |
+| 失败阶段与错误码 | 枚举值，例如 `colmap_mapper_failed`；不含原始错误文本 |
+
+不会发送的内容：视频、图片、PLY 等任何素材；文件名、路径和项目名称；日志与命令输出；用户名或任何个人信息。
+
+数据发送到 `https://www.ooolab.cn/api/telemetry/event`。这是应用唯一的对外网络请求，抽帧、重建与训练全部在本机完成。
+
+开关状态和安装 ID 保存在 `%LOCALAPPDATA%\SplatStudio\telemetry.json`。删除该文件会在下次启动时生成一个新的随机安装 ID。
 
 ## 内置引擎
 
