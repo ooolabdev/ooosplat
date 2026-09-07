@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import {
   Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox, Images,
   Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
-  Settings2, Zap,
+  Settings2, TriangleAlert, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
@@ -542,6 +542,8 @@ export function App() {
           </div>
           {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? "正在终止任务" : "取消任务并终止所有进程"}</button>}
         </section>}
+
+        {store.result?.warning && <div className="inline-warning"><TriangleAlert size={16} /><span>{store.result.warning}</span></div>}
 
         {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{store.error}</span><button type="button" onClick={() => store.setError(null)}>关闭</button></div>}
       </section>
