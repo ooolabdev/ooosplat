@@ -1,0 +1,207 @@
+name: Publish signed Windows update
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      # The update public key is not signing material: it only lets a client
+      # verify the maintainer signature. Keep it a repository variable so it is
+      # never masked out of build logs, and never confuse it with the private key.
+      TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Validate release tag and enable the updater feed
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+([-.+].+)?$') { throw "Release tags must use a semantic version, for example v0.3.1." }
+          if (-not $env:TAURI_UPDATER_PUBLIC_KEY) { throw "TAURI_UPDATER_PUBLIC_KEY repository variable is required to build a client that verifies update signatures." }
+          $packageVersion = node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version"
+          $cargoVersion = (Select-String -Path 'src-tauri/Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $tauriVersion = (Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
+          if ($tag.TrimStart('v') -ne $packageVersion) { throw "Tag $tag does not match package.json version $packageVersion." }
+          if ($packageVersion -ne $cargoVersion -or $packageVersion -ne $tauriVersion) { throw "Version mismatch: package.json=$packageVersion, Cargo.toml=$cargoVersion, tauri.conf.json=$tauriVersion." }
+          # The tag must equal the package version exactly, so the pre-release
+          # suffix that decides the feed channel can never disagree with the tag
+          # that triggered this run: v0.5.0 cannot publish 0.5.0-beta.1 content.
+          # Only this release job enables the updater. Ordinary and fork builds
+          # keep an unconfigured client and never query the official feed.
+          $config = Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json
+          $config | Add-Member -NotePropertyName plugins -NotePropertyValue ([pscustomobject]@{
+            updater = [pscustomobject]@{
+              pubkey = $env:TAURI_UPDATER_PUBLIC_KEY
+              endpoints = @('https://github.com/ooolabdev/ooosplat/releases/latest/download/latest.json')
+              windows = [pscustomobject]@{ installMode = 'passive' }
+            }
+          })
+          $config.bundle.createUpdaterArtifacts = $true
+          $config | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 'src-tauri/tauri.conf.json'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          npm run verify:telemetry:release
+          npm test
+          npm run build
+          npm run verify:licenses:windows
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          # The updater code path only exists behind this feature, so lint and
+          # test it explicitly instead of shipping an unverified branch.
+          cargo test --manifest-path src-tauri/Cargo.toml --features updater
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features updater -- -D warnings
+
+      - name: Install and verify bundled engines
+        shell: pwsh
+        run: |
+          npm run setup:engines:windows
+          npm run verify:engines:windows
+
+      - name: Build signed updater installer
+        # Signing material is scoped to this single step: `npm ci`, tests, and
+        # helper scripts in earlier steps cannot read the private key.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Enables the updater UI and check in the frontend bundle; it must stay
+          # paired with the `updater` Rust feature and the injected plugin config.
+          VITE_UPDATER_ENABLED: "true"
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY secret is required to publish a signed update." }
+          npm run tauri -- build --bundles nsis --features updater
+
+      - name: Assemble signed update feed
+        id: update
+        shell: pwsh
+        run: |
+          $version = node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version"
+          # A semver pre-release suffix (for example 0.5.0-beta.1) never enters
+          # the stable feed: it is published as a GitHub pre-release and ships no
+          # latest.json, so /releases/latest/ keeps serving the last stable build.
+          $isPrerelease = $version.Contains('-')
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not generated.' }
+          $signature = "$($installer.FullName).sig"
+          if (-not (Test-Path $signature)) { throw 'Updater signature was not generated.' }
+
+          $assetName = "OOOSplat-$version-x64-setup.exe"
+          New-Item -ItemType Directory -Force -Path dist-artifacts | Out-Null
+          Copy-Item $installer.FullName "dist-artifacts/$assetName"
+          Copy-Item $signature "dist-artifacts/$assetName.sig"
+          if (-not $isPrerelease) {
+            $publishedAt = (Get-Date).ToUniversalTime().ToString('o')
+            $releaseUrl = "https://github.com/ooolabdev/ooosplat/releases/download/v$version/$assetName"
+            @{
+              version = $version
+              notes = "OOOSplat $version"
+              pub_date = $publishedAt
+              platforms = @{
+                'windows-x86_64' = @{
+                  signature = (Get-Content -Raw "dist-artifacts/$assetName.sig").Trim()
+                  url = $releaseUrl
+                }
+              }
+            } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 'dist-artifacts/latest.json'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release and update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          ASSET_NAME: ${{ steps.update.outputs.asset_name }}
+          VERSION: ${{ steps.update.outputs.version }}
+          PRERELEASE: ${{ steps.update.outputs.prerelease }}
+        shell: pwsh
+        run: |
+          $assets = @(
+            "dist-artifacts/$env:ASSET_NAME",
+            "dist-artifacts/$env:ASSET_NAME.sig"
+          )
+          if ($env:PRERELEASE -ne 'true') { $assets = @('dist-artifacts/latest.json') + $assets }
+
+          # Query the release through the API so a missing release (HTTP 404) is
+          # distinguishable from an operational failure such as missing
+          # permissions, rate limiting, or a network error.
+          $errFile = New-TemporaryFile
+          $body = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG" 2>$errFile
+          $queryExit = $LASTEXITCODE
+          $queryError = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
+          Remove-Item -Force $errFile -ErrorAction SilentlyContinue
+
+          if ($queryExit -ne 0) {
+            if ($queryError -notmatch 'HTTP 404') { throw "Unable to inspect release $env:TAG`: $queryError" }
+            $ghArgs = @('release', 'create', $env:TAG) + $assets + @('--title', "OOOSplat $env:VERSION", '--generate-notes')
+            if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+            gh @ghArgs
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create release $env:TAG." }
+            exit 0
+          }
+
+          $release = $body | ConvertFrom-Json
+          $existing = @($release.assets | ForEach-Object { $_.name })
+          $missing = @($assets | Where-Object { $existing -notcontains (Split-Path $_ -Leaf) })
+
+          if ($release.draft) {
+            # A draft was never downloadable, so completing it cannot replace a
+            # binary that anyone already installed.
+            if ($missing.Count -gt 0) {
+              gh release upload $env:TAG @missing
+              if ($LASTEXITCODE -ne 0) { throw "Failed to upload assets to draft release $env:TAG." }
+            }
+            Write-Host "Draft release $env:TAG is ready. Publish the draft to finish the release."
+            exit 0
+          }
+
+          if ($missing.Count -eq 0) {
+            Write-Host "Release $env:TAG already provides every expected asset; no upload was needed."
+            exit 0
+          }
+          # Never overwrite a published asset, and never complete a partially
+          # uploaded version: either would hand users different bytes under a
+          # version they may already have installed.
+          $missingNames = ($missing | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+          throw "Release $env:TAG does not match the expected asset set (missing: $missingNames). Published binaries are immutable; publish a new patch version instead."

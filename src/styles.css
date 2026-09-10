@@ -53,6 +53,13 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .topbar-actions { gap: 17px; }
 .settings-action { height: 32px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; color: #5b6679; background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 12px; font-weight: 650; }
 .settings-action:hover { color: var(--blue); background: #edf2ff; border-color: #cbd7f7; }
+.update-action, .update-progress { height: 32px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; }
+.update-action { color: #fff; background: var(--blue); border: 1px solid var(--blue); cursor: pointer; }
+.update-action:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+.update-action:disabled { color: #5b6474; background: #e7eaf0; border-color: #d4d9e2; cursor: not-allowed; }
+.update-progress { color: var(--blue); border: 1px solid #cbd7f7; background: #edf2ff; }
+.update-check-action { color: var(--green); }
+.update-check-action:hover { color: var(--green); }
 .status-light { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(45,153,101,.1); }
 .status-light.warning { background: var(--amber); box-shadow: 0 0 0 4px rgba(199,131,20,.12); }
 

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox, Images,
+  ArrowDownToLine, Blend, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clapperboard, Cpu, FileBox, Images,
   Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
   Settings2, Zap,
 } from "lucide-react";
@@ -15,6 +15,8 @@ import {
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
+import { checkForAppUpdate, discardAppUpdate, downloadAppUpdate, installAppUpdate, isUpdaterEnabled, isUpdaterPluginMissing, type UpdateDownloadProgress } from "../lib/updater";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, InputType, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
@@ -22,6 +24,12 @@ import type { TelemetryPreferences as TelemetryPreferencesState } from "../types
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
 const CANCELLATION_OVERLAY_DELAY_MS = 300;
+
+/** Updater state for builds that only check the maintainer-signed release feed. */
+type UpdateStatus = "disabled" | "checking" | "idle" | "ready" | "downloading" | "error";
+
+/** Installing restarts the app, so a running pipeline always wins over an update. */
+const UPDATE_WAITS_FOR_TASK = "任务运行中，已暂停安装；任务结束后可再次更新";
 
 const qualities: Array<{ value: Quality; label: string; description: string }> = [
   { value: "fast", label: "快速", description: "快速验证素材与拍摄路径" },
@@ -119,6 +127,8 @@ export function App() {
   const runStartedAt = useRef<number | null>(null);
   const runElapsedOffset = useRef(0);
   const cancellationOverlayTimer = useRef<number | null>(null);
+  const pipelineRunningRef = useRef(isRunning);
+  const downloadedUpdateRef = useRef<Update | null>(null);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
   const [isCancellationRequested, setIsCancellationRequested] = useState(false);
   const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
@@ -134,6 +144,11 @@ export function App() {
   const [privacySettingsOpen, setPrivacySettingsOpen] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updaterEnabled] = useState(isUpdaterEnabled);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(() => (isUpdaterEnabled() ? "checking" : "disabled"));
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null);
+  const [updateError, setUpdateError] = useState<{ stage: "check" | "install"; message: string } | null>(null);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
@@ -174,6 +189,73 @@ export function App() {
     void initializeTelemetry()
       .then(setTelemetryPreferences)
       .catch(() => undefined);
+  }, []);
+
+  const checkForUpdate = useCallback(async () => {
+    if (!updaterEnabled) {
+      setUpdateStatus("disabled");
+      return;
+    }
+    setUpdateStatus("checking");
+    setUpdateError(null);
+    try {
+      const update = await checkForAppUpdate();
+      setAvailableUpdate(update);
+      setUpdateStatus(update ? "ready" : "idle");
+    } catch (error) {
+      setAvailableUpdate(null);
+      // A binary built without the updater feature has no updater commands at
+      // all. Hide the feature instead of reporting a feed failure forever.
+      if (isUpdaterPluginMissing(error)) {
+        setUpdateStatus("disabled");
+        setUpdateError(null);
+        return;
+      }
+      setUpdateStatus("error");
+      setUpdateError({ stage: "check", message: messageOf(error) });
+    }
+  }, [updaterEnabled]);
+
+  useEffect(() => { void checkForUpdate(); }, [checkForUpdate]);
+
+  // The install guard must read live state: a download can outlive many renders.
+  useEffect(() => { pipelineRunningRef.current = isRunning; }, [isRunning]);
+
+  const installUpdate = async () => {
+    // Installing restarts the application, so it must never run while a pipeline
+    // is driving FFmpeg, COLMAP, or Brush or writing project files.
+    if (!updaterEnabled || isRunning || !availableUpdate || updateStatus === "downloading") return;
+    setUpdateError(null);
+    try {
+      if (downloadedUpdateRef.current !== availableUpdate) {
+        setUpdateStatus("downloading");
+        await downloadAppUpdate(availableUpdate, setUpdateProgress);
+        downloadedUpdateRef.current = availableUpdate;
+      }
+      if (pipelineRunningRef.current) {
+        setUpdateProgress(null);
+        setUpdateStatus("ready");
+        setUpdateError({ stage: "install", message: UPDATE_WAITS_FOR_TASK });
+        return;
+      }
+      await installAppUpdate(availableUpdate);
+    } catch (error) {
+      downloadedUpdateRef.current = null;
+      setUpdateProgress(null);
+      if (isUpdaterPluginMissing(error)) {
+        setAvailableUpdate(null);
+        setUpdateStatus("disabled");
+        return;
+      }
+      setUpdateStatus("error");
+      setUpdateError({ stage: "install", message: messageOf(error) });
+    }
+  };
+
+  // Discard a package that was downloaded for an update the user no longer sees.
+  useEffect(() => () => {
+    const pending = downloadedUpdateRef.current;
+    if (pending) void discardAppUpdate(pending);
   }, []);
 
   useEffect(() => {
@@ -310,6 +392,9 @@ export function App() {
 
   const generate = async () => {
     if (!store.inputPath || !store.plan || !store.projectsRoot) return;
+    // A downloaded update installs and restarts the app, so a task must not
+    // begin while that install is already in flight.
+    if (updateStatus === "downloading") return;
     if (
       store.inputType === "images"
       && store.imageSequence?.requiresLargeSequenceConfirmation
@@ -339,6 +424,7 @@ export function App() {
   };
 
   const resume = async (project: ProjectSummary) => {
+    if (updateStatus === "downloading") return;
     clearCancellationFeedback();
     runElapsedOffset.current = project.durationMs ?? 0;
     runStartedAt.current = Date.now();
@@ -451,6 +537,13 @@ export function App() {
     <header className="topbar">
       <div className="brand-lockup"><span className="brand-mark"><img src={appLogo} alt="" aria-hidden="true" /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / {packageMetadata.version}</span></div>
       <div className="topbar-actions">
+        {updaterEnabled && updateStatus === "ready" && availableUpdate && (isRunning
+          ? <button className="update-action" type="button" disabled title="任务运行中不会安装更新，以免中断正在进行的处理"><LoaderCircle className="spin" size={15} />任务完成后可更新</button>
+          : <button className="update-action" type="button" title={updateError?.stage === "install" ? updateError.message : undefined} onClick={() => void installUpdate()}><ArrowDownToLine size={15} />更新至 {availableUpdate.version}</button>)}
+        {updaterEnabled && updateStatus === "downloading" && <span className="update-progress" aria-live="polite"><LoaderCircle className="spin" size={14} />正在下载更新{updateProgress?.totalBytes ? ` ${Math.min(100, Math.round((updateProgress.downloadedBytes / updateProgress.totalBytes) * 100))}%` : ""}</span>}
+        {updaterEnabled && updateStatus === "idle" && <button className="settings-action update-check-action" type="button" disabled={isRunning} onClick={() => void checkForUpdate()}><CircleCheck size={15} />已是最新</button>}
+        {updaterEnabled && updateStatus === "checking" && <span className="update-progress"><LoaderCircle className="spin" size={14} />检查更新</span>}
+        {updaterEnabled && updateStatus === "error" && <button className="settings-action update-check-action" type="button" title={updateError?.message ?? undefined} onClick={() => void (updateError?.stage === "install" ? installUpdate() : checkForUpdate())}><CircleAlert size={15} />{updateError?.stage === "install" ? "更新失败，重试" : "检查更新失败"}</button>}
         {telemetryPreferences && <button className="settings-action" type="button" onClick={() => setPrivacySettingsOpen(true)}><Settings2 size={15} />设置</button>}
         <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常` : "FFmpeg · COLMAP · Brush 就绪"}</div>
       </div>
@@ -523,9 +616,9 @@ export function App() {
 
         {store.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>大型图片序列</strong><small>超过 500 张图片，穷举匹配可能需要较长时间和更多磁盘空间；开始生成前会再次确认。</small></span></div>}
 
-        {!isRunning && <button className="primary-action" type="button" disabled={!store.inputPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
+        {!isRunning && <button className="primary-action" type="button" disabled={!store.inputPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0 || updateStatus === "downloading"} onClick={() => void generate()}>
           {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}
-          {store.phase === "analyzing" ? "正在分析素材" : "开始生成"}
+          {store.phase === "analyzing" ? "正在分析素材" : updateStatus === "downloading" ? "更新下载完成后可开始" : "开始生成"}
         </button>}
 
         {(isRunning || store.events.length > 0) && <section className="live-process">

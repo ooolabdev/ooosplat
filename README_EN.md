@@ -315,6 +315,38 @@ dist-artifacts\OOOSplat-0.4.0-x64-windows.exe
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.
 
+### In-app Updates and Releases
+
+Only the official signed release checks for updates. The official Windows build asks the official GitHub Release feed on startup and shows "更新至 <version>" in the top bar when a newer version exists. Installing downloads the package inside the app, shows progress, verifies the signature, and then launches the native installer and restarts the app.
+
+The update button is disabled and reads "任务完成后可更新" while FFmpeg, COLMAP, or Brush is running. Installing restarts the application, so it never happens during a pipeline task; starting a new task is likewise blocked while an update package is downloading.
+
+Developer and fork builds never query the official feed and show no update controls at all. The updater is enabled only when both conditions hold: the frontend was built by release CI with `VITE_UPDATER_ENABLED=true`, and the Rust binary was compiled with the `updater` feature plus an injected `plugins.updater` configuration. Every other build stays unconfigured and never reports "update check failed".
+
+The feed is fixed to `https://github.com/ooolabdev/ooosplat/releases/latest/download/latest.json`. Every package is verified with the Tauri updater public key, so a replaced endpoint, release asset, or `latest.json` cannot install without a matching signature.
+
+Signing stays with the maintainers of `ooolabdev/ooosplat`. Generate a Tauri signer key pair in your own secure environment, then configure:
+
+- Actions Secret `TAURI_SIGNING_PRIVATE_KEY`: the full private key. Never commit, share, or attach it to a release.
+- Actions Secret `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: only needed when the private key has a password.
+- Actions Variable `TAURI_UPDATER_PUBLIC_KEY`: the single-line `.pub` content. It is a public key rather than a secret, so it belongs in Variables; CI injects it into the client configuration at build time only.
+
+The private key and its password are injected into the single "Build signed updater installer" step only, so earlier steps such as `npm ci`, tests, and engine checks cannot read them.
+
+Key generation example (run once, in the maintainer's secure environment):
+
+```powershell
+npm run tauri -- signer generate --write-keys "$HOME\.tauri\ooosplat-updater.key"
+```
+
+To publish, bump `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` to the same SemVer version, merge to `main`, and push a matching tag such as `v0.3.1`. `.github/workflows/release.yml` injects the configured public key, builds the NSIS package, `.sig`, and `latest.json`, and uploads them to that GitHub Release. A mismatched tag, a missing public key, or a missing signature fails the workflow instead of publishing an unverifiable update.
+
+Pre-release versions use a SemVer suffix such as `v0.5.0-beta.1`. They are created as GitHub pre-releases and ship no `latest.json`, so they never enter the stable feed and `/releases/latest/` keeps pointing at the newest stable build.
+
+Published binaries are immutable. When the target release already holds assets, the workflow fails and asks for a new patch version instead of replacing a binary that users may already have installed.
+
+> Windows installation stays per-machine, and in-app updates use NSIS passive mode, so Windows may still request administrator rights.
+
 ## CLI
 
 The repository also provides the `splatstudio` diagnostic CLI:

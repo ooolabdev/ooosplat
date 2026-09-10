@@ -13,6 +13,11 @@ default-run = "ooo-splat"
 name = "ooo_splat"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+default = []
+# Maintainer release CI injects the signed updater configuration before enabling this.
+updater = []
+
 [[bin]]
 name = "ooo-splat"
 path = "src/main.rs"
@@ -35,6 +40,7 @@ serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"

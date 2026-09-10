@@ -315,6 +315,38 @@ dist-artifacts\OOOSplat-0.4.0-x64-windows.exe
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。
 
+### 应用内更新与发布
+
+只有官方签名发布版会检查更新。官方 Windows 包在启动时会从官方 GitHub Release 检查更新；发现新版本后，顶栏会显示“更新至 <版本号>”。点击后，应用会先在页面内下载更新并显示进度，签名校验通过后再启动更新安装程序并重启应用。用户无需到其他渠道重新下载安装包。
+
+当 FFmpeg、COLMAP 或 Brush 正在执行管线任务时，更新按钮会被禁用并显示“任务完成后可更新”；反过来，更新包正在下载时也不能开始新任务。安装更新会重启应用，因此这两种情况都不会让更新中断正在进行的处理。
+
+开发者自行打包和 Fork 构建不会查询官方更新源，也不会显示任何更新入口。updater 需要同时满足两个条件才会启用：前端由发布 CI 以 `VITE_UPDATER_ENABLED=true` 构建，同时 Rust 侧以 `--features updater` 编译并注入 `plugins.updater` 配置。若只满足前端条件而二进制未编译 updater feature，应用会识别出缺少 updater 命令并直接隐藏更新入口，而不是一直显示“检查更新失败”。
+
+更新清单固定为 `https://github.com/ooolabdev/ooosplat/releases/latest/download/latest.json`。每个更新包都由 Tauri updater 公钥验证；网络地址、Release 资产或 `latest.json` 被替换时，签名不匹配的包不会安装。
+
+签名认证必须由 `ooolabdev/ooosplat` 的仓库管理人独占。首次启用发布前，管理人在自己的安全环境中生成一对 Tauri signer 密钥，并在上游仓库配置：
+
+- Actions Secrets 中的 `TAURI_SIGNING_PRIVATE_KEY`：Tauri signer 生成的私钥全文；不得提交、共享或上传到 Release。
+- Actions Secrets 中的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：只有生成私钥时设置了密码才需要。
+- Actions Variables 中的 `TAURI_UPDATER_PUBLIC_KEY`：与该私钥配对的 `.pub` 文件单行内容。它是公钥而不是 Secret，因此放在 Variables 中；它只在 CI 构建时注入客户端配置，源码和 PR 中不保存具体公钥。
+
+私钥和密码只注入“Build signed updater installer”这一个 step；前面的 `npm ci`、测试、引擎校验等步骤都无法读取它们。
+
+密钥生成示例（只在仓库管理人的安全环境中执行一次）：
+
+```powershell
+npm run tauri -- signer generate --write-keys "$HOME\.tauri\ooosplat-updater.key"
+```
+
+发布时，将 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本一致地更新为下一个 SemVer 版本，合入 `main` 后创建匹配的 tag，例如 `v0.3.1`。`.github/workflows/release.yml` 会将管理员配置的公钥临时注入构建、生成 NSIS 更新包、`.sig` 和 `latest.json`，并将它们上传至同一个 GitHub Release。tag 和版本不一致、未配置公钥或未产出签名时，工作流会失败而不是发布不可验证更新。
+
+预发布版本通过 SemVer 后缀区分，例如 `v0.5.0-beta.1`。这类 tag 会自动创建为 GitHub pre-release，并且不生成 `latest.json`，因此不会进入稳定更新通道，`/releases/latest/` 始终指向最近一个稳定版。
+
+同一个版本号的二进制发布后不再覆盖。工作流在目标 Release 已完整发布时会直接跳过重复上传；若已发布的 Release 资产不完整，则直接失败并提示改为发布新的 patch 版本。这样既不会用不同内容覆盖同名安装包，也不会在版本已发布后悄悄补齐资产。草稿（draft）Release 尚未公开下载，因此允许补齐资产后由维护者手动发布。
+
+> Windows 安装模式保持为整机安装（per-machine）。应用内更新会使用 NSIS passive 模式，必要时 Windows 仍会请求管理员权限。
+
 ## CLI
 
 仓库同时提供 `splatstudio` 诊断 CLI：
