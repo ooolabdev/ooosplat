@@ -211,6 +211,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .cancellation-status p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
 .inline-error button { color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.inline-warning { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr; gap: 8px; align-items: start; color: var(--amber); border-top: 1px solid #e6d3a8; border-bottom: 1px solid #e6d3a8; font-size: 12px; line-height: 1.5; }
 
 .refresh-action { padding: 7px 0; display: flex; align-items: center; gap: 6px; color: var(--muted); background: transparent; border: 0; cursor: pointer; font-size: 11px; }
 .archive-summary { margin-bottom: 24px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line-dark); border-bottom: 1px solid var(--line-dark); }
