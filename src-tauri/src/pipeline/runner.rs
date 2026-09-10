@@ -29,7 +29,7 @@ use crate::{
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
         catalog, FrameState, PipelineStateFile, ProjectInputType, ProjectManager, ProjectMetadata,
-        ProjectOutput, ProjectPaths, ProjectStatus,
+        ProjectOutput, ProjectPaths, ProjectStatus, ReshootProvenance,
     },
     reconstruction::{
         ply::inspect_gaussian_ply,
@@ -431,6 +431,124 @@ impl PipelineRunner {
             .await
     }
 
+    /// Creates a derived project from an already completed project and fresh reshoot media.
+    /// The source project is read-only: its frames and final.ply are never moved or replaced.
+    pub async fn generate_reshoot(
+        &self,
+        source_project_id: uuid::Uuid,
+        reshoot_input: &Path,
+        quality: Quality,
+        projects_root: &Path,
+        plan: ReshootPlan,
+    ) -> Result<PipelineResult> {
+        plan.validate()?;
+        let ReshootPlan {
+            regions,
+            guidance,
+            guidance_images,
+        } = plan;
+        let acceleration = self.verify_pipeline_engines().await?;
+        self.events.acceleration(acceleration.clone());
+        let (source_root, source_metadata) =
+            catalog::load_registered_project(source_project_id).await?;
+        if source_metadata.status != ProjectStatus::Completed
+            || !source_root.join("final.ply").is_file()
+        {
+            return Err(SplatError::Process(
+                "只能为已完成且包含 final.ply 的项目创建高清补拍".into(),
+            ));
+        }
+        let source_frames = source_root.join("work").join("frames");
+        if !source_frames.is_dir() {
+            return Err(SplatError::Process(
+                "原项目缺少可复用的输入画面，无法融合补拍素材".into(),
+            ));
+        }
+        let source_masks = source_root.join("work").join("masks");
+        if source_masks.is_dir()
+            && tokio::fs::read_dir(&source_masks)
+                .await?
+                .next_entry()
+                .await?
+                .is_some()
+        {
+            return Err(SplatError::Process(
+                "原项目含透明 Mask，当前高清补拍不支持混合透明素材".into(),
+            ));
+        }
+
+        let project_manager = ProjectManager::with_root(projects_root.to_path_buf());
+        let (paths, mut metadata) = project_manager.create(reshoot_input, quality).await?;
+        let stored_reshoot_source = metadata.source_path.clone();
+        let temporary = paths.work.join("reshoot-frames");
+        let temporary_masks = paths.work.join("reshoot-masks");
+        let prepared_reshoot = if reshoot_input.is_dir() {
+            self.prepare_images(reshoot_input, quality, &temporary, &temporary_masks)
+                .await?
+        } else {
+            self.prepare_frames(
+                reshoot_input,
+                quality,
+                &temporary,
+                &temporary_masks,
+                Some(&paths.logs),
+            )
+            .await?
+        };
+        if prepared_reshoot.has_alpha {
+            return Err(SplatError::Process(
+                "高清补拍暂不支持透明素材；请导出不含 Alpha 的 JPG/PNG 或 MP4/MOV".into(),
+            ));
+        }
+        reset_directory(&paths.frames).await?;
+        copy_merged_frames(&source_frames, &temporary, &paths.frames).await?;
+        let original_frame_count = count_image_files(&source_frames).await?;
+        let merged_count = original_frame_count + prepared_reshoot.extracted_frames;
+        metadata.name = format!("{}_高清补拍", source_metadata.name);
+        // Keep the copied reshoot input as the project source. The merged frames are a
+        // checkpoint; if it is lost, resume can reconstruct it from provenance.
+        metadata.source_path = stored_reshoot_source.clone();
+        metadata.input_type = ProjectInputType::Images;
+        let guidance_images =
+            write_reshoot_guidance_images(&paths.project, &guidance_images).await?;
+        metadata.reshoot = Some(ReshootProvenance {
+            source_project_id,
+            source_project_path: source_root.clone(),
+            source_final_ply: source_root.join("final.ply"),
+            reshoot_source_path: stored_reshoot_source,
+            regions,
+            guidance,
+            guidance_images,
+            original_frame_count,
+            reshoot_frame_count: prepared_reshoot.extracted_frames,
+        });
+        project_manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await?;
+        let mut state = PipelineStateFile::created_for(quality, ProjectInputType::Images);
+        state.stage = PipelineStage::ExtractingFrames;
+        state.image_sequence = Some(ImageSequenceInfo {
+            image_count: merged_count,
+            width: 0,
+            height: 0,
+            has_alpha: false,
+            requires_large_sequence_confirmation: merged_count
+                > crate::video::LARGE_SEQUENCE_WARNING_COUNT,
+        });
+        state.frames = Some(FrameState {
+            retention_ratio: 1.0,
+            sampling_fps: 0.0,
+            estimated_frames: merged_count,
+            extracted_frames: Some(merged_count),
+            image_format: Some("merged".into()),
+            mask_count: Some(0),
+            has_alpha: false,
+        });
+        project_manager.write_state(&paths.state, &state).await?;
+        self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
+            .await
+    }
+
     pub async fn resume(&self, project_id: uuid::Uuid) -> Result<PipelineResult> {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
@@ -438,9 +556,14 @@ impl PipelineRunner {
         if metadata.status == ProjectStatus::Completed || project.join("final.ply").is_file() {
             return Err(SplatError::Process("该项目已经完成，无需继续".into()));
         }
-        let source_available = match metadata.input_type {
-            ProjectInputType::Video => metadata.source_path.is_file(),
-            ProjectInputType::Images => metadata.source_path.is_dir(),
+        let source_available = if metadata.reshoot.is_some() {
+            // A derived reshoot can retain either a video file or an image folder.
+            metadata.source_path.exists()
+        } else {
+            match metadata.input_type {
+                ProjectInputType::Video => metadata.source_path.is_file(),
+                ProjectInputType::Images => metadata.source_path.is_dir(),
+            }
         };
         if !source_available {
             return Err(SplatError::Process("项目源素材缺失，无法继续".into()));
@@ -529,53 +652,115 @@ impl PipelineRunner {
         }
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
-        let prepared = if let Some(prepared) =
-            prepared_frames_from_checkpoint(paths, &state).await?
-        {
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                1.0,
-                format!("已复用 {} 帧检查点", prepared.extracted_frames),
-            );
-            prepared
-        } else {
-            reset_directory(&paths.frames).await?;
-            reset_directory(&paths.masks).await?;
-            reset_directory(&paths.colmap).await?;
-            reset_directory(&paths.brush).await?;
-            let prepared = match metadata.input_type {
-                ProjectInputType::Video => {
-                    self.prepare_frames(
-                        &metadata.source_path,
-                        quality,
-                        &paths.frames,
-                        &paths.masks,
-                        Some(&paths.logs),
-                    )
-                    .await?
-                }
-                ProjectInputType::Images => {
-                    self.prepare_images(&metadata.source_path, quality, &paths.frames, &paths.masks)
+        let prepared =
+            if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    1.0,
+                    format!("已复用 {} 帧检查点", prepared.extracted_frames),
+                );
+                prepared
+            } else {
+                reset_directory(&paths.colmap).await?;
+                reset_directory(&paths.brush).await?;
+                let prepared = if let Some(provenance) = metadata.reshoot.as_ref() {
+                    let source_frames = provenance.source_project_path.join("work").join("frames");
+                    if !source_frames.is_dir() {
+                        return Err(SplatError::Process(
+                            "原项目输入画面已缺失，无法继续高清补拍".into(),
+                        ));
+                    }
+                    reset_directory(&paths.frames).await?;
+                    reset_directory(&paths.masks).await?;
+                    let reshoot_frames = paths.work.join("reshoot-recovery-frames");
+                    let reshoot_masks = paths.work.join("reshoot-recovery-masks");
+                    reset_directory(&reshoot_frames).await?;
+                    reset_directory(&reshoot_masks).await?;
+                    let recovered_reshoot = if metadata.source_path.is_dir() {
+                        self.prepare_images(
+                            &metadata.source_path,
+                            quality,
+                            &reshoot_frames,
+                            &reshoot_masks,
+                        )
                         .await?
-                }
+                    } else {
+                        self.prepare_frames(
+                            &metadata.source_path,
+                            quality,
+                            &reshoot_frames,
+                            &reshoot_masks,
+                            Some(&paths.logs),
+                        )
+                        .await?
+                    };
+                    if recovered_reshoot.has_alpha {
+                        return Err(SplatError::Process("高清补拍恢复不支持透明素材".into()));
+                    }
+                    copy_merged_frames(&source_frames, &reshoot_frames, &paths.frames).await?;
+                    let extracted_frames = count_image_files(&paths.frames).await?;
+                    PreparedFrames {
+                        input_type: ProjectInputType::Images,
+                        video: None,
+                        image_sequence: Some(ImageSequenceInfo {
+                            image_count: extracted_frames,
+                            width: 0,
+                            height: 0,
+                            has_alpha: false,
+                            requires_large_sequence_confirmation: false,
+                        }),
+                        plan: FramePlan {
+                            retention_ratio: 1.0,
+                            sampling_fps: 0.0,
+                            estimated_frames: extracted_frames,
+                        },
+                        extracted_frames,
+                        image_format: "merged".into(),
+                        mask_count: 0,
+                        has_alpha: false,
+                    }
+                } else {
+                    reset_directory(&paths.frames).await?;
+                    reset_directory(&paths.masks).await?;
+                    match metadata.input_type {
+                        ProjectInputType::Video => {
+                            self.prepare_frames(
+                                &metadata.source_path,
+                                quality,
+                                &paths.frames,
+                                &paths.masks,
+                                Some(&paths.logs),
+                            )
+                            .await?
+                        }
+                        ProjectInputType::Images => {
+                            self.prepare_images(
+                                &metadata.source_path,
+                                quality,
+                                &paths.frames,
+                                &paths.masks,
+                            )
+                            .await?
+                        }
+                    }
+                };
+                state.input_type = prepared.input_type;
+                state.video = prepared.video.clone();
+                state.image_sequence = prepared.image_sequence.clone();
+                let mut frames = FrameState::from(&prepared.plan);
+                frames.extracted_frames = Some(prepared.extracted_frames);
+                frames.image_format = Some(prepared.image_format.clone());
+                frames.mask_count = Some(prepared.mask_count);
+                frames.has_alpha = prepared.has_alpha;
+                state.frames = Some(frames);
+                state.features_complete = false;
+                state.matching_complete = false;
+                state.reconstruction_complete = false;
+                state.brush_complete = false;
+                state.stage = PipelineStage::ExtractingFrames;
+                project_manager.write_state(&paths.state, &state).await?;
+                prepared
             };
-            state.input_type = prepared.input_type;
-            state.video = prepared.video.clone();
-            state.image_sequence = prepared.image_sequence.clone();
-            let mut frames = FrameState::from(&prepared.plan);
-            frames.extracted_frames = Some(prepared.extracted_frames);
-            frames.image_format = Some(prepared.image_format.clone());
-            frames.mask_count = Some(prepared.mask_count);
-            frames.has_alpha = prepared.has_alpha;
-            state.frames = Some(frames);
-            state.features_complete = false;
-            state.matching_complete = false;
-            state.reconstruction_complete = false;
-            state.brush_complete = false;
-            state.stage = PipelineStage::ExtractingFrames;
-            project_manager.write_state(&paths.state, &state).await?;
-            prepared
-        };
         let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
 
         let database = paths.colmap.join("database.db");
@@ -1100,6 +1285,165 @@ fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
     }
 }
 
+/// Everything the user selected in the preview for one reshoot run.
+#[derive(Debug, Clone, Default)]
+pub struct ReshootPlan {
+    pub regions: Vec<crate::project::GaussianCrop>,
+    pub guidance: Vec<String>,
+    /// PNG data URLs: the circled region plus arrows for the shooting positions.
+    pub guidance_images: Vec<String>,
+}
+
+impl ReshootPlan {
+    fn validate(&self) -> Result<()> {
+        if self.regions.is_empty() {
+            return Err(SplatError::Process("请至少圈选一个需要补拍的区域".into()));
+        }
+        ensure_distinct_reshoot_regions(&self.regions)?;
+        if self.guidance.len() != self.regions.len()
+            || self.guidance_images.len() != self.regions.len()
+        {
+            return Err(SplatError::Process(
+                "补拍区域与补拍指引数量不一致，请重新圈选区域".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Two selections closer than this describe the same spot, not two regions.
+const RESHOOT_REGION_PRECISION: f64 = 1e3;
+
+fn reshoot_region_key(region: &crate::project::GaussianCrop) -> String {
+    let round = |value: f64| (value * RESHOOT_REGION_PRECISION).round() as i64;
+    match region {
+        crate::project::GaussianCrop::Sphere { center, radius } => format!(
+            "sphere:{}:{}:{}:{}",
+            round(center[0]),
+            round(center[1]),
+            round(center[2]),
+            round(*radius)
+        ),
+        crate::project::GaussianCrop::Box { center, size } => format!(
+            "box:{}:{}:{}:{}:{}:{}",
+            round(center[0]),
+            round(center[1]),
+            round(center[2]),
+            round(size[0]),
+            round(size[1]),
+            round(size[2])
+        ),
+    }
+}
+
+/// The reshoot list must describe distinct areas: a repeated selection would ask
+/// the shooter for the same footage twice and skew the merged frame set.
+fn ensure_distinct_reshoot_regions(regions: &[crate::project::GaussianCrop]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for region in regions {
+        if !seen.insert(reshoot_region_key(region)) {
+            return Err(SplatError::Process(
+                "补拍清单中存在重复区域，请移除重复项或重新圈选不同区域".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Persist the annotated guidance images inside the derived project so the
+/// shooting plan stays traceable next to the frames it belongs to.
+async fn write_reshoot_guidance_images(
+    project_root: &Path,
+    images: &[String],
+) -> Result<Vec<PathBuf>> {
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let directory = project_root.join("reshoot-guidance");
+    let mut written = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        if image.trim().is_empty() {
+            continue;
+        }
+        let payload = image
+            .split_once(',')
+            .filter(|(header, _)| header.starts_with("data:image/png"))
+            .map(|(_, payload)| payload)
+            .ok_or_else(|| SplatError::Process("补拍指引图格式无效，请重新生成".into()))?;
+        let bytes = decode_base64(payload)
+            .ok_or_else(|| SplatError::Process("补拍指引图无法解码，请重新生成".into()))?;
+        if !bytes.starts_with(&PNG_MAGIC) {
+            return Err(SplatError::Process("补拍指引图不是有效的 PNG".into()));
+        }
+        tokio::fs::create_dir_all(&directory).await?;
+        let path = directory.join(format!("region-{:02}.png", index + 1));
+        tokio::fs::write(&path, &bytes).await?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
+/// Minimal standard-alphabet base64 decoder; the repository ships no base64 crate.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    let mut output = Vec::with_capacity(input.len() / 4 * 3);
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+async fn count_image_files(directory: &Path) -> Result<u64> {
+    let directory = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Ok::<u64, SplatError>(crate::video::list_images(&directory)?.len() as u64)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("无法统计输入画面：{error}")))?
+}
+
+/// Copy original and reshoot frames into one stable, contiguous image sequence.
+/// Source material remains untouched; the derived project exclusively owns `destination`.
+async fn copy_merged_frames(original: &Path, reshoot: &Path, destination: &Path) -> Result<()> {
+    let original = original.to_path_buf();
+    let reshoot = reshoot.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut sources = crate::video::list_images(&original)?;
+        sources.extend(crate::video::list_images(&reshoot)?);
+        if sources.len() < 2 {
+            return Err(SplatError::Process("融合后至少需要 2 张有效画面".into()));
+        }
+        std::fs::create_dir_all(&destination)?;
+        for (index, source) in sources.iter().enumerate() {
+            let extension = source
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("jpg")
+                .to_ascii_lowercase();
+            let target = destination.join(format!("frame_{index:06}.{extension}"));
+            std::fs::copy(source, target)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("融合输入画面失败：{error}")))?
+}
+
 async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFile) -> Result<()> {
     let frames_complete = prepared_frames_from_checkpoint(paths, state)
         .await?
@@ -1279,7 +1623,106 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 
 #[cfg(test)]
 mod tests {
+    use super::{copy_merged_frames, count_image_files};
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn merged_frames_are_contiguous_and_sources_remain_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let reshoot = root.path().join("reshoot");
+        let destination = root.path().join("merged");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&reshoot).unwrap();
+        std::fs::write(original.join("frame_9.jpg"), b"original").unwrap();
+        std::fs::write(reshoot.join("hi_1.png"), b"reshoot").unwrap();
+        copy_merged_frames(
+            Path::new(&original),
+            Path::new(&reshoot),
+            Path::new(&destination),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_image_files(Path::new(&original)).await.unwrap(), 1);
+        assert_eq!(count_image_files(Path::new(&reshoot)).await.unwrap(), 1);
+        assert!(destination.join("frame_000000.jpg").is_file());
+        assert!(destination.join("frame_000001.png").is_file());
+        assert!(!original.join("frame_000000.jpg").exists());
+    }
+
     use super::*;
+
+    fn sphere_region(center: [f64; 3], radius: f64) -> crate::project::GaussianCrop {
+        crate::project::GaussianCrop::Sphere { center, radius }
+    }
+
+    #[test]
+    fn rejects_a_repeated_reshoot_region() {
+        let regions = vec![
+            sphere_region([1.0, 2.0, 3.0], 0.5),
+            sphere_region([1.0, 2.0, 3.0], 0.5),
+        ];
+        let error = ensure_distinct_reshoot_regions(&regions).unwrap_err();
+        assert!(error.to_string().contains("重复区域"));
+    }
+
+    #[test]
+    fn accepts_distinct_reshoot_regions() {
+        let regions = vec![
+            sphere_region([1.0, 2.0, 3.0], 0.5),
+            sphere_region([1.0, 2.0, 3.4], 0.5),
+            crate::project::GaussianCrop::Box {
+                center: [1.0, 2.0, 3.0],
+                size: [1.0, 1.0, 1.0],
+            },
+        ];
+        assert!(ensure_distinct_reshoot_regions(&regions).is_ok());
+    }
+
+    #[test]
+    fn decodes_png_data_urls_and_rejects_other_payloads() {
+        // "iVBORw0KGgo=" is the base64 form of the eight PNG signature bytes.
+        let signature = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        assert_eq!(decode_base64("iVBORw0KGgo=").unwrap(), signature);
+        assert!(decode_base64("####").is_none());
+        assert!(decode_base64("aGVsbG8=").is_some());
+    }
+
+    #[tokio::test]
+    async fn writes_guidance_images_into_the_derived_project() {
+        let root = tempfile::tempdir().unwrap();
+        let signature = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let images = vec![
+            "data:image/png;base64,iVBORw0KGgo=".to_string(),
+            String::new(),
+        ];
+        let written = write_reshoot_guidance_images(root.path(), &images)
+            .await
+            .unwrap();
+
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            written[0],
+            root.path().join("reshoot-guidance").join("region-01.png")
+        );
+        assert_eq!(std::fs::read(&written[0]).unwrap(), signature);
+        assert!(!root
+            .path()
+            .join("reshoot-guidance")
+            .join("region-02.png")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_guidance_image_that_is_not_png() {
+        let root = tempfile::tempdir().unwrap();
+        let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
+        let error = write_reshoot_guidance_images(root.path(), &images)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("PNG"));
+        assert!(!root.path().join("reshoot-guidance").exists());
+    }
 
     #[test]
     fn parses_ffmpeg_progress() {

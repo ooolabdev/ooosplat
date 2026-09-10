@@ -47,7 +47,7 @@ vi.mock("../lib/backend", () => ({
 }));
 
 vi.mock("../components/GaussianViewer", () => ({
-  GaussianViewer: ({ onExit, onDisposed }: { onExit: () => void | Promise<void>; onDisposed: (projectId: string) => void }) => <section className="preview-workspace"><h1>高斯泼溅预览</h1><button type="button" onClick={() => {
+  GaussianViewer: ({ onExit, onDisposed, reshootEntry }: { onExit: () => void | Promise<void>; onDisposed: (projectId: string) => void; reshootEntry?: boolean }) => <section className="preview-workspace"><h1>高斯泼溅预览</h1><span data-testid="reshoot-entry">{String(Boolean(reshootEntry))}</span><button type="button" onClick={() => {
     void onExit();
     mocks.notifyPreviewDisposed(onDisposed, "11111111-1111-1111-1111-111111111111");
   }}>返回任务</button></section>,
@@ -158,8 +158,35 @@ describe("App preview workspace", () => {
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
   });
 
-  it("shows automatic mask extraction when the selected video has alpha", async () => {
-    act(() => useAppStore.setState({
+  it("offers a reshoot entry on a completed project and opens the preview in reshoot mode", async () => {
+    const reshootButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "高清补拍");
+    expect(reshootButton).not.toBeUndefined();
+
+    await act(async () => { reshootButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(mocks.prepareGaussianPreview).toHaveBeenCalledWith(project.id);
+    expect(container.querySelector('[data-testid="reshoot-entry"]')?.textContent).toBe("true");
+  });
+
+  it("opens a plain preview without the reshoot workflow", async () => {
+    const previewButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "预览");
+
+    await act(async () => { previewButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(container.querySelector('[data-testid="reshoot-entry"]')?.textContent).toBe("false");
+  });
+
+  it("keeps the reshoot entry away from unfinished projects", async () => {
+    const unfinished = { ...project, status: "cancelled" as const, finalPly: null, completedAt: null };
+    await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
+
+    expect([...container.querySelectorAll("button")].find((button) => button.textContent === "高清补拍")).toBeUndefined();
+    expect([...container.querySelectorAll("button")].find((button) => button.textContent === "继续任务")).not.toBeUndefined();
+  });
+
+  it("shows automatic mask extraction when the selected video has alpha", async () => {    act(() => useAppStore.setState({
       video: {
         duration: 10,
         width: 1920,

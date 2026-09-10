@@ -483,6 +483,7 @@ mod tests {
             model: "final.ply".into(),
             transform: Default::default(),
             editing: Default::default(),
+            reshoot: None,
         };
         assert!(!has_project_ownership(
             &metadata,

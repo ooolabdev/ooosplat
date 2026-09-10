@@ -184,6 +184,31 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
   background: rgba(19, 26, 39, .54);
   backdrop-filter: blur(3px);
 }
+.reshoot-input-backdrop { position: fixed; inset: 0; z-index: 130; display: grid; place-items: center; padding: 24px; background: rgba(19, 26, 39, .54); backdrop-filter: blur(3px); }
+.reshoot-input-dialog { width: min(520px, calc(100vw - 48px)); padding: 24px; color: var(--ink); background: #f8f9fb; border: 1px solid var(--line-dark); box-shadow: 0 24px 60px rgba(10, 17, 29, .3); }
+.reshoot-input-dialog h2 { margin: 0 0 8px; font-size: 18px; }
+.reshoot-input-dialog > p { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.reshoot-input-options { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.reshoot-input-options button { min-height: 108px; padding: 14px; display: grid; justify-items: start; align-content: center; gap: 6px; text-align: left; color: var(--ink); background: #eef2f8; border: 1px solid #c4cfdd; cursor: pointer; }
+.reshoot-input-options button:hover { background: #e3edff; border-color: var(--blue); }
+.reshoot-input-options small { color: var(--muted); }
+.reshoot-input-cancel { margin-top: 14px; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
+.reshoot-guide-panel { position: absolute; top: 14px; right: 14px; z-index: 5; width: min(340px, calc(100% - 28px)); max-height: calc(100% - 28px); overflow-y: auto; padding: 12px; color: #e7eef9; background: rgba(11, 18, 31, .88); border: 1px solid rgba(130, 156, 204, .5); box-shadow: 0 12px 28px rgba(0, 0, 0, .3); }
+.reshoot-guide-panel > p, .reshoot-guide-panel li { margin: 7px 0; font-size: 10px; line-height: 1.55; }
+.reshoot-guide-panel > button, .reshoot-guide-panel li button { padding: 5px 7px; color: #e8f0ff; background: #264f9f; border: 1px solid #5684dd; cursor: pointer; font-size: 10px; }
+.reshoot-guide-panel ol { margin: 9px 0 0; padding-left: 18px; }
+.reshoot-guide-panel li { margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid rgba(120, 145, 190, .28); }
+.reshoot-guide-panel li button { margin-left: 6px; padding: 2px 4px; background: transparent; border-color: #6f819d; }
+.reshoot-guide-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.reshoot-guide-head b { color: #ffd166; font-size: 11px; }
+.reshoot-guide-head span { color: #9db0cd; font-family: "Cascadia Mono", monospace; font-size: 9px; }
+.reshoot-guide-head button { margin-left: auto; }
+.reshoot-guide-figure { margin: 6px 0; display: block; color: #9db0cd; }
+.reshoot-guide-figure img { width: 100%; display: block; border: 1px solid rgba(130, 156, 204, .45); }
+.reshoot-guide-figure span { display: block; margin-top: 3px; font-size: 9px; }
+.reshoot-guide-figure.pending, .reshoot-guide-figure.missing { display: flex; align-items: center; gap: 5px; font-size: 9px; }
+.reshoot-guide-text { color: #cbd8ec; }
+.reshoot-guide-error { color: #ffb3a9; }
 .cancellation-status {
   width: min(420px, calc(100vw - 48px));
   min-height: 112px;
@@ -249,6 +274,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-actions button:hover:not(:disabled) { color: var(--blue); }
 .project-actions .preview-link { color: var(--blue); font-weight: 700; }
 .project-actions .resume-link { color: var(--blue); font-weight: 700; }
+.project-actions .reshoot-link { color: #7a5af8; font-weight: 700; }
 .project-actions .danger-link:hover:not(:disabled) { color: var(--red); }
 
 .preview-mode { background: #e7ebf1; }

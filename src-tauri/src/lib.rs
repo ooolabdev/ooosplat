@@ -22,6 +22,7 @@ pub fn run_app() {
             commands::probe_and_plan,
             commands::estimate_project_runtime,
             commands::start_pipeline,
+            commands::start_reshoot_pipeline,
             commands::resume_pipeline,
             commands::cancel_pipeline,
             commands::export_ply,
