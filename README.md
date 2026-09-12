@@ -60,6 +60,7 @@ Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLM
 - 可在平台文件管理器中定位 `final.ply`，或将整个项目移入系统回收站。
 - 可拖动中央分界线调整左右面板宽度；右下角支持 80%–140% 整体界面缩放。
 - 支持中文、空格、长文件名和 UNC 项目路径。
+- 界面支持简体中文与英文即时切换；首次启动按系统语言自动选择，手动切换后会记住用户选择。
 
 ### Gaussian 编辑快捷键
 
@@ -137,7 +138,7 @@ sudo apt install ./OOOSplat-0.4.0-x64-linux.deb
 ## 安装与使用
 
 1. Windows 运行 `OOOSplat-0.4.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.4.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.4.0-x64-linux.deb`。
-2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常。
+2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在“01 创建新任务”的输入类型下拉栏选择“视频”或“图片”，再点击输入框选择视频文件或图片序列文件夹。
 4. 选择项目根目录；程序会记住上次使用的位置。
 5. 选择“快速”“均衡”或“精细”档位。

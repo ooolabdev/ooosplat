@@ -1,3 +1,5 @@
+import { getCurrentLocale, translate } from "../../i18n";
+
 export interface NormalizedCaptureRegion {
   x: number;
   y: number;
@@ -13,7 +15,7 @@ export function normalizedCaptureRegion(
   guide: Pick<DOMRect, "left" | "top" | "width" | "height">,
 ): NormalizedCaptureRegion {
   if (canvas.width <= 0 || canvas.height <= 0 || guide.width <= 0 || guide.height <= 0) {
-    throw new Error("视频取景框尺寸无效。请调整窗口大小后重试。");
+    throw new Error(translate(getCurrentLocale(), "viewer.captureSize"));
   }
 
   const left = clamp(guide.left, canvas.left, canvas.left + canvas.width);
@@ -21,7 +23,7 @@ export function normalizedCaptureRegion(
   const right = clamp(guide.left + guide.width, canvas.left, canvas.left + canvas.width);
   const bottom = clamp(guide.top + guide.height, canvas.top, canvas.top + canvas.height);
   if (right <= left || bottom <= top) {
-    throw new Error("视频取景框不在渲染画面内。请调整窗口大小后重试。");
+    throw new Error(translate(getCurrentLocale(), "viewer.captureOutside"));
   }
 
   return {
@@ -41,7 +43,7 @@ export function verticalFovForCapture(sourceFovDegrees: number, regionHeight: nu
     || regionHeight <= 0
     || regionHeight > 1
   ) {
-    throw new Error("无法计算视频取景框的相机视野。");
+    throw new Error(translate(getCurrentLocale(), "viewer.captureFov"));
   }
   const sourceHalfFov = sourceFovDegrees * Math.PI / 360;
   return Math.atan(Math.tan(sourceHalfFov) * regionHeight) * 360 / Math.PI;
@@ -56,7 +58,7 @@ export function copyFlippedRgbaRows(
   const rowBytes = width * 4;
   const requiredBytes = rowBytes * height;
   if (source.byteLength < requiredBytes || target.byteLength < requiredBytes) {
-    throw new Error("视频帧像素数据不完整。");
+    throw new Error(translate(getCurrentLocale(), "viewer.framePixels"));
   }
   for (let sourceRow = 0; sourceRow < height; sourceRow += 1) {
     const sourceOffset = sourceRow * rowBytes;

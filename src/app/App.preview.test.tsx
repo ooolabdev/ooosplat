@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
+import { LanguageProvider } from "../i18n";
 import type { ProjectSummary } from "../types/pipeline";
 
 const mocks = vi.hoisted(() => ({
@@ -89,6 +90,7 @@ describe("App preview workspace", () => {
     // jsdom does not implement scrollIntoView, and starting a run renders the live log,
     // whose auto-scroll effect then calls it.
     Element.prototype.scrollIntoView = vi.fn();
+    window.localStorage.setItem("ooo-splat-language", "zh-CN");
     if (!window.requestAnimationFrame) {
       window.requestAnimationFrame = (callback) => window.setTimeout(() => callback(performance.now()), 0);
       window.cancelAnimationFrame = (handle) => window.clearTimeout(handle);
@@ -141,13 +143,14 @@ describe("App preview workspace", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
-    await act(async () => { root.render(<App />); });
+    await act(async () => { root.render(<LanguageProvider><App /></LanguageProvider>); });
     await flush();
   });
 
   afterEach(async () => {
     await act(async () => { root.unmount(); });
     container.remove();
+    window.localStorage.clear();
   });
 
   it("shows the current package version and a start action without a trailing arrow", () => {
@@ -156,6 +159,22 @@ describe("App preview workspace", () => {
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
+  });
+
+  it("switches the complete task workspace to English without reloading", async () => {
+    const languageButton = container.querySelector<HTMLButtonElement>(".language-action");
+    expect(languageButton?.textContent).toContain("EN");
+    expect(languageButton?.title).toBe("中英文切换 / Switch language");
+
+    await act(async () => languageButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+    expect(container.textContent).toContain("01 Create New Task");
+    expect(container.textContent).toContain("02 Task History");
+    expect(container.textContent).toContain("Start Generation");
+    expect(container.textContent).toContain("Checking bundled engines");
+    expect(languageButton?.textContent).toContain("中文");
+    expect(languageButton?.title).toBe("中英文切换 / Switch language");
+    expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
   });
 
   it("shows automatic mask extraction when the selected video has alpha", async () => {

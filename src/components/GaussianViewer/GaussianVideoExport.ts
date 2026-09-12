@@ -8,6 +8,7 @@ import {
 import {
   VIDEO_DURATION_SECONDS,
 } from "./PreviewAnimation";
+import { getCurrentLocale, translate } from "../../i18n";
 
 export const GAUSSIAN_VIDEO_WIDTH = 1080;
 export const GAUSSIAN_VIDEO_HEIGHT = 1920;
@@ -30,11 +31,12 @@ export interface GaussianVideoCapability {
 }
 
 export async function checkGaussianVideoCapability(): Promise<GaussianVideoCapability> {
+  const locale = getCurrentLocale();
   if (!window.isSecureContext) {
-    return { supported: false, reason: "当前 WebView 不是安全上下文，无法使用 H.264 视频编码器。" };
+    return { supported: false, reason: translate(locale, "video.insecure") };
   }
   if (typeof VideoEncoder === "undefined") {
-    return { supported: false, reason: "当前系统的 WebView 不支持 WebCodecs VideoEncoder。" };
+    return { supported: false, reason: translate(locale, "video.noWebCodecs") };
   }
   try {
     const supported = await canEncodeVideo("avc", {
@@ -44,11 +46,11 @@ export async function checkGaussianVideoCapability(): Promise<GaussianVideoCapab
     });
     return supported
       ? { supported: true, reason: null }
-      : { supported: false, reason: "当前系统没有可用的 AVC / H.264 编码器。" };
+      : { supported: false, reason: translate(locale, "video.noAvc") };
   } catch (error) {
     return {
       supported: false,
-      reason: `无法检测 H.264 编码能力：${error instanceof Error ? error.message : String(error)}`,
+      reason: translate(locale, "video.capabilityError", { detail: error instanceof Error ? error.message : String(error) }),
     };
   }
 }
@@ -99,10 +101,10 @@ export async function encodeGaussianVideo({
   onProgress?: (progress: GaussianVideoEncodingProgress) => void;
 }) {
   if (canvas.width !== GAUSSIAN_VIDEO_WIDTH || canvas.height !== GAUSSIAN_VIDEO_HEIGHT) {
-    throw new Error("视频合成画布必须为 1080 × 1920。 ");
+    throw new Error(translate(getCurrentLocale(), "video.invalidCanvas"));
   }
   const context = canvas.getContext("2d", { alpha: false });
-  if (!context) throw new Error("无法创建视频合成画布。 ");
+  if (!context) throw new Error(translate(getCurrentLocale(), "video.noCanvas"));
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
 
@@ -151,7 +153,7 @@ export async function encodeGaussianVideo({
     await output.finalize();
     signal.throwIfAborted();
     if (!target.buffer || target.buffer.byteLength === 0) {
-      throw new Error("H.264 编码器返回了空文件。 ");
+      throw new Error(translate(getCurrentLocale(), "video.empty"));
     }
     return new Uint8Array(target.buffer);
   } catch (error) {
@@ -168,7 +170,7 @@ export async function loadWatermarkLogo(source: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
     image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("无法加载 OOOSplat 水印 Logo。"));
+    image.onerror = () => reject(new Error(translate(getCurrentLocale(), "viewer.watermarkLoad")));
     image.src = source;
   });
 }

@@ -70,6 +70,7 @@ import {
   saveGaussianTransform,
 } from "../../lib/backend";
 import { previewAssetUrl as withPreviewAssetRevision } from "../../lib/previewAssetUrl";
+import { getCurrentLocale, translate, useI18n, type TranslationKey } from "../../i18n";
 import { IDENTITY_TRANSFORM, useGaussianTransformStore } from "../../stores/gaussianTransformStore";
 import type {
   GaussianCrop,
@@ -187,7 +188,7 @@ function nextAnimationFrame(signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     const abort = () => {
       cancelAnimationFrame(frame);
-      reject(new DOMException("视频导出已取消。", "AbortError"));
+      reject(new DOMException(translate(getCurrentLocale(), "video.cancelled"), "AbortError"));
     };
     const frame = requestAnimationFrame(() => {
       signal.removeEventListener("abort", abort);
@@ -203,7 +204,7 @@ function waitForSplatFrame(
   signal: AbortSignal,
 ) {
   const gsplatSystem = app.systems.gsplat;
-  if (!gsplatSystem) return Promise.reject(new Error("PlayCanvas GSplat 系统不可用。"));
+  if (!gsplatSystem) return Promise.reject(new Error(translate(getCurrentLocale(), "video.gsplatUnavailable")));
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error) => {
@@ -221,9 +222,9 @@ function waitForSplatFrame(
         if (frameCamera === camera && ready && loadingCount === 0) finish();
       },
     );
-    const abort = () => finish(new DOMException("视频导出已取消。", "AbortError"));
+    const abort = () => finish(new DOMException(translate(getCurrentLocale(), "video.cancelled"), "AbortError"));
     const timeout = window.setTimeout(
-      () => finish(new Error("等待高斯泼溅排序完成超时。请降低系统负载后重试。")),
+      () => finish(new Error(translate(getCurrentLocale(), "video.sortTimeout"))),
       8_000,
     );
     signal.addEventListener("abort", abort, { once: true });
@@ -246,6 +247,7 @@ interface SplatSceneProps {
 }
 
 const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ assetUrl, transform, mode, tool, crop, deletedMask, selectionMask, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
+  const { t } = useI18n();
   const app = useApp();
   const cameraRef = useRef<PcEntity>(null);
   const modelRef = useRef<PcEntity>(null);
@@ -354,7 +356,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       onStatus({
         phase: "error",
         progress: 0,
-        error: "WebGL2 图形上下文已丢失。大模型可能超过当前显卡或驱动可分配的单次图形资源，请关闭其他图形应用后重新加载。",
+        error: t("viewer.contextLost"),
         renderer,
       });
     };
@@ -601,7 +603,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
           onStatus({
             phase: "error",
             progress: 0,
-            error: "PLY 已加载，但无法读取有效的模型边界。请确认该文件是 OOOSplat 生成的 Brush Gaussian PLY。",
+            error: t("viewer.invalidBounds"),
             renderer,
           });
         }
@@ -654,12 +656,12 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   }) => {
     const controls = controlsRef.current;
     const cameraEntity = cameraRef.current;
-    if (!controls || !cameraEntity?.camera) throw new Error("预览相机尚未就绪。 ");
-    if (exportingRef.current) throw new Error("已有视频正在导出。 ");
+    if (!controls || !cameraEntity?.camera) throw new Error(t("viewer.cameraNotReady"));
+    if (exportingRef.current) throw new Error(t("video.exportBusy"));
 
     const graphicsDevice = app.graphicsDevice as WebglGraphicsDevice;
     if (graphicsDevice.maxTextureSize < Math.max(GAUSSIAN_VIDEO_WIDTH, GAUSSIAN_VIDEO_HEIGHT)) {
-      throw new Error(`显卡最大纹理尺寸 ${graphicsDevice.maxTextureSize} 无法导出 1080 × 1920 视频。`);
+      throw new Error(t("video.textureCapacity", { maximum: graphicsDevice.maxTextureSize }));
     }
     const readbackPixels = new Uint8Array(GAUSSIAN_VIDEO_WIDTH * GAUSSIAN_VIDEO_HEIGHT * 4);
     let frameImageData: ImageData | null = null;
@@ -755,15 +757,15 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
 
   const selectRectangle = useCallback((rectangle: SelectionRectangle, selectionMode: RectangleSelectionMode) => {
     const selection = selectionRef.current;
-    if (!selection) return Promise.reject(new Error("Gaussian 选择器尚未就绪"));
-    if (contextLostRef.current) return Promise.reject(new Error("图形上下文已丢失，请重新加载预览。"));
+    if (!selection) return Promise.reject(new Error(t("viewer.selectorNotReady")));
+    if (contextLostRef.current) return Promise.reject(new Error(t("viewer.contextReload")));
     return selection.select(rectangle, selectionMode, editorStateRef.current.crop);
   }, []);
 
   const freezeCrop = useCallback((currentCrop: Exclude<GaussianCrop, null>, currentDeletedMask: Uint8Array) => {
     const selection = selectionRef.current;
-    if (!selection) return Promise.reject(new Error("Gaussian 选择器尚未就绪"));
-    if (contextLostRef.current) return Promise.reject(new Error("图形上下文已丢失，请重新加载预览。"));
+    if (!selection) return Promise.reject(new Error(t("viewer.selectorNotReady")));
+    if (contextLostRef.current) return Promise.reject(new Error(t("viewer.contextReload")));
     return selection.freezeCrop(currentCrop, currentDeletedMask);
   }, []);
 
@@ -811,10 +813,11 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
 });
 
 const SplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function SplatScene(props, ref) {
+  const { locale } = useI18n();
   const app = useApp();
   const maximumTextureSide = app.graphicsDevice.maxTextureSize;
   const renderer = `${app.graphicsDevice.deviceType.toUpperCase()} / UNIFIED GSPLAT`;
-  const capacityError = splatTextureCapacityError(props.splatCount, maximumTextureSide);
+  const capacityError = splatTextureCapacityError(props.splatCount, maximumTextureSide, locale);
 
   useEffect(() => {
     if (!capacityError) return;
@@ -830,14 +833,17 @@ const SplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function SplatScen
   return <LoadedSplatScene ref={ref} {...props} />;
 });
 
-const formatBytes = (bytes: number) => bytes >= 1024 ** 3
-  ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
-  : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+const formatBytes = (bytes: number, locale: string) => {
+  const [value, unit, digits] = bytes >= 1024 ** 3
+    ? [bytes / 1024 ** 3, "GB", 2] as const
+    : [bytes / 1024 ** 2, "MB", 1] as const;
+  return `${new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)} ${unit}`;
+};
 const compact = (values: number[]) => values.map((value) => Number(value.toFixed(2))).join(" / ");
-const phaseLabels: Record<PreviewAnimationPhase, string> = {
-  reveal: "显现",
-  shockwave: "冲击波",
-  orbit: "环绕",
+const phaseLabelKeys: Record<PreviewAnimationPhase, TranslationKey> = {
+  reveal: "animation.reveal",
+  shockwave: "animation.shockwave",
+  orbit: "animation.orbit",
 };
 
 export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
@@ -845,6 +851,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
   onDisposed: (projectId: string) => void;
   pipelineRunning: boolean;
 }) {
+  const { locale, t, formatNumber } = useI18n();
   const store = useGaussianTransformStore();
   const sceneApiRef = useRef<SplatSceneApi | null>(null);
   const captureGuideRef = useRef<HTMLDivElement | null>(null);
@@ -914,7 +921,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
       if (active) setVideoCapability({ ...capability, checking: false });
     });
     return () => { active = false; };
-  }, []);
+  }, [locale]);
 
   useEffect(() => {
     const descriptor = store.descriptor;
@@ -926,7 +933,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
     }
     void fetch(descriptor.editMaskAssetUrl)
       .then((response) => {
-        if (!response.ok) throw new Error(`删除位图读取失败（HTTP ${response.status}）`);
+        if (!response.ok) throw new Error(t("viewer.maskRead", { status: response.status }));
         return response.arrayBuffer();
       })
       .then((buffer) => {
@@ -947,7 +954,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
       setViewport((current) => current.phase === "initializing" ? {
         phase: "error",
         progress: 0,
-        error: "WebGL2 渲染器初始化超时。请更新显卡驱动和 Microsoft Edge WebView2 Runtime 后重试。",
+        error: t("viewer.initTimeout"),
         renderer: "WEBGL2 / UNIFIED GSPLAT",
       } : current);
     }, 10_000);
@@ -987,7 +994,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
         const current = useGaussianTransformStore.getState();
         if (current.descriptor?.projectId !== projectId) return;
         const reservation = await beginGaussianEditSave(projectId, crop, current.editing.revision);
-        if (reservation.expectedMaskBytes !== mask.byteLength) throw new Error("编辑位图长度与后端预期不一致");
+        if (reservation.expectedMaskBytes !== mask.byteLength) throw new Error(t("viewer.maskLength"));
         const editing = await commitGaussianEditSave(reservation.editId, mask);
         if (useGaussianTransformStore.getState().descriptor?.projectId === projectId) {
           useGaussianTransformStore.getState().applySavedEditing(editing, savedSerial);
@@ -1061,7 +1068,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
     try {
       await Promise.all([saveQueue.current, editSaveQueue.current]);
       const current = useGaussianTransformStore.getState();
-      if (current.saveState === "error") throw new Error(current.saveError ?? "编辑状态尚未保存，请重试后再导出");
+      if (current.saveState === "error") throw new Error(current.saveError ?? t("viewer.editsUnsaved"));
       const result = await exportTransformedGaussian(store.descriptor.projectId, current.transform, current.editing.revision);
       setGaussianExportProgress(100);
       setGaussianExportResult(result.path);
@@ -1087,7 +1094,7 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
     const guide = captureGuideRef.current;
     const canvas = guide?.parentElement?.querySelector("canvas");
     if (!guide || !(canvas instanceof HTMLCanvasElement)) {
-      setVideoError("无法读取视频取景框，请退出预览后重试。");
+      setVideoError(t("viewer.captureUnavailable"));
       setVideoPhase("error");
       return;
     }
@@ -1285,91 +1292,91 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
   if (!store.descriptor) return null;
 
   const loadingLabel = viewport.phase === "initializing"
-    ? "正在初始化 WebGL2 渲染器"
+    ? t("viewer.initializing")
     : viewport.phase === "mounting"
-      ? "正在创建高斯泼溅 GPU 资源"
-      : "正在读取高斯泼溅文件";
+      ? t("viewer.mounting")
+      : t("viewer.loading");
   const phaseLabel = {
-    initializing: "初始化中",
-    loading: "加载中",
-    mounting: "准备中",
-    ready: "就绪",
-    error: "异常",
+    initializing: t("viewer.phaseInitializing"),
+    loading: t("viewer.phaseLoading"),
+    mounting: t("viewer.phaseMounting"),
+    ready: t("viewer.phaseReady"),
+    error: t("viewer.phaseError"),
   }[viewport.phase];
   const videoBusy = !["idle", "completed", "error"].includes(videoPhase);
   const videoButtonLabel = videoPhase === "preparing"
-    ? "准备导出"
+    ? t("viewer.preparingExport")
     : videoPhase === "rendering"
-      ? `渲染 ${videoProgress.currentFrame} / ${videoProgress.totalFrames}`
+      ? t("viewer.rendering", { current: videoProgress.currentFrame, total: videoProgress.totalFrames })
       : videoPhase === "finalizing"
-        ? "正在封装 MP4"
+        ? t("viewer.packaging")
         : videoPhase === "saving"
-          ? "正在保存"
-          : "导出竖屏视频";
+          ? t("viewer.saving")
+          : t("viewer.exportVideo");
   const toolItems: Array<{ id: GaussianEditorTool; label: string; icon: typeof MousePointer2 }> = [
-    { id: "transform", label: "变换", icon: MousePointer2 },
-    { id: "rectangle", label: "矩形选择", icon: RectangleHorizontal },
-    { id: "sphere", label: "球选择", icon: CircleDot },
-    { id: "box", label: "盒选择", icon: Box },
+    { id: "transform", label: t("viewer.transform"), icon: MousePointer2 },
+    { id: "rectangle", label: t("viewer.rectangle"), icon: RectangleHorizontal },
+    { id: "sphere", label: t("viewer.sphere"), icon: CircleDot },
+    { id: "box", label: t("viewer.box"), icon: Box },
   ];
   const selectionRectStyle = selectionDrag ? {
     left: Math.min(selectionDrag.startX, selectionDrag.x), top: Math.min(selectionDrag.startY, selectionDrag.y),
     width: Math.abs(selectionDrag.x - selectionDrag.startX), height: Math.abs(selectionDrag.y - selectionDrag.startY),
   } : undefined;
 
-  return <section className={`preview-pane active preview-workspace viewer-mode-${mode}`} aria-label="高斯泼溅预览">
+  return <section className={`preview-pane active preview-workspace viewer-mode-${mode}`} aria-label={t("viewer.aria")}>
     <header className="preview-header">
       <div className="preview-heading">
-        <button className="preview-back-icon" type="button" title="返回任务" aria-label="返回任务" disabled={busy} onClick={() => requestNavigation("exit")}><ArrowLeft size={19} /></button>
-        <h1>03 预览</h1>
+        <button className="preview-back-icon" type="button" title={t("viewer.back")} aria-label={t("viewer.back")} disabled={busy} onClick={() => requestNavigation("exit")}><ArrowLeft size={19} /></button>
+        <h1>{t("viewer.title")}</h1>
       </div>
       <div className="preview-mode-control">
-        <div className={`preview-mode-toggle mode-${mode}`} role="group" aria-label="预览工作模式">
-          <button type="button" className={mode === "adjust" ? "active" : ""} aria-pressed={mode === "adjust"} disabled={busy} onClick={() => switchMode("adjust")}>调整</button>
-          <button type="button" className={mode === "preview" ? "active" : ""} aria-pressed={mode === "preview"} disabled={busy} onClick={() => switchMode("preview")}>动画</button>
+        <div className={`preview-mode-toggle mode-${mode}`} role="group" aria-label={t("viewer.modeAria")}>
+          <button type="button" className={mode === "adjust" ? "active" : ""} aria-pressed={mode === "adjust"} disabled={busy} onClick={() => switchMode("adjust")}>{t("viewer.adjust")}</button>
+          <button type="button" className={mode === "preview" ? "active" : ""} aria-pressed={mode === "preview"} disabled={busy} onClick={() => switchMode("preview")}>{t("viewer.animation")}</button>
         </div>
-        <p>{mode === "adjust" ? "调整高斯泼溅的原点、大小与位置等" : "调整画面并导出展示视频"}</p>
+        <p>{mode === "adjust" ? t("viewer.adjustHint") : t("viewer.animationHint")}</p>
       </div>
-      <div className="preview-input-hints" aria-label="视图鼠标操作">
-        <span><Orbit size={15} /><kbd>{mode === "adjust" && store.tool === "rectangle" ? "中键" : "左键"}</kbd>旋转</span>
-        <span><Move size={15} /><kbd>右键</kbd>拖动</span>
-        <span><ZoomIn size={15} /><kbd>滚轮</kbd>缩放</span>
+      <div className="preview-input-hints" aria-label={t("viewer.inputAria")}>
+        <span><Orbit size={15} /><kbd>{mode === "adjust" && store.tool === "rectangle" ? t("viewer.middle") : t("viewer.left")}</kbd>{t("viewer.rotate")}</span>
+        <span><Move size={15} /><kbd>{t("viewer.right")}</kbd>{t("viewer.drag")}</span>
+        <span><ZoomIn size={15} /><kbd>{t("viewer.wheel")}</kbd>{t("viewer.zoom")}</span>
         {mode === "adjust" && store.tool === "rectangle" && <>
-          <span><RectangleHorizontal size={15} /><kbd>左键</kbd>框选</span>
-          <span><Plus size={15} /><kbd>Shift</kbd>添加</span>
-          <span><Minus size={15} /><kbd>Ctrl</kbd>移除</span>
-          <span><Trash2 size={15} /><kbd>Delete / Backspace</kbd>删除</span>
-          <span><X size={15} /><kbd>Esc</kbd>取消选择</span>
+          <span><RectangleHorizontal size={15} /><kbd>{t("viewer.left")}</kbd>{t("viewer.select")}</span>
+          <span><Plus size={15} /><kbd>Shift</kbd>{t("viewer.add")}</span>
+          <span><Minus size={15} /><kbd>Ctrl</kbd>{t("viewer.remove")}</span>
+          <span><Trash2 size={15} /><kbd>Delete / Backspace</kbd>{t("viewer.delete")}</span>
+          <span><X size={15} /><kbd>Esc</kbd>{t("viewer.cancelSelection")}</span>
         </>}
       </div>
     </header>
     <div className="preview-commandbar">
       <div className="preview-commandbar-left">
-        {mode === "adjust" && <div className="preview-editor-tools" role="toolbar" aria-label="Gaussian 编辑工具">
+        {mode === "adjust" && <div className="preview-editor-tools" role="toolbar" aria-label={t("viewer.toolsAria")}>
           {toolItems.map(({ id, label, icon: Icon }) => <button key={id} type="button" className={store.tool === id ? "active" : ""} aria-pressed={store.tool === id} disabled={busy || viewport.phase !== "ready"} onClick={() => void switchTool(id)}><Icon size={14} />{label}</button>)}
         </div>}
       </div>
       <div className="preview-commandbar-center">
-        {mode === "adjust" && <div className="preview-view-control" role="group" aria-label="正交视图">
-          {(["side", "front", "top"] as const).map((view) => <button key={view} type="button" className={orthographicView === view ? "active" : ""} aria-pressed={orthographicView === view} disabled={busy || viewport.phase !== "ready"} title={`切换到${view === "side" ? "侧视图" : view === "front" ? "正视图" : "顶视图"}`} onClick={() => alignView(view)}>{view === "side" ? "侧视" : view === "front" ? "正视" : "顶视"}</button>)}
+        {mode === "adjust" && <div className="preview-view-control" role="group" aria-label={t("viewer.viewsAria")}>
+          {(["side", "front", "top"] as const).map((view) => { const viewLabel = view === "side" ? t("viewer.side") : view === "front" ? t("viewer.front") : t("viewer.top"); return <button key={view} type="button" className={orthographicView === view ? "active" : ""} aria-pressed={orthographicView === view} disabled={busy || viewport.phase !== "ready"} title={t("viewer.switchView", { view: viewLabel })} onClick={() => alignView(view)}>{viewLabel}</button>; })}
         </div>}
       </div>
       <div className="preview-header-actions">
         {mode === "adjust" ? <>
-          <button type="button" title="撤销（Ctrl+Z）" disabled={store.history.length === 0 || busy} onClick={() => runHistory("undo")}><Undo2 size={14} />撤销</button>
-          <button type="button" title="重做（Ctrl+Shift+Z / Ctrl+Y）" disabled={store.future.length === 0 || busy} onClick={() => runHistory("redo")}><Redo2 size={14} />重做</button>
-          {store.tool === "rectangle" && <button type="button" disabled={store.selectedCount === 0 || busy} onClick={store.deleteSelection}><Trash2 size={14} />删除选中</button>}
-          <button type="button" title="恢复为原始 final.ply" disabled={busy || (store.history.length === 0 && store.editing.crop === null && store.editing.deletedCount === 0 && store.transform.scale === 1 && store.transform.position.every((value) => value === 0) && store.transform.rotation.every((value) => value === 0))} onClick={() => { store.resetAll(); setGaussianExportResult(null); }}><RotateCcw size={14} />全部撤销</button>
-          <button type="button" disabled={busy || viewport.phase !== "ready"} onClick={() => void exportGaussian()}>{gaussianExporting ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />} {gaussianExporting ? `保存中 ${gaussianExportProgress.toFixed(0)}%` : "保存"}</button>
+          <button type="button" title={t("viewer.undoTitle")} disabled={store.history.length === 0 || busy} onClick={() => runHistory("undo")}><Undo2 size={14} />{t("viewer.undo")}</button>
+          <button type="button" title={t("viewer.redoTitle")} disabled={store.future.length === 0 || busy} onClick={() => runHistory("redo")}><Redo2 size={14} />{t("viewer.redo")}</button>
+          {store.tool === "rectangle" && <button type="button" disabled={store.selectedCount === 0 || busy} onClick={store.deleteSelection}><Trash2 size={14} />{t("viewer.deleteSelected")}</button>}
+          <button type="button" title={t("viewer.resetAllTitle")} disabled={busy || (store.history.length === 0 && store.editing.crop === null && store.editing.deletedCount === 0 && store.transform.scale === 1 && store.transform.position.every((value) => value === 0) && store.transform.rotation.every((value) => value === 0))} onClick={() => { store.resetAll(); setGaussianExportResult(null); }}><RotateCcw size={14} />{t("viewer.resetAll")}</button>
+          <button type="button" disabled={busy || viewport.phase !== "ready"} onClick={() => void exportGaussian()}>{gaussianExporting ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />} {gaussianExporting ? t("viewer.saveProgress", { value: gaussianExportProgress.toFixed(0) }) : t("viewer.save")}</button>
         </> : <>
-          <button type="button" disabled={videoBusy || viewport.phase !== "ready"} onClick={() => sceneApiRef.current?.replay()}><Play size={14} />重新播放</button>
+          <button type="button" disabled={videoBusy || viewport.phase !== "ready"} onClick={() => sceneApiRef.current?.replay()}><Play size={14} />{t("viewer.replay")}</button>
           {videoBusy
-            ? <button type="button" className="video-cancel" disabled={videoPhase === "saving"} onClick={cancelVideo}><X size={14} />取消导出</button>
+            ? <button type="button" className="video-cancel" disabled={videoPhase === "saving"} onClick={cancelVideo}><X size={14} />{t("viewer.cancelExport")}</button>
             : <button type="button" disabled={!videoCapability.supported || viewport.phase !== "ready"} title={videoCapability.reason ?? undefined} onClick={() => void exportVideo()}><Film size={14} />{videoButtonLabel}</button>}
         </>}
       </div>
     </div>
-    {pipelineRunning && <div className="preview-resource-note">预览与生成任务正在同时使用图形资源，显存不足时交互可能暂时变慢。</div>}
+    {pipelineRunning && <div className="preview-resource-note">{t("viewer.resourceNote")}</div>}
     <div className="preview-editor">
       <div className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
         <Application key={`${store.descriptor.projectId}-${rendererRevision}`} className="gaussian-canvas" deviceTypes={[DEVICETYPE_WEBGL2]} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
@@ -1381,54 +1388,54 @@ export function GaussianViewer({ onExit, onDisposed, pipelineRunning }: {
         </div>}
         {mode === "preview" && <div className="portrait-matte" aria-hidden="true" />}
         {viewport.phase !== "ready" && viewport.phase !== "error" && <div className="viewport-overlay"><LoaderCircle className="spin" size={22} /><strong>{loadingLabel}</strong>{viewport.phase === "loading" && <span>{(viewport.progress * 100).toFixed(0)}%</span>}</div>}
-        {viewport.phase === "error" && <div className="viewport-overlay error"><strong>预览不可用</strong><p>{viewport.error}</p><div className="viewport-error-actions"><button type="button" onClick={retry}>重新加载</button><button type="button" onClick={() => requestNavigation("exit")}>返回任务</button></div></div>}
-        {cropFreezing && <div className="viewport-overlay"><LoaderCircle className="spin" size={22} /><strong>正在固定裁切结果</strong><span>请稍候</span></div>}
-        {cropFreezeError && !cropFreezing && <div className="viewport-overlay error"><strong>无法固定裁切结果</strong><p>{cropFreezeError}</p><div className="viewport-error-actions"><button type="button" onClick={() => setCropFreezeError(null)}>返回编辑</button></div></div>}
+        {viewport.phase === "error" && <div className="viewport-overlay error"><strong>{t("viewer.unavailable")}</strong><p>{viewport.error}</p><div className="viewport-error-actions"><button type="button" onClick={retry}>{t("viewer.reload")}</button><button type="button" onClick={() => requestNavigation("exit")}>{t("viewer.back")}</button></div></div>}
+        {cropFreezing && <div className="viewport-overlay"><LoaderCircle className="spin" size={22} /><strong>{t("viewer.freezing")}</strong><span>{t("viewer.wait")}</span></div>}
+        {cropFreezeError && !cropFreezing && <div className="viewport-overlay error"><strong>{t("viewer.freezeFailed")}</strong><p>{cropFreezeError}</p><div className="viewport-error-actions"><button type="button" onClick={() => setCropFreezeError(null)}>{t("viewer.backToEdit")}</button></div></div>}
         {selectionDrag && <div className={`rectangle-selection-box mode-${selectionDrag.selectionMode}`} style={selectionRectStyle} aria-hidden="true" />}
         {mode === "adjust" && store.tool === "transform" && <TransformPanel transform={store.transform} onBegin={store.beginTransaction} onChange={store.setTransformLive} onCommit={store.commitTransaction} />}
         {mode === "adjust" && (store.tool === "sphere" || store.tool === "box") && <SelectionPanel crop={store.editing.crop} kind={store.tool} onBegin={store.beginCropTransaction} onChange={store.setCropLive} onCommit={store.commitCropTransaction} onEnable={() => { const tool = useGaussianTransformStore.getState().tool; if (tool === "sphere" || tool === "box") enableCrop(tool); }} />}
         {mode === "preview" && <div className="animation-hud">
           <span className={`animation-pulse phase-${animationStatus.phase}`} />
-          <b>{phaseLabels[animationStatus.phase]}</b>
+          <b>{t(phaseLabelKeys[animationStatus.phase])}</b>
           <span className="animation-time">{animationStatus.elapsedSeconds.toFixed(1)}s</span>
-          <span className="orbit-axis-key"><i aria-hidden="true" />旋转轴 Y · 24 秒/圈</span>
+          <span className="orbit-axis-key"><i aria-hidden="true" />{t("viewer.orbitAxis")}</span>
         </div>}
         {mode === "preview" && videoBusy && <div className="video-export-overlay">
           <div><LoaderCircle className="spin" size={20} /><strong>{videoButtonLabel}</strong></div>
           <div className="video-export-track"><span style={{ width: `${videoProgress.progress * 100}%` }} /></div>
-          <small>{videoPhase === "rendering" ? `${Math.round(videoProgress.progress * 100)}% · ${videoProgress.currentFrame} / ${GAUSSIAN_VIDEO_FRAME_COUNT} 帧` : "请保持窗口开启"}</small>
+          <small>{videoPhase === "rendering" ? t("viewer.framesProgress", { percent: Math.round(videoProgress.progress * 100), current: videoProgress.currentFrame, total: GAUSSIAN_VIDEO_FRAME_COUNT }) : t("viewer.keepOpen")}</small>
         </div>}
       </div>
     </div>
     <footer className="preview-statusbar">
-      <span><b>泼溅数量</b>{store.descriptor.splatCount.toLocaleString()}</span>
-      {mode === "adjust" && store.selectedCount > 0 && <span className="selection-count"><b>已选择</b>{store.selectedCount.toLocaleString()}</span>}
-      {mode === "adjust" && store.editing.deletedCount > 0 && <span><b>已删除</b>{store.editing.deletedCount.toLocaleString()}</span>}
-      <span><b>文件大小</b>{formatBytes(store.descriptor.fileSize)}</span>
+      <span><b>{t("viewer.splats")}</b>{formatNumber(store.descriptor.splatCount)}</span>
+      {mode === "adjust" && store.selectedCount > 0 && <span className="selection-count"><b>{t("viewer.selected")}</b>{formatNumber(store.selectedCount)}</span>}
+      {mode === "adjust" && store.editing.deletedCount > 0 && <span><b>{t("viewer.deleted")}</b>{formatNumber(store.editing.deletedCount)}</span>}
+      <span><b>{t("viewer.fileSize")}</b>{formatBytes(store.descriptor.fileSize, locale)}</span>
       {mode === "adjust"
-        ? <span><b>位置</b>{compact(store.transform.position)} <b>旋转</b>{compact(store.transform.rotation)} <b>缩放</b>{Number(store.transform.scale.toFixed(3))}</span>
-        : <span><b>时间线</b>显现 5s · 冲击波 8s · 环绕 24s / 圈</span>}
-      <span><b>渲染器</b>{viewport.renderer}</span>
-      <span><b>状态</b>{phaseLabel}</span>
-      {mode === "adjust" && <span className={`save-state ${store.saveState}`}><b>项目</b>{store.saveState === "saving" ? "保存中" : store.saveState === "error" ? "保存失败" : store.saveState === "dirty" ? "未保存" : "已保存"}</span>}
-      {gaussianExportResult && mode === "adjust" && <span className="export-result" title={gaussianExportResult}><b>已保存</b>{gaussianExportResult.split(/[\\/]/).at(-1)}</span>}
-      {mode === "preview" && <span><b>视频编码</b>{videoCapability.checking ? "检测中" : videoCapability.supported ? "H.264 可用" : "不可用"}</span>}
-      {videoResult && mode === "preview" && <button className="statusbar-file-action" type="button" title={videoResult.path} onClick={() => void revealFile(videoResult.path)}><FolderOpen size={12} /><b>已导出</b>{videoResult.path.split(/[\\/]/).at(-1)} · {formatBytes(videoResult.fileSize)}</button>}
+        ? <span><b>{t("viewer.position")}</b>{compact(store.transform.position)} <b>{t("viewer.rotation")}</b>{compact(store.transform.rotation)} <b>{t("viewer.scale")}</b>{Number(store.transform.scale.toFixed(3))}</span>
+        : <span><b>{t("viewer.timeline")}</b>{t("viewer.timelineValue")}</span>}
+      <span><b>{t("viewer.renderer")}</b>{viewport.renderer}</span>
+      <span><b>{t("viewer.status")}</b>{phaseLabel}</span>
+      {mode === "adjust" && <span className={`save-state ${store.saveState}`}><b>{t("viewer.project")}</b>{store.saveState === "saving" ? t("viewer.stateSaving") : store.saveState === "error" ? t("viewer.stateFailed") : store.saveState === "dirty" ? t("viewer.stateDirty") : t("viewer.stateSaved")}</span>}
+      {gaussianExportResult && mode === "adjust" && <span className="export-result" title={gaussianExportResult}><b>{t("common.saved")}</b>{gaussianExportResult.split(/[\\/]/).at(-1)}</span>}
+      {mode === "preview" && <span><b>{t("viewer.videoEncoding")}</b>{videoCapability.checking ? t("viewer.checking") : videoCapability.supported ? t("viewer.h264Ready") : t("common.unavailable")}</span>}
+      {videoResult && mode === "preview" && <button className="statusbar-file-action" type="button" title={videoResult.path} onClick={() => void revealFile(videoResult.path)}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{videoResult.path.split(/[\\/]/).at(-1)} · {formatBytes(videoResult.fileSize, locale)}</button>}
     </footer>
-    {store.saveError && mode === "adjust" && <div className="preview-save-error"><span>{store.saveError}</span><button type="button" onClick={retrySave}>重试保存</button></div>}
+    {store.saveError && mode === "adjust" && <div className="preview-save-error"><span>{store.saveError}</span><button type="button" onClick={retrySave}>{t("viewer.retrySave")}</button></div>}
     {mode === "preview" && !videoCapability.checking && !videoCapability.supported && <div className="preview-video-message warning">{videoCapability.reason}</div>}
-    {mode === "preview" && videoError && <div className="preview-video-message error">视频导出失败：{videoError}</div>}
+    {mode === "preview" && videoError && <div className="preview-video-message error">{t("viewer.exportFailed", { detail: videoError })}</div>}
     {pendingNavigation && <div className="gaussian-save-backdrop" role="dialog" aria-modal="true" aria-labelledby="gaussian-save-title" aria-describedby="gaussian-save-description">
       <div className="gaussian-save-dialog">
         <div className="gaussian-save-symbol"><Save size={19} /></div>
         <div>
-          <h2 id="gaussian-save-title">保存编辑结果？</h2>
-          <p id="gaussian-save-description">当前调整尚未保存为 <b>edit.ply</b>。项目中的裁切和删除记录会继续保留，原始 <b>final.ply</b> 不会被修改。</p>
+          <h2 id="gaussian-save-title">{t("viewer.saveQuestion")}</h2>
+          <p id="gaussian-save-description">{t("viewer.saveDescription")}</p>
         </div>
         <div className="gaussian-save-actions">
-          <button type="button" className="secondary" disabled={navigationSaving} onClick={() => setPendingNavigation(null)}>取消</button>
-          <button type="button" className="secondary" disabled={navigationSaving} onClick={() => void completeNavigation(pendingNavigation)}>暂不保存</button>
-          <button type="button" className="primary" disabled={navigationSaving} onClick={() => void saveAndContinue()}>{navigationSaving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}保存并继续</button>
+          <button type="button" className="secondary" disabled={navigationSaving} onClick={() => setPendingNavigation(null)}>{t("common.cancel")}</button>
+          <button type="button" className="secondary" disabled={navigationSaving} onClick={() => void completeNavigation(pendingNavigation)}>{t("viewer.skipSave")}</button>
+          <button type="button" className="primary" disabled={navigationSaving} onClick={() => void saveAndContinue()}>{navigationSaving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{t("viewer.saveContinue")}</button>
         </div>
       </div>
     </div>}

@@ -31,7 +31,6 @@ Current version: **0.4.0**. This release focuses on multiple input types, recove
 | P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. | To be created |
 | P1 | Telemetry data collection and learning | Active-user, Pipeline performance, and Failure distribution metrics already exist. Improve data quality, long-term samples, dashboards, and release comparisons. | To be created |
 | P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
-| P1 | English UI and Chinese/English switching | Complete the English application UI and let users switch languages, covering the primary UI, status, interaction guidance, and error summaries while persisting the choice. | To be created |
 | P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
 | P2 | MCP tool support | Provide safe MCP tools for AI Agents to analyze media, start generation, query status, resume tasks, and retrieve results. | To be created |
@@ -53,6 +52,7 @@ Current version: **0.4.0**. This release focuses on multiple input types, recove
 | Completed · 0.4.0 | Automatic masks for transparent video and images | Detects transparent MOV and PNG media, preserves RGBA data for Brush, and generates COLMAP masks to exclude transparent backgrounds. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) and follow-up work |
 | Completed · 0.4.0 | Image-sequence input | Unifies video and image input. Image sequences use a shared camera, exhaustive matching, and the incremental Mapper, with automatic masks for transparent PNG files. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) |
 | Completed · 0.4.0 | Gaussian editing | Supports rectangle, sphere, and box selection, non-destructive deletion, crop freezing, undo/redo, and saving to `edit.ply`, with a foundation compatible with future AI Agent workflows. | Implemented in 0.4.0; issue to be created |
+| Completed · 0.4.0 | English UI and Chinese/English switching | Switches instantly between Simplified Chinese and English, chooses the first-run default from the system language, and persists explicit choices across restarts; task, settings, preview, status, and interaction guidance are covered. | Implemented in 0.4.0; issue to be created |
 
 ## Tracking and Contributions
 

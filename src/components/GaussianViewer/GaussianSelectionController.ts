@@ -8,6 +8,7 @@ import {
   WORKBUFFER_UPDATE_ONCE,
 } from "playcanvas";
 import type { GaussianCrop } from "../../types/pipeline";
+import { getCurrentLocale, translate } from "../../i18n";
 import { maskBit, packedMaskLength, setMaskBit } from "../../stores/gaussianTransformStore";
 
 export type RectangleSelectionMode = "replace" | "add" | "remove";
@@ -66,7 +67,7 @@ export function packSelectionTextureData(data: Uint8Array, splatCount: number) {
 }
 
 export function combineSelectionMasks(current: Uint8Array, hit: Uint8Array, mode: RectangleSelectionMode) {
-  if (current.length !== hit.length) throw new Error("选择位图长度不一致");
+  if (current.length !== hit.length) throw new Error(translate(getCurrentLocale(), "viewer.selectionMaskLength"));
   if (mode === "replace") return hit.slice();
   const next = current.slice();
   for (let index = 0; index < next.length; index += 1) {
@@ -76,7 +77,7 @@ export function combineSelectionMasks(current: Uint8Array, hit: Uint8Array, mode
 }
 
 export function combineDeletedMasks(current: Uint8Array, outsideCrop: Uint8Array) {
-  if (current.length !== outsideCrop.length) throw new Error("删除位图长度不一致");
+  if (current.length !== outsideCrop.length) throw new Error(translate(getCurrentLocale(), "viewer.deletedMaskLength"));
   const next = current.slice();
   for (let index = 0; index < next.length; index += 1) next[index] |= outsideCrop[index];
   return next;
@@ -107,7 +108,7 @@ export class GaussianSelectionController {
     const selected = component.getInstanceTexture("ooosplatSelected");
     const deleted = component.getInstanceTexture("ooosplatDeleted");
     const scratch = component.getInstanceTexture("ooosplatScratch");
-    if (!selected || !deleted || !scratch) throw new Error("无法创建 Gaussian 编辑状态纹理");
+    if (!selected || !deleted || !scratch) throw new Error(translate(getCurrentLocale(), "viewer.editTextures"));
     this.selectedTexture = selected;
     this.deletedTexture = deleted;
     this.scratchTexture = scratch;
@@ -136,7 +137,7 @@ export class GaussianSelectionController {
   }
 
   private validateMask(mask: Uint8Array) {
-    if (mask.length !== packedMaskLength(this.splatCount)) throw new Error("Gaussian 编辑位图长度不一致");
+    if (mask.length !== packedMaskLength(this.splatCount)) throw new Error(translate(getCurrentLocale(), "viewer.editMaskLength"));
   }
 
   private uploadMask(texture: Texture, pixels: Uint8Array, mask: Uint8Array) {
@@ -209,7 +210,7 @@ export class GaussianSelectionController {
     const currentDeleted = deletedMask.slice();
     const revision = ++this.requestedSelectionRevision;
     const execute = async () => {
-      if (this.destroyed) throw new Error("Gaussian 选择器已销毁");
+      if (this.destroyed) throw new Error(translate(getCurrentLocale(), "viewer.selectorDestroyed"));
       this.validateMask(currentDeleted);
       if (!masksEqual(this.deletedMask, currentDeleted)) {
         this.deletedMask = currentDeleted;
@@ -226,7 +227,7 @@ export class GaussianSelectionController {
       this.processor.setParameter("uOoosplatSelectionOperation", 1);
       this.processor.process();
       const pixels = await this.scratchTexture.read(0, 0, this.scratchTexture.width, this.scratchTexture.height, { immediate: true }) as Uint8Array;
-      if (this.destroyed || revision < this.appliedSelectionRevision) throw new Error("Gaussian 裁切结果已过期");
+      if (this.destroyed || revision < this.appliedSelectionRevision) throw new Error(translate(getCurrentLocale(), "viewer.cropExpired"));
       const outsideCrop = packSelectionTextureData(pixels, this.splatCount);
       const next = combineDeletedMasks(this.deletedMask, outsideCrop);
       this.deletedMask = next.slice();

@@ -6,9 +6,10 @@ export function requiredSplatTextureSide(splatCount: number) {
   return Math.ceil(Math.sqrt(Math.max(0, splatCount)));
 }
 
-export function splatTextureCapacityError(splatCount: number, maximumTextureSide: number) {
+export function splatTextureCapacityError(splatCount: number, maximumTextureSide: number, locale: Locale = "zh-CN") {
   const requiredTextureSide = requiredSplatTextureSide(splatCount);
   return requiredTextureSide > maximumTextureSide
-    ? `当前显卡支持的最大纹理尺寸为 ${maximumTextureSide}，但该模型需要至少 ${requiredTextureSide}。无法安全创建预览资源。`
+    ? translate(locale, "viewer.textureCapacity", { maximum: maximumTextureSide, required: requiredTextureSide })
     : null;
 }
+import { translate, type Locale } from "../../i18n";

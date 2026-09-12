@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useI18n } from "../../i18n";
 import type { GaussianTransform } from "../../types/pipeline";
 
 type ScrubMode = "linear" | "rotation" | "scale";
@@ -30,6 +31,7 @@ export function NumberField({
   onCommit: () => void;
   mode?: ScrubMode;
 }) {
+  const { t } = useI18n();
   const [text, setText] = useState(formatValue(value));
   const [focused, setFocused] = useState(false);
   const dragRef = useRef<DragState | null>(null);
@@ -84,12 +86,13 @@ export function NumberField({
     if (drag.dragging) onCommit();
   };
 
-  return <div className="transform-field">
+  const longLabel = label.length > 2;
+  return <div className={`transform-field${longLabel ? " long-label" : ""}`}>
     <button
-      className="transform-scrubber"
+      className={`transform-scrubber${longLabel ? " long-label" : ""}`}
       type="button"
-      title={`${name}：按住鼠标左键左右拖动调整，按 Shift 精细调整`}
-      aria-label={`${name}拖动调整`}
+      title={t("panel.scrubTitle", { name })}
+      aria-label={t("panel.scrubAria", { name })}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerEnd}
@@ -113,9 +116,10 @@ export function NumberField({
 }
 
 export function TransformPanel({ transform, onBegin, onChange, onCommit }: { transform: GaussianTransform; onBegin: () => void; onChange: (transform: GaussianTransform) => void; onCommit: () => void }) {
+  const { t } = useI18n();
   const vectorField = (group: "position" | "rotation", index: 0 | 1 | 2, value: number) => {
     const axis = ["X", "Y", "Z"][index];
-    const groupName = group === "position" ? "位置" : "旋转";
+    const groupName = group === "position" ? t("panel.position") : t("panel.rotation");
     return <NumberField
       key={`${group}-${axis}`}
       label={axis}
@@ -132,10 +136,10 @@ export function TransformPanel({ transform, onBegin, onChange, onCommit }: { tra
     />;
   };
 
-  return <aside className="transform-panel" aria-label="模型变换">
-    <div className="transform-panel-heading"><strong>变换</strong><small>拖动轴标签快速调整</small></div>
-    <section><h4>位置</h4><div className="transform-fields">{vectorField("position", 0, transform.position[0])}{vectorField("position", 1, transform.position[1])}{vectorField("position", 2, transform.position[2])}</div></section>
-    <section><h4>旋转</h4><div className="transform-fields">{vectorField("rotation", 0, transform.rotation[0])}{vectorField("rotation", 1, transform.rotation[1])}{vectorField("rotation", 2, transform.rotation[2])}</div><p>角度</p></section>
-    <section><h4>缩放</h4><NumberField label="等比" name="等比缩放" value={transform.scale} mode="scale" onBegin={onBegin} onCommit={onCommit} onChange={(scale) => onChange({ ...transform, scale })} /></section>
+  return <aside className="transform-panel" aria-label={t("panel.modelTransform")}>
+    <div className="transform-panel-heading"><strong>{t("viewer.transform")}</strong><small>{t("panel.dragHint")}</small></div>
+    <section><h4>{t("panel.position")}</h4><div className="transform-fields">{vectorField("position", 0, transform.position[0])}{vectorField("position", 1, transform.position[1])}{vectorField("position", 2, transform.position[2])}</div></section>
+    <section><h4>{t("panel.rotation")}</h4><div className="transform-fields">{vectorField("rotation", 0, transform.rotation[0])}{vectorField("rotation", 1, transform.rotation[1])}{vectorField("rotation", 2, transform.rotation[2])}</div><p>{t("panel.angle")}</p></section>
+    <section><h4>{t("panel.scale")}</h4><NumberField label={t("panel.uniform")} name={t("panel.uniformScale")} value={transform.scale} mode="scale" onBegin={onBegin} onCommit={onCommit} onChange={(scale) => onChange({ ...transform, scale })} /></section>
   </aside>;
 }

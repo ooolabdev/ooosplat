@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import {
   Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox, Images,
   Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
-  Settings2, Zap,
+  Languages, Settings2, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
@@ -15,6 +15,7 @@ import {
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
+import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, InputType, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
@@ -23,46 +24,39 @@ import type { TelemetryPreferences as TelemetryPreferencesState } from "../types
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
 const CANCELLATION_OVERLAY_DELAY_MS = 300;
 
-const qualities: Array<{ value: Quality; label: string; description: string }> = [
-  { value: "fast", label: "快速", description: "快速验证素材与拍摄路径" },
-  { value: "balanced", label: "均衡", description: "质量与处理时间的推荐平衡" },
-  { value: "high", label: "精细", description: "更充分地利用视频画面细节" },
+const qualities: Array<{ value: Quality; label: TranslationKey; description: TranslationKey }> = [
+  { value: "fast", label: "quality.fast", description: "quality.fastHint" },
+  { value: "balanced", label: "quality.balanced", description: "quality.balancedHint" },
+  { value: "high", label: "quality.high", description: "quality.highHint" },
 ];
 
 const stages = [
-  ["probingVideo", "素材分析"], ["extractingFrames", "画面准备"],
-  ["extractingFeatures", "特征提取"], ["matching", "图像匹配"],
-  ["reconstructing", "相机重建"], ["trainingSplats", "Splat 训练"],
-  ["exporting", "结果发布"],
+  ["probingVideo", "stage.material"], ["extractingFrames", "stage.frames"],
+  ["extractingFeatures", "stage.features"], ["matching", "stage.matching"],
+  ["reconstructing", "stage.reconstruction"], ["trainingSplats", "stage.training"],
+  ["exporting", "stage.export"],
 ] as const;
 
-const messageOf = (error: unknown) => typeof error === "string" ? error : error instanceof Error ? error.message : "处理失败，请查看项目日志。";
+const rawMessageOf = (error: unknown) => typeof error === "string" ? error : error instanceof Error ? error.message : null;
 const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
-const formatBytes = (bytes: number | null) => bytes == null ? "—" : bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
-const formatDuration = (milliseconds: number | null) => {
-  if (milliseconds == null) return "—";
-  const seconds = Math.floor(milliseconds / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
-  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分`;
+const formatBytes = (bytes: number | null, locale: string) => {
+  if (bytes == null) return "—";
+  const [value, unit, digits] = bytes >= 1024 ** 3
+    ? [bytes / 1024 ** 3, "GB", 2] as const
+    : bytes >= 1024 ** 2
+      ? [bytes / 1024 ** 2, "MB", 1] as const
+      : [bytes / 1024, "KB", 1] as const;
+  return `${new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)} ${unit}`;
 };
 const formatVideoDuration = (seconds: number) => `${Math.floor(seconds / 60)}:${Math.round(seconds % 60).toString().padStart(2, "0")}`;
-const formatDate = (value: string | null) => value ? new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "—";
-const qualityLabel = (quality: Quality) => qualities.find((item) => item.value === quality)?.label ?? quality;
-const statusLabel: Record<ProjectStatus, string> = { running: "处理中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断" };
+const qualityKey: Record<Quality, TranslationKey> = { fast: "quality.fast", balanced: "quality.balanced", high: "quality.high" };
+const statusKey: Record<ProjectStatus, TranslationKey> = { running: "status.running", completed: "status.completed", failed: "status.failed", cancelled: "status.cancelled", interrupted: "status.interrupted" };
 const stagePosition = (stage?: string) => {
   if (!stage || ["created", "probingVideo", "planningFrames"].includes(stage)) return 0;
   if (stage === "validatingReconstruction") return 4;
   if (["completed", "failed", "cancelled"].includes(stage)) return 6;
   const index = stages.findIndex(([key]) => key === stage);
   return index < 0 ? 0 : index;
-};
-
-const currentStageLabel = (stage: string | undefined, activeStageIndex: number) => {
-  if (stage === "completed") return "已完成";
-  if (stage === "failed") return "任务失败";
-  if (stage === "cancelled") return "已取消";
-  return stages[activeStageIndex]?.[1] ?? "准备";
 };
 
 const readSavedNumber = (key: string, fallback: number) => {
@@ -79,32 +73,34 @@ function engineReady(engine: EngineStatus) {
 }
 
 function ProjectRow({ project, busy, previewing, previewDisabled, onPreview, onResume, onDelete }: { project: ProjectSummary; busy: boolean; previewing: boolean; previewDisabled: boolean; onPreview: (project: ProjectSummary) => void; onResume: (project: ProjectSummary) => void; onDelete: (project: ProjectSummary) => void }) {
+  const { locale, t, formatDate, formatDuration } = useI18n();
   return <article className="project-row">
     <div className="project-row-main">
       <div className="project-title-line">
         <span className={`project-status ${project.status}`} />
         <strong>{project.name}</strong>
-        <span className="status-copy">{statusLabel[project.status]}</span>
+        <span className="status-copy">{t(statusKey[project.status])}</span>
       </div>
       <p className="project-path" title={project.projectPath}>{project.projectPath}</p>
-      {project.failureMessage && <p className="project-failure">{project.failureMessage}</p>}
+      {project.failureMessage && <p className="project-failure">{localizePipelineMessage(locale, project.failureMessage)}</p>}
     </div>
     <dl className="project-stats">
-      <div><dt>PLY</dt><dd>{formatBytes(project.fileSize)}</dd></div>
-      <div><dt>生成日期</dt><dd>{formatDate(project.completedAt ?? project.createdAt)}</dd></div>
-      <div><dt>耗时</dt><dd>{formatDuration(project.durationMs)}</dd></div>
-      <div><dt>档位</dt><dd>{qualityLabel(project.quality)}</dd></div>
+      <div><dt>PLY</dt><dd>{formatBytes(project.fileSize, locale)}</dd></div>
+      <div><dt>{t("project.date")}</dt><dd>{formatDate(project.completedAt ?? project.createdAt)}</dd></div>
+      <div><dt>{t("project.elapsed")}</dt><dd>{formatDuration(project.durationMs)}</dd></div>
+      <div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[project.quality])}</dd></div>
     </dl>
     <div className="project-actions">
-      {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={() => onPreview(project)}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? "正在打开" : "预览"}</button>}
-      {project.status !== "completed" && <button className="resume-link" type="button" disabled={busy} onClick={() => onResume(project)}><Play size={14} fill="currentColor" />继续任务</button>}
-      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />在文件管理器中显示</button>
-      <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />删除</button>
+      {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={() => onPreview(project)}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? t("project.opening") : t("project.preview")}</button>}
+      {project.status !== "completed" && <button className="resume-link" type="button" disabled={busy} onClick={() => onResume(project)}><Play size={14} fill="currentColor" />{t("project.resume")}</button>}
+      <button type="button" onClick={() => void revealProject(project)}><MapPin size={14} />{t("project.reveal")}</button>
+      <button className="danger-link" type="button" disabled={busy} onClick={() => onDelete(project)}><Trash2 size={14} />{t("project.delete")}</button>
     </div>
   </article>;
 }
 
 export function App() {
+  const { locale, t, toggleLocale, formatNumber, formatDuration } = useI18n();
   const store = useAppStore();
   const loadGaussian = useGaussianTransformStore((state) => state.load);
   const closeGaussian = useGaussianTransformStore((state) => state.close);
@@ -139,10 +135,17 @@ export function App() {
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
   const activeStageIndex = stagePosition(store.latestEvent?.stage);
   const liveProgressLabel = store.latestEvent?.unit === "estimated_progress" && store.latestEvent.stageProgress != null
-    ? `估算 ${store.latestEvent.stageProgress.toFixed(0)}%`
+    ? t("progress.estimated", { value: store.latestEvent.stageProgress.toFixed(0) })
     : store.latestEvent?.current != null
-      ? `${store.latestEvent.current.toLocaleString()}${store.latestEvent.total ? ` / ${store.latestEvent.total.toLocaleString()}` : ""}`
-      : "持续运行";
+      ? `${formatNumber(store.latestEvent.current)}${store.latestEvent.total ? ` / ${formatNumber(store.latestEvent.total)}` : ""}`
+      : t("progress.continuing");
+  const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
+  const currentStageLabel = useCallback((stage: string | undefined, index: number) => {
+    if (stage === "completed") return t("stage.completed");
+    if (stage === "failed") return t("stage.failed");
+    if (stage === "cancelled") return t("stage.cancelled");
+    return t(stages[index]?.[1] ?? "stage.preparing");
+  }, [t]);
 
   const clearCancellationFeedback = useCallback(() => {
     if (cancellationOverlayTimer.current != null) {
@@ -246,7 +249,7 @@ export function App() {
       const preferences = await setTelemetryConsent(enabled);
       setTelemetryPreferences(preferences);
     } catch (error) {
-      store.setError(`无法保存隐私设置：${messageOf(error)}`);
+      store.setError(t("progress.privacyError", { detail: messageOf(error) }));
     } finally {
       setTelemetryBusy(false);
     }
@@ -304,7 +307,7 @@ export function App() {
       await cancelPipeline();
     } catch (error) {
       clearCancellationFeedback();
-      store.setError(`无法终止任务：${messageOf(error)}`);
+      store.setError(t("progress.cancelError", { detail: messageOf(error) }));
     }
   };
 
@@ -332,7 +335,7 @@ export function App() {
       }
       const message = messageOf(error);
       store.setError(message);
-      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+      store.setPhase(message.includes("取消") || message.toLowerCase().includes("cancel") ? "cancelled" : "failed");
     } finally {
       try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
     }
@@ -359,7 +362,7 @@ export function App() {
       setLiveElapsedMs(runElapsedOffset.current + backendElapsed);
       const message = messageOf(error);
       store.setError(message);
-      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+      store.setPhase(message.includes("取消") || message.toLowerCase().includes("cancel") ? "cancelled" : "failed");
     } finally {
       try { await refreshProjects(); } catch { /* the project remains on disk */ }
     }
@@ -440,7 +443,7 @@ export function App() {
 
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
-      <Suspense fallback={<section className="preview-pane active preview-workspace"><div className="preview-empty"><LoaderCircle className="spin" size={24} /><strong>正在准备预览模块</strong></div></section>}>
+      <Suspense fallback={<section className="preview-pane active preview-workspace"><div className="preview-empty"><LoaderCircle className="spin" size={24} /><strong>{t("preview.preparingModule")}</strong></div></section>}>
         <GaussianViewer onExit={exitPreview} onDisposed={previewRendererDisposed} pipelineRunning={isRunning} />
       </Suspense>
     </main>;
@@ -451,52 +454,53 @@ export function App() {
     <header className="topbar">
       <div className="brand-lockup"><span className="brand-mark"><img src={appLogo} alt="" aria-hidden="true" /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / {packageMetadata.version}</span></div>
       <div className="topbar-actions">
-        {telemetryPreferences && <button className="settings-action" type="button" onClick={() => setPrivacySettingsOpen(true)}><Settings2 size={15} />设置</button>}
-        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? "正在检查内置引擎" : missingEngines.length ? `${missingEngines.length} 个引擎异常` : "FFmpeg · COLMAP · Brush 就绪"}</div>
+        <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
+        {telemetryPreferences && <button className="settings-action" type="button" onClick={() => setPrivacySettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>}
+        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
       </div>
     </header>
 
     <section className="workspace" ref={workspaceRef} style={{ "--left-pane-width": `${leftPanePercent}%` } as CSSProperties}>
-      <section className="control-pane" ref={controlPaneRef} aria-label="生成控制台">
-        <div className="pane-header"><h1>01 创建新任务</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? "运行中" : "待命"}</span></div>
+      <section className="control-pane" ref={controlPaneRef} aria-label={t("task.console")}>
+        <div className="pane-header"><h1>{t("task.create")}</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? t("task.running") : t("task.idle")}</span></div>
 
         <div className="form-section">
-          <label className="field-label">输入素材</label>
+          <label className="field-label">{t("input.label")}</label>
           <div className="input-picker">
             <div className="input-type-picker">
-              <button className="input-picker-toggle" type="button" disabled={isRunning} aria-label="选择输入素材类型" aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
+              <button className="input-picker-toggle" type="button" disabled={isRunning} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
                 {store.inputType === "images" ? <Images size={16} /> : <Clapperboard size={16} />}
-                <span>{store.inputType === "images" ? "图片" : "视频"}</span>
+                <span>{store.inputType === "images" ? t("input.images") : t("input.video")}</span>
                 <ChevronDown size={14} />
               </button>
               {inputMenuOpen && <div className="input-picker-menu" role="menu">
-                <button type="button" role="menuitemradio" aria-checked={store.inputType === "video"} onClick={() => chooseInputType("video")}><Clapperboard size={15} /><span><strong>视频</strong><small>MP4 或 MOV</small></span></button>
-                <button type="button" role="menuitemradio" aria-checked={store.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>图片</strong><small>JPG、JPEG 或 PNG 文件夹</small></span></button>
+                <button type="button" role="menuitemradio" aria-checked={store.inputType === "video"} onClick={() => chooseInputType("video")}><Clapperboard size={15} /><span><strong>{t("input.video")}</strong><small>{t("input.videoTypes")}</small></span></button>
+                <button type="button" role="menuitemradio" aria-checked={store.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>{t("input.images")}</strong><small>{t("input.imageTypes")}</small></span></button>
               </div>}
             </div>
             <button className="path-picker" type="button" disabled={isRunning} onClick={() => void chooseInput(store.inputType)}>
               {store.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
               <span>
-                <strong>{store.inputPath ? basename(store.inputPath) : store.inputType === "images" ? "选择图片序列文件夹" : "选择 MP4 或 MOV 视频"}</strong>
-                <small>{store.inputPath ?? (store.inputType === "images" ? "点击选择包含 JPG、JPEG 或 PNG 的文件夹" : "点击选择本机视频文件")}</small>
+                <strong>{store.inputPath ? basename(store.inputPath) : store.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
+                <small>{store.inputPath ?? (store.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint"))}</small>
               </span>
             </button>
           </div>
         </div>
 
         <div className="form-section">
-          <label className="field-label">项目根目录</label>
+          <label className="field-label">{t("project.root")}</label>
           <button className="path-picker compact" type="button" disabled={isRunning} onClick={() => void chooseRoot()}>
-            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : "正在读取默认目录"}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
+            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
           </button>
-          <p className="field-note">每次生成会在此处创建独立项目文件夹，final.ply 直接保存在项目根部。</p>
+          <p className="field-note">{t("project.rootHint")}</p>
         </div>
 
         <div className="form-section">
-          <label className="field-label">生成质量</label>
+          <label className="field-label">{t("quality.label")}</label>
           <div className="quality-list" role="radiogroup">
             {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
-              <span className="radio-mark"><span /></span><span><strong>{quality.label}</strong><small>{quality.description}</small></span>
+              <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
             </button>)}
           </div>
         </div>
@@ -504,57 +508,57 @@ export function App() {
         <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">
           <span className="acceleration-icon">{store.colmapAcceleration?.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? <CircleAlert size={17} /> : store.colmapAcceleration ? <Cpu size={17} /> : <LoaderCircle className="spin" size={17} />}</span>
           <span>
-            <strong>{store.colmapAcceleration == null ? "正在检测 COLMAP GPU 加速…" : store.colmapAcceleration.backend === "gpu" ? "COLMAP GPU 加速已开启" : "COLMAP 使用 CPU"}</strong>
-            <small>{store.colmapAcceleration == null ? "正在读取 COLMAP 加速能力" : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name}${store.colmapAcceleration.device.totalMemoryMb ? ` · ${(store.colmapAcceleration.device.totalMemoryMb / 1024).toFixed(1)} GB 显存` : ""} · 驱动 ${store.colmapAcceleration.device.driverVersion} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? store.colmapAcceleration.reason : `${store.colmapAcceleration.reason} · 最低要求：驱动 ${store.colmapAcceleration.requirements.minimumDriverVersion}，Compute Capability ${store.colmapAcceleration.requirements.minimumComputeCapability}`}</small>
+            <strong>{store.colmapAcceleration == null ? t("gpu.detecting") : store.colmapAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
+            <small>{store.colmapAcceleration == null ? t("gpu.reading") : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name}${store.colmapAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (store.colmapAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: store.colmapAcceleration.device.driverVersion })} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, store.colmapAcceleration.reason) : `${localizePipelineMessage(locale, store.colmapAcceleration.reason)} · ${t("gpu.requirements", { driver: store.colmapAcceleration.requirements.minimumDriverVersion, capability: store.colmapAcceleration.requirements.minimumComputeCapability })}`}</small>
           </span>
         </div>
 
         {(store.video || store.imageSequence) && store.plan && <div className="source-metrics">
-          <span><small>{store.inputType === "images" ? "图片数量" : "素材时长"}</small><b>{store.imageSequence ? `${store.imageSequence.imageCount.toLocaleString()} 张` : formatVideoDuration(store.video!.duration)}</b></span>
-          <span><small>分辨率</small><b>{store.imageSequence?.width ?? store.video?.width} × {store.imageSequence?.height ?? store.video?.height}</b></span>
-          <span><small>{store.inputType === "images" ? "处理图片" : "预计帧数"}</small><b>{store.inputType === "images" ? "全部保留" : `约 ${store.plan.estimatedFrames.toLocaleString()}`}</b></span>
-          <span title={store.estimate?.basis}><small>预计时长</small><b>{store.estimate ? `约 ${formatDuration(store.estimate.estimatedMs)}` : "分析中"}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
+          <span><small>{store.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{store.imageSequence ? t("common.images", { count: formatNumber(store.imageSequence.imageCount) }) : formatVideoDuration(store.video!.duration)}</b></span>
+          <span><small>{t("metrics.resolution")}</small><b>{store.imageSequence?.width ?? store.video?.width} × {store.imageSequence?.height ?? store.video?.height}</b></span>
+          <span><small>{store.inputType === "images" ? t("metrics.processingImages") : t("metrics.estimatedFrames")}</small><b>{store.inputType === "images" ? t("metrics.keepAll") : t("metrics.approx", { value: formatNumber(store.plan.estimatedFrames) })}</b></span>
+          <span title={store.estimate ? localizePipelineMessage(locale, store.estimate.basis) : undefined}><small>{t("metrics.estimate")}</small><b>{store.estimate ? t("metrics.approx", { value: formatDuration(store.estimate.estimatedMs) }) : t("metrics.analyzing")}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
         </div>}
 
         {(store.video?.hasAlpha || store.imageSequence?.hasAlpha) && <div className="alpha-source-status" role="status">
           <Blend size={17} />
-          <span><strong>{store.inputType === "images" ? "检测到透明图片" : "检测到 Alpha 通道"}</strong><small>{store.inputType === "images" ? "将保留 PNG Alpha 并自动生成 COLMAP Mask" : `将自动提取透明画面和 COLMAP Mask · ${store.video?.pixelFormat || "Alpha"}`}</small></span>
+          <span><strong>{store.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{store.inputType === "images" ? t("alpha.imagesHint") : t("alpha.videoHint", { format: store.video?.pixelFormat || "Alpha" })}</small></span>
         </div>}
 
-        {store.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>大型图片序列</strong><small>超过 500 张图片，穷举匹配可能需要较长时间和更多磁盘空间；开始生成前会再次确认。</small></span></div>}
+        {store.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>{t("sequence.title")}</strong><small>{t("sequence.hint")}</small></span></div>}
 
         {!isRunning && <button className="primary-action" type="button" disabled={!store.inputPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
           {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}
-          {store.phase === "analyzing" ? "正在分析素材" : "开始生成"}
+          {store.phase === "analyzing" ? t("generate.analyzing") : t("generate.start")}
         </button>}
 
         {(isRunning || store.events.length > 0) && <section className="live-process">
-          <div className="live-heading"><div><span className="live-dot" /><strong>实时进程</strong></div><span className="mono">{store.progress.toFixed(1)}%</span></div>
-          <p className="current-message">{store.progressMessage || "正在准备任务"}</p>
+          <div className="live-heading"><div><span className="live-dot" /><strong>{t("progress.title")}</strong></div><span className="mono">{store.progress.toFixed(1)}%</span></div>
+          <p className="current-message">{store.latestEvent ? localizePipelineMessage(locale, store.latestEvent.message) : store.progressMessage ? localizePipelineMessage(locale, store.progressMessage) : t("progress.preparing")}</p>
           <div className="process-metrics">
-            <span><small>当前阶段</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
-            <span><small>进度</small><b>{liveProgressLabel}</b></span>
-            <span><small>总耗时</small><b>{formatDuration(liveElapsedMs)}</b></span>
+            <span><small>{t("progress.stage")}</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
+            <span><small>{t("progress.progress")}</small><b>{liveProgressLabel}</b></span>
+            <span><small>{t("progress.elapsed")}</small><b>{formatDuration(liveElapsedMs)}</b></span>
           </div>
           <ol className="stage-timeline">
-            {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || store.phase === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{label}</b>{index === activeStageIndex && isRunning && <small>{store.latestEvent?.indeterminate ? "运行中" : `${(store.latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}
+            {stages.map(([key, label], index) => <li key={key} className={index < activeStageIndex || store.phase === "completed" ? "done" : index === activeStageIndex && isRunning ? "active" : ""}><span /><b>{t(label)}</b>{index === activeStageIndex && isRunning && <small>{store.latestEvent?.indeterminate ? t("progress.running") : `${(store.latestEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>)}
           </ol>
-          <div className="log-toolbar"><span>任务日志</span><small>最近 {store.events.length} / 500 条</small></div>
+          <div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: store.events.length })}</small></div>
           <div className="live-log" aria-live="polite">
-            {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.message}</p></div>)}
+            {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString(locale, { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message)}</p></div>)}
             <div ref={logEnd} />
           </div>
-          {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? "正在终止任务" : "取消任务并终止所有进程"}</button>}
+          {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? t("progress.terminating") : t("progress.cancel")}</button>}
         </section>}
 
-        {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{store.error}</span><button type="button" onClick={() => store.setError(null)}>关闭</button></div>}
+        {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{localizePipelineMessage(locale, store.error)}</span><button type="button" onClick={() => store.setError(null)}>{t("common.close")}</button></div>}
       </section>
 
       <div
         className="pane-resizer"
         role="separator"
         tabIndex={0}
-        aria-label="调整创建任务与历史任务面板宽度"
+        aria-label={t("layout.resize")}
         aria-orientation="vertical"
         aria-valuemin={32}
         aria-valuemax={68}
@@ -577,23 +581,23 @@ export function App() {
         }}
       ><span /></div>
 
-      <section className="projects-pane" ref={projectsPaneRef} aria-label="项目成果">
-        <div className="pane-header"><h2>02 历史任务</h2><button className="refresh-action" type="button" disabled={isRunning} onClick={() => void refreshProjects()}><RotateCcw size={14} />刷新</button></div>
-        <div className="archive-summary"><span><b>{completed.length}</b><small>已完成</small></span><span><b>{unfinished.length}</b><small>未完成</small></span></div>
+      <section className="projects-pane" ref={projectsPaneRef} aria-label={t("history.aria")}>
+        <div className="pane-header"><h2>{t("history.title")}</h2><button className="refresh-action" type="button" disabled={isRunning} onClick={() => void refreshProjects()}><RotateCcw size={14} />{t("history.refresh")}</button></div>
+        <div className="archive-summary"><span><b>{completed.length}</b><small>{t("history.completed")}</small></span><span><b>{unfinished.length}</b><small>{t("history.unfinished")}</small></span></div>
 
-        {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>还没有生成项目</strong><p>选择视频和项目目录后开始生成，成果会自动出现在这里。</p></div>}
+        {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>{t("history.emptyTitle")}</strong><p>{t("history.emptyHint")}</p></div>}
 
-        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>已完成</span><small>{completed.length} 个项目</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId !== null} onPreview={(item) => void previewProject(item)} onResume={() => undefined} onDelete={(item) => void removeProject(item)} />)}</div>}
-        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>未完成</span><small>{unfinished.length} 个项目</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled onPreview={() => undefined} onResume={(item) => void resume(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId !== null} onPreview={(item) => void previewProject(item)} onResume={() => undefined} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled onPreview={() => undefined} onResume={(item) => void resume(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
       </section>
     </section>
     </div>
 
-    <aside className={showZoomControls ? "zoom-dock open" : "zoom-dock"} aria-label="界面缩放">
+    <aside className={showZoomControls ? "zoom-dock open" : "zoom-dock"} aria-label={t("zoom.aria")}>
       {showZoomControls && <div className="zoom-controls">
-        <button type="button" aria-label="缩小界面" disabled={uiScale <= 80} onClick={() => changeScale(-10)}><Minus size={16} /></button>
-        <button className="zoom-reset" type="button" title="恢复 100%" onClick={() => setUiScale(100)}>恢复</button>
-        <button type="button" aria-label="放大界面" disabled={uiScale >= 140} onClick={() => changeScale(10)}><Plus size={16} /></button>
+        <button type="button" aria-label={t("zoom.out")} disabled={uiScale <= 80} onClick={() => changeScale(-10)}><Minus size={16} /></button>
+        <button className="zoom-reset" type="button" title={t("zoom.resetTitle")} onClick={() => setUiScale(100)}>{t("zoom.reset")}</button>
+        <button type="button" aria-label={t("zoom.in")} disabled={uiScale >= 140} onClick={() => changeScale(10)}><Plus size={16} /></button>
       </div>}
       <button className="zoom-trigger" type="button" aria-expanded={showZoomControls} onClick={() => setShowZoomControls((visible) => !visible)}>{uiScale}%</button>
     </aside>
@@ -601,8 +605,8 @@ export function App() {
       <div className="cancellation-status" aria-live="assertive" aria-busy="true">
         <span className="cancellation-spinner" aria-hidden="true"><LoaderCircle className="spin" size={26} /></span>
         <div>
-          <strong id="cancellation-title">正在终止任务</strong>
-          <p id="cancellation-description">正在关闭当前阶段及其子进程，请稍候。完成后此窗口会自动关闭。</p>
+          <strong id="cancellation-title">{t("cancel.title")}</strong>
+          <p id="cancellation-description">{t("cancel.description")}</p>
         </div>
       </div>
     </div>}

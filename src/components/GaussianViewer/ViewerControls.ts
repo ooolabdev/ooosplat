@@ -1,4 +1,5 @@
 import { BoundingBox, Entity, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Vec3, type CameraComponent } from "playcanvas";
+import { getCurrentLocale, translate } from "../../i18n";
 import type { GaussianOrthographicView } from "../../types/pipeline";
 
 const DEFAULT_YAW = 35;
@@ -60,7 +61,7 @@ export class ViewerControls {
     cameraEntity: Entity,
     private readonly onOrthographicViewChange?: (view: GaussianOrthographicView | null) => void,
   ) {
-    if (!cameraEntity.camera) throw new Error("预览相机组件不可用");
+    if (!cameraEntity.camera) throw new Error(translate(getCurrentLocale(), "viewer.cameraUnavailable"));
     this.canvas = canvas;
     this.cameraEntity = cameraEntity;
     this.camera = cameraEntity.camera;

@@ -4,37 +4,42 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, Quality, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
+import { getCurrentLocale, translate } from "../i18n";
 import { previewAssetUrl } from "./previewAssetUrl";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
 export async function selectVideo(): Promise<string | null> {
   if (!inTauri()) return null;
-  const selected = await open({ multiple: false, directory: false, filters: [{ name: "视频", extensions: ["mp4", "mov"] }] });
+  const locale = getCurrentLocale();
+  const selected = await open({ title: translate(locale, "dialog.selectVideoTitle"), multiple: false, directory: false, filters: [{ name: translate(locale, "input.video"), extensions: ["mp4", "mov"] }] });
   return typeof selected === "string" ? selected : null;
 }
 
 export async function selectImageSequence(): Promise<string | null> {
   if (!inTauri()) return null;
-  const selected = await open({ multiple: false, directory: true });
+  const locale = getCurrentLocale();
+  const selected = await open({ title: translate(locale, "dialog.selectImagesTitle"), multiple: false, directory: true });
   return typeof selected === "string" ? selected : null;
 }
 
 export async function confirmLargeImageSequence(imageCount: number): Promise<boolean> {
+  const locale = getCurrentLocale();
   return confirm(
-    `该文件夹包含 ${imageCount.toLocaleString()} 张图片。穷举匹配的计算量和数据库占用会随图片数量平方增长，处理可能需要很长时间。\n\n仍要继续生成吗？`,
+    translate(locale, "dialog.largeSequence", { count: imageCount.toLocaleString(locale) }),
     {
-      title: "大型图片序列",
+      title: translate(locale, "dialog.largeSequenceTitle"),
       kind: "warning",
-      okLabel: "继续生成",
-      cancelLabel: "取消",
+      okLabel: translate(locale, "dialog.continue"),
+      cancelLabel: translate(locale, "common.cancel"),
     },
   );
 }
 
 export async function selectProjectsRoot(current: string): Promise<string | null> {
   if (!inTauri()) return null;
-  const selected = await open({ multiple: false, directory: true, defaultPath: current || undefined });
+  const locale = getCurrentLocale();
+  const selected = await open({ title: translate(locale, "dialog.selectProjectRootTitle"), multiple: false, directory: true, defaultPath: current || undefined });
   return typeof selected === "string" ? selected : null;
 }
 
@@ -59,11 +64,12 @@ export async function prepareGaussianPreview(projectId: string): Promise<Gaussia
     const message = error instanceof Error ? error.message : String(error);
     const damagedEditState = message.includes("编辑") && (message.includes("位图") || message.includes("损坏") || message.includes("校验") || message.includes("数量不匹配"));
     if (!damagedEditState) throw error;
-    const accepted = await confirm(`${message}\n\n可以清除损坏的裁切与删除记录后重新打开。原始 final.ply 不会受到影响。`, {
-      title: "编辑数据需要恢复",
+    const locale = getCurrentLocale();
+    const accepted = await confirm(translate(locale, "dialog.editRecovery", { detail: message }), {
+      title: translate(locale, "dialog.editRecoveryTitle"),
       kind: "warning",
-      okLabel: "清除编辑记录",
-      cancelLabel: "取消",
+      okLabel: translate(locale, "dialog.clearEdits"),
+      cancelLabel: translate(locale, "common.cancel"),
     });
     if (!accepted) throw error;
     await resetGaussianEdits(projectId);
@@ -103,11 +109,12 @@ export async function revealFile(path: string): Promise<void> {
 }
 
 export async function confirmAndDeleteProject(project: ProjectSummary, beforeDelete?: () => void | Promise<void>): Promise<boolean> {
-  const accepted = await confirm(`将“${project.name}”及其中的源素材、输入画面、COLMAP、Brush 和日志全部移入回收站。\n\n此操作无法在应用内撤销。`, {
-    title: "删除项目",
+  const locale = getCurrentLocale();
+  const accepted = await confirm(translate(locale, "dialog.deleteProject", { name: project.name }), {
+    title: translate(locale, "dialog.deleteTitle"),
     kind: "warning",
-    okLabel: "移入回收站",
-    cancelLabel: "取消",
+    okLabel: translate(locale, "dialog.trash"),
+    cancelLabel: translate(locale, "common.cancel"),
   });
   if (!accepted) return false;
   await beforeDelete?.();
@@ -116,7 +123,8 @@ export async function confirmAndDeleteProject(project: ProjectSummary, beforeDel
 }
 
 export async function exportPly(result: PipelineResult): Promise<string | null> {
-  const destination = await save({ defaultPath: "final.ply", filters: [{ name: "Gaussian Splat PLY", extensions: ["ply"] }] });
+  const locale = getCurrentLocale();
+  const destination = await save({ title: translate(locale, "dialog.savePlyTitle"), defaultPath: "final.ply", filters: [{ name: "Gaussian Splat PLY", extensions: ["ply"] }] });
   if (!destination) return null;
   await invoke("export_ply", { sourcePath: result.finalPly, destinationPath: destination });
   return destination;

@@ -60,6 +60,7 @@ See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 - Reveal `final.ply` in the platform file manager or move the complete project to the system trash.
 - Resize the left and right panels by dragging the divider, and scale the full interface from 80% to 140%.
 - Support Chinese characters, spaces, long file names, and UNC project paths.
+- Switch instantly between the Simplified Chinese and English interfaces. The first launch follows the system language, and an explicit choice is remembered.
 
 ### Gaussian Editing Shortcuts
 
@@ -137,7 +138,7 @@ The `.deb` installs FFmpeg, FFprobe, and CPU COLMAP through Ubuntu's package man
 ## Installation and Use
 
 1. On Windows, run `OOOSplat-0.4.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.4.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.4.0-x64-linux.deb`.
-2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy.
+2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Under “01 Create New Task,” choose Video or Images from the input-type menu, then click the input field to select a video file or image-sequence folder.
 4. Choose the projects root; OOOSplat remembers the last location.
 5. Select the Fast, Balanced, or Detailed quality preset.

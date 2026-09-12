@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { getCurrentLocale, translate } from "../i18n";
 import type { GaussianCrop, GaussianEditState, GaussianEditorTool, GaussianPreviewDescriptor, GaussianTransform } from "../types/pipeline";
 
 export const IDENTITY_TRANSFORM: GaussianTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 };
@@ -147,8 +148,8 @@ export const useGaussianTransformStore = create<GaussianTransformState>((set, ge
   },
   commitCropFreeze: (crop, deletedMask) => {
     const state = get();
-    if (!equalCrop(state.editing.crop, crop)) throw new Error("裁切区域已发生变化，请重试");
-    if (deletedMask.length !== state.deletedMask.length) throw new Error("冻结裁切位图长度不一致");
+    if (!equalCrop(state.editing.crop, crop)) throw new Error(translate(getCurrentLocale(), "viewer.cropChanged"));
+    if (deletedMask.length !== state.deletedMask.length) throw new Error(translate(getCurrentLocale(), "viewer.freezeMaskLength"));
     const next = deletedMask.slice();
     const delta = new Uint8Array(next.length);
     for (let index = 0; index < next.length; index += 1) delta[index] = state.deletedMask[index] ^ next[index];
@@ -164,7 +165,7 @@ export const useGaussianTransformStore = create<GaussianTransformState>((set, ge
   },
   setInitialDeletedMask: (mask) => {
     const state = get();
-    if (mask.length !== state.deletedMask.length) throw new Error("删除位图与当前 Gaussian 数量不一致");
+    if (mask.length !== state.deletedMask.length) throw new Error(translate(getCurrentLocale(), "viewer.deletedMaskCount"));
     const deletedMask = mask.slice();
     set({ deletedMask, editing: { ...state.editing, deletedCount: countMaskBits(deletedMask) } });
   },
