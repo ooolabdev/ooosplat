@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
+use crate::video::FrameFilterConfig;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
@@ -15,6 +17,8 @@ pub struct QualityPreset {
     pub frame_retention_ratio: f64,
     pub brush_iterations: usize,
     pub brush_max_resolution: u32,
+    pub enable_smart_filter: bool,
+    pub smart_filter_config: FrameFilterConfig,
 }
 
 impl Quality {
@@ -24,16 +28,22 @@ impl Quality {
                 frame_retention_ratio: 0.30,
                 brush_iterations: 8_000,
                 brush_max_resolution: 1_200,
+                enable_smart_filter: true,
+                smart_filter_config: FrameFilterConfig::fast(),
             },
             Self::Balanced => QualityPreset {
                 frame_retention_ratio: 0.50,
                 brush_iterations: 15_000,
                 brush_max_resolution: 1_600,
+                enable_smart_filter: true,
+                smart_filter_config: FrameFilterConfig::balanced(),
             },
             Self::High => QualityPreset {
                 frame_retention_ratio: 1.00,
                 brush_iterations: 30_000,
                 brush_max_resolution: 2_000,
+                enable_smart_filter: true,
+                smart_filter_config: FrameFilterConfig::high(),
             },
         }
     }
@@ -73,6 +83,22 @@ mod tests {
         assert_eq!(Quality::High.preset().frame_retention_ratio, 1.00);
         assert_eq!(Quality::Fast.preset().brush_iterations, 8_000);
         assert_eq!(Quality::Balanced.preset().brush_max_resolution, 1_600);
+        assert!(Quality::Fast.preset().enable_smart_filter);
+        assert_eq!(
+            Quality::Fast.preset().smart_filter_config.keep_per_window,
+            2
+        );
+        assert_eq!(
+            Quality::Balanced
+                .preset()
+                .smart_filter_config
+                .keep_per_window,
+            3
+        );
+        assert_eq!(
+            Quality::High.preset().smart_filter_config.keep_per_window,
+            4
+        );
     }
 
     #[test]

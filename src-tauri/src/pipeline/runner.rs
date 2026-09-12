@@ -36,8 +36,9 @@ use crate::{
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
     video::{
-        prepare_image_sequence, validate_prepared_image_sequence, FramePlan,
-        FrameSelectionStrategy, ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
+        filter_frames_with_masks_at_fps, prepare_image_sequence, validate_prepared_image_sequence,
+        FrameFilterConfig, FramePlan, FrameSelectionStrategy, ImageSequenceInfo,
+        SmartFrameSelection, VideoInfo,
     },
 };
 
@@ -254,8 +255,8 @@ impl PipelineRunner {
             .stage(PipelineStage::ProbingVideo, 1.0, probe_message);
 
         self.events
-            .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+            .stage(PipelineStage::PlanningFrames, 0.0, "正在规划智能抽帧");
+        let plan = SmartFrameSelection.create_plan(&video, &quality.preset());
         self.events.stage(
             PipelineStage::PlanningFrames,
             1.0,
@@ -277,7 +278,7 @@ impl PipelineRunner {
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
-        let extraction = extract_uniform_frames(
+        let mut extraction = extract_uniform_frames(
             &self.engines.ffmpeg,
             input,
             output,
@@ -289,6 +290,39 @@ impl PipelineRunner {
             Some(observer),
         )
         .await?;
+        let filtered_output = output.with_file_name("frames.filtered");
+        if quality.preset().enable_smart_filter {
+            let config: FrameFilterConfig = quality.preset().smart_filter_config;
+            let input_for_filter = output.to_path_buf();
+            let output_for_filter = filtered_output.clone();
+            let masks_for_filter = masks.to_path_buf();
+            let sampling_fps = plan.sampling_fps;
+            let outcome = tokio::task::spawn_blocking(move || {
+                filter_frames_with_masks_at_fps(
+                    &input_for_filter,
+                    &output_for_filter,
+                    &masks_for_filter,
+                    &config,
+                    sampling_fps,
+                )
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("智能抽帧过滤任务失败：{error}")))?
+            .map_err(|error| SplatError::Process(format!("智能抽帧过滤失败：{error}")))?;
+            replace_filtered_frames(output, masks, &filtered_output, video.has_alpha).await?;
+            extraction.frame_count = outcome.kept_frames as u64;
+            if extraction.has_alpha {
+                extraction.mask_count = outcome.kept_frames as u64;
+            }
+            self.events.stage(
+                PipelineStage::ExtractingFrames,
+                1.0,
+                format!(
+                    "已智能筛选 {} / {} 帧",
+                    outcome.kept_frames, outcome.total_frames
+                ),
+            );
+        }
         self.events.stage(
             PipelineStage::ExtractingFrames,
             1.0,
@@ -1246,6 +1280,66 @@ fn best_sparse_model(frames: &Path, sparse: &Path) -> Result<(PathBuf, Reconstru
         }
     }
     best.ok_or_else(|| SplatError::Process("COLMAP 未生成完整的稀疏模型".into()))
+}
+
+/// 用智能过滤后的画面替换原始抽帧结果，并同步裁剪 Alpha Mask 与保留审计产物。
+async fn replace_filtered_frames(
+    frames: &Path,
+    masks: &Path,
+    filtered: &Path,
+    has_alpha: bool,
+) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(frames).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.path().is_file()
+            && entry.path().extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("png")
+            })
+        {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    let mut kept_names = std::collections::HashSet::new();
+    let mut filtered_entries = tokio::fs::read_dir(filtered).await?;
+    while let Some(entry) = filtered_entries.next_entry().await? {
+        let source = entry.path();
+        let name = entry.file_name();
+        if source.is_file()
+            && source.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("png")
+            })
+        {
+            kept_names.insert(name.to_string_lossy().into_owned());
+            tokio::fs::copy(&source, frames.join(&name)).await?;
+        }
+    }
+    if has_alpha && masks.is_dir() {
+        let mut mask_entries = tokio::fs::read_dir(masks).await?;
+        while let Some(entry) = mask_entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(frame_name) = name.strip_suffix(".png") {
+                if !kept_names.contains(frame_name) {
+                    tokio::fs::remove_file(entry.path()).await?;
+                }
+            }
+        }
+    }
+    for name in [
+        "metadata.csv",
+        "filter_summary.json",
+        "filter_forced_keep.log",
+    ] {
+        let source = filtered.join(name);
+        if source.is_file() {
+            tokio::fs::copy(&source, frames.join(name)).await?;
+        }
+    }
+    tokio::fs::remove_dir_all(filtered).await?;
+    Ok(())
 }
 
 async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {

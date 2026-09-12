@@ -40,7 +40,7 @@ use crate::{
     },
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
-        ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
+        ImageSequenceInfo, SmartFrameSelection, VideoInfo,
     },
 };
 
@@ -197,7 +197,7 @@ pub async fn probe_and_plan(
         })
     } else {
         let video = probe_video(&engine_paths.ffprobe, &input, None).await?;
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        let plan = SmartFrameSelection.create_plan(&video, &quality.preset());
         let estimate = estimate_runtime(&video, &plan, quality, &samples);
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
@@ -256,7 +256,7 @@ pub async fn estimate_project_runtime(
                 }
             };
             let plan = saved_plan.unwrap_or_else(|| {
-                UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
+                SmartFrameSelection.create_plan(&video, &metadata.quality.preset())
             });
             estimate_runtime(&video, &plan, metadata.quality, &samples)
         }

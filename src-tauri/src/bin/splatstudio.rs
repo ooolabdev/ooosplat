@@ -8,8 +8,9 @@ use ooo_splat::{
     presets::Quality,
     process::ProcessManager,
     video::{
-        analyze_image_sequence, create_image_plan, prepare_image_sequence, FrameSelectionStrategy,
-        UniformRatioFrameSelection,
+        analyze_image_sequence, create_image_plan, filter_frames_at_fps,
+        filter_frames_with_masks_at_fps, prepare_image_sequence, FrameSelectionStrategy,
+        SmartFrameSelection,
     },
 };
 
@@ -90,7 +91,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 create_image_plan(&analyze_image_sequence(&input)?, &quality.preset())
             } else {
                 let video = probe_video(&engines.ffprobe, &input, None).await?;
-                UniformRatioFrameSelection.create_plan(&video, &quality.preset())
+                SmartFrameSelection.create_plan(&video, &quality.preset())
             };
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
@@ -117,8 +118,8 @@ async fn execute(cli: Cli) -> Result<()> {
             ensure_engine(&engines.ffprobe)?;
             ensure_engine(&engines.ffmpeg)?;
             let video = probe_video(&engines.ffprobe, &input, None).await?;
-            let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
-            let extraction = extract_uniform_frames(
+            let plan = SmartFrameSelection.create_plan(&video, &quality.preset());
+            let mut extraction = extract_uniform_frames(
                 &engines.ffmpeg,
                 &input,
                 &output,
@@ -130,6 +131,34 @@ async fn execute(cli: Cli) -> Result<()> {
                 None,
             )
             .await?;
+            let filtered_output = output.with_file_name("frames.filtered");
+            let config = quality.preset().smart_filter_config;
+            let outcome = tokio::task::spawn_blocking({
+                let output = output.clone();
+                let filtered_output = filtered_output.clone();
+                let masks = masks.clone();
+                move || {
+                    if video.has_alpha {
+                        filter_frames_with_masks_at_fps(
+                            &output,
+                            &filtered_output,
+                            &masks,
+                            &config,
+                            plan.sampling_fps,
+                        )
+                    } else {
+                        filter_frames_at_fps(&output, &filtered_output, &config, plan.sampling_fps)
+                    }
+                }
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("智能抽帧过滤任务失败：{error}")))?
+            .map_err(|error| SplatError::Process(format!("智能抽帧过滤失败：{error}")))?;
+            replace_cli_filtered_frames(&output, &masks, &filtered_output, video.has_alpha).await?;
+            extraction.frame_count = outcome.kept_frames as u64;
+            if extraction.has_alpha {
+                extraction.mask_count = outcome.kept_frames as u64;
+            }
             if extraction.has_alpha {
                 println!(
                     "extracted {} RGBA frames to {} and {} masks to {}",
@@ -173,6 +202,64 @@ async fn execute(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
+    Ok(())
+}
+
+async fn replace_cli_filtered_frames(
+    frames: &std::path::Path,
+    masks: &std::path::Path,
+    filtered: &std::path::Path,
+    has_alpha: bool,
+) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(frames).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.path().is_file()
+            && entry.path().extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("png")
+            })
+        {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    let mut kept = std::collections::HashSet::new();
+    let mut filtered_entries = tokio::fs::read_dir(filtered).await?;
+    while let Some(entry) = filtered_entries.next_entry().await? {
+        let source = entry.path();
+        let name = entry.file_name();
+        if source.is_file()
+            && source.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("png")
+            })
+        {
+            kept.insert(name.to_string_lossy().into_owned());
+            tokio::fs::copy(&source, frames.join(&name)).await?;
+        }
+    }
+    if has_alpha && masks.is_dir() {
+        let mut mask_entries = tokio::fs::read_dir(masks).await?;
+        while let Some(entry) = mask_entries.next_entry().await? {
+            if let Some(frame_name) = entry.file_name().to_string_lossy().strip_suffix(".png") {
+                if !kept.contains(frame_name) {
+                    tokio::fs::remove_file(entry.path()).await?;
+                }
+            }
+        }
+    }
+    for name in [
+        "metadata.csv",
+        "filter_summary.json",
+        "filter_forced_keep.log",
+    ] {
+        let source = filtered.join(name);
+        if source.is_file() {
+            tokio::fs::copy(&source, frames.join(name)).await?;
+        }
+    }
+    tokio::fs::remove_dir_all(filtered).await?;
     Ok(())
 }
 

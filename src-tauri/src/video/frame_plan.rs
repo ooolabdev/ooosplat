@@ -17,6 +17,26 @@ pub trait FrameSelectionStrategy {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UniformRatioFrameSelection;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SmartFrameSelection;
+
+impl FrameSelectionStrategy for SmartFrameSelection {
+    fn create_plan(&self, video: &VideoInfo, preset: &QualityPreset) -> FramePlan {
+        // 智能过滤发生在 FFmpeg 抽帧之后；先按 1.5 倍超采样，给质量过滤留下足够候选帧。
+        // 过滤可能剔除模糊、曝光异常和时序冗余帧，超采样可避免有效帧数量不足。
+        const OVERSAMPLE_FACTOR: f64 = 1.5;
+        let sampling_fps =
+            (video.fps * preset.frame_retention_ratio * OVERSAMPLE_FACTOR).min(video.fps);
+        FramePlan {
+            retention_ratio: preset.frame_retention_ratio,
+            sampling_fps,
+            estimated_frames: (video.total_frames as f64
+                * (sampling_fps / video.fps.max(f64::EPSILON)))
+            .round() as u64,
+        }
+    }
+}
+
 impl FrameSelectionStrategy for UniformRatioFrameSelection {
     fn create_plan(&self, video: &VideoInfo, preset: &QualityPreset) -> FramePlan {
         FramePlan {
@@ -32,6 +52,14 @@ impl FrameSelectionStrategy for UniformRatioFrameSelection {
 mod tests {
     use super::*;
     use crate::presets::Quality;
+
+    #[test]
+    fn smart_selection_oversamples_for_post_filtering() {
+        let plan =
+            SmartFrameSelection.create_plan(&thirty_fps_video(), &Quality::Balanced.preset());
+        assert_eq!(plan.sampling_fps, 22.5);
+        assert_eq!(plan.estimated_frames, 1_350);
+    }
 
     fn thirty_fps_video() -> VideoInfo {
         VideoInfo {
