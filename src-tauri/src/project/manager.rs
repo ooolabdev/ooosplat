@@ -21,6 +21,10 @@ pub struct ProjectPaths {
     pub output: PathBuf,
     pub work: PathBuf,
     pub frames: PathBuf,
+    /// 智能筛选后的保留帧（COLMAP 实际输入）。frames 目录始终保留原始抽取结果。
+    pub frames_filtered: PathBuf,
+    /// 智能筛选后保留帧对应的掩码（alpha 素材用）。
+    pub masks_filtered: PathBuf,
     pub masks: PathBuf,
     pub colmap: PathBuf,
     pub brush: PathBuf,
@@ -37,6 +41,8 @@ impl ProjectPaths {
             metadata: project.join("project.json"),
             output: project.clone(),
             frames: work.join("frames"),
+            frames_filtered: work.join("frames_filtered"),
+            masks_filtered: work.join("masks_filtered"),
             masks: work.join("masks"),
             colmap: work.join("colmap"),
             brush: work.join("brush"),
@@ -124,6 +130,8 @@ impl ProjectManager {
         let source = project.join("source");
         let work = project.join("work");
         let frames = work.join("frames");
+        let frames_filtered = work.join("frames_filtered");
+        let masks_filtered = work.join("masks_filtered");
         let masks = work.join("masks");
         let colmap = work.join("colmap");
         let brush = work.join("brush");
@@ -187,6 +195,8 @@ impl ProjectManager {
                 output: project,
                 work,
                 frames,
+                frames_filtered,
+                masks_filtered,
                 masks,
                 colmap,
                 brush,

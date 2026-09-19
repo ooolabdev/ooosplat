@@ -222,6 +222,12 @@ pub struct FrameState {
     pub mask_count: Option<u64>,
     #[serde(default)]
     pub has_alpha: bool,
+    /// 智能筛选后实际保留的帧数（COLMAP 的输入量）。
+    #[serde(default)]
+    pub filtered_frames: Option<u64>,
+    /// 筛选配置的指纹：配置或策略版本变了就必须重新筛选，不能复用旧保留集。
+    #[serde(default)]
+    pub filter_config_hash: Option<String>,
 }
 
 impl From<&FramePlan> for FrameState {
@@ -234,6 +240,8 @@ impl From<&FramePlan> for FrameState {
             image_format: None,
             mask_count: None,
             has_alpha: false,
+            filtered_frames: None,
+            filter_config_hash: None,
         }
     }
 }
@@ -249,6 +257,9 @@ pub struct PipelineStateFile {
     #[serde(default)]
     pub image_sequence: Option<ImageSequenceInfo>,
     pub frames: Option<FrameState>,
+    /// 智能筛选是否已产出可复用的保留集（带配置指纹校验）。
+    #[serde(default)]
+    pub filter_complete: bool,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -268,6 +279,7 @@ impl PipelineStateFile {
             input_type,
             image_sequence: None,
             frames: None,
+            filter_complete: false,
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
