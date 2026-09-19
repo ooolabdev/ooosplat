@@ -41,6 +41,7 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
+    "@tauri-apps/plugin-updater": "^2.11.0",
     "lucide-react": "^0.539.0",
     "mediabunny": "1.52.3",
     "playcanvas": "2.21.4",

@@ -10,9 +10,12 @@ pub mod telemetry;
 pub mod video;
 
 pub fn run_app() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(feature = "updater")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .manage(commands::PipelineController::default())
         .manage(commands::PreviewController::default())
         .manage(telemetry::TelemetryService::new())

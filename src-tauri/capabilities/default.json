@@ -8,6 +8,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-confirm",
-    "opener:allow-reveal-item-in-dir"
+    "opener:allow-reveal-item-in-dir",
+    "updater:default"
   ]
 }

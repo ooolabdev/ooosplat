@@ -27,3 +27,7 @@ engines/linux/brush/**
 !engines/linux/brush/README.md
 engines/macos/arm64/**
 !engines/macos/arm64/README.md
+
+# Tauri updater signing credentials are local/CI secrets, never repository files.
+*.key
+*.key.pub
