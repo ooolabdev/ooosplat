@@ -10,6 +10,13 @@ use std::{
 use chrono::Utc;
 use serde::Serialize;
 
+/// Registration ratio below which a reconstruction is treated as degenerate.
+///
+/// It gates two things: whether a global mapper result is good enough to keep
+/// instead of falling back to the incremental mapper, and whether the run may
+/// proceed to training at all.
+const GLOBAL_MAPPER_MIN_REGISTERED_RATIO: f64 = 0.60;
+
 use crate::{
     engines::{
         brush, colmap,
@@ -824,6 +831,9 @@ impl PipelineRunner {
             "正在核验注册率和三维点",
         );
         let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+        // 退化重建不进入训练：注册率过低时 Brush 只会把噪声拟合成一团糊，
+        // 与其让用户等几十分钟拿到无用的结果，不如在这里明确失败并说明原因。
+        ensure_trainable_reconstruction(&report)?;
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
@@ -1092,6 +1102,26 @@ enum ObserverMode {
     BracketProgress,
     Mapper,
     Brush { estimated_duration_ms: u64 },
+}
+
+/// Refuse to train on a reconstruction that registered too few images.
+///
+/// Brush fits whatever cameras COLMAP produced, so a degenerate reconstruction
+/// (very low registration) trains into a blur with no relation to the scene. The
+/// run would burn its full training budget and hand back an unusable model, so it
+/// stops here with an actionable message instead.
+fn ensure_trainable_reconstruction(report: &ReconstructionReport) -> Result<()> {
+    if report.registered_ratio >= GLOBAL_MAPPER_MIN_REGISTERED_RATIO {
+        return Ok(());
+    }
+    Err(SplatError::Process(format!(
+        "重建注册率仅 {:.1}%（{} / {} 张图像），低于 {}% 的可训练下限。\
+请检查素材清晰度与重叠度，或改用更充分的匹配参数后重试。",
+        report.registered_ratio * 100.0,
+        report.registered_images,
+        report.input_images,
+        (GLOBAL_MAPPER_MIN_REGISTERED_RATIO * 100.0).round(),
+    )))
 }
 
 fn estimated_brush_progress(elapsed_ms: u64, estimated_duration_ms: u64) -> f32 {
