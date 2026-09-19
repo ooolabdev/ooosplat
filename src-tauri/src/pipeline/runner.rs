@@ -9,6 +9,51 @@ use std::{
 
 use chrono::Utc;
 use serde::Serialize;
+use std::time::Duration;
+
+/// Minimum accepted registration ratio for a global mapper result. Below it the
+/// run falls back to the incremental mapper.
+const GLOBAL_MAPPER_MIN_REGISTERED_RATIO: f64 = 0.60;
+
+/// Lower bound for the global mapper's time budget, so small inputs still get
+/// generous headroom and are never killed prematurely.
+const GLOBAL_MAPPER_MIN_BUDGET: Duration = Duration::from_secs(600);
+
+/// Per-frame time budget for the global mapper.
+///
+/// Measured on one handheld 1920×1080 clip with Fast parameters (1280px / 8192
+/// features): 299 frames took 145 s (0.48 s/frame), 600 frames took 432 s
+/// (0.72 s/frame), and 1200 frames never finished in 68 minutes. A budget of
+/// 1.5 s/frame is more than twice the observed healthy cost, so only a genuinely
+/// degenerate run reaches it.
+const GLOBAL_MAPPER_BUDGET_PER_FRAME: f64 = 1.5;
+
+/// Time budget for the global mapper: `max(lower bound, frames × per-frame budget)`.
+fn global_mapper_budget(frames: u64) -> Duration {
+    let scaled = Duration::from_secs_f64(frames as f64 * GLOBAL_MAPPER_BUDGET_PER_FRAME);
+    scaled.max(GLOBAL_MAPPER_MIN_BUDGET)
+}
+
+/// Render a budget as "X 分 Y 秒" for user-facing events.
+fn format_wait_budget(budget: Duration) -> String {
+    let total = budget.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if minutes == 0 {
+        format!("{seconds} 秒")
+    } else if seconds == 0 {
+        format!("{minutes} 分钟")
+    } else {
+        format!("{minutes} 分 {seconds} 秒")
+    }
+}
+
+fn mapper_backend_label(backend: crate::engines::MapperBackend) -> &'static str {
+    match backend {
+        crate::engines::MapperBackend::Global => "Global Mapper",
+        crate::engines::MapperBackend::Incremental => "Incremental Mapper",
+    }
+}
 
 use crate::{
     engines::{
@@ -713,6 +758,10 @@ impl PipelineRunner {
                     ObserverMode::BracketProgress,
                 )),
                 gpu_index,
+                colmap::FeatureExtractionTuning {
+                    max_image_size: quality.preset().feature_max_image_size,
+                    max_num_features: quality.preset().feature_max_num_features,
+                },
             )
             .await?;
             state.stage = PipelineStage::ExtractingFeatures;
@@ -772,6 +821,9 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    colmap::SequentialMatchingTuning {
+                        overlap: quality.preset().sequential_overlap,
+                    },
                 )
                 .await?;
             }
@@ -794,28 +846,178 @@ impl PipelineRunner {
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
         } else {
             reset_directory(&sparse).await?;
-            self.events
-                .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
-            colmap::map(
-                &self.engines.colmap,
-                &database,
-                colmap_images,
-                &sparse,
-                colmap_log,
-                &self.process_manager,
-                Some(self.process_observer(
-                    PipelineStage::Reconstructing,
-                    PipelineEngine::Colmap,
-                    Some(prepared.extracted_frames),
-                    ObserverMode::Mapper,
-                )),
-            )
-            .await?;
+            let frame_count = prepared.extracted_frames;
+            let preference = quality.preset().mapper_backend;
+            let global_available =
+                colmap::supports_global_mapper(&self.engines.colmap, &self.process_manager).await;
+            // 按帧数权衡：小规模上 global 又快又好，大规模上它会卡在全局定位不返回
+            // （实测 1200 帧 >68 分钟未完成、2121 帧 >58 分钟被取消），此时增量 mapper
+            // 虽然会碎成多块，但至少能在几十分钟内跑完。
+            let preferred_backend = preference.backend_for_frames(
+                global_available,
+                frame_count,
+                quality.preset().feature_max_num_features,
+            );
+            let mut selected_backend = preferred_backend;
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                0.0,
+                format!(
+                    "正在使用 {} 重建相机轨迹",
+                    mapper_backend_label(preferred_backend)
+                ),
+            );
+            if preferred_backend == colmap::MapperBackend::Global {
+                // The global mapper needs focal-length priors. FFmpeg-extracted
+                // frames carry no EXIF, so the cameras start without priors and
+                // COLMAP itself recommends calibrating the view graph first. The
+                // step is best-effort: without it the mapper still runs, just with
+                // the warning this prevents.
+                let calibrated =
+                    colmap::cli_capabilities(&self.engines.colmap, &self.process_manager)
+                        .await
+                        .map(|capabilities| capabilities.has_view_graph_calibrator())
+                        .unwrap_or(false);
+                if calibrated {
+                    if let Err(error) = colmap::calibrate_view_graph(
+                        &self.engines.colmap,
+                        &database,
+                        paths.logs.join("colmap_view_graph.log"),
+                        &self.process_manager,
+                        None,
+                    )
+                    .await
+                    {
+                        self.events.send(
+                            PipelineStage::Reconstructing,
+                            Some(PipelineEngine::Colmap),
+                            EventKind::Log,
+                            EventLevel::Warning,
+                            Some(0.05),
+                            false,
+                            format!("视图图标定未完成，继续以原参数重建：{error}"),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+                // 给 global mapper 一个时间预算：它的全局定位阶段会随观测数超线性增长，
+                // 长序列上可能出现"既不失败也不返回"的情况。没有预算时用户只能手动取消。
+                // 用**子令牌**单独取消这一次调用，取消后仍能回退增量 mapper。
+                let global_budget = global_mapper_budget(frame_count);
+                let global_token = self.process_manager.child_token();
+                let global_result = tokio::select! {
+                    result = colmap::map_with_backend(
+                        colmap::MapperBackend::Global,
+                        &self.engines.colmap,
+                        &database,
+                        colmap_images,
+                        &sparse,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::Reconstructing,
+                            PipelineEngine::Colmap,
+                            Some(frame_count),
+                            ObserverMode::Mapper,
+                        )),
+                        Some(global_token.clone()),
+                    ) => result,
+                    _ = tokio::time::sleep(global_budget) => {
+                        global_token.cancel();
+                        self.events.send(
+                            PipelineStage::Reconstructing,
+                            Some(PipelineEngine::Colmap),
+                            EventKind::Log,
+                            EventLevel::Warning,
+                            Some(0.2),
+                            false,
+                            format!(
+                                "Global Mapper 超过时间预算 {}（{} 帧），已终止并回退 Incremental",
+                                format_wait_budget(global_budget),
+                                frame_count
+                            ),
+                            None,
+                            None,
+                            None,
+                        );
+                        Err(SplatError::Process("global mapper 超时".into()))
+                    }
+                };
+                let global_quality = if global_result.is_ok() {
+                    best_sparse_model(colmap_images, &sparse).await.ok()
+                } else {
+                    None
+                }
+                .filter(|(_, report)| {
+                    report.registered_ratio >= GLOBAL_MAPPER_MIN_REGISTERED_RATIO
+                });
+                if global_quality.is_none() {
+                    let reason = if global_result.is_err() {
+                        "global_mapper 执行失败或超时"
+                    } else {
+                        "global_mapper 输出无效或注册率低于 60%"
+                    };
+                    self.events.send(
+                        PipelineStage::Reconstructing,
+                        Some(PipelineEngine::Colmap),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        Some(0.2),
+                        false,
+                        format!("Global Mapper 未达到要求，回退 Incremental：{reason}"),
+                        None,
+                        None,
+                        None,
+                    );
+                    reset_directory(&sparse).await?;
+                    selected_backend = colmap::MapperBackend::Incremental;
+                    colmap::map_with_backend(
+                        selected_backend,
+                        &self.engines.colmap,
+                        &database,
+                        colmap_images,
+                        &sparse,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::Reconstructing,
+                            PipelineEngine::Colmap,
+                            Some(frame_count),
+                            ObserverMode::Mapper,
+                        )),
+                        None,
+                    )
+                    .await?;
+                }
+            } else {
+                colmap::map_with_backend(
+                    selected_backend,
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    &sparse,
+                    colmap_log,
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::Reconstructing,
+                        PipelineEngine::Colmap,
+                        Some(frame_count),
+                        ObserverMode::Mapper,
+                    )),
+                    None,
+                )
+                .await?;
+            }
             state.stage = PipelineStage::Reconstructing;
             state.reconstruction_complete = true;
             project_manager.write_state(&paths.state, &state).await?;
-            self.events
-                .stage(PipelineStage::Reconstructing, 1.0, "增量重建完成");
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                1.0,
+                format!("{} 重建完成", mapper_backend_label(selected_backend)),
+            );
         }
 
         self.events.stage(

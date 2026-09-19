@@ -233,6 +233,30 @@ impl ProcessManager {
     }
 
     pub async fn run(&self, spec: ProcessSpec) -> Result<ProcessOutput> {
+        self.run_with_cancellation(spec, None).await
+    }
+
+    /// Same as [`ProcessManager::run`], but the call can be given its **own** token.
+    ///
+    /// With `Some(token)` the process is cancelled only by that token (plus the
+    /// manager-wide one), so a caller can abandon a single slow stage without
+    /// tearing down the whole pipeline — the reason this exists is the global
+    /// mapper, which can sit in bundle adjustment long past any useful budget
+    /// while the caller still wants to fall back to the incremental mapper.
+    pub async fn run_with_cancellation(
+        &self,
+        spec: ProcessSpec,
+        token: Option<CancellationToken>,
+    ) -> Result<ProcessOutput> {
+        let cancellation = token.unwrap_or_else(|| self.cancellation.clone());
+        self.run_inner(spec, cancellation).await
+    }
+
+    async fn run_inner(
+        &self,
+        spec: ProcessSpec,
+        cancellation: CancellationToken,
+    ) -> Result<ProcessOutput> {
         if !spec.executable.is_file() {
             return Err(SplatError::EngineMissing(
                 spec.executable.display().to_string(),
@@ -354,7 +378,7 @@ impl ProcessManager {
 
         let status = tokio::select! {
             status = child.wait() => status?,
-            _ = self.cancellation.cancelled() => {
+            _ = cancellation.cancelled() => {
                 #[cfg(windows)]
                 job.terminate();
                 #[cfg(unix)]
