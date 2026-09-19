@@ -57,7 +57,7 @@ vi.mock("../lib/backend", () => ({
 }));
 
 vi.mock("../components/GaussianViewer", () => ({
-  GaussianViewer: ({ previewSessionId, onExit, onDisposed }: { previewSessionId: number; onExit: () => void | Promise<void>; onDisposed: (projectId: string, previewSessionId: number) => void }) => <section className="preview-workspace"><h1>高斯泼溅预览</h1><button type="button" onClick={() => {
+  GaussianViewer: ({ previewSessionId, onExit, onDisposed, reshootEntry }: { previewSessionId: number; onExit: () => void | Promise<void>; onDisposed: (projectId: string, previewSessionId: number) => void; reshootEntry?: boolean }) => <section className="preview-workspace"><h1>高斯泼溅预览</h1><span data-testid="reshoot-entry">{String(Boolean(reshootEntry))}</span><button type="button" onClick={() => {
     void onExit();
     mocks.notifyPreviewDisposed(onDisposed, "11111111-1111-1111-1111-111111111111", previewSessionId);
   }}>返回任务</button></section>,
@@ -176,6 +176,36 @@ describe("App preview workspace", () => {
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
+  });
+
+  it("offers a reshoot entry on a completed project and opens the preview in reshoot mode", async () => {
+    // Selected by class rather than by label: the row is translated, so asserting
+    // on text would couple this test to the active interface language.
+    const reshootButton = container.querySelector<HTMLButtonElement>(".reshoot-link");
+    expect(reshootButton).not.toBeNull();
+
+    await act(async () => { reshootButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(mocks.prepareGaussianPreview).toHaveBeenCalledWith(project.id);
+    expect(container.querySelector('[data-testid="reshoot-entry"]')?.textContent).toBe("true");
+  });
+
+  it("opens a plain preview without the reshoot workflow", async () => {
+    const previewButton = container.querySelector<HTMLButtonElement>(".preview-link");
+
+    await act(async () => { previewButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(container.querySelector('[data-testid="reshoot-entry"]')?.textContent).toBe("false");
+  });
+
+  it("keeps the reshoot entry away from unfinished projects", async () => {
+    const unfinished = { ...project, status: "cancelled" as const, finalPly: null, completedAt: null };
+    await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
+
+    expect(container.querySelector(".reshoot-link")).toBeNull();
+    expect(container.querySelector(".resume-link")).not.toBeNull();
   });
 
   it("switches the complete task workspace to English without reloading", async () => {

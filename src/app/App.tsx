@@ -1,8 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox, Images,
-  Download, Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
-  Languages, Settings2, X, Zap,
+  ArrowDownToLine, Blend, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clapperboard, Cpu, Download, Eye,
+  FileBox, Film, FolderOpen, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
+  Square, Trash2, X, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
@@ -12,14 +12,14 @@ import {
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
-  initializeTelemetry, setTelemetryConsent, resumePipeline,
+  initializeTelemetry, setTelemetryConsent, resumePipeline, startReshootPipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type PipelineFailureKind } from "../lib/pipelineError";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
+import type { EngineStatus, GaussianCrop, InputType, ProjectStatus, ProjectSummary, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
@@ -27,6 +27,7 @@ const CANCELLATION_OVERLAY_DELAY_MS = 300;
 const PREVIEW_CLOSE_TIMEOUT_MS = 8_000;
 const NATIVE_ACTION_TIMEOUT_MS = 8_000;
 const MAPPER_REFINEMENT_PATTERN = /retriangulation|global bundle adjustment/i;
+
 
 type FailureDialogState = {
   kind: PipelineFailureKind;
@@ -159,7 +160,7 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-function ProjectRow({ project, busy, previewing, previewDisabled, deleting, revealing, onPreview, onResume, onReveal, onDelete }: {
+function ProjectRow({ project, busy, previewing, previewDisabled, deleting, revealing, onPreview, onReshoot, onResume, onReveal, onDelete }: {
   project: ProjectSummary;
   busy: boolean;
   previewing: boolean;
@@ -167,6 +168,7 @@ function ProjectRow({ project, busy, previewing, previewDisabled, deleting, reve
   deleting: boolean;
   revealing: boolean;
   onPreview: (project: ProjectSummary) => void;
+  onReshoot: (project: ProjectSummary) => void;
   onResume: (project: ProjectSummary) => void;
   onReveal: (project: ProjectSummary) => void;
   onDelete: (project: ProjectSummary) => void;
@@ -191,6 +193,7 @@ function ProjectRow({ project, busy, previewing, previewDisabled, deleting, reve
     </dl>
     <div className="project-actions">
       {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={() => onPreview(project)}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? t("project.opening") : t("project.preview")}</button>}
+      {project.status === "completed" && <button className="reshoot-link" type="button" disabled={busy || previewDisabled} onClick={() => onReshoot(project)}><Film size={14} />{t("project.reshoot")}</button>}
       {project.status !== "completed" && <button className="resume-link" type="button" disabled={busy} onClick={() => onResume(project)}><Play size={14} fill="currentColor" />{t("project.resume")}</button>}
       <button type="button" disabled={revealing} onClick={() => onReveal(project)}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t("project.reveal")}</button>
       <button className="danger-link" type="button" disabled={busy || deleting} onClick={() => onDelete(project)}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t("project.delete")}</button>
@@ -219,6 +222,7 @@ export function App() {
   const runStartedAt = useRef<number | null>(null);
   const runElapsedOffset = useRef(0);
   const cancellationOverlayTimer = useRef<number | null>(null);
+  const pipelineRunningRef = useRef(isRunning);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
   const [isCancellationRequested, setIsCancellationRequested] = useState(false);
   const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
@@ -238,6 +242,9 @@ export function App() {
   const [privacySettingsOpen, setPrivacySettingsOpen] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
+  const [reshootInputMenuOpen, setReshootInputMenuOpen] = useState(false);
+  const [pendingReshoot, setPendingReshoot] = useState<{ sourceProjectId: string; regions: NonNullable<GaussianCrop>[]; guidance: string[]; guideImages: Array<string | null> } | null>(null);
+  const [reshootEntry, setReshootEntry] = useState(false);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
@@ -328,6 +335,9 @@ export function App() {
       .then(setTelemetryPreferences)
       .catch(() => undefined);
   }, []);
+
+  // The install guard must read live state: a download can outlive many renders.
+  useEffect(() => { pipelineRunningRef.current = isRunning; }, [isRunning]);
 
   useEffect(() => {
     let unlisten: undefined | (() => void);
@@ -621,10 +631,11 @@ export function App() {
     }
   }, [clearPreviewSession, messageOf, releasePreviewSession, store.setError, t]);
 
-  const previewProject = async (project: ProjectSummary) => {
+  const previewProject = async (project: ProjectSummary, options?: { reshoot?: boolean }) => {
     if (project.status !== "completed" || openingPreviewProjectId || closingPreviewProjectId === project.id) return;
     const previous = useGaussianTransformStore.getState().descriptor?.projectId;
     setOpeningPreviewProjectId(project.id);
+    setReshootEntry(Boolean(options?.reshoot));
     store.setError(null);
     try {
       await reconcileRuntimeState();
@@ -645,6 +656,51 @@ export function App() {
       store.setError(messageOf(error));
     } finally {
       setOpeningPreviewProjectId(null);
+    }
+  };
+
+  const startReshoot = async (
+    sourceProjectId: string,
+    regions: NonNullable<GaussianCrop>[],
+    guidance: string[],
+    guideImages: Array<string | null>,
+  ) => {
+    if (isRunning || !store.projectsRoot) return;
+    setPendingReshoot({ sourceProjectId, regions, guidance, guideImages });
+    setReshootInputMenuOpen(true);
+  };
+
+  const chooseReshootInput = async (inputType: InputType) => {
+    const request = pendingReshoot;
+    setReshootInputMenuOpen(false);
+    setPendingReshoot(null);
+    if (!request || isRunning || !store.projectsRoot) return;
+    const reshootPath = inputType === "images" ? await selectImageSequence() : await selectVideo();
+    if (!reshootPath) return;
+    await exitPreview();
+    clearCancellationFeedback();
+    runElapsedOffset.current = 0;
+    runStartedAt.current = Date.now();
+    setLiveElapsedMs(0);
+    store.beginRun();
+    try {
+      const result = await startReshootPipeline({
+        sourceProjectId: request.sourceProjectId,
+        reshootPath,
+        quality: store.quality,
+        projectsRoot: store.projectsRoot,
+        regions: request.regions,
+        guidance: request.guidance,
+        guideImages: request.guideImages,
+      });
+      store.setResult(result);
+      store.setPhase("completed");
+    } catch (error) {
+      const message = messageOf(error);
+      store.setError(message);
+      store.setPhase(message.includes("取消") ? "cancelled" : "failed");
+    } finally {
+      try { await refreshProjects(); } catch { /* derived project remains on disk */ }
     }
   };
 
@@ -707,6 +763,7 @@ export function App() {
     const active = activePreviewSession.current;
     if (!active || closingPreviewProjectId) return;
     setClosingPreviewProjectId(active.projectId);
+    setReshootEntry(false);
     setViewMode("tasks");
     if (previewCloseWatchdog.current != null) window.clearTimeout(previewCloseWatchdog.current);
     previewCloseWatchdog.current = window.setTimeout(() => {
@@ -729,8 +786,19 @@ export function App() {
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
       <Suspense fallback={<section className="preview-pane active preview-workspace"><div className="preview-empty"><LoaderCircle className="spin" size={24} /><strong>{t("preview.preparingModule")}</strong></div></section>}>
-        <GaussianViewer previewSessionId={previewSessionId} onExit={exitPreview} onDisposed={previewRendererDisposed} pipelineRunning={isRunning} />
+        <GaussianViewer previewSessionId={previewSessionId} onExit={exitPreview} onDisposed={previewRendererDisposed} pipelineRunning={isRunning} onStartReshoot={startReshoot} reshootEntry={reshootEntry} />
       </Suspense>
+      {reshootInputMenuOpen && <div className="reshoot-input-backdrop" role="dialog" aria-modal="true" aria-labelledby="reshoot-input-title">
+        <section className="reshoot-input-dialog">
+          <h2 id="reshoot-input-title">{t("reshoot.importTitle")}</h2>
+          <p>{t("reshoot.importHint")}</p>
+          <div className="reshoot-input-options">
+            <button type="button" onClick={() => void chooseReshootInput("video")}><Clapperboard size={18} /><strong>{t("reshoot.chooseVideo")}</strong><small>{t("reshoot.chooseVideoHint")}</small></button>
+            <button type="button" onClick={() => void chooseReshootInput("images")}><Images size={18} /><strong>{t("reshoot.chooseImages")}</strong><small>{t("reshoot.chooseImagesHint")}</small></button>
+          </div>
+          <button type="button" className="reshoot-input-cancel" onClick={() => { setReshootInputMenuOpen(false); setPendingReshoot(null); }}>{t("common.cancel")}</button>
+        </section>
+      </div>}
     </main>;
   }
 
@@ -893,8 +961,8 @@ export function App() {
 
         {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>{t("history.emptyTitle")}</strong><p>{t("history.emptyHint")}</p></div>}
 
-        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={(item) => void previewProject(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
-        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void previewProject(item, { reshoot: true })} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
+        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={() => undefined} onReshoot={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
       </section>
     </section>
     </div>

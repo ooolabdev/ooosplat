@@ -21,6 +21,7 @@ import {
   GSPLAT_STREAM_INSTANCE,
   type GSplatComponent,
   GSplatResource,
+  Mat4,
   PIXELFORMAT_RGBA8,
   PIXELFORMAT_R8,
   RenderTarget,
@@ -32,6 +33,9 @@ import {
   WORKBUFFER_UPDATE_ONCE,
   type Application as PcApplication,
   type CameraComponent,
+  // 重拍引导截图需要 WebGL 设备的像素读回接口；上游切到 WebGPU 预览后端后
+  // 这个类型在本文件的其它路径上不再使用，但 `captureReshootFrame` 仍然需要它。
+  type WebglGraphicsDevice,
 } from "playcanvas";
 import {
   ArrowLeft,
@@ -69,7 +73,7 @@ import {
 } from "../../lib/backend";
 import { previewAssetUrl as withPreviewAssetRevision } from "../../lib/previewAssetUrl";
 import { getCurrentLocale, translate, useI18n, type TranslationKey } from "../../i18n";
-import { IDENTITY_TRANSFORM, useGaussianTransformStore } from "../../stores/gaussianTransformStore";
+import { cloneCrop, IDENTITY_TRANSFORM, useGaussianTransformStore } from "../../stores/gaussianTransformStore";
 import type {
   GaussianCrop,
   GaussianEditorTool,
@@ -81,6 +85,17 @@ import type {
 } from "../../types/pipeline";
 import { PLY_TO_ENGINE_ROTATION } from "./CoordinateSystem";
 import {
+  composeReshootGuideImage,
+  findReshootRegion,
+  guideMarkerRadius,
+  regionGeometryLabel,
+  regionKey,
+  reshootGuidance,
+  shootingDirections,
+  type ReshootEntry,
+} from "./ReshootGuidance";
+import {
+  copyFlippedRgbaRows,
   copyRgbaReadbackRows,
   normalizedCaptureRegion,
   verticalFovForCapture,
@@ -138,6 +153,10 @@ interface SplatSceneApi {
   deactivateCrop: () => void;
   alignView: (view: GaussianOrthographicView) => void;
   initializeCrop: (kind: "sphere" | "box", previous: GaussianCrop) => Exclude<GaussianCrop, null> | null;
+  /** Current view as top-down RGBA pixels, used to draw a reshoot guide. */
+  captureReshootFrame: () => Promise<{ width: number; height: number; rgba: Uint8ClampedArray } | null>;
+  /** Model-space point to image pixels, so the guide can circle the region. */
+  projectToScreen: (point: [number, number, number]) => { x: number; y: number; width: number; height: number; visible: boolean } | null;
   exportVideo: (options: {
     signal: AbortSignal;
     onProgress: (progress: GaussianVideoEncodingProgress) => void;
@@ -821,7 +840,46 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       : { kind, center, size };
   }, [transformedModelBounds]);
 
-  useImperativeHandle(ref, () => ({ replay, exportVideo, selectRectangle, freezeCrop, deactivateCrop, alignView, initializeCrop }), [alignView, deactivateCrop, exportVideo, freezeCrop, initializeCrop, replay, selectRectangle]);
+  /**
+   * Captures the current view for a reshoot guide, and projects a model-space
+   * point to image pixels so the guide can circle the selected region.
+   */
+  const captureReshootFrame = useCallback(async () => {
+    if (appDestroyedRef.current || contextLostRef.current) return null;
+    const device = app.graphicsDevice as WebglGraphicsDevice;
+    const width = device.width;
+    const height = device.height;
+    if (!width || !height) return null;
+    app.render();
+    const pixels = new Uint8Array(width * height * 4);
+    device.setRenderTarget(null);
+    device.updateBegin();
+    await device.readPixelsAsync(0, 0, width, height, pixels, true);
+    if (appDestroyedRef.current) return null;
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    copyFlippedRgbaRows(pixels, rgba, width, height);
+    return { width, height, rgba };
+  }, [app]);
+
+  const projectToScreen = useCallback((point: [number, number, number]) => {
+    const cameraEntity = cameraRef.current;
+    const splatEntity = splatRef.current;
+    if (!cameraEntity?.camera || !splatEntity) return null;
+    const device = app.graphicsDevice;
+    const matrix = new Mat4().mul2(cameraEntity.camera.projectionMatrix, cameraEntity.camera.viewMatrix);
+    const world = splatEntity.getWorldTransform().transformPoint(new Vec3(point[0], point[1], point[2]));
+    const clip = matrix.transformPoint(world);
+    if (!Number.isFinite(clip.x) || !Number.isFinite(clip.y)) return null;
+    return {
+      x: (clip.x * 0.5 + 0.5) * device.width,
+      y: (1 - (clip.y * 0.5 + 0.5)) * device.height,
+      width: device.width,
+      height: device.height,
+      visible: clip.z >= 0 && clip.z <= 1,
+    };
+  }, [app]);
+
+  useImperativeHandle(ref, () => ({ replay, exportVideo, selectRectangle, freezeCrop, deactivateCrop, alignView, initializeCrop, captureReshootFrame, projectToScreen }), [alignView, captureReshootFrame, deactivateCrop, exportVideo, freezeCrop, initializeCrop, projectToScreen, replay, selectRectangle]);
 
   return <>
     <PreviewCamera ref={cameraRef} />
@@ -867,11 +925,19 @@ const phaseLabelKeys: Record<PreviewAnimationPhase, TranslationKey> = {
   orbit: "animation.orbit",
 };
 
-export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineRunning }: {
+export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineRunning, onStartReshoot, reshootEntry = false }: {
   previewSessionId: number;
   onExit: () => void | Promise<void>;
   onDisposed: (projectId: string, previewSessionId: number) => void;
   pipelineRunning: boolean;
+  onStartReshoot: (
+    projectId: string,
+    regions: NonNullable<GaussianCrop>[],
+    guidance: string[],
+    guideImages: Array<string | null>,
+  ) => void | Promise<void>;
+  /** Opened from the project list's reshoot entry: land on the reshoot workflow. */
+  reshootEntry?: boolean;
 }) {
   const { locale, t, formatNumber } = useI18n();
   const store = useGaussianTransformStore();
@@ -909,6 +975,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   const [navigationSaving, setNavigationSaving] = useState(false);
   const [cropFreezing, setCropFreezing] = useState(false);
   const [cropFreezeError, setCropFreezeError] = useState<string | null>(null);
+  const [reshootRegions, setReshootRegions] = useState<ReshootEntry[]>([]);
+  const [reshootError, setReshootError] = useState<string | null>(null);
+  const [guidePending, setGuidePending] = useState<number | null>(null);
   const previewAssetUrl = useMemo(() => {
     if (!store.descriptor) return "";
     return withPreviewAssetRevision(store.descriptor.assetUrl, "retry", rendererRevision.toString());
@@ -1279,6 +1348,17 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     sceneApiRef.current?.alignView(view);
   };
 
+  // The reshoot panel only exists while a sphere or box tool is active, so the
+  // list entry activates one instead of leaving the user on an empty adjust view.
+  const reshootEntryApplied = useRef(false);
+  useEffect(() => {
+    if (!reshootEntry || reshootEntryApplied.current) return;
+    reshootEntryApplied.current = true;
+    setMode("adjust");
+    const current = useGaussianTransformStore.getState();
+    if (current.tool !== "sphere" && current.tool !== "box") void switchTool("sphere");
+  }, [reshootEntry, switchTool]);
+
   const rectanglePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (mode !== "adjust" || store.tool !== "rectangle" || event.button !== 0 || busy || viewport.phase !== "ready") return;
     if ((event.target as Element).closest("button,input,aside")) return;
@@ -1333,6 +1413,60 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     error: t("viewer.phaseError"),
   }[viewport.phase];
   const videoBusy = !["idle", "completed", "error"].includes(videoPhase);
+  const addReshootRegion = async () => {
+    const crop = store.editing.crop;
+    if (!crop) {
+      setReshootError(t("reshoot.errorSelectFirst"));
+      return;
+    }
+    if (findReshootRegion(reshootRegions.map((entry) => entry.region), crop) >= 0) {
+      setReshootError(t("reshoot.errorDuplicate"));
+      return;
+    }
+    const index = reshootRegions.length;
+    const entry: ReshootEntry = { region: cloneCrop(crop)!, guidance: reshootGuidance(crop, index), guideImage: null };
+    setReshootRegions((regions) => [...regions, entry]);
+    setReshootError(null);
+    setGuidePending(index);
+    try {
+      const projected = sceneApiRef.current?.projectToScreen(crop.center);
+      const frame = await sceneApiRef.current?.captureReshootFrame();
+      if (!projected || !frame) throw new Error(t("reshoot.errorNoFrame"));
+      // Screen pixels per model unit, so the highlight matches the selection size.
+      const edgePoint: [number, number, number] = crop.kind === "sphere"
+        ? [crop.center[0] + crop.radius, crop.center[1], crop.center[2]]
+        : [crop.center[0] + crop.size[0] / 2, crop.center[1], crop.center[2]];
+      const edge = sceneApiRef.current?.projectToScreen(edgePoint);
+      const pixelsPerUnit = edge ? Math.hypot(edge.x - projected.x, edge.y - projected.y) || 1 : 1;
+      const guideImage = composeReshootGuideImage({
+        frame,
+        marker: { x: projected.x, y: projected.y, radius: guideMarkerRadius(crop, pixelsPerUnit) },
+        region: crop,
+        index,
+        directions: shootingDirections(crop),
+      });
+      if (!guideImage) throw new Error(t("reshoot.errorNoGuide"));
+      setReshootRegions((regions) => regions.map((item, position) => position === index ? { ...item, guideImage } : item));
+    } catch (error) {
+      // The region stays in the list: guidance text and the region geometry are
+      // still usable without the annotated frame.
+      setReshootError(t("reshoot.errorGuideFailed", { index: index + 1, detail: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      setGuidePending(null);
+    }
+  };
+  const startReshoot = async () => {
+    if (!store.descriptor || reshootRegions.length === 0 || busy) {
+      setReshootError(t("reshoot.errorEmpty"));
+      return;
+    }
+    await onStartReshoot(
+      store.descriptor.projectId,
+      reshootRegions.map((entry) => entry.region),
+      reshootRegions.map((entry) => entry.guidance),
+      reshootRegions.map((entry) => entry.guideImage),
+    );
+  };
   const videoButtonLabel = videoPhase === "preparing"
     ? t("viewer.preparingExport")
     : videoPhase === "rendering"
@@ -1397,6 +1531,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
           {store.tool === "rectangle" && <button type="button" disabled={store.selectedCount === 0 || busy} onClick={store.deleteSelection}><Trash2 size={14} />{t("viewer.deleteSelected")}</button>}
           <button type="button" title={t("viewer.resetAllTitle")} disabled={busy || (store.history.length === 0 && store.editing.crop === null && store.editing.deletedCount === 0 && store.transform.scale === 1 && store.transform.position.every((value) => value === 0) && store.transform.rotation.every((value) => value === 0))} onClick={() => { store.resetAll(); setGaussianExportResult(null); }}><RotateCcw size={14} />{t("viewer.resetAll")}</button>
           <button type="button" disabled={busy || viewport.phase !== "ready"} onClick={() => void exportGaussian()}>{gaussianExporting ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />} {gaussianExporting ? t("viewer.saveProgress", { value: gaussianExportProgress.toFixed(0) }) : t("viewer.save")}</button>
+          <button type="button" className="reshoot-action" disabled={busy || viewport.phase !== "ready"} onClick={() => void startReshoot()}><Film size={14} />{t("viewer.reshoot")} {reshootRegions.length > 0 ? `(${reshootRegions.length})` : ""}</button>
         </> : <>
           <button type="button" disabled={videoBusy || viewport.phase !== "ready"} onClick={() => sceneApiRef.current?.replay()}><Play size={14} />{t("viewer.replay")}</button>
           {videoBusy
@@ -1423,6 +1558,23 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         {selectionDrag && <div className={`rectangle-selection-box mode-${selectionDrag.selectionMode}`} style={selectionRectStyle} aria-hidden="true" />}
         {mode === "adjust" && store.tool === "transform" && <TransformPanel transform={store.transform} onBegin={store.beginTransaction} onChange={store.setTransformLive} onCommit={store.commitTransaction} />}
         {mode === "adjust" && (store.tool === "sphere" || store.tool === "box") && <SelectionPanel crop={store.editing.crop} kind={store.tool} onBegin={store.beginCropTransaction} onChange={store.setCropLive} onCommit={store.commitCropTransaction} onEnable={() => { const tool = useGaussianTransformStore.getState().tool; if (tool === "sphere" || tool === "box") enableCrop(tool); }} />}
+        {mode === "adjust" && (store.tool === "sphere" || store.tool === "box") && <div className="reshoot-guide-panel">
+          <strong>{t("reshoot.panelTitle")}</strong>
+          <p>{t("reshoot.panelHint", { tool: store.tool === "sphere" ? t("reshoot.kindSphere") : t("reshoot.kindBox") })}</p>
+          <button type="button" disabled={!store.editing.crop || busy || guidePending !== null} onClick={() => void addReshootRegion()}>{guidePending !== null ? t("reshoot.generatingGuide") : t("reshoot.addCurrent")}</button>
+          {reshootRegions.length > 0 && <ol>{reshootRegions.map((entry, index) => <li key={regionKey(entry.region)}>
+            <div className="reshoot-guide-head"><b>{t("reshoot.region", { index: index + 1 })}</b><span>{regionGeometryLabel(entry.region)}</span>
+              <button type="button" aria-label={t("reshoot.removeAria", { index: index + 1 })} onClick={() => setReshootRegions((regions) => regions.filter((_, item) => item !== index))}>{t("reshoot.remove")}</button>
+            </div>
+            {entry.guideImage
+              ? <a className="reshoot-guide-figure" href={entry.guideImage} target="_blank" rel="noreferrer" title={t("reshoot.viewGuideTitle")}><img src={entry.guideImage} alt={t("reshoot.guideImageAlt", { index: index + 1 })} /><span>{t("reshoot.arrowLegend")}</span></a>
+              : guidePending === index
+                ? <p className="reshoot-guide-figure pending"><LoaderCircle className="spin" size={14} />{t("reshoot.generatingDirection")}</p>
+                : <p className="reshoot-guide-figure missing">{t("reshoot.missingGuide")}</p>}
+            <p className="reshoot-guide-text">{entry.guidance}</p>
+          </li>)}</ol>}
+          {reshootError && <p className="reshoot-guide-error">{reshootError}</p>}
+        </div>}
         {mode === "preview" && <div className="animation-hud">
           <span className={`animation-pulse phase-${animationStatus.phase}`} />
           <b>{t(phaseLabelKeys[animationStatus.phase])}</b>

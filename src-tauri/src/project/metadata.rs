@@ -199,6 +199,37 @@ pub struct ProjectMetadata {
     pub transform: GaussianTransform,
     #[serde(default)]
     pub editing: GaussianEditing,
+    /// 高清补拍溯源：仅当本项目由补拍派生时存在。源项目始终只读。
+    #[serde(default)]
+    pub reshoot: Option<ReshootProvenance>,
+}
+
+/// Where a derived reshoot project came from, and what was added to it.
+///
+/// The source project stays read-only: this records the paths the derivation
+/// read, so it is auditable, and it never implies the source was modified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshootProvenance {
+    pub source_project_id: Uuid,
+    pub source_project_path: PathBuf,
+    /// The source's `final.ply`, kept as a reference for the user.
+    pub source_final_ply: PathBuf,
+    /// The reshoot media the user supplied.
+    pub reshoot_source_path: PathBuf,
+    /// Regions of the source model the user marked for a fresh capture.
+    pub regions: Vec<GaussianCrop>,
+    /// Per-region shooting directions shown to the user while capturing.
+    pub guidance: Vec<String>,
+    /// Annotated guide images written into the derived project: the circled
+    /// region plus arrows marking where each shot should be taken from.
+    #[serde(default)]
+    pub guidance_images: Vec<PathBuf>,
+    /// Images the source contributed, and images the reshoot media contributed.
+    #[serde(default)]
+    pub original_frame_count: u64,
+    #[serde(default)]
+    pub reshoot_frame_count: u64,
 }
 
 pub const fn schema_version() -> u32 {

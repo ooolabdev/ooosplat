@@ -170,6 +170,7 @@ impl ProjectManager {
             model: "final.ply".into(),
             transform: Default::default(),
             editing: Default::default(),
+            reshoot: None,
         };
         let metadata_path = project.join("project.json");
         atomic_write_json(&metadata_path, &metadata).await?;
