@@ -160,13 +160,15 @@ Usage notes:
 
 ## Quality Presets
 
-| Preset | Frames retained | FFmpeg extraction rate | Brush iterations | Maximum training resolution |
+| Preset | Target / candidate FPS | Normal SfM | Brush baseline | Planner extension ceiling |
 | --- | ---: | ---: | ---: | ---: |
-| Fast | 30% | Source FPS × 0.30 | 8,000 | 1,200 |
-| Balanced | 50% | Source FPS × 0.50 | 15,000 | 1,600 |
-| Detailed | 100% | Source FPS × 1.00 | 30,000 | 2,000 |
+| Fast | 6 / 12 | 1600 / 4096 | 8k @ 1200 | 15k @ 1600 |
+| Balanced | 8 / 20 | 1920 / 8192 | 15k @ 1600 | 30k @ 2000 |
+| Detailed | 10 / 30 | 2400 / 8192 | 30k @ 2000 | 50k @ Native/Auto |
 
-FFmpeg performs frame reduction; COLMAP does not reduce the number of frames. OOOSplat does not set a maximum extracted-frame count or an additional Splat-count limit. The final number of Splats depends on the source material, reconstruction, and Brush training.
+Quality defines the normal-path resource budget; it does not directly select Mapper or Pairing algorithms. When Auto Reconstruction Planner Beta is enabled, a low-resolution in-memory scan drives non-uniform frame selection, verified matches are analyzed as a view graph, and Global or Incremental Mapper runs against an isolated database copy. Once the normal budget is exhausted, a bounded Success Recovery ladder may run. Every valid sparse model is archived and compared before Brush. Brush still uses only the selected preset's baseline in Beta v1.
+
+The default preference is “Ask each time.” Choosing the traditional pipeline affects only that run and is never saved as Always Off; Settings can switch the global preference to “Always on.” With Planner disabled, the main-branch frame retention, COLMAP feature defaults, matching, Incremental Mapper, and Brush parameters remain the stable A/B baseline. See the [Quality v2 and Planner same-image benchmark](docs/quality-v2-benchmark-2026-09-19.md) for the three-generation image comparison, and the [Planner Beta same-video benchmark](docs/auto-reconstruction-planner-beta-benchmark-2026-09-20.md) for the first video comparison.
 
 ## Project and File Locations
 
@@ -227,7 +229,7 @@ What is never sent: any source media, including videos, images, and PLY files; f
 | COLMAP | Windows 4.0.4 CUDA; macOS arm64 4.0.4 CPU CLI-only | Feature extraction, matching, and camera reconstruction |
 | Brush | v0.3.0 for Windows x64 / macOS arm64 | Gaussian Splatting training and PLY export |
 
-Windows, Ubuntu, and macOS source and integrity policies are recorded in [`engines/manifest.json`](engines/manifest.json), [`engines/manifest.linux.json`](engines/manifest.linux.json), and [`engines/manifest.macos.json`](engines/manifest.macos.json). Large engine files are not committed to Git; developers restore them with `npm run setup:engines`. Release builds verify sources, hashes, architecture, the dynamic-library closure, and Brush CLI compatibility.
+Windows, Ubuntu, and macOS source and integrity policies are recorded in [`engines/manifest.json`](engines/manifest.json), [`engines/manifest.linux.json`](engines/manifest.linux.json), and [`engines/manifest.macos.json`](engines/manifest.macos.json). Large engine files are not committed to Git; developers restore them with `npm run setup:engines`. Release builds verify sources, hashes, architecture, the dynamic-library closure, and Brush CLI compatibility. The COLMAP loop-closure vocabulary tree is verified and embedded as well, so reconstruction never downloads it from GitHub.
 
 Third-party licenses and notices are in [`licenses/`](licenses/):
 

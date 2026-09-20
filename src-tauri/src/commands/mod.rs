@@ -21,6 +21,7 @@ use crate::{
         runner::{PipelineFailureContext, PipelineResult, PipelineRunner},
         PipelineEngine, PipelineStage,
     },
+    planner::{BudgetFramePlanner, CaptureAnalysis, FramePlanner},
     presets::Quality,
     process::ProcessManager,
     project::{
@@ -333,7 +334,14 @@ pub async fn probe_and_plan(
     } else {
         let video =
             probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        let planner_enabled = catalog::load_settings().await?.planner_enabled;
+        let plan = if planner_enabled {
+            BudgetFramePlanner
+                .plan(&video, quality, CaptureAnalysis::default())
+                .map_err(|error| SplatError::Process(format!("画面规划失败：{error}")))?
+        } else {
+            UniformRatioFrameSelection.create_plan(&video, quality)
+        };
         let estimate = estimate_runtime(&video, &plan, quality, &samples);
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
@@ -375,12 +383,29 @@ pub async fn estimate_project_runtime(
     let state_bytes = tokio::fs::read(project.join("state.json")).await?;
     let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
     let saved_plan = state.frames.as_ref().map(|frames| FramePlan {
+        quality: frames.quality,
         retention_ratio: frames.retention_ratio,
         sampling_fps: frames.sampling_fps,
+        actual_average_fps: frames.actual_average_fps,
+        target_fps: if frames.target_fps > 0.0 {
+            frames.target_fps
+        } else {
+            frames.sampling_fps
+        },
+        candidate_fps: if frames.candidate_fps > 0.0 {
+            frames.candidate_fps
+        } else {
+            frames.sampling_fps
+        },
         estimated_frames: frames
             .extracted_frames
             .unwrap_or(frames.estimated_frames)
             .max(1),
+        planning_mode: frames.planning_mode,
+        preferred_fps: frames.preferred_fps,
+        selected_frames: frames.selected_frames.clone(),
+        candidate_frames: frames.candidate_frames.clone(),
+        minimum_frame_protection: frames.minimum_frame_protection.clone(),
     });
     let samples = catalog::runtime_samples().await;
     let mut estimate = match metadata.input_type {
@@ -398,7 +423,7 @@ pub async fn estimate_project_runtime(
                 }
             };
             let plan = saved_plan.unwrap_or_else(|| {
-                UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
+                UniformRatioFrameSelection.create_plan(&video, metadata.quality)
             });
             estimate_runtime(&video, &plan, metadata.quality, &samples)
         }
@@ -459,6 +484,23 @@ pub async fn set_projects_root(
 }
 
 #[tauri::command]
+pub async fn get_app_settings() -> std::result::Result<AppSettings, SplatError> {
+    catalog::load_settings().await
+}
+
+#[tauri::command]
+pub async fn set_planner_enabled(enabled: bool) -> std::result::Result<AppSettings, SplatError> {
+    catalog::save_planner_enabled(enabled).await
+}
+
+#[tauri::command]
+pub async fn set_planner_preference(
+    preference: catalog::PlannerPreference,
+) -> std::result::Result<AppSettings, SplatError> {
+    catalog::save_planner_preference(preference).await
+}
+
+#[tauri::command]
 pub async fn initialize_telemetry(
     telemetry: State<'_, TelemetryService>,
 ) -> std::result::Result<TelemetryPreferences, SplatError> {
@@ -481,6 +523,7 @@ pub async fn start_pipeline(
     path: String,
     quality: Quality,
     projects_root: String,
+    planner_enabled: bool,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
     let emitter = app.clone();
     let telemetry_session = Arc::new(PipelineTelemetrySession::new(
@@ -493,10 +536,14 @@ pub async fn start_pipeline(
         },
     ));
     let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
-        event_telemetry.observe(&event);
-        let _ = emitter.emit("pipeline-event", event);
-    }));
+    let runner = Arc::new(PipelineRunner::new_with_planner(
+        paths_for_app(&app),
+        planner_enabled,
+        move |event| {
+            event_telemetry.observe(&event);
+            let _ = emitter.emit("pipeline-event", event);
+        },
+    ));
     {
         let mut active = state.active.lock().await;
         if active.is_some() {
@@ -509,11 +556,14 @@ pub async fn start_pipeline(
         .generate(Path::new(&path), quality, Path::new(&projects_root))
         .await;
     match &result {
-        Ok(output) => telemetry_session.generation_completed(
-            output.duration_ms,
-            output.input_images,
-            output.source_duration_seconds,
-        ),
+        Ok(output) => {
+            telemetry_session.generation_completed(
+                output.duration_ms,
+                output.input_images,
+                output.source_duration_seconds,
+            );
+            telemetry_session.quality_metrics_recorded(&output.quality_metrics);
+        }
         Err(error) => telemetry_session.generation_failed(error),
     }
     if let Err(error) = &result {
@@ -556,11 +606,14 @@ pub async fn resume_pipeline(
     telemetry_session.generation_started();
     let result = runner.resume(project_id).await;
     match &result {
-        Ok(output) => telemetry_session.generation_completed(
-            output.duration_ms,
-            output.input_images,
-            output.source_duration_seconds,
-        ),
+        Ok(output) => {
+            telemetry_session.generation_completed(
+                output.duration_ms,
+                output.input_images,
+                output.source_duration_seconds,
+            );
+            telemetry_session.quality_metrics_recorded(&output.quality_metrics);
+        }
         Err(error) => telemetry_session.generation_failed(error),
     }
     if let Err(error) = &result {

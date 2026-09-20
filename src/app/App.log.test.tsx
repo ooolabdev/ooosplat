@@ -10,6 +10,7 @@ import type { PipelineEvent } from "../types/pipeline";
 const mocks = vi.hoisted(() => ({
   initializeTelemetry: vi.fn(),
   getProjectOverview: vi.fn(),
+  getAppSettings: vi.fn(),
   getAppRuntimeStatus: vi.fn(),
 }));
 
@@ -22,6 +23,7 @@ vi.mock("../lib/backend", () => ({
   exportPly: vi.fn(),
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
+  getAppSettings: mocks.getAppSettings,
   initializeTelemetry: mocks.initializeTelemetry,
   onPipelineEvent: vi.fn().mockResolvedValue(() => undefined),
   prepareGaussianPreview: vi.fn(),
@@ -35,6 +37,7 @@ vi.mock("../lib/backend", () => ({
   selectProjectsRoot: vi.fn(),
   selectVideo: vi.fn().mockResolvedValue(null),
   setProjectsRoot: vi.fn(),
+  setPlannerPreference: vi.fn(),
   setTelemetryConsent: vi.fn(),
   startPipeline: vi.fn(),
 }));
@@ -92,6 +95,7 @@ describe("App live log", () => {
       latestEvent: null, events: [], result: null, error: null,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
+    mocks.getAppSettings.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", plannerEnabled: false, plannerPreference: "askEachTime" });
     mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({
       analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured",

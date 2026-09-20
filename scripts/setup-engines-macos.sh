@@ -18,6 +18,10 @@ read_manifest() {
 archive_name="$(read_manifest distribution.archiveName)"
 archive="$cache/$archive_name"
 checksum="$archive.sha256"
+vocab_url="$(read_manifest runtimeAssets.0.sourceUrl)"
+vocab_sha="$(read_manifest runtimeAssets.0.sha256)"
+vocab_cache="$cache/vocab_tree_faiss_flickr100K_words256K.bin"
+vocab_relative="$(read_manifest runtimeAssets.0.destination)"
 
 mkdir -p "$cache" "$(dirname "$destination")"
 if [[ -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
@@ -63,5 +67,15 @@ if [[ -f "$destination/README.md" ]]; then
 fi
 rm -rf -- "$destination"
 mv "$staged" "$destination"
+
+if [[ ! -f "$vocab_cache" ]] || [[ "$(shasum -a 256 "$vocab_cache" | awk '{print toupper($1)}')" != "$vocab_sha" ]]; then
+  curl --fail --location --retry 3 "$vocab_url" --output "$vocab_cache"
+fi
+[[ "$(shasum -a 256 "$vocab_cache" | awk '{print toupper($1)}')" == "$vocab_sha" ]] || {
+  echo "COLMAP vocabulary tree SHA-256 mismatch." >&2
+  exit 1
+}
+mkdir -p "$(dirname "$destination/$vocab_relative")"
+install -m 0644 "$vocab_cache" "$destination/$vocab_relative"
 
 "$workspace/scripts/verify-engines-macos.sh"

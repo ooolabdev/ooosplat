@@ -1,4 +1,7 @@
-use std::{io::Read, path::Path};
+use std::{
+    io::{BufReader, Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +85,143 @@ fn read_colmap_count(path: &Path) -> Result<u64> {
     let mut bytes = [0_u8; 8];
     file.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+/// Rejects non-finite poses, points, reprojection errors, and obviously invalid
+/// camera intrinsics before a sparse model is allowed to reach Brush.
+pub fn validate_sparse_geometry(model: &Path) -> Result<bool> {
+    validate_cameras(&model.join("cameras.bin"))
+        .and_then(|valid| {
+            if valid {
+                validate_images(&model.join("images.bin"))
+            } else {
+                Ok(false)
+            }
+        })
+        .and_then(|valid| {
+            if valid {
+                validate_points(&model.join("points3D.bin"))
+            } else {
+                Ok(false)
+            }
+        })
+}
+
+fn validate_cameras(path: &Path) -> Result<bool> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let count = read_u64(&mut reader)?;
+    for _ in 0..count {
+        let _camera_id = read_u32(&mut reader)?;
+        let model_id = read_i32(&mut reader)?;
+        let width = read_u64(&mut reader)?;
+        let height = read_u64(&mut reader)?;
+        if width == 0 || height == 0 {
+            return Ok(false);
+        }
+        let Some(params) = camera_parameter_count(model_id) else {
+            return Ok(false);
+        };
+        let mut values = Vec::with_capacity(params);
+        for _ in 0..params {
+            values.push(read_f64(&mut reader)?);
+        }
+        if values.iter().any(|value| !value.is_finite())
+            || values.first().is_none_or(|focal| *focal <= 0.0)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_images(path: &Path) -> Result<bool> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let count = read_u64(&mut reader)?;
+    for _ in 0..count {
+        let _image_id = read_u32(&mut reader)?;
+        for _ in 0..7 {
+            if !read_f64(&mut reader)?.is_finite() {
+                return Ok(false);
+            }
+        }
+        let _camera_id = read_u32(&mut reader)?;
+        loop {
+            let mut byte = [0_u8; 1];
+            reader.read_exact(&mut byte)?;
+            if byte[0] == 0 {
+                break;
+            }
+        }
+        let points = read_u64(&mut reader)?;
+        let bytes = points
+            .checked_mul(24)
+            .ok_or_else(|| SplatError::Process("Invalid COLMAP image observations".into()))?;
+        reader.seek(SeekFrom::Current(bytes as i64))?;
+    }
+    Ok(true)
+}
+
+fn validate_points(path: &Path) -> Result<bool> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let count = read_u64(&mut reader)?;
+    for _ in 0..count {
+        let _point_id = read_u64(&mut reader)?;
+        for _ in 0..3 {
+            if !read_f64(&mut reader)?.is_finite() {
+                return Ok(false);
+            }
+        }
+        let mut rgb = [0_u8; 3];
+        reader.read_exact(&mut rgb)?;
+        let error = read_f64(&mut reader)?;
+        if !error.is_finite() || error < 0.0 {
+            return Ok(false);
+        }
+        let track = read_u64(&mut reader)?;
+        let bytes = track
+            .checked_mul(8)
+            .ok_or_else(|| SplatError::Process("Invalid COLMAP point track".into()))?;
+        reader.seek(SeekFrom::Current(bytes as i64))?;
+    }
+    Ok(true)
+}
+
+fn camera_parameter_count(model_id: i32) -> Option<usize> {
+    Some(match model_id {
+        0 => 3,
+        1 => 4,
+        2 => 4,
+        3 => 5,
+        4 => 8,
+        5 => 8,
+        6 => 12,
+        7 => 5,
+        8 => 4,
+        9 => 5,
+        10 => 12,
+        _ => return None,
+    })
+}
+
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn read_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+fn read_i32(reader: &mut impl Read) -> Result<i32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+fn read_f64(reader: &mut impl Read) -> Result<f64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(f64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]

@@ -102,4 +102,36 @@ foreach ($engine in $manifest.engines) {
   }
 }
 
+foreach ($asset in @($manifest.runtimeAssets)) {
+  $destination = Assert-WorkspaceDestination $asset.destination
+  $destinationReady = (Test-Path -LiteralPath $destination -PathType Leaf) -and
+    ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -eq $asset.sha256)
+  if (-not $Force -and $destinationReady) {
+    Write-Host "Ready: $($asset.name)"
+    continue
+  }
+
+  $cacheName = if ($asset.cacheName) { $asset.cacheName } else { Split-Path -Leaf $asset.destination }
+  $assetCache = Join-Path $CacheDirectory $cacheName
+  $cacheReady = (Test-Path -LiteralPath $assetCache -PathType Leaf) -and
+    ((Get-FileHash -LiteralPath $assetCache -Algorithm SHA256).Hash -eq $asset.sha256)
+  if (-not $cacheReady) {
+    if (Test-Path -LiteralPath $assetCache) {
+      Remove-Item -LiteralPath $assetCache -Force
+    }
+    Write-Host "Downloading $($asset.name)..."
+    Invoke-WebRequest -Uri $asset.sourceUrl -OutFile $assetCache -UseBasicParsing
+  } else {
+    Write-Host "Using cached asset: $cacheName"
+  }
+
+  $actualHash = (Get-FileHash -LiteralPath $assetCache -Algorithm SHA256).Hash
+  if ($actualHash -ne $asset.sha256) {
+    throw "Runtime asset hash mismatch for $($asset.name). Expected $($asset.sha256), got $actualHash."
+  }
+  New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+  Copy-Item -LiteralPath $assetCache -Destination $destination -Force
+  Write-Host "Installed: $($asset.name) -> $($asset.destination)"
+}
+
 & (Join-Path $PSScriptRoot 'verify-engines.ps1')

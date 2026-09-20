@@ -38,7 +38,28 @@ export interface ImageSequenceInfo {
   hasAlpha: boolean;
   requiresLargeSequenceConfirmation: boolean;
 }
-export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
+export interface PlannedFrame { sourceFrameIndex: number; timestampSeconds: number; }
+export interface FramePlan {
+  quality?: Quality | null;
+  retentionRatio: number;
+  samplingFps: number;
+  actualAverageFps?: number;
+  targetFps?: number;
+  candidateFps?: number;
+  estimatedFrames: number;
+  planningMode?: "legacy" | "budgeted";
+  preferredFps?: number;
+  selectedFrames?: PlannedFrame[];
+  candidateFrames?: PlannedFrame[];
+  shortCapture?: boolean;
+  minimumRequiredFps?: number;
+  minimumFrameTarget?: number;
+  minimumFrameOverrideApplied?: boolean;
+  minimumFrameTargetUnreachable?: boolean;
+  selectedFramesBeforeFilter?: number;
+  selectedFramesAfterFilter?: number;
+  backfilledForMinimumCount?: number;
+}
 export interface RuntimeEstimate {
   estimatedMs: number;
   lowerBoundMs: number;
@@ -83,10 +104,42 @@ export interface PipelineResult {
   registeredImages: number;
   registeredRatio: number;
   points3d: number;
+  qualityMetrics: QualityRunMetrics;
   durationMs: number;
   completedAt: string;
   warning: string | null;
   logsDirectory: string;
+}
+
+export interface QualityRunMetrics {
+  actualFrameCount: number;
+  actualSfmResolution: number;
+  actualFeatureCount: number | null;
+  actualBrushResolution: number;
+  actualBrushIterations: number;
+  registeredImages: number;
+  reprojectionError: number | null;
+  splatCount: number;
+  stageDurationsMs: Record<string, number>;
+  peakGpuMemoryMb: number | null;
+  plannerEnabled: boolean;
+  plannerVersion: number | null;
+  captureType: string | null;
+  pairingPlanned: string | null;
+  pairingActual: string | null;
+  mapperPlanned: string | null;
+  mapperActual: string | null;
+  largestComponentRatio: number | null;
+  twoCoreRatio: number | null;
+  bridgeRatio: number | null;
+  normalRescueRounds: number;
+  successRecoveryRounds: number;
+  normalBudgetExhausted: boolean;
+  successRecoveryEntered: boolean;
+  budgetOverriddenForSuccess: boolean;
+  normalDurationMs: number;
+  recoveryDurationMs: number;
+  reconstructionQuality: string | null;
 }
 
 export interface ProjectSummary {

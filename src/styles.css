@@ -479,6 +479,16 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .privacy-summary p { margin: 0 0 6px; }
 .privacy-summary p:last-child { margin-bottom: 0; }
 .privacy-summary b { color: #354159; }
+.planner-dialog { width: min(570px, calc(100vw - 48px)); }
+.planner-remember { margin: 18px 20px 0; padding: 13px 14px; display: flex; align-items: center; gap: 10px; color: #44516a; background: #eef2f8; border: 1px solid #d1d9e5; font-size: 12px; cursor: pointer; }
+.planner-remember input { width: 16px; height: 16px; accent-color: var(--blue); }
+.planner-actions { margin-top: 4px; }
+.planner-preference-options { margin: 18px 20px 0; display: grid; gap: 8px; }
+.planner-preference-options > button { min-height: 64px; padding: 11px 13px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 10px; text-align: left; color: #3f4c63; background: #f4f6f9; border: 1px solid #cbd3df; cursor: pointer; }
+.planner-preference-options > button.selected { color: #243a70; background: #edf2ff; border-color: #8da8ed; box-shadow: inset 3px 0 var(--blue); }
+.planner-preference-options strong, .planner-preference-options small { display: block; }
+.planner-preference-options strong { font-size: 12px; }
+.planner-preference-options small { margin-top: 5px; color: #6b7689; font-size: 10px; line-height: 1.5; }
 
 @media (max-width: 1240px) {
   .preview-header { grid-template-columns: minmax(155px, 1fr) auto minmax(260px, 1fr); gap: 10px; }

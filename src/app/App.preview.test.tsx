@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   resumePipeline: vi.fn(),
   getAppRuntimeStatus: vi.fn(),
   getProjectOverview: vi.fn(),
+  getAppSettings: vi.fn(),
   initializeTelemetry: vi.fn(),
   setTelemetryConsent: vi.fn(),
   selectVideo: vi.fn(),
@@ -39,6 +40,7 @@ vi.mock("../lib/backend", () => ({
   exportPly: mocks.exportPly,
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
+  getAppSettings: mocks.getAppSettings,
   initializeTelemetry: mocks.initializeTelemetry,
   onPipelineEvent: vi.fn().mockResolvedValue(() => undefined),
   prepareGaussianPreview: mocks.prepareGaussianPreview,
@@ -52,6 +54,7 @@ vi.mock("../lib/backend", () => ({
   selectImageSequence: mocks.selectImageSequence,
   selectVideo: mocks.selectVideo,
   setProjectsRoot: vi.fn(),
+  setPlannerPreference: vi.fn(),
   setTelemetryConsent: mocks.setTelemetryConsent,
   startPipeline: mocks.startPipeline,
 }));
@@ -137,6 +140,7 @@ describe("App preview workspace", () => {
       logsDirectory: `${project.projectPath}\\logs`,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [project] });
+    mocks.getAppSettings.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", plannerEnabled: false, plannerPreference: "askEachTime" });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
     mocks.setTelemetryConsent.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
     mocks.selectVideo.mockReset().mockResolvedValue(null);
@@ -633,7 +637,7 @@ describe("App preview workspace", () => {
 
     expect(mocks.selectImageSequence).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("24 张");
-    expect(container.textContent).toContain("将保留 PNG Alpha");
+    expect(container.textContent).toContain("生成时将精确检测透明度");
     expect(container.querySelectorAll(".input-picker")).toHaveLength(1);
   });
 

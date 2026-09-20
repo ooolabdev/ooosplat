@@ -14,8 +14,10 @@ workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime="$workspace/engines/macos/arm64"
 manifest="$workspace/engines/manifest.macos.json"
 minimum_system_version="$(node -e 'process.stdout.write(require(process.argv[1]).minimumSystemVersion)' "$manifest")"
+vocab_relative="$(node -e 'process.stdout.write(require(process.argv[1]).runtimeAssets[0].destination)' "$manifest")"
+vocab_sha="$(node -e 'process.stdout.write(require(process.argv[1]).runtimeAssets[0].sha256)' "$manifest")"
 
-for relative in bin/ffmpeg bin/ffprobe bin/colmap bin/brush_app SHA256SUMS BUILD-INFO.json BUNDLED-COMPONENTS.json; do
+for relative in bin/ffmpeg bin/ffprobe bin/colmap bin/brush_app "$vocab_relative" SHA256SUMS BUILD-INFO.json BUNDLED-COMPONENTS.json; do
   [[ -f "$runtime/$relative" ]] || { echo "Missing macOS runtime file: $relative" >&2; exit 1; }
 done
 
@@ -24,6 +26,10 @@ for binary in ffmpeg ffprobe colmap brush_app; do
 done
 
 (cd "$runtime" && shasum -a 256 -c SHA256SUMS)
+[[ "$(shasum -a 256 "$runtime/$vocab_relative" | awk '{print toupper($1)}')" == "$vocab_sha" ]] || {
+  echo "COLMAP vocabulary tree SHA-256 mismatch." >&2
+  exit 1
+}
 
 version_le() {
   local left_major="${1%%.*}" left_minor="${1#*.}" right_major="${2%%.*}" right_minor="${2#*.}"
@@ -85,6 +91,10 @@ else
   echo "Unsupported COLMAP CLI: no recognized CPU SIFT options." >&2
   exit 1
 fi
+grep -q -- '--SequentialMatching.vocab_tree_path' <<<"$matching_help" || {
+  echo "COLMAP does not support an explicit local loop-closure vocabulary tree." >&2
+  exit 1
+}
 
 if find "$runtime" -type f -print | grep -Ei 'cuda|cudnn|cudart|curand' >/dev/null; then
   echo "CUDA files are forbidden in the macOS COLMAP runtime." >&2
@@ -105,4 +115,4 @@ for (const file of fs.readdirSync(path.join(process.argv[4],"lib"))) if (!covere
 for (const license of c.sourceLicenseFiles||[]) if (!fs.existsSync(path.join(process.argv[4],"licenses",license))) throw new Error(`Missing source license ${license}`);
 if ((c.sourceLicenseFiles||[]).length < 6) throw new Error("Incomplete COLMAP source license inventory");
 ' "$manifest" "$runtime/BUILD-INFO.json" "$runtime/BUNDLED-COMPONENTS.json" "$runtime"
-echo "Verified bundled Apple Silicon FFmpeg/FFprobe, CPU COLMAP, and Brush without PATH fallback."
+echo "Verified bundled Apple Silicon FFmpeg/FFprobe, CPU COLMAP, offline loop-closure vocabulary tree, and Brush without PATH fallback."

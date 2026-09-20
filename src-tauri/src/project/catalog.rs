@@ -66,11 +66,23 @@ fn runtime_sample_frame_count(
         .filter(|count| *count > 0)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlannerPreference {
+    #[default]
+    AskEachTime,
+    AlwaysOn,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub schema_version: u32,
     pub projects_root: PathBuf,
+    #[serde(default)]
+    pub planner_enabled: bool,
+    #[serde(default)]
+    pub planner_preference: PlannerPreference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,7 +189,12 @@ pub async fn load_settings() -> Result<AppSettings> {
     let path = settings_path()?;
     if path.is_file() {
         if let Ok(bytes) = tokio::fs::read(&path).await {
-            if let Ok(value) = serde_json::from_slice(&bytes) {
+            if let Ok(mut value) = serde_json::from_slice::<AppSettings>(&bytes) {
+                if value.planner_enabled
+                    && matches!(value.planner_preference, PlannerPreference::AskEachTime)
+                {
+                    value.planner_preference = PlannerPreference::AlwaysOn;
+                }
                 return Ok(value);
             }
         }
@@ -185,6 +202,8 @@ pub async fn load_settings() -> Result<AppSettings> {
     Ok(AppSettings {
         schema_version: 1,
         projects_root: default_projects_root()?,
+        planner_enabled: false,
+        planner_preference: PlannerPreference::AskEachTime,
     })
 }
 
@@ -201,6 +220,26 @@ pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
     crate::project::ProjectManager::validate_root(&root).await?;
     let mut settings = load_settings().await?;
     settings.projects_root = root;
+    save_settings(&settings).await?;
+    Ok(settings)
+}
+
+pub async fn save_planner_enabled(enabled: bool) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.planner_enabled = enabled;
+    settings.planner_preference = if enabled {
+        PlannerPreference::AlwaysOn
+    } else {
+        PlannerPreference::AskEachTime
+    };
+    save_settings(&settings).await?;
+    Ok(settings)
+}
+
+pub async fn save_planner_preference(preference: PlannerPreference) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.planner_enabled = matches!(preference, PlannerPreference::AlwaysOn);
+    settings.planner_preference = preference;
     save_settings(&settings).await?;
     Ok(settings)
 }
@@ -493,6 +532,8 @@ mod tests {
     fn default_summary_shape_is_serializable() {
         let value = AppSettings {
             schema_version: 1,
+            planner_enabled: false,
+            planner_preference: PlannerPreference::AskEachTime,
             projects_root: PathBuf::from("C:/项目 Root"),
         };
         assert!(serde_json::to_string(&value)

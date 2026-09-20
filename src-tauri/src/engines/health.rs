@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engines::colmap::{detect_cli_family, ColmapCliFamily},
+    engines::colmap::{detect_cli_family, ColmapCliFamily, VOCABULARY_TREE_FILE},
     process::{ProcessManager, ProcessSpec},
 };
 
@@ -110,6 +110,7 @@ pub struct EnginePaths {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub colmap: PathBuf,
+    pub colmap_vocab_tree: PathBuf,
     pub brush: PathBuf,
 }
 
@@ -121,6 +122,7 @@ impl EnginePaths {
             ffmpeg: root.join("ffmpeg").join("ffmpeg.exe"),
             ffprobe: root.join("ffmpeg").join("ffprobe.exe"),
             colmap: root.join("colmap").join("bin").join("colmap.exe"),
+            colmap_vocab_tree: root.join("colmap").join("share").join(VOCABULARY_TREE_FILE),
             brush: root.join("brush").join("brush_app.exe"),
             root,
         };
@@ -129,6 +131,7 @@ impl EnginePaths {
             ffmpeg: root.join("bin").join("ffmpeg"),
             ffprobe: root.join("bin").join("ffprobe"),
             colmap: root.join("bin").join("colmap"),
+            colmap_vocab_tree: root.join("share").join("colmap").join(VOCABULARY_TREE_FILE),
             brush: root.join("bin").join("brush_app"),
             root,
         };
@@ -137,6 +140,7 @@ impl EnginePaths {
             ffmpeg: root.join("ffmpeg"),
             ffprobe: root.join("ffprobe"),
             colmap: root.join("colmap"),
+            colmap_vocab_tree: root.join("linux").join("colmap").join(VOCABULARY_TREE_FILE),
             brush: root.join("brush_app"),
             root,
         };
@@ -177,6 +181,7 @@ impl EnginePaths {
                     std::slice::from_ref(&defaults.colmap),
                     "colmap",
                 ),
+                colmap_vocab_tree: defaults.colmap_vocab_tree,
                 brush: resolve_engine(
                     "OOOSPLAT_BRUSH",
                     &[
@@ -243,7 +248,7 @@ impl EnginePaths {
         let (ffmpeg, ffprobe, colmap, brush) = tokio::join!(
             check_basic(EngineKind::Ffmpeg, &self.ffmpeg, &["-version"]),
             check_basic(EngineKind::Ffprobe, &self.ffprobe, &["-version"]),
-            check_colmap(&self.colmap, &self.root),
+            check_colmap(&self.colmap, &self.colmap_vocab_tree, &self.root),
             check_basic(EngineKind::Brush, &self.brush, &["--help"]),
         );
         vec![ffmpeg, ffprobe, colmap, brush]
@@ -337,7 +342,7 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
     }
 }
 
-async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
+async fn check_colmap(path: &Path, vocabulary_tree: &Path, engines_root: &Path) -> EngineStatus {
     if !path.is_file() {
         let mut status = missing(EngineKind::Colmap, path);
         status.acceleration = Some(cpu_status(
@@ -402,6 +407,10 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
 
     let cli_family = detect_cli_family(&feature_help, &matching_help);
     successful &= cli_family.is_some();
+    let supports_local_vocabulary_tree =
+        matching_help.contains("--SequentialMatching.vocab_tree_path");
+    let vocabulary_tree_available = vocabulary_tree.is_file();
+    successful &= supports_local_vocabulary_tree && vocabulary_tree_available;
     #[cfg(target_os = "macos")]
     let cpu_only = Some(true);
     #[cfg(not(target_os = "macos"))]
@@ -454,14 +463,31 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     };
     let family_label = cli_family.map_or("不支持的 CLI", ColmapCliFamily::label);
     #[cfg(target_os = "macos")]
-    let detail = format!("三个必需命令可启动；{family_label}；macOS arm64 CPU-only 构建");
+    let detail = if !supports_local_vocabulary_tree {
+        "COLMAP 不支持本地回环词汇树参数".into()
+    } else if !vocabulary_tree_available {
+        format!("缺少内置 COLMAP 回环词汇树：{}", vocabulary_tree.display())
+    } else {
+        format!("三个必需命令可启动；{family_label}；内置回环词汇树可用；macOS arm64 CPU-only 构建")
+    };
     #[cfg(not(target_os = "macos"))]
-    let detail = match cpu_only {
-        Some(true) => {
-            format!("三个必需命令可启动；{family_label}；帮助输出明确报告无 CUDA")
+    let detail = if !supports_local_vocabulary_tree {
+        "COLMAP 不支持本地回环词汇树参数".into()
+    } else if !vocabulary_tree_available {
+        format!("缺少内置 COLMAP 回环词汇树：{}", vocabulary_tree.display())
+    } else {
+        match cpu_only {
+            Some(true) => {
+                format!("三个必需命令可启动；{family_label}；内置回环词汇树可用；帮助输出明确报告无 CUDA")
+            }
+            Some(false) => format!(
+                "{family_label}；内置回环词汇树可用；{}",
+                acceleration.reason
+            ),
+            None => format!(
+                "三个必需命令可启动；{family_label}；内置回环词汇树可用；未明确报告 CUDA 构建状态"
+            ),
         }
-        Some(false) => format!("{family_label}；{}", acceleration.reason),
-        None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
     };
     EngineStatus {
         kind: EngineKind::Colmap,
@@ -502,7 +528,7 @@ fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 3]) {
 }
 
 pub async fn check_colmap_acceleration(paths: &EnginePaths) -> ColmapAccelerationStatus {
-    check_colmap(&paths.colmap, &paths.root)
+    check_colmap(&paths.colmap, &paths.colmap_vocab_tree, &paths.root)
         .await
         .acceleration
         .unwrap_or_else(|| {
@@ -836,6 +862,10 @@ mod tests {
     fn linux_root_is_flat_and_discovery_can_fall_back_to_path() {
         let paths = EnginePaths::from_root("/opt/ooosplat-engines");
         assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
+        assert_eq!(
+            paths.colmap_vocab_tree,
+            PathBuf::from("/opt/ooosplat-engines/linux/colmap").join(VOCABULARY_TREE_FILE)
+        );
         let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
         // FFmpeg is not installed on every contributor machine or CI runner, so assert
         // the resolver contract instead of requiring the binary: an explicit override
@@ -856,6 +886,10 @@ mod tests {
         assert_eq!(paths.ffmpeg, root.join("bin").join("ffmpeg"));
         assert_eq!(paths.ffprobe, root.join("bin").join("ffprobe"));
         assert_eq!(paths.colmap, root.join("bin").join("colmap"));
+        assert_eq!(
+            paths.colmap_vocab_tree,
+            root.join("share").join("colmap").join(VOCABULARY_TREE_FILE)
+        );
         assert_eq!(paths.brush, root.join("bin").join("brush_app"));
     }
 
@@ -869,6 +903,10 @@ mod tests {
         assert_eq!(
             paths.colmap,
             root.join("colmap").join("bin").join("colmap.exe")
+        );
+        assert_eq!(
+            paths.colmap_vocab_tree,
+            root.join("colmap").join("share").join(VOCABULARY_TREE_FILE)
         );
         assert_eq!(paths.brush, root.join("brush").join("brush_app.exe"));
     }

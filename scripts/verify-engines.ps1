@@ -17,6 +17,14 @@ foreach ($item in $manifest.requiredFiles) {
   $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
   if ($actual -ne $item.sha256) { throw "Hash mismatch for $($item.path): $actual" }
 }
+foreach ($asset in @($manifest.runtimeAssets)) {
+  $path = Join-Path $workspace $asset.destination
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "Missing runtime asset: $($asset.destination). Run 'npm run setup:engines' first."
+  }
+  $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+  if ($actual -ne $asset.sha256) { throw "Hash mismatch for $($asset.destination): $actual" }
+}
 # CUDA build must ship its NVIDIA runtime DLLs; requiredFiles hash-locks them,
 # this existence guard is a coarse second line of defense.
 $cudaRuntime = Get-ChildItem -LiteralPath (Join-Path $workspace 'engines\colmap\bin') -File | Where-Object { $_.Name -match '(?i)cudart64_|curand64_|onnxruntime_providers_cuda' }
@@ -26,7 +34,12 @@ $savedPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 $help = & $colmap feature_extractor -h 2>&1 | Out-String
 $colmapExit = $LASTEXITCODE
+$matchingHelp = & $colmap sequential_matcher -h 2>&1 | Out-String
+$matchingExit = $LASTEXITCODE
 if ($colmapExit -ne 0 -or $help -notmatch '(?i)with CUDA') { throw 'Bundled COLMAP did not explicitly report CUDA support.' }
+if ($matchingExit -ne 0 -or $matchingHelp -notmatch [regex]::Escape('--SequentialMatching.vocab_tree_path')) {
+  throw 'Bundled COLMAP does not support an explicit local loop-closure vocabulary tree.'
+}
 $brush = Join-Path $workspace 'engines\brush\brush_app.exe'
 $brushHelp = & $brush --help 2>&1 | Out-String
 $brushExit = $LASTEXITCODE
@@ -35,4 +48,4 @@ if ($brushExit -ne 0) { throw "Bundled Brush help failed with exit code $brushEx
 foreach ($flag in '--total-steps','--max-resolution','--export-path','--export-name') {
   if ($brushHelp -notmatch [regex]::Escape($flag)) { throw "Bundled Brush is missing $flag" }
 }
-Write-Host "Verified $($manifest.requiredFiles.Count) locked engine files; COLMAP CUDA and Brush CLI are valid."
+Write-Host "Verified $($manifest.requiredFiles.Count) locked engine files and $(@($manifest.runtimeAssets).Count) runtime assets; COLMAP CUDA, offline loop closure, and Brush CLI are valid."

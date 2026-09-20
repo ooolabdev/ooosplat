@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -6,8 +6,12 @@ use uuid::Uuid;
 
 use crate::{
     pipeline::PipelineStage,
+    planner::PlannerCheckpoint,
     presets::Quality,
-    video::{FramePlan, ImageSequenceInfo, VideoInfo},
+    video::{
+        FramePlan, FramePlanningMode, ImageSequenceInfo, MinimumFrameProtection, PlannedFrame,
+        VideoInfo,
+    },
 };
 
 pub const PROJECT_APP_ID: &str = "studio.ooo.splat";
@@ -160,6 +164,43 @@ pub struct ProjectOutput {
     pub registered_images: u64,
     pub registered_ratio: f64,
     pub points_3d: u64,
+    #[serde(default)]
+    pub quality_metrics: QualityRunMetrics,
+}
+
+/// Non-sensitive benchmark facts produced by a run. This intentionally has no
+/// image data, source names, or filesystem paths.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QualityRunMetrics {
+    pub actual_frame_count: u64,
+    pub actual_sfm_resolution: u32,
+    pub actual_feature_count: Option<u64>,
+    pub actual_brush_resolution: u32,
+    pub actual_brush_iterations: usize,
+    pub registered_images: u64,
+    pub reprojection_error: Option<f64>,
+    pub splat_count: u64,
+    pub stage_durations_ms: BTreeMap<String, u64>,
+    pub peak_gpu_memory_mb: Option<u64>,
+    pub planner_enabled: bool,
+    pub planner_version: Option<u32>,
+    pub capture_type: Option<String>,
+    pub pairing_planned: Option<String>,
+    pub pairing_actual: Option<String>,
+    pub mapper_planned: Option<String>,
+    pub mapper_actual: Option<String>,
+    pub largest_component_ratio: Option<f32>,
+    pub two_core_ratio: Option<f32>,
+    pub bridge_ratio: Option<f32>,
+    pub normal_rescue_rounds: u32,
+    pub success_recovery_rounds: u32,
+    pub normal_budget_exhausted: bool,
+    pub success_recovery_entered: bool,
+    pub budget_overridden_for_success: bool,
+    pub normal_duration_ms: u64,
+    pub recovery_duration_ms: u64,
+    pub reconstruction_quality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,18 +243,36 @@ pub struct ProjectMetadata {
 }
 
 pub const fn schema_version() -> u32 {
-    5
+    8
 }
 
 fn default_model() -> String {
     "final.ply".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct FrameState {
+    #[serde(default)]
+    pub quality: Option<Quality>,
     pub retention_ratio: f64,
     pub sampling_fps: f64,
+    #[serde(default)]
+    pub actual_average_fps: f64,
+    #[serde(default)]
+    pub target_fps: f64,
+    #[serde(default)]
+    pub candidate_fps: f64,
+    #[serde(default)]
+    pub planning_mode: FramePlanningMode,
+    #[serde(default)]
+    pub preferred_fps: f64,
+    #[serde(default)]
+    pub selected_frames: Vec<PlannedFrame>,
+    #[serde(default)]
+    pub candidate_frames: Vec<PlannedFrame>,
+    #[serde(flatten)]
+    pub minimum_frame_protection: MinimumFrameProtection,
     pub estimated_frames: u64,
     pub extracted_frames: Option<u64>,
     #[serde(default)]
@@ -227,8 +286,17 @@ pub struct FrameState {
 impl From<&FramePlan> for FrameState {
     fn from(plan: &FramePlan) -> Self {
         Self {
+            quality: plan.quality,
             retention_ratio: plan.retention_ratio,
             sampling_fps: plan.sampling_fps,
+            actual_average_fps: plan.actual_average_fps,
+            target_fps: plan.target_fps,
+            candidate_fps: plan.candidate_fps,
+            planning_mode: plan.planning_mode,
+            preferred_fps: plan.preferred_fps,
+            selected_frames: plan.selected_frames.clone(),
+            candidate_frames: plan.candidate_frames.clone(),
+            minimum_frame_protection: plan.minimum_frame_protection.clone(),
             estimated_frames: plan.estimated_frames,
             extracted_frames: None,
             image_format: None,
@@ -249,6 +317,13 @@ pub struct PipelineStateFile {
     #[serde(default)]
     pub image_sequence: Option<ImageSequenceInfo>,
     pub frames: Option<FrameState>,
+    /// Snapshotted at project creation so resume never changes extraction mode.
+    #[serde(default)]
+    pub planner_enabled: bool,
+    /// Versioned, authoritative Planner decisions and actual execution state.
+    /// Old checkpoints migrate to `None` and continue through the legacy path.
+    #[serde(default)]
+    pub planner: Option<PlannerCheckpoint>,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -268,6 +343,8 @@ impl PipelineStateFile {
             input_type,
             image_sequence: None,
             frames: None,
+            planner_enabled: false,
+            planner: None,
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
@@ -310,6 +387,9 @@ mod tests {
         assert_eq!(frames.image_format, None);
         assert_eq!(frames.mask_count, None);
         assert!(!frames.has_alpha);
+        assert!(!state.planner_enabled);
+        assert!(state.planner.is_none());
+        assert_eq!(frames.planning_mode, FramePlanningMode::Legacy);
     }
 
     #[test]

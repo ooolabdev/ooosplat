@@ -25,10 +25,10 @@ Current version: **0.4.1**. This release focuses on multiple input types, recove
 | --- | --- | --- | --- |
 | P0 | Very large PLY preview stability and performance | Eliminate memory peaks and WebView2 OOM crashes when loading PLY files larger than 1 GB, and improve large-scale Gaussian loading, editing, and cleanup. | [#21](https://github.com/ooolabdev/ooosplat/issues/21) |
 | P0 | Performance optimization | Reduce time spent on media preparation, feature extraction, matching, reconstruction, and training while preserving result compatibility. | To be created |
-| P0 | Generation quality optimization | Improve camera registration, geometric completeness, visual detail, and edge quality with measurable optimization strategies. | To be created |
+| P0 | Auto Reconstruction Planner Beta | Capture analysis, adaptive frames, Pairing / View Graph / Mapper decisions, candidate archiving, bounded Normal Rescue, and Success Recovery are integrated; Release datasets will continue calibrating thresholds. | Beta implemented |
 | P0 | Better error guidance | Turn engine, media, disk, GPU, and reconstruction failures into clear actions and recovery guidance. | To be created |
 | P0 | UI simplification | Reduce unnecessary information and interaction layers while unifying generation, history, preview, and editing workflows. | To be created |
-| P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. | To be created |
+| P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. The [first Quality v2 same-source record](docs/quality-v2-benchmark-2026-09-19.md) is archived. | To be created |
 | P1 | Telemetry data collection and learning | Active-user, Pipeline performance, and Failure distribution metrics already exist. Improve data quality, long-term samples, dashboards, and release comparisons. | To be created |
 | P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
 | P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |

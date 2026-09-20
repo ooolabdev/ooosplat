@@ -15,9 +15,11 @@ npm run verify:engines
 Downloaded archives are cached under `.cache/engines/`, and extracted runtimes
 are placed in this directory. Both are ignored by Git. The finished NSIS
 installer still embeds the complete verified runtimes, so Windows end users do
-not need to download or configure engines. For the Ubuntu 24.04 Alpha, setup
-installs only the pinned Linux x86_64 Brush binary under
-`engines/linux/brush`; the Ubuntu `.deb` embeds that runtime while FFmpeg,
+not need to download or configure engines. The hash-locked COLMAP loop-closure
+vocabulary tree is embedded as well, so reconstruction never downloads it from
+GitHub. For the Ubuntu 24.04 Alpha, setup installs the pinned Linux x86_64
+Brush binary under `engines/linux/brush` and the vocabulary tree under
+`engines/linux/colmap`; the Ubuntu `.deb` embeds both assets while FFmpeg,
 FFprobe, and CPU COLMAP are provided through declared package dependencies.
 Other Linux distributions remain outside the current delivery scope.
 

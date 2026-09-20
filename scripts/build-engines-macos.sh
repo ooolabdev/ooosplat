@@ -47,9 +47,14 @@ dependency_origins="$build/dependency-origins.tsv"
 ffmpeg_archive="$sources/ffmpeg-8.1.2.tar.xz"
 colmap_archive="$sources/colmap-4.0.4.tar.gz"
 brush_archive="$sources/brush-app-aarch64-apple-darwin.tar.xz"
+vocab_asset="$sources/vocab_tree_faiss_flickr100K_words256K.bin"
 download_verified "$(engine_field 'FFmpeg / FFprobe' sourceUrl)" "$(engine_field 'FFmpeg / FFprobe' sourceSha256)" "$ffmpeg_archive"
 download_verified "$(engine_field COLMAP sourceUrl)" "$(engine_field COLMAP sourceSha256)" "$colmap_archive"
 download_verified "$(engine_field Brush sourceUrl)" "$(engine_field Brush sourceSha256)" "$brush_archive"
+download_verified "$(read_manifest runtimeAssets.0.sourceUrl)" "$(read_manifest runtimeAssets.0.sha256)" "$vocab_asset"
+vocab_relative="$(read_manifest runtimeAssets.0.destination)"
+mkdir -p "$(dirname "$stage/$vocab_relative")"
+install -m 0644 "$vocab_asset" "$stage/$vocab_relative"
 
 mkdir -p "$build/ffmpeg-source"
 tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
@@ -259,7 +264,7 @@ fs.writeFileSync(path.join(process.argv[2],"BUILD-INFO.json"),JSON.stringify(out
 
 (
   cd "$stage"
-  find bin lib licenses -type f -print | LC_ALL=C sort | while IFS= read -r relative; do shasum -a 256 "$relative"; done > SHA256SUMS
+  find bin lib licenses share -type f -print | LC_ALL=C sort | while IFS= read -r relative; do shasum -a 256 "$relative"; done > SHA256SUMS
   shasum -a 256 BUILD-INFO.json BUNDLED-COMPONENTS.json >> SHA256SUMS
 )
 

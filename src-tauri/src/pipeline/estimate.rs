@@ -143,9 +143,9 @@ fn base_estimate_ms(frames: u64, quality: Quality) -> u64 {
 /// This duration model is therefore used only to provide a clearly labelled,
 /// best-effort progress indicator while the process is alive.
 pub(crate) fn estimate_brush_stage_ms(quality: Quality) -> u64 {
-    let preset = quality.preset();
-    let resolution_factor = (preset.brush_max_resolution as f64 / 960.0).powf(1.35);
-    let iteration_factor = preset.brush_iterations as f64 / 6_000.0;
+    let budget = quality.budget().baseline.brush;
+    let resolution_factor = (budget.resolution.estimate_max_resolution() as f64 / 960.0).powf(1.35);
+    let iteration_factor = budget.iterations as f64 / 6_000.0;
     (80_000.0 * resolution_factor * iteration_factor)
         .round()
         .max(1_000.0) as u64
@@ -228,9 +228,18 @@ mod tests {
     fn brush_stage_estimate_uses_the_same_local_history_calibration() {
         let video = video();
         let plan = FramePlan {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 30.0,
+            actual_average_fps: 30.0,
+            target_fps: 30.0,
+            candidate_fps: 30.0,
             estimated_frames: 533,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
         };
         let base_total = base_estimate_ms(plan.estimated_frames, Quality::Balanced);
         let sample = RuntimeSample {
@@ -248,9 +257,18 @@ mod tests {
     fn completed_local_runs_calibrate_and_narrow_the_range() {
         let video = video();
         let plan = FramePlan {
+            quality: None,
             retention_ratio: 0.064,
             sampling_fps: 3.83,
+            actual_average_fps: 3.83,
+            target_fps: 3.83,
+            candidate_fps: 3.83,
             estimated_frames: 48,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
         };
         let sample = RuntimeSample {
             quality: Quality::Fast,
@@ -273,9 +291,18 @@ mod tests {
     fn same_quality_samples_take_priority_and_use_the_median() {
         let video = video();
         let plan = FramePlan {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 30.0,
+            actual_average_fps: 30.0,
+            target_fps: 30.0,
+            candidate_fps: 30.0,
             estimated_frames: 533,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
         };
         let samples = [
             RuntimeSample {
@@ -304,9 +331,18 @@ mod tests {
     fn nearby_frame_counts_do_not_mix_unrelated_runs() {
         let video = video();
         let plan = FramePlan {
+            quality: None,
             retention_ratio: 0.3,
             sampling_fps: 9.0,
+            actual_average_fps: 9.0,
+            target_fps: 9.0,
+            candidate_fps: 9.0,
             estimated_frames: 320,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
         };
         let samples = [
             RuntimeSample {

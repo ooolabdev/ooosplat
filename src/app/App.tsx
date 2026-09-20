@@ -9,11 +9,12 @@ import packageMetadata from "../../package.json";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
-  estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
+  estimateProjectRuntime, exportPly, getAppRuntimeStatus, getAppSettings, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
-  initializeTelemetry, setTelemetryConsent, resumePipeline,
+  initializeTelemetry, setPlannerPreference, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
+import type { PlannerPreference } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type PipelineFailureKind } from "../lib/pipelineError";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
@@ -237,6 +238,11 @@ export function App() {
   const [telemetryPreferences, setTelemetryPreferences] = useState<TelemetryPreferencesState | null>(null);
   const [privacySettingsOpen, setPrivacySettingsOpen] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
+  const [plannerPreference, setPlannerPreferenceState] = useState<PlannerPreference>("askEachTime");
+  const [plannerPromptOpen, setPlannerPromptOpen] = useState(false);
+  const [plannerSettingsOpen, setPlannerSettingsOpen] = useState(false);
+  const [rememberPlanner, setRememberPlanner] = useState(false);
+  const [plannerSettingsBusy, setPlannerSettingsBusy] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
@@ -306,12 +312,13 @@ export function App() {
   }, [clearCancellationFeedback, closeGaussian, viewMode]);
 
   useEffect(() => {
-    void Promise.all([checkEngines(), getProjectOverview()])
-      .then(([engines, overview]) => {
+    void Promise.all([checkEngines(), getProjectOverview(), getAppSettings()])
+      .then(([engines, overview, settings]) => {
         store.setEngines(engines);
         store.setProjectsRoot(overview.projectsRoot);
         store.setProjects(overview.projects);
         store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+        setPlannerPreferenceState(settings.plannerPreference);
       })
       .catch((error) => store.setError(messageOf(error)));
   }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setColmapAcceleration, store.setError]);
@@ -478,13 +485,9 @@ export function App() {
     }
   };
 
-  const generate = async () => {
+  const runGeneration = async (plannerEnabled: boolean) => {
     if (!store.inputPath || !store.plan || !store.projectsRoot) return;
-    if (
-      store.inputType === "images"
-      && store.imageSequence?.requiresLargeSequenceConfirmation
-      && !(await confirmLargeImageSequence(store.imageSequence.imageCount))
-    ) return;
+    setPlannerPromptOpen(false);
     clearCancellationFeedback();
     runElapsedOffset.current = 0;
     runStartedAt.current = Date.now();
@@ -493,7 +496,7 @@ export function App() {
     pipelineCommandPending.current = true;
     store.beginRun();
     try {
-      const result = await startPipeline(store.inputPath, store.quality, store.projectsRoot);
+      const result = await startPipeline(store.inputPath, store.quality, store.projectsRoot, plannerEnabled);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -514,6 +517,50 @@ export function App() {
     } finally {
       try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
       pipelineCommandPending.current = false;
+    }
+  };
+
+  const generate = async () => {
+    if (!store.inputPath || !store.plan || !store.projectsRoot) return;
+    if (
+      store.inputType === "images"
+      && store.imageSequence?.requiresLargeSequenceConfirmation
+      && !(await confirmLargeImageSequence(store.imageSequence.imageCount))
+    ) return;
+    if (plannerPreference === "alwaysOn") {
+      await runGeneration(true);
+    } else {
+      setRememberPlanner(false);
+      setPlannerPromptOpen(true);
+    }
+  };
+
+  const choosePlannerForRun = async (enabled: boolean) => {
+    if (enabled && rememberPlanner) {
+      setPlannerSettingsBusy(true);
+      try {
+        const settings = await setPlannerPreference("alwaysOn");
+        setPlannerPreferenceState(settings.plannerPreference);
+      } catch (error) {
+        store.setError(messageOf(error));
+        return;
+      } finally {
+        setPlannerSettingsBusy(false);
+      }
+    }
+    await runGeneration(enabled);
+  };
+
+  const changePlannerPreference = async (preference: PlannerPreference) => {
+    if (plannerSettingsBusy) return;
+    setPlannerSettingsBusy(true);
+    try {
+      const settings = await setPlannerPreference(preference);
+      setPlannerPreferenceState(settings.plannerPreference);
+    } catch (error) {
+      store.setError(messageOf(error));
+    } finally {
+      setPlannerSettingsBusy(false);
     }
   };
 
@@ -740,7 +787,7 @@ export function App() {
       <div className="brand-lockup"><span className="brand-mark"><img src={appLogo} alt="" aria-hidden="true" /></span><span className="brand-name">OOO<span>Splat</span></span><span className="version-tag">LOCAL / {packageMetadata.version}</span></div>
       <div className="topbar-actions">
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
-        {telemetryPreferences && <button className="settings-action" type="button" onClick={() => setPrivacySettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>}
+        <button className="settings-action" type="button" onClick={() => setPlannerSettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>
         <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
       </div>
     </header>
@@ -917,6 +964,36 @@ export function App() {
       </div>
     </div>}
     {failureDialog && <FailureGuidanceDialog failure={failureDialog} action={failureDialogAction} onClose={closeFailureDialog} onRetry={() => void retryFailedProject()} onOpenLogs={() => void openFailureLogs()} />}
+    {plannerPromptOpen && <div className="privacy-backdrop" role="dialog" aria-modal="true" aria-labelledby="planner-prompt-title">
+      <section className="privacy-dialog settings planner-dialog">
+        <div className="privacy-heading">
+          <span className="privacy-symbol"><Zap size={19} /></span>
+          <div><small>{t("planner.beta")}</small><h2 id="planner-prompt-title">{t("planner.title")}</h2></div>
+          <button className="privacy-close" type="button" aria-label={t("common.close")} onClick={() => setPlannerPromptOpen(false)}><X size={17} /></button>
+        </div>
+        <p className="privacy-intro">{t("planner.description")}</p>
+        <label className="planner-remember"><input type="checkbox" checked={rememberPlanner} onChange={(event) => setRememberPlanner(event.currentTarget.checked)} /><span>{t("planner.remember")}</span></label>
+        <div className="privacy-actions planner-actions">
+          <button className="privacy-secondary" type="button" disabled={plannerSettingsBusy} onClick={() => void choosePlannerForRun(false)}>{t("planner.traditional")}</button>
+          <button className="privacy-primary" type="button" disabled={plannerSettingsBusy} onClick={() => void choosePlannerForRun(true)}>{plannerSettingsBusy ? t("common.saving") : t("planner.enable")}</button>
+        </div>
+      </section>
+    </div>}
+    {plannerSettingsOpen && <div className="privacy-backdrop" role="dialog" aria-modal="true" aria-labelledby="planner-settings-title">
+      <section className="privacy-dialog settings planner-dialog">
+        <div className="privacy-heading">
+          <span className="privacy-symbol"><Settings2 size={19} /></span>
+          <div><small>{t("planner.beta")}</small><h2 id="planner-settings-title">{t("planner.settingsTitle")}</h2></div>
+          <button className="privacy-close" type="button" aria-label={t("common.close")} onClick={() => setPlannerSettingsOpen(false)}><X size={17} /></button>
+        </div>
+        <p className="privacy-intro">{t("planner.settingsDescription")}</p>
+        <div className="planner-preference-options" role="radiogroup">
+          <button type="button" role="radio" aria-checked={plannerPreference === "askEachTime"} disabled={plannerSettingsBusy} className={plannerPreference === "askEachTime" ? "selected" : ""} onClick={() => void changePlannerPreference("askEachTime")}><span className="radio-mark"><span /></span><span><strong>{t("planner.askEachTime")}</strong><small>{t("planner.askEachTimeHint")}</small></span></button>
+          <button type="button" role="radio" aria-checked={plannerPreference === "alwaysOn"} disabled={plannerSettingsBusy} className={plannerPreference === "alwaysOn" ? "selected" : ""} onClick={() => void changePlannerPreference("alwaysOn")}><span className="radio-mark"><span /></span><span><strong>{t("planner.alwaysOn")}</strong><small>{t("planner.alwaysOnHint")}</small></span></button>
+        </div>
+        {telemetryPreferences && <div className="privacy-actions"><button className="privacy-secondary" type="button" onClick={() => { setPlannerSettingsOpen(false); setPrivacySettingsOpen(true); }}>{t("planner.privacy")}</button><button className="privacy-primary" type="button" onClick={() => setPlannerSettingsOpen(false)}>{t("common.close")}</button></div>}
+      </section>
+    </div>}
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
     {telemetryPreferences && privacySettingsOpen && <TelemetryPreferences mode="settings" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} onClose={() => setPrivacySettingsOpen(false)} />}
   </main>;

@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     error::{Result, SplatError},
-    presets::QualityPreset,
+    presets::ResolvedBrushBudget,
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
@@ -21,7 +21,7 @@ pub async fn train(
     executable: &Path,
     dataset: &Path,
     output_directory: &Path,
-    preset: QualityPreset,
+    budget: ResolvedBrushBudget,
     log_path: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -36,11 +36,11 @@ pub async fn train(
             executable: executable.to_path_buf(),
             args: vec![
                 OsString::from("--total-steps"),
-                preset.brush_iterations.to_string().into(),
+                budget.iterations.to_string().into(),
                 OsString::from("--max-resolution"),
-                preset.brush_max_resolution.to_string().into(),
+                budget.max_resolution.to_string().into(),
                 OsString::from("--export-every"),
-                preset.brush_iterations.to_string().into(),
+                budget.iterations.to_string().into(),
                 OsString::from("--export-path"),
                 output_directory.into(),
                 OsString::from("--export-name"),
@@ -81,4 +81,54 @@ pub async fn train(
         )));
     }
     Ok(candidate)
+}
+
+/// Camera parameters and RGB dimensions must always use the same scale. Brush
+/// applies this transform internally when `--max-resolution` downsizes the
+/// dataset; this helper documents and verifies the contract at our boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraIntrinsics {
+    pub width: u32,
+    pub height: u32,
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+}
+
+impl CameraIntrinsics {
+    pub fn scaled_to(self, width: u32, height: u32) -> Self {
+        let scale_x = width as f64 / self.width.max(1) as f64;
+        let scale_y = height as f64 / self.height.max(1) as f64;
+        Self {
+            width,
+            height,
+            fx: self.fx * scale_x,
+            fy: self.fy * scale_y,
+            cx: self.cx * scale_x,
+            cy: self.cy * scale_y,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_intrinsics_follow_training_image_scale() {
+        let camera = CameraIntrinsics {
+            width: 3_840,
+            height: 2_160,
+            fx: 3_000.0,
+            fy: 3_020.0,
+            cx: 1_920.0,
+            cy: 1_080.0,
+        };
+        let scaled = camera.scaled_to(1_920, 1_080);
+        assert_eq!(scaled.fx, 1_500.0);
+        assert_eq!(scaled.fy, 1_510.0);
+        assert_eq!(scaled.cx, 960.0);
+        assert_eq!(scaled.cy, 540.0);
+    }
 }

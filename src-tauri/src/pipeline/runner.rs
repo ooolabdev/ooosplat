@@ -13,7 +13,10 @@ use serde::Serialize;
 use crate::{
     engines::{
         brush, colmap,
-        ffmpeg::{extract_uniform_frames, validate_extraction},
+        ffmpeg::{
+            extract_additional_frames, extract_selected_frames, extract_uniform_frames,
+            scan_frame_candidates, validate_extraction,
+        },
         ffprobe::probe_video,
         EngineKind, EnginePaths,
     },
@@ -25,19 +28,33 @@ use crate::{
         progress::stage_progress_range,
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
-    presets::Quality,
+    planner::{
+        parse_model_analyzer, BudgetFramePlanner, CaptureAnalysis, CaptureAnalyzer, CapturePrior,
+        EstimatedMatchingCost, FailureAnalyzer, FramePlanner, GraphDecision, GraphQualityGate,
+        MapperBackend, MapperPlan, MinimumCapturePolicy, PairingPlan, PairingPlanner,
+        PairingStrategy, PairingThresholds, PlannerCheckpoint, PlannerReconstructionValidator,
+        PlannerRecoveryMode, ReconstructionCandidate, ReconstructionComparator,
+        ReconstructionDecision, ReconstructionViability, RescueAction, RescueRecord,
+        SuccessRecoveryPolicy, ViewGraphAnalyzer,
+    },
+    presets::{BrushResolutionContext, MatchingBudget, Quality, ResolvedBrushBudget, SfmBudget},
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
-        catalog, manager::atomic_replace_file, FrameState, PipelineStateFile, ProjectInputType,
-        ProjectManager, ProjectMetadata, ProjectOutput, ProjectPaths, ProjectStatus,
+        catalog, manager::atomic_replace_file, FrameState, PipelineStateFile,
+        ProjectImportObserver, ProjectInputType, ProjectManager, ProjectMetadata, ProjectOutput,
+        ProjectPaths, ProjectStatus, QualityRunMetrics,
     },
     reconstruction::{
         ply::inspect_gaussian_ply,
-        validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
+        validator::{
+            validate_sparse_geometry, ReconstructionQuality, ReconstructionReport,
+            ReconstructionValidator,
+        },
     },
     video::{
-        prepare_image_sequence, validate_prepared_image_sequence, FramePlan,
-        FrameSelectionStrategy, ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
+        prepare_scanned_image_sequence, scan_image_sequence, validate_prepared_image_sequence,
+        FramePlan, FramePlanningMode, FrameSelectionStrategy, ImagePreparationObserver,
+        ImagePreparationPhase, ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -50,6 +67,13 @@ pub struct PreparedFrames {
     pub image_format: String,
     pub mask_count: u64,
     pub has_alpha: bool,
+    pub capture_prior: Option<CapturePrior>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FramePreparationMode<'a> {
+    planner_enabled: bool,
+    saved_plan: Option<&'a FramePlan>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +88,7 @@ pub struct PipelineResult {
     pub registered_images: u64,
     pub registered_ratio: f64,
     pub points_3d: u64,
+    pub quality_metrics: QualityRunMetrics,
     pub duration_ms: u64,
     pub completed_at: chrono::DateTime<Utc>,
     pub warning: Option<String>,
@@ -234,10 +259,19 @@ pub struct PipelineRunner {
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
+    planner_enabled: bool,
 }
 
 impl PipelineRunner {
     pub fn new(engines: EnginePaths, emit: impl Fn(PipelineEvent) + Send + Sync + 'static) -> Self {
+        Self::new_with_planner(engines, false, emit)
+    }
+
+    pub fn new_with_planner(
+        engines: EnginePaths,
+        planner_enabled: bool,
+        emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             engines,
             process_manager: ProcessManager::new(),
@@ -250,6 +284,7 @@ impl PipelineRunner {
                 started: Instant::now(),
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
+            planner_enabled,
         }
     }
 
@@ -305,6 +340,7 @@ impl PipelineRunner {
             }
         }
         colmap::require_verified_cli(&self.engines.colmap)?;
+        colmap::require_vocabulary_tree(&self.engines.colmap_vocab_tree)?;
         brush::require_verified_cli(&self.engines.brush)?;
         statuses
             .into_iter()
@@ -320,6 +356,26 @@ impl PipelineRunner {
         output: &Path,
         masks: &Path,
         logs: Option<&Path>,
+    ) -> Result<PreparedFrames> {
+        self.prepare_frames_with_mode(
+            input,
+            quality,
+            output,
+            masks,
+            logs,
+            FramePreparationMode::default(),
+        )
+        .await
+    }
+
+    async fn prepare_frames_with_mode(
+        &self,
+        input: &Path,
+        quality: Quality,
+        output: &Path,
+        masks: &Path,
+        logs: Option<&Path>,
+        mode: FramePreparationMode<'_>,
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
@@ -344,13 +400,99 @@ impl PipelineRunner {
         self.events
             .stage(PipelineStage::ProbingVideo, 1.0, probe_message);
 
+        let planning_message = if mode.saved_plan.is_some() {
+            "正在恢复已保存的画面计划"
+        } else if mode.planner_enabled {
+            "Planner 正在根据质量预算选择画面"
+        } else {
+            "正在规划均匀抽帧"
+        };
         self.events
-            .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+            .stage(PipelineStage::PlanningFrames, 0.0, planning_message);
+        let mut capture_prior = None;
+        let plan = if let Some(saved_plan) = mode.saved_plan {
+            saved_plan.clone()
+        } else if mode.planner_enabled {
+            self.events
+                .stage(PipelineStage::PlanningFrames, 0.08, "正在分析拍摄素材");
+            let candidates = scan_frame_candidates(
+                &self.engines.ffmpeg,
+                input,
+                &video,
+                MinimumCapturePolicy::default()
+                    .analysis_fps(&video, quality.budget().frame.analysis_fps),
+                &self.process_manager,
+                Some({
+                    let events = self.events.clone();
+                    Arc::new(move |current, total| {
+                        let ratio = current as f32 / total.max(1) as f32;
+                        events.send(
+                            PipelineStage::PlanningFrames,
+                            Some(PipelineEngine::Ffmpeg),
+                            EventKind::Progress,
+                            EventLevel::Info,
+                            Some(0.08 + ratio.clamp(0.0, 1.0) * 0.52),
+                            false,
+                            format!("正在分析拍摄素材 {current}/{total} 帧"),
+                            Some(current),
+                            Some(total),
+                            Some("frames"),
+                        );
+                    })
+                }),
+            )
+            .await?;
+            let prior = CaptureAnalyzer.analyze_video(&candidates);
+            let activity = candidates
+                .iter()
+                .map(|candidate| {
+                    (candidate.motion_score + candidate.view_change_score) as f64 * 0.5
+                })
+                .sum::<f64>()
+                / candidates.len().max(1) as f64;
+            if let Some(parent) = output.parent() {
+                let planner_dir = parent.join("planner");
+                tokio::fs::create_dir_all(&planner_dir).await?;
+                let bytes = serde_json::to_vec(&candidates).map_err(|error| {
+                    SplatError::Process(format!("Unable to cache frame candidates: {error}"))
+                })?;
+                tokio::fs::write(planner_dir.join("frame-candidates.json"), bytes).await?;
+            }
+            capture_prior = Some(prior.clone());
+            self.events
+                .stage(PipelineStage::PlanningFrames, 0.62, "正在选择合适的画面");
+            BudgetFramePlanner
+                .plan(
+                    &video,
+                    quality,
+                    CaptureAnalysis {
+                        activity,
+                        prior,
+                        candidates,
+                    },
+                )
+                .map_err(|error| SplatError::Process(format!("画面规划失败：{error}")))?
+        } else {
+            UniformRatioFrameSelection.create_plan(&video, quality)
+        };
+        let minimum = &plan.minimum_frame_protection;
+        let planning_complete_message = if minimum.minimum_frame_target_unreachable {
+            format!(
+                "最低 {} 帧目标不可达，将尽量保留可用画面（计划 {} 帧）",
+                minimum.minimum_frame_target, plan.estimated_frames
+            )
+        } else if minimum.minimum_frame_override_applied {
+            format!(
+                "短视频最低帧数保护已启用：目标 {} 帧，有效采样 {:.2} fps",
+                minimum.minimum_frame_target, plan.target_fps
+            )
+        } else {
+            format!("预计提取 {} 帧", plan.estimated_frames)
+        };
         self.events.stage(
             PipelineStage::PlanningFrames,
             1.0,
-            format!("预计提取 {} 帧", plan.estimated_frames),
+            planning_complete_message,
         );
 
         self.events.stage(
@@ -368,18 +510,33 @@ impl PipelineRunner {
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
-        let extraction = extract_uniform_frames(
-            &self.engines.ffmpeg,
-            input,
-            output,
-            masks,
-            &plan,
-            video.has_alpha,
-            logs.map(|path| path.join("ffmpeg.log")),
-            &self.process_manager,
-            Some(observer),
-        )
-        .await?;
+        let extraction = if plan.planning_mode == FramePlanningMode::Budgeted {
+            extract_selected_frames(
+                &self.engines.ffmpeg,
+                input,
+                output,
+                masks,
+                &plan,
+                video.has_alpha,
+                logs.map(|path| path.join("ffmpeg.log")),
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?
+        } else {
+            extract_uniform_frames(
+                &self.engines.ffmpeg,
+                input,
+                output,
+                masks,
+                &plan,
+                video.has_alpha,
+                logs.map(|path| path.join("ffmpeg.log")),
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?
+        };
         self.events.stage(
             PipelineStage::ExtractingFrames,
             1.0,
@@ -401,6 +558,7 @@ impl PipelineRunner {
             image_format: extraction.image_format.as_str().into(),
             mask_count: extraction.mask_count,
             has_alpha: extraction.has_alpha,
+            capture_prior,
         })
     }
 
@@ -410,14 +568,19 @@ impl PipelineRunner {
         quality: Quality,
         output: &Path,
         masks: &Path,
+        probe_already_complete: bool,
     ) -> Result<PreparedFrames> {
-        self.events
-            .stage(PipelineStage::ProbingVideo, 0.0, "正在分析图片序列");
+        if !probe_already_complete {
+            self.events
+                .stage(PipelineStage::ProbingVideo, 0.0, "正在快速读取图片头");
+        }
         let source = input.to_path_buf();
-        let image_sequence =
-            tokio::task::spawn_blocking(move || crate::video::analyze_image_sequence(&source))
+        let cancellation = self.process_manager.child_token();
+        let scan =
+            tokio::task::spawn_blocking(move || scan_image_sequence(&source, Some(&cancellation)))
                 .await
                 .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
+        let image_sequence = scan.info.clone();
         self.events.stage(
             PipelineStage::ProbingVideo,
             1.0,
@@ -427,7 +590,7 @@ impl PipelineRunner {
                 image_sequence.width,
                 image_sequence.height,
                 if image_sequence.has_alpha {
-                    " · 检测到透明区域"
+                    " · 检测到 Alpha 通道"
                 } else {
                     ""
                 }
@@ -443,16 +606,55 @@ impl PipelineRunner {
             PipelineStage::ExtractingFrames,
             0.0,
             if image_sequence.has_alpha {
-                "正在准备原始图片并生成 COLMAP Alpha Mask"
+                "正在建立画面链接并检查 Alpha 通道"
             } else {
-                "正在准备图片序列"
+                "正在建立画面链接"
             },
         );
-        let source = input.to_path_buf();
         let frames = output.to_path_buf();
         let mask_root = masks.to_path_buf();
+        let events = self.events.clone();
+        let observer: ImagePreparationObserver = Arc::new(move |progress| {
+            let message = match progress.phase {
+                ImagePreparationPhase::LinkingFrames => format!(
+                    "正在建立画面链接或复制 {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::InspectingAlpha => format!(
+                    "正在检测 Alpha 并生成 Mask {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::WritingOpaqueMasks => format!(
+                    "正在补全不透明 Mask {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::Validating if progress.current == progress.total => {
+                    "图片与 Mask 完整性校验完成".into()
+                }
+                ImagePreparationPhase::Validating => "正在校验图片与 Mask".into(),
+            };
+            events.send(
+                PipelineStage::ExtractingFrames,
+                Some(PipelineEngine::System),
+                EventKind::Stage,
+                EventLevel::Info,
+                Some(progress.stage_progress),
+                false,
+                message,
+                Some(progress.current),
+                Some(progress.total),
+                Some("images"),
+            );
+        });
+        let cancellation = self.process_manager.child_token();
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_image_sequence(&source, &frames, &mask_root)
+            prepare_scanned_image_sequence(
+                scan,
+                &frames,
+                &mask_root,
+                Some(observer),
+                Some(&cancellation),
+            )
         })
         .await
         .map_err(|error| SplatError::Process(format!("图片序列准备任务失败：{error}")))??;
@@ -477,6 +679,7 @@ impl PipelineRunner {
             image_format: "images".into(),
             mask_count: prepared.mask_count,
             has_alpha: prepared.has_alpha,
+            capture_prior: Some(CaptureAnalyzer.unordered_images(prepared.image_count)),
         })
     }
 
@@ -516,8 +719,46 @@ impl PipelineRunner {
     ) -> Result<PipelineResult> {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
-        let (paths, mut metadata) = project_manager.create(input, quality).await?;
-        let state = PipelineStateFile::created_for(quality, metadata.input_type);
+        let (paths, mut metadata) = if input.is_dir() {
+            self.events
+                .stage(PipelineStage::ProbingVideo, 0.0, "正在快速读取图片头");
+            let events = self.events.clone();
+            let observer: ProjectImportObserver = Arc::new(move |progress| {
+                let ratio = if progress.total == 0 {
+                    1.0
+                } else {
+                    progress.current as f32 / progress.total as f32
+                };
+                events.send(
+                    PipelineStage::ProbingVideo,
+                    Some(PipelineEngine::System),
+                    EventKind::Stage,
+                    EventLevel::Info,
+                    Some(0.1 + 0.9 * ratio),
+                    false,
+                    format!("正在导入图片 {}/{} 张", progress.current, progress.total),
+                    Some(progress.current),
+                    Some(progress.total),
+                    Some("images"),
+                );
+            });
+            project_manager
+                .create_with_progress(
+                    input,
+                    quality,
+                    Some(observer),
+                    Some(self.process_manager.child_token()),
+                )
+                .await?
+        } else {
+            project_manager.create(input, quality).await?
+        };
+        let mut state = project_manager.read_state(&paths.state).await?;
+        state.planner_enabled = self.planner_enabled;
+        state.planner = self
+            .planner_enabled
+            .then(|| PlannerCheckpoint::new(quality.budget(), SuccessRecoveryPolicy::default()));
+        project_manager.write_state(&paths.state, &state).await?;
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
     }
@@ -617,6 +858,7 @@ impl PipelineRunner {
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
         let quality = metadata.quality;
+        let budget = quality.budget();
         if state.input_type != metadata.input_type {
             return Err(SplatError::Process(
                 "项目输入类型与检查点不一致，无法安全继续".into(),
@@ -624,55 +866,93 @@ impl PipelineRunner {
         }
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
+        if state.planner_enabled && state.planner.is_none() {
+            state.planner = Some(PlannerCheckpoint::new(
+                budget.clone(),
+                SuccessRecoveryPolicy::default(),
+            ));
+        }
         project_manager.write_state(&paths.state, &state).await?;
-        let prepared = if let Some(prepared) =
-            prepared_frames_from_checkpoint(paths, &state).await?
-        {
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                1.0,
-                format!("已复用 {} 帧检查点", prepared.extracted_frames),
-            );
-            prepared
-        } else {
-            reset_directory(&paths.frames).await?;
-            reset_directory(&paths.masks).await?;
-            reset_directory(&paths.colmap).await?;
-            reset_directory(&paths.brush).await?;
-            let prepared = match metadata.input_type {
-                ProjectInputType::Video => {
-                    self.prepare_frames(
-                        &metadata.source_path,
-                        quality,
-                        &paths.frames,
-                        &paths.masks,
-                        Some(&paths.logs),
-                    )
-                    .await?
-                }
-                ProjectInputType::Images => {
-                    self.prepare_images(&metadata.source_path, quality, &paths.frames, &paths.masks)
+        let mut prepared =
+            if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    1.0,
+                    format!("已复用 {} 帧检查点", prepared.extracted_frames),
+                );
+                prepared
+            } else {
+                let saved_frame_plan = state.frames.as_ref().map(frame_plan_from_state);
+                reset_directory(&paths.frames).await?;
+                reset_directory(&paths.masks).await?;
+                reset_directory(&paths.colmap).await?;
+                reset_directory(&paths.brush).await?;
+                let prepared = match metadata.input_type {
+                    ProjectInputType::Video => {
+                        self.prepare_frames_with_mode(
+                            &metadata.source_path,
+                            quality,
+                            &paths.frames,
+                            &paths.masks,
+                            Some(&paths.logs),
+                            FramePreparationMode {
+                                planner_enabled: state.planner_enabled,
+                                saved_plan: saved_frame_plan.as_ref(),
+                            },
+                        )
                         .await?
+                    }
+                    ProjectInputType::Images => {
+                        self.prepare_images(
+                            &metadata.source_path,
+                            quality,
+                            &paths.frames,
+                            &paths.masks,
+                            state.image_sequence.is_some(),
+                        )
+                        .await?
+                    }
+                };
+                state.input_type = prepared.input_type;
+                state.video = prepared.video.clone();
+                state.image_sequence = prepared.image_sequence.clone();
+                let mut frames = FrameState::from(&prepared.plan);
+                frames.extracted_frames = Some(prepared.extracted_frames);
+                frames.image_format = Some(prepared.image_format.clone());
+                frames.mask_count = Some(prepared.mask_count);
+                frames.has_alpha = prepared.has_alpha;
+                state.frames = Some(frames);
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.capture_prior = prepared.capture_prior.clone();
+                    planner.frame_plan = Some(prepared.plan.clone());
+                    planner.actual_selected_frames = prepared
+                        .plan
+                        .selected_frames
+                        .iter()
+                        .map(|frame| frame.source_frame_index)
+                        .collect();
                 }
+                state.features_complete = false;
+                state.matching_complete = false;
+                state.reconstruction_complete = false;
+                state.brush_complete = false;
+                state.stage = PipelineStage::ExtractingFrames;
+                project_manager.write_state(&paths.state, &state).await?;
+                write_planner_snapshot(paths, &state).await?;
+                prepared
             };
-            state.input_type = prepared.input_type;
-            state.video = prepared.video.clone();
-            state.image_sequence = prepared.image_sequence.clone();
-            let mut frames = FrameState::from(&prepared.plan);
-            frames.extracted_frames = Some(prepared.extracted_frames);
-            frames.image_format = Some(prepared.image_format.clone());
-            frames.mask_count = Some(prepared.mask_count);
-            frames.has_alpha = prepared.has_alpha;
-            state.frames = Some(frames);
-            state.features_complete = false;
-            state.matching_complete = false;
-            state.reconstruction_complete = false;
-            state.brush_complete = false;
-            state.stage = PipelineStage::ExtractingFrames;
-            project_manager.write_state(&paths.state, &state).await?;
-            prepared
-        };
         let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
+        let sfm_source_size = prepared
+            .video
+            .as_ref()
+            .map(|video| (video.width, video.height))
+            .or_else(|| {
+                prepared
+                    .image_sequence
+                    .as_ref()
+                    .map(|images| (images.width, images.height))
+            })
+            .ok_or_else(|| SplatError::Process("项目输入尺寸信息不完整".into()))?;
 
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
@@ -699,22 +979,41 @@ impl PipelineRunner {
                 0.0,
                 format!("COLMAP 正在使用 {backend_label} 提取特征"),
             );
-            colmap::extract_features(
-                &self.engines.colmap,
-                &database,
-                colmap_images,
-                colmap_masks,
-                colmap_log.clone(),
-                &self.process_manager,
-                Some(self.process_observer(
-                    PipelineStage::ExtractingFeatures,
-                    PipelineEngine::Colmap,
-                    Some(prepared.extracted_frames),
-                    ObserverMode::BracketProgress,
-                )),
-                gpu_index,
-            )
-            .await?;
+            let observer = Some(self.process_observer(
+                PipelineStage::ExtractingFeatures,
+                PipelineEngine::Colmap,
+                Some(prepared.extracted_frames),
+                ObserverMode::BracketProgress,
+            ));
+            if state.planner_enabled {
+                colmap::extract_features(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    colmap_masks,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    observer,
+                    gpu_index,
+                    budget
+                        .baseline
+                        .sfm
+                        .capped_for_source(sfm_source_size.0, sfm_source_size.1),
+                )
+                .await?;
+            } else {
+                colmap::extract_features_legacy(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    colmap_masks,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    observer,
+                    gpu_index,
+                )
+                .await?;
+            }
             state.stage = PipelineStage::ExtractingFeatures;
             state.features_complete = true;
             project_manager.write_state(&paths.state, &state).await?;
@@ -725,28 +1024,63 @@ impl PipelineRunner {
             );
         }
 
+        let pairing_plan = if state.planner_enabled {
+            if let Some(saved) = state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.pairing_plan.clone())
+            {
+                saved
+            } else {
+                let prior = state
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.capture_prior.clone())
+                    .or_else(|| prepared.capture_prior.clone())
+                    .unwrap_or_default();
+                let plan = PairingPlanner::default().plan(
+                    &prior,
+                    prepared.extracted_frames,
+                    budget.baseline.matching,
+                );
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.capture_prior = Some(prior);
+                    planner.pairing_plan = Some(plan.clone());
+                }
+                project_manager.write_state(&paths.state, &state).await?;
+                plan
+            }
+        } else {
+            PairingPlan {
+                strategy: if prepared.input_type == ProjectInputType::Images {
+                    PairingStrategy::Exhaustive
+                } else {
+                    PairingStrategy::Sequential
+                },
+                sequential_overlap: 10,
+                prefilter_neighbors: 10,
+                estimated_pairs: 0,
+                reason_codes: vec!["legacy_main_baseline".into()],
+            }
+        };
+        let pairing_label = match pairing_plan.strategy {
+            PairingStrategy::Exhaustive => "穷举匹配",
+            PairingStrategy::Sequential => "顺序匹配",
+            PairingStrategy::SequentialWithLoopClosure => "带回环的顺序匹配",
+            PairingStrategy::Prefilter => "预筛选匹配",
+        };
+
         if state.matching_complete {
             self.events.stage(
                 PipelineStage::Matching,
                 1.0,
-                if prepared.input_type == ProjectInputType::Images {
-                    "已复用穷举匹配检查点"
-                } else {
-                    "已复用顺序匹配检查点"
-                },
+                format!("已复用{pairing_label}检查点"),
             );
         } else {
             self.events.stage(
                 PipelineStage::Matching,
                 0.0,
-                format!(
-                    "COLMAP 正在进行 {backend_label} {}",
-                    if prepared.input_type == ProjectInputType::Images {
-                        "穷举匹配"
-                    } else {
-                        "顺序匹配"
-                    }
-                ),
+                format!("COLMAP 正在进行 {backend_label} {pairing_label}"),
             );
             let observer = Some(self.process_observer(
                 PipelineStage::Matching,
@@ -754,82 +1088,148 @@ impl PipelineRunner {
                 Some(prepared.extracted_frames),
                 ObserverMode::BracketProgress,
             ));
-            if prepared.input_type == ProjectInputType::Images {
-                colmap::match_exhaustive(
-                    &self.engines.colmap,
-                    &database,
-                    colmap_log.clone(),
-                    &self.process_manager,
-                    observer,
-                    gpu_index,
-                )
-                .await?;
-            } else {
-                colmap::match_sequential(
-                    &self.engines.colmap,
-                    &database,
-                    colmap_log.clone(),
-                    &self.process_manager,
-                    observer,
-                    gpu_index,
-                )
-                .await?;
+            match pairing_plan.strategy {
+                PairingStrategy::Exhaustive => {
+                    colmap::match_exhaustive(
+                        &self.engines.colmap,
+                        &database,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        observer,
+                        gpu_index,
+                    )
+                    .await?
+                }
+                PairingStrategy::Sequential => {
+                    colmap::match_sequential(
+                        &self.engines.colmap,
+                        &database,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        observer,
+                        gpu_index,
+                        MatchingBudget {
+                            sequential_overlap: pairing_plan.sequential_overlap,
+                            prefilter_neighbors: pairing_plan.prefilter_neighbors,
+                        },
+                    )
+                    .await?
+                }
+                PairingStrategy::SequentialWithLoopClosure => {
+                    colmap::match_sequential_with_loop(
+                        &self.engines.colmap,
+                        &database,
+                        &self.engines.colmap_vocab_tree,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        observer,
+                        gpu_index,
+                        budget.baseline.matching,
+                    )
+                    .await?
+                }
+                PairingStrategy::Prefilter => {
+                    colmap::match_prefilter(
+                        &self.engines.colmap,
+                        &database,
+                        &self.engines.colmap_vocab_tree,
+                        colmap_log.clone(),
+                        &self.process_manager,
+                        observer,
+                        gpu_index,
+                        pairing_plan.prefilter_neighbors,
+                    )
+                    .await?
+                }
             }
             state.stage = PipelineStage::Matching;
             state.matching_complete = true;
+            if let Some(planner) = state.planner.as_mut() {
+                planner.pairing_actual = Some(pairing_plan.strategy);
+            }
             project_manager.write_state(&paths.state, &state).await?;
-            self.events.stage(
-                PipelineStage::Matching,
-                1.0,
-                if prepared.input_type == ProjectInputType::Images {
-                    "穷举匹配完成"
-                } else {
-                    "顺序匹配完成"
-                },
-            );
+            self.events
+                .stage(PipelineStage::Matching, 1.0, format!("{pairing_label}完成"));
         }
 
-        if state.reconstruction_complete {
-            self.events
-                .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
+        let (model, report, planner_candidate, actual_frame_count) = if state.planner_enabled {
+            let (model, report, candidate, actual_frame_count) = self
+                .reconstruct_with_planner(
+                    project_manager,
+                    paths,
+                    &mut state,
+                    &database,
+                    colmap_images,
+                    &colmap_log,
+                    gpu_index,
+                    prepared.extracted_frames,
+                    &pairing_plan,
+                    &metadata.source_path,
+                    prepared.has_alpha,
+                    budget
+                        .baseline
+                        .sfm
+                        .capped_for_source(sfm_source_size.0, sfm_source_size.1),
+                )
+                .await?;
+            (model, report, Some(candidate), actual_frame_count)
         } else {
-            reset_directory(&sparse).await?;
-            self.events
-                .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
-            colmap::map(
-                &self.engines.colmap,
-                &database,
-                colmap_images,
-                &sparse,
-                colmap_log,
-                &self.process_manager,
-                Some(self.process_observer(
-                    PipelineStage::Reconstructing,
-                    PipelineEngine::Colmap,
-                    Some(prepared.extracted_frames),
-                    ObserverMode::Mapper,
-                )),
-            )
-            .await?;
-            state.stage = PipelineStage::Reconstructing;
-            state.reconstruction_complete = true;
-            project_manager.write_state(&paths.state, &state).await?;
-            self.events
-                .stage(PipelineStage::Reconstructing, 1.0, "增量重建完成");
-        }
-
-        self.events.stage(
-            PipelineStage::ValidatingReconstruction,
-            0.0,
-            "正在核验注册率和三维点",
-        );
-        let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
-        let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
-            format!(
-                "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
-                report.registered_ratio * 100.0
-            )
-        });
+            if state.reconstruction_complete {
+                self.events
+                    .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
+            } else {
+                reset_directory(&sparse).await?;
+                self.events
+                    .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
+                colmap::map(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    &sparse,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::Reconstructing,
+                        PipelineEngine::Colmap,
+                        Some(prepared.extracted_frames),
+                        ObserverMode::Mapper,
+                    )),
+                )
+                .await?;
+                state.stage = PipelineStage::Reconstructing;
+                state.reconstruction_complete = true;
+                project_manager.write_state(&paths.state, &state).await?;
+                self.events
+                    .stage(PipelineStage::Reconstructing, 1.0, "增量重建完成");
+            }
+            self.events.stage(
+                PipelineStage::ValidatingReconstruction,
+                0.0,
+                "正在核验注册率和三维点",
+            );
+            let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+            (model, report, None, prepared.extracted_frames)
+        };
+        prepared.extracted_frames = actual_frame_count;
+        let warning = if let Some(candidate) = &planner_candidate {
+            (candidate.decision != ReconstructionDecision::Pass).then(|| {
+                if candidate.viability == ReconstructionViability::DegradedButViable {
+                    "已选择降级但可用的重建结果，将继续 Brush".to_owned()
+                } else {
+                    format!(
+                        "注册率 {:.1}%：将使用当前最佳可用重建继续训练",
+                        report.registered_ratio * 100.0
+                    )
+                }
+            })
+        } else {
+            (report.quality == ReconstructionQuality::Warning).then(|| {
+                format!(
+                    "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
+                    report.registered_ratio * 100.0
+                )
+            })
+        };
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
             1.0,
@@ -839,7 +1239,33 @@ impl PipelineRunner {
             ),
         );
 
-        let preset = quality.preset();
+        let (source_width, source_height) = prepared
+            .video
+            .as_ref()
+            .map(|video| (video.width, video.height))
+            .or_else(|| {
+                prepared
+                    .image_sequence
+                    .as_ref()
+                    .map(|images| (images.width, images.height))
+            })
+            .ok_or_else(|| SplatError::Process("项目输入尺寸信息不完整".into()))?;
+        let brush_budget = if state.planner_enabled {
+            budget.baseline.brush.resolve(BrushResolutionContext::new(
+                source_width,
+                source_height,
+                prepared.extracted_frames,
+                acceleration
+                    .device
+                    .as_ref()
+                    .and_then(|device| device.total_memory_mb),
+            ))
+        } else {
+            ResolvedBrushBudget {
+                iterations: budget.baseline.brush.iterations,
+                max_resolution: budget.baseline.brush.resolution.estimate_max_resolution(),
+            }
+        };
         let candidate = if state.brush_complete {
             self.events.stage(
                 PipelineStage::TrainingSplats,
@@ -876,25 +1302,25 @@ impl PipelineRunner {
                 true,
                 format!(
                     "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {} · 预计约 {}",
-                    preset.brush_iterations,
-                    preset.brush_max_resolution,
+                    brush_budget.iterations,
+                    brush_budget.max_resolution,
                     format_duration(estimated_brush_duration_ms)
                 ),
                 Some(0),
-                Some(preset.brush_iterations as u64),
+                Some(brush_budget.iterations as u64),
                 Some("iterations"),
             );
             let candidate = brush::train(
                 &self.engines.brush,
                 &dataset,
                 &paths.brush,
-                preset,
+                brush_budget,
                 paths.logs.join("brush.log"),
                 &self.process_manager,
                 Some(self.process_observer(
                     PipelineStage::TrainingSplats,
                     PipelineEngine::Brush,
-                    Some(preset.brush_iterations as u64),
+                    Some(brush_budget.iterations as u64),
                     ObserverMode::Brush {
                         estimated_duration_ms: estimated_brush_duration_ms,
                     },
@@ -927,6 +1353,132 @@ impl PipelineRunner {
         metadata.status = ProjectStatus::Completed;
         metadata.completed_at = Some(completed_at);
         metadata.duration_ms = Some(duration_ms);
+        let quality_metrics = QualityRunMetrics {
+            actual_frame_count: prepared.extracted_frames,
+            actual_sfm_resolution: if state.planner_enabled {
+                source_width
+                    .max(source_height)
+                    .min(budget.baseline.sfm.max_image_size)
+            } else {
+                source_width.max(source_height).min(1_920)
+            },
+            // COLMAP currently does not emit a stable aggregate feature count.
+            actual_feature_count: None,
+            actual_brush_resolution: brush_budget.max_resolution,
+            actual_brush_iterations: brush_budget.iterations,
+            registered_images: report.registered_images,
+            reprojection_error: planner_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.metrics.mean_reprojection_error),
+            splat_count: ply.splat_count,
+            // Stage durations are emitted by PipelineTelemetrySession.
+            stage_durations_ms: Default::default(),
+            // Total VRAM is not a peak-memory measurement.
+            peak_gpu_memory_mb: None,
+            planner_enabled: state.planner_enabled,
+            planner_version: state
+                .planner
+                .as_ref()
+                .map(|planner| planner.planner_version),
+            capture_type: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.capture_prior.as_ref())
+                .map(|prior| format!("{:?}", prior.capture_type).to_ascii_lowercase()),
+            pairing_planned: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.pairing_plan.as_ref())
+                .map(|plan| format!("{:?}", plan.strategy).to_ascii_lowercase()),
+            pairing_actual: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.pairing_actual)
+                .map(|value| format!("{value:?}").to_ascii_lowercase()),
+            mapper_planned: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.mapper_plan.as_ref())
+                .map(|plan| format!("{:?}", plan.backend).to_ascii_lowercase()),
+            mapper_actual: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.mapper_actual)
+                .map(|value| format!("{value:?}").to_ascii_lowercase()),
+            largest_component_ratio: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.view_graph_report.as_ref())
+                .map(|graph| graph.largest_component_ratio),
+            two_core_ratio: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.view_graph_report.as_ref())
+                .map(|graph| graph.two_core_ratio),
+            bridge_ratio: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.view_graph_report.as_ref())
+                .map(|graph| graph.bridge_ratio),
+            normal_rescue_rounds: state
+                .planner
+                .as_ref()
+                .map(|planner| {
+                    planner
+                        .rescue_history
+                        .iter()
+                        .filter(|record| record.mode == PlannerRecoveryMode::Normal)
+                        .count() as u32
+                })
+                .unwrap_or(0),
+            success_recovery_rounds: state
+                .planner
+                .as_ref()
+                .map(|planner| {
+                    planner
+                        .rescue_history
+                        .iter()
+                        .filter(|record| record.mode == PlannerRecoveryMode::SuccessRecovery)
+                        .count() as u32
+                })
+                .unwrap_or(0),
+            normal_budget_exhausted: state
+                .planner
+                .as_ref()
+                .is_some_and(|planner| planner.normal_budget_exhausted),
+            success_recovery_entered: state
+                .planner
+                .as_ref()
+                .is_some_and(|planner| planner.success_recovery_entered),
+            budget_overridden_for_success: state
+                .planner
+                .as_ref()
+                .is_some_and(|planner| planner.budget_overridden_for_success),
+            normal_duration_ms: state
+                .planner
+                .as_ref()
+                .map(|planner| planner.normal_duration_ms)
+                .unwrap_or(0),
+            recovery_duration_ms: state
+                .planner
+                .as_ref()
+                .map(|planner| planner.recovery_duration_ms)
+                .unwrap_or(0),
+            reconstruction_quality: planner_candidate.as_ref().map(|candidate| {
+                match candidate.viability {
+                    ReconstructionViability::Viable => {
+                        if candidate.decision == ReconstructionDecision::Pass {
+                            "normal"
+                        } else {
+                            "warning"
+                        }
+                    }
+                    ReconstructionViability::DegradedButViable => "degraded",
+                    ReconstructionViability::NotViable => "failed",
+                }
+                .to_owned()
+            }),
+        };
         metadata.output = Some(ProjectOutput {
             final_ply: final_ply.clone(),
             file_size: ply.file_size,
@@ -935,6 +1487,7 @@ impl PipelineRunner {
             registered_images: report.registered_images,
             registered_ratio: report.registered_ratio,
             points_3d: report.points_3d,
+            quality_metrics: quality_metrics.clone(),
         });
         project_manager
             .write_metadata(&paths.metadata, metadata)
@@ -957,11 +1510,841 @@ impl PipelineRunner {
             registered_images: report.registered_images,
             registered_ratio: report.registered_ratio,
             points_3d: report.points_3d,
+            quality_metrics,
             duration_ms,
             completed_at,
             warning,
             logs_directory: paths.logs.clone(),
             source_duration_seconds,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconstruct_with_planner(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        database: &Path,
+        images: &Path,
+        colmap_log: &Path,
+        gpu_index: Option<u32>,
+        input_images: u64,
+        pairing_plan: &PairingPlan,
+        source_video: &Path,
+        has_alpha: bool,
+        sfm_budget: SfmBudget,
+    ) -> Result<(PathBuf, ReconstructionReport, ReconstructionCandidate, u64)> {
+        let mut input_images = input_images;
+        let planner_started = Instant::now();
+        let mut recovery_started = None;
+        if state.reconstruction_complete {
+            if let Some(planner) = &state.planner {
+                if let Some(best_id) = &planner.best_reconstruction_id {
+                    if let Some(candidate) = planner
+                        .reconstruction_candidates
+                        .iter()
+                        .find(|candidate| &candidate.id == best_id)
+                    {
+                        if let Ok(report) =
+                            ReconstructionValidator::validate(&paths.frames, &candidate.model_path)
+                        {
+                            self.events.stage(
+                                PipelineStage::Reconstructing,
+                                1.0,
+                                "已复用 Planner 最佳重建候选",
+                            );
+                            return Ok((
+                                candidate.model_path.clone(),
+                                report,
+                                candidate.clone(),
+                                input_images,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.events
+            .stage(PipelineStage::Matching, 0.92, "正在分析图像关系");
+        let mut graph = ViewGraphAnalyzer.analyze_database(database)?;
+        let mut graph_decision = GraphQualityGate::default().decide(&graph);
+        let normal_budget = state
+            .planner
+            .as_ref()
+            .and_then(|planner| planner.quality_budget_snapshot.as_ref())
+            .map(|budget| budget.extension.rescue)
+            .unwrap_or_else(|| state.preset.budget().extension.rescue);
+        let mut normal_rounds = state
+            .planner
+            .as_ref()
+            .map(|planner| {
+                planner
+                    .rescue_history
+                    .iter()
+                    .filter(|record| record.mode == PlannerRecoveryMode::Normal)
+                    .count() as u32
+            })
+            .unwrap_or(0);
+
+        if graph_decision == GraphDecision::NeedRescue
+            && normal_budget.allow_frame_backfill
+            && normal_rounds < normal_budget.max_rounds
+            && source_video.is_file()
+        {
+            if let Some(mut full_plan) = state.frames.as_ref().map(frame_plan_from_state) {
+                let old_selected: std::collections::HashSet<u64> = full_plan
+                    .selected_frames
+                    .iter()
+                    .map(|frame| frame.source_frame_index)
+                    .collect();
+                let remaining = full_plan
+                    .candidate_frames
+                    .iter()
+                    .filter(|frame| !old_selected.contains(&frame.source_frame_index))
+                    .count();
+                let additional = ((full_plan.selected_frames.len() as f32 * 0.25).ceil() as usize)
+                    .max(1)
+                    .min(remaining);
+                if additional > 0
+                    && BudgetFramePlanner
+                        .backfill(&mut full_plan, additional)
+                        .is_ok()
+                {
+                    let additions: Vec<_> = full_plan
+                        .selected_frames
+                        .iter()
+                        .filter(|frame| !old_selected.contains(&frame.source_frame_index))
+                        .cloned()
+                        .collect();
+                    let mut addition_plan = full_plan.clone();
+                    addition_plan.selected_frames = additions.clone();
+                    addition_plan.estimated_frames = additions.len() as u64;
+                    self.events.stage(
+                        PipelineStage::ExtractingFrames,
+                        0.80,
+                        "正在为薄弱区域补充画面",
+                    );
+                    let extraction = extract_additional_frames(
+                        &self.engines.ffmpeg,
+                        source_video,
+                        &paths.frames,
+                        &paths.masks,
+                        &addition_plan,
+                        has_alpha,
+                        Some(paths.logs.join("ffmpeg-backfill.log")),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::ExtractingFrames,
+                            PipelineEngine::Ffmpeg,
+                            Some(additions.len() as u64),
+                            ObserverMode::Ffmpeg,
+                        )),
+                    )
+                    .await?;
+                    input_images = extraction.frame_count;
+                    let extension = if has_alpha { "png" } else { "jpg" };
+                    let names: Vec<String> = additions
+                        .iter()
+                        .map(|frame| format!("frame_{:010}.{extension}", frame.source_frame_index))
+                        .collect();
+                    let image_list = paths.colmap.join("planner-backfill-images.txt");
+                    tokio::fs::write(&image_list, names.join("\n")).await?;
+                    colmap::extract_features_for_list(
+                        &self.engines.colmap,
+                        database,
+                        images,
+                        has_alpha.then_some(Path::new("../masks")),
+                        &image_list,
+                        paths.logs.join("colmap-backfill.log"),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::ExtractingFeatures,
+                            PipelineEngine::Colmap,
+                            Some(additions.len() as u64),
+                            ObserverMode::BracketProgress,
+                        )),
+                        gpu_index,
+                        sfm_budget,
+                    )
+                    .await?;
+                    let pair_list = paths.colmap.join("planner-backfill-pairs.txt");
+                    write_backfill_pairs(
+                        &paths.frames,
+                        &names,
+                        pairing_plan.sequential_overlap.max(4) as usize,
+                        &pair_list,
+                    )
+                    .await?;
+                    colmap::match_pairs(
+                        &self.engines.colmap,
+                        database,
+                        &pair_list,
+                        paths.logs.join("colmap-backfill.log"),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::Matching,
+                            PipelineEngine::Colmap,
+                            Some(additions.len() as u64),
+                            ObserverMode::BracketProgress,
+                        )),
+                        gpu_index,
+                    )
+                    .await?;
+                    let previous_lcc = graph.largest_component_ratio;
+                    graph = ViewGraphAnalyzer.analyze_database(database)?;
+                    graph_decision = GraphQualityGate::default().decide(&graph);
+                    normal_rounds += 1;
+                    if let Some(frames) = state.frames.as_mut() {
+                        *frames = FrameState::from(&full_plan);
+                        frames.extracted_frames = Some(input_images);
+                        frames.image_format = Some(if has_alpha { "png" } else { "jpeg" }.into());
+                        frames.mask_count = Some(if has_alpha { input_images } else { 0 });
+                        frames.has_alpha = has_alpha;
+                    }
+                    if let Some(planner) = state.planner.as_mut() {
+                        planner.frame_plan = Some(full_plan.clone());
+                        planner.actual_selected_frames = full_plan
+                            .selected_frames
+                            .iter()
+                            .map(|frame| frame.source_frame_index)
+                            .collect();
+                        planner.rescue_history.push(RescueRecord {
+                            round: normal_rounds,
+                            mode: PlannerRecoveryMode::Normal,
+                            action: RescueAction::FrameBackfill,
+                            effective: Some(graph.largest_component_ratio > previous_lcc + 0.005),
+                            reason_codes: vec!["weak_temporal_region".into()],
+                        });
+                    }
+                    project_manager.write_state(&paths.state, state).await?;
+                }
+            }
+        }
+
+        if graph_decision == GraphDecision::NeedRescue
+            && normal_rounds < normal_budget.max_rounds
+            && pairing_plan.strategy != PairingStrategy::Exhaustive
+        {
+            let reason_codes = FailureAnalyzer
+                .graph_failures(&graph, graph_decision)
+                .into_iter()
+                .map(|value| format!("{value:?}").to_ascii_lowercase())
+                .collect();
+            self.events
+                .stage(PipelineStage::Matching, 0.94, "正在优化重建策略");
+            colmap::match_exhaustive(
+                &self.engines.colmap,
+                database,
+                colmap_log.to_path_buf(),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Matching,
+                    PipelineEngine::Colmap,
+                    Some(input_images),
+                    ObserverMode::BracketProgress,
+                )),
+                gpu_index,
+            )
+            .await?;
+            graph = ViewGraphAnalyzer.analyze_database(database)?;
+            graph_decision = GraphQualityGate::default().decide(&graph);
+            normal_rounds += 1;
+            if let Some(planner) = state.planner.as_mut() {
+                planner.pairing_actual = Some(PairingStrategy::Exhaustive);
+                planner.rescue_history.push(RescueRecord {
+                    round: normal_rounds,
+                    mode: PlannerRecoveryMode::Normal,
+                    action: RescueAction::LocalExhaustive,
+                    effective: Some(graph_decision != GraphDecision::NeedRescue),
+                    reason_codes,
+                });
+            }
+        }
+
+        let prior = state
+            .planner
+            .as_ref()
+            .and_then(|planner| planner.capture_prior.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        // Production Planner always uses Incremental. Persisted plans from an
+        // older Planner version are intentionally normalized here on resume.
+        let mapper_plan = MapperPlan::production_incremental();
+        if let Some(planner) = state.planner.as_mut() {
+            planner.view_graph_report = Some(graph.clone());
+            planner.graph_decision = Some(graph_decision);
+            planner.mapper_plan = Some(mapper_plan.clone());
+        }
+        project_manager.write_state(&paths.state, state).await?;
+        write_planner_snapshot(paths, state).await?;
+
+        let mut candidates: Vec<_> = state
+            .planner
+            .as_ref()
+            .map(|planner| planner.reconstruction_candidates.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| candidate.mapper == MapperBackend::Incremental)
+            .collect();
+        let primary_id =
+            format!("normal-{}-{:?}", normal_rounds, mapper_plan.backend).to_ascii_lowercase();
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.id == primary_id)
+        {
+            if let Ok(candidate) = self
+                .execute_mapper_candidate(
+                    paths,
+                    database,
+                    images,
+                    colmap_log,
+                    input_images,
+                    primary_id,
+                    mapper_plan.backend,
+                    normal_rounds,
+                    mapper_plan.calibrate_view_graph,
+                )
+                .await
+            {
+                candidates.push(candidate);
+            }
+        }
+        checkpoint_planner_candidates(project_manager, paths, state, &candidates).await?;
+
+        let has_pass = candidates
+            .iter()
+            .any(|candidate| candidate.decision == ReconstructionDecision::Pass);
+        if !has_pass {
+            recovery_started = Some(Instant::now());
+            let policy = state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.success_recovery_policy_snapshot)
+                .unwrap_or_default();
+            if let Some(planner) = state.planner.as_mut() {
+                // No distinct normal-budget action remains useful. This may occur
+                // before max_rounds when every applicable action has already run.
+                planner.normal_budget_exhausted = true;
+                planner.success_recovery_entered = true;
+                planner.recovery_mode = PlannerRecoveryMode::SuccessRecovery;
+            }
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                0.70,
+                "正在尝试提高重建成功率",
+            );
+            let mut recovery_round = state
+                .planner
+                .as_ref()
+                .map(|planner| {
+                    planner
+                        .rescue_history
+                        .iter()
+                        .filter(|record| record.mode == PlannerRecoveryMode::SuccessRecovery)
+                        .count() as u32
+                })
+                .unwrap_or(0);
+            if policy.allow_frame_backfill_beyond_quality
+                && source_video.is_file()
+                && recovery_round < policy.max_rounds
+                && !recovery_action_completed(state, RescueAction::FrameBackfill)
+            {
+                if let Some(mut full_plan) = state.frames.as_ref().map(frame_plan_from_state) {
+                    let old_selected: std::collections::HashSet<u64> = full_plan
+                        .selected_frames
+                        .iter()
+                        .map(|frame| frame.source_frame_index)
+                        .collect();
+                    let duration = state
+                        .video
+                        .as_ref()
+                        .map(|video| video.duration)
+                        .unwrap_or(0.0);
+                    let recovery_fps = (full_plan.actual_average_fps * 1.25)
+                        .max(full_plan.actual_average_fps + 1.0)
+                        .min(policy.max_recovery_fps.unwrap_or(f64::INFINITY));
+                    let target_count = (duration * recovery_fps).ceil() as usize;
+                    let remaining = full_plan
+                        .candidate_frames
+                        .iter()
+                        .filter(|frame| !old_selected.contains(&frame.source_frame_index))
+                        .count();
+                    let additional = target_count
+                        .saturating_sub(full_plan.selected_frames.len())
+                        .max(1)
+                        .min(remaining);
+                    if additional > 0
+                        && BudgetFramePlanner
+                            .backfill(&mut full_plan, additional)
+                            .is_ok()
+                    {
+                        full_plan.actual_average_fps =
+                            full_plan.selected_frames.len() as f64 / duration.max(0.001);
+                        full_plan.sampling_fps = full_plan.actual_average_fps;
+                        let additions: Vec<_> = full_plan
+                            .selected_frames
+                            .iter()
+                            .filter(|frame| !old_selected.contains(&frame.source_frame_index))
+                            .cloned()
+                            .collect();
+                        let mut addition_plan = full_plan.clone();
+                        addition_plan.selected_frames = additions.clone();
+                        addition_plan.estimated_frames = additions.len() as u64;
+                        let extraction = extract_additional_frames(
+                            &self.engines.ffmpeg,
+                            source_video,
+                            &paths.frames,
+                            &paths.masks,
+                            &addition_plan,
+                            has_alpha,
+                            Some(paths.logs.join("ffmpeg-recovery.log")),
+                            &self.process_manager,
+                            Some(self.process_observer(
+                                PipelineStage::ExtractingFrames,
+                                PipelineEngine::Ffmpeg,
+                                Some(additions.len() as u64),
+                                ObserverMode::Ffmpeg,
+                            )),
+                        )
+                        .await?;
+                        input_images = extraction.frame_count;
+                        let extension = if has_alpha { "png" } else { "jpg" };
+                        let names: Vec<String> = additions
+                            .iter()
+                            .map(|frame| {
+                                format!("frame_{:010}.{extension}", frame.source_frame_index)
+                            })
+                            .collect();
+                        let image_list = paths.colmap.join("planner-recovery-images.txt");
+                        tokio::fs::write(&image_list, names.join("\n")).await?;
+                        let recovery_sfm = state
+                            .planner
+                            .as_ref()
+                            .and_then(|planner| planner.quality_budget_snapshot.as_ref())
+                            .map(|budget| budget.extension.sfm_rescue)
+                            .unwrap_or(sfm_budget);
+                        colmap::extract_features_for_list(
+                            &self.engines.colmap,
+                            database,
+                            images,
+                            has_alpha.then_some(Path::new("../masks")),
+                            &image_list,
+                            paths.logs.join("colmap-recovery.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                            recovery_sfm,
+                        )
+                        .await?;
+                        let pair_list = paths.colmap.join("planner-recovery-pairs.txt");
+                        write_backfill_pairs(
+                            &paths.frames,
+                            &names,
+                            pairing_plan.sequential_overlap.max(4) as usize,
+                            &pair_list,
+                        )
+                        .await?;
+                        colmap::match_pairs(
+                            &self.engines.colmap,
+                            database,
+                            &pair_list,
+                            paths.logs.join("colmap-recovery.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                        )
+                        .await?;
+                        recovery_round += 1;
+                        let id = format!("recovery-{recovery_round}-{:?}", mapper_plan.backend)
+                            .to_ascii_lowercase();
+                        if let Ok(candidate) = self
+                            .execute_mapper_candidate(
+                                paths,
+                                database,
+                                images,
+                                colmap_log,
+                                input_images,
+                                id,
+                                mapper_plan.backend,
+                                normal_rounds + recovery_round,
+                                false,
+                            )
+                            .await
+                        {
+                            candidates.push(candidate);
+                        }
+                        if let Some(frames) = state.frames.as_mut() {
+                            *frames = FrameState::from(&full_plan);
+                            frames.extracted_frames = Some(input_images);
+                            frames.image_format =
+                                Some(if has_alpha { "png" } else { "jpeg" }.into());
+                            frames.mask_count = Some(if has_alpha { input_images } else { 0 });
+                            frames.has_alpha = has_alpha;
+                        }
+                        if let Some(planner) = state.planner.as_mut() {
+                            let normal_max = planner
+                                .quality_budget_snapshot
+                                .as_ref()
+                                .map(|budget| budget.frame.max_fps)
+                                .unwrap_or(f64::INFINITY);
+                            planner.frame_plan = Some(full_plan.clone());
+                            planner.actual_selected_frames = full_plan
+                                .selected_frames
+                                .iter()
+                                .map(|frame| frame.source_frame_index)
+                                .collect();
+                            planner.budget_overridden_for_success |=
+                                full_plan.actual_average_fps > normal_max;
+                            planner.rescue_history.push(RescueRecord {
+                                round: recovery_round,
+                                mode: PlannerRecoveryMode::SuccessRecovery,
+                                action: RescueAction::FrameBackfill,
+                                effective: Some(candidates.last().is_some_and(|candidate| {
+                                    candidate.viability != ReconstructionViability::NotViable
+                                })),
+                                reason_codes: vec!["frame_budget_overridden_for_success".into()],
+                            });
+                        }
+                        checkpoint_planner_candidates(project_manager, paths, state, &candidates)
+                            .await?;
+                    }
+                }
+            }
+            if policy.allow_pairing_escalation_beyond_quality
+                && state
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.pairing_actual)
+                    != Some(PairingStrategy::Exhaustive)
+                && recovery_round < policy.max_rounds
+                && !recovery_action_completed(state, RescueAction::LocalExhaustive)
+                && !recovery_action_completed(state, RescueAction::Prefilter)
+            {
+                let recovery_matching = MatchingBudget {
+                    sequential_overlap: pairing_plan.sequential_overlap.max(20),
+                    prefilter_neighbors: pairing_plan.prefilter_neighbors.max(32),
+                };
+                let matching_cost =
+                    EstimatedMatchingCost::new(input_images, recovery_matching.sequential_overlap);
+                let recovery_strategy = if matching_cost.exhaustive_pairs
+                    <= PairingThresholds::default().exhaustive_pair_limit
+                {
+                    colmap::match_exhaustive(
+                        &self.engines.colmap,
+                        database,
+                        colmap_log.to_path_buf(),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::Matching,
+                            PipelineEngine::Colmap,
+                            Some(input_images),
+                            ObserverMode::BracketProgress,
+                        )),
+                        gpu_index,
+                    )
+                    .await?;
+                    PairingStrategy::Exhaustive
+                } else {
+                    colmap::match_prefilter(
+                        &self.engines.colmap,
+                        database,
+                        &self.engines.colmap_vocab_tree,
+                        colmap_log.to_path_buf(),
+                        &self.process_manager,
+                        Some(self.process_observer(
+                            PipelineStage::Matching,
+                            PipelineEngine::Colmap,
+                            Some(input_images),
+                            ObserverMode::BracketProgress,
+                        )),
+                        gpu_index,
+                        recovery_matching.prefilter_neighbors,
+                    )
+                    .await?;
+                    PairingStrategy::Prefilter
+                };
+                recovery_round += 1;
+                let id = format!("recovery-{recovery_round}-{:?}", mapper_plan.backend)
+                    .to_ascii_lowercase();
+                if let Ok(candidate) = self
+                    .execute_mapper_candidate(
+                        paths,
+                        database,
+                        images,
+                        colmap_log,
+                        input_images,
+                        id,
+                        mapper_plan.backend,
+                        normal_rounds + recovery_round,
+                        false,
+                    )
+                    .await
+                {
+                    candidates.push(candidate);
+                }
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.pairing_actual = Some(recovery_strategy);
+                    planner.budget_overridden_for_success = true;
+                    planner.rescue_history.push(RescueRecord {
+                        round: recovery_round,
+                        mode: PlannerRecoveryMode::SuccessRecovery,
+                        action: if recovery_strategy == PairingStrategy::Exhaustive {
+                            RescueAction::LocalExhaustive
+                        } else {
+                            RescueAction::Prefilter
+                        },
+                        effective: Some(candidates.last().is_some_and(|candidate| {
+                            candidate.viability != ReconstructionViability::NotViable
+                        })),
+                        reason_codes: vec!["normal_budget_exhausted".into()],
+                    });
+                }
+                checkpoint_planner_candidates(project_manager, paths, state, &candidates).await?;
+            }
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.decision == ReconstructionDecision::Pass)
+                && policy.allow_sfm_escalation_beyond_quality
+                && recovery_round < policy.max_rounds
+                && !recovery_action_completed(state, RescueAction::SfmEscalation)
+            {
+                let escalated_database = paths.colmap.join("database-recovery-sfm.db");
+                if escalated_database.is_file() {
+                    tokio::fs::remove_file(&escalated_database).await?;
+                }
+                let escalated_sfm = SfmBudget {
+                    max_image_size: policy.max_sfm_image_size,
+                    max_features: policy.max_sfm_features,
+                };
+                self.events.stage(
+                    PipelineStage::ExtractingFeatures,
+                    0.0,
+                    "正在提高重建特征精度",
+                );
+                colmap::extract_features(
+                    &self.engines.colmap,
+                    &escalated_database,
+                    images,
+                    has_alpha.then_some(Path::new("../masks")),
+                    paths.logs.join("colmap-recovery-sfm.log"),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::ExtractingFeatures,
+                        PipelineEngine::Colmap,
+                        Some(input_images),
+                        ObserverMode::BracketProgress,
+                    )),
+                    gpu_index,
+                    escalated_sfm,
+                )
+                .await?;
+                let recovery_matching = MatchingBudget {
+                    sequential_overlap: pairing_plan.sequential_overlap.max(20),
+                    prefilter_neighbors: pairing_plan.prefilter_neighbors.max(32),
+                };
+                let recovery_pairing =
+                    PairingPlanner::default().plan(&prior, input_images, recovery_matching);
+                match recovery_pairing.strategy {
+                    PairingStrategy::Exhaustive => {
+                        colmap::match_exhaustive(
+                            &self.engines.colmap,
+                            &escalated_database,
+                            paths.logs.join("colmap-recovery-sfm.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                        )
+                        .await?;
+                    }
+                    PairingStrategy::Sequential => {
+                        colmap::match_sequential(
+                            &self.engines.colmap,
+                            &escalated_database,
+                            paths.logs.join("colmap-recovery-sfm.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                            recovery_matching,
+                        )
+                        .await?;
+                    }
+                    PairingStrategy::SequentialWithLoopClosure => {
+                        colmap::match_sequential_with_loop(
+                            &self.engines.colmap,
+                            &escalated_database,
+                            &self.engines.colmap_vocab_tree,
+                            paths.logs.join("colmap-recovery-sfm.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                            recovery_matching,
+                        )
+                        .await?;
+                    }
+                    PairingStrategy::Prefilter => {
+                        colmap::match_prefilter(
+                            &self.engines.colmap,
+                            &escalated_database,
+                            &self.engines.colmap_vocab_tree,
+                            paths.logs.join("colmap-recovery-sfm.log"),
+                            &self.process_manager,
+                            None,
+                            gpu_index,
+                            recovery_matching.prefilter_neighbors,
+                        )
+                        .await?;
+                    }
+                }
+                recovery_round += 1;
+                let id = format!("recovery-{recovery_round}-sfm-{:?}", mapper_plan.backend)
+                    .to_ascii_lowercase();
+                if let Ok(candidate) = self
+                    .execute_mapper_candidate(
+                        paths,
+                        &escalated_database,
+                        images,
+                        colmap_log,
+                        input_images,
+                        id,
+                        mapper_plan.backend,
+                        normal_rounds + recovery_round,
+                        false,
+                    )
+                    .await
+                {
+                    candidates.push(candidate);
+                }
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.pairing_actual = Some(recovery_pairing.strategy);
+                    planner.budget_overridden_for_success = true;
+                    planner.rescue_history.push(RescueRecord {
+                        round: recovery_round,
+                        mode: PlannerRecoveryMode::SuccessRecovery,
+                        action: RescueAction::SfmEscalation,
+                        effective: Some(candidates.last().is_some_and(|candidate| {
+                            candidate.viability != ReconstructionViability::NotViable
+                        })),
+                        reason_codes: vec!["sfm_budget_overridden_for_success".into()],
+                    });
+                }
+                checkpoint_planner_candidates(project_manager, paths, state, &candidates).await?;
+            }
+        }
+
+        let best = ReconstructionComparator
+            .best(&candidates)
+            .cloned()
+            .ok_or_else(|| {
+                SplatError::Process(
+                    "所有正常与恢复重建路径均已结束，未找到可用于 Brush 的重建结果".into(),
+                )
+            })?;
+        let report = ReconstructionValidator::validate(&paths.frames, &best.model_path)?;
+        if let Some(planner) = state.planner.as_mut() {
+            planner.mapper_actual = Some(best.mapper);
+            planner.reconstruction_candidates = candidates;
+            planner.best_reconstruction_id = Some(best.id.clone());
+            planner.reconstruction_report = Some(report.clone());
+            planner.normal_duration_ms = recovery_started
+                .map(|started| started.duration_since(planner_started).as_millis() as u64)
+                .unwrap_or_else(|| planner_started.elapsed().as_millis() as u64);
+            planner.recovery_duration_ms = recovery_started
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+        }
+        state.stage = PipelineStage::Reconstructing;
+        state.reconstruction_complete = true;
+        project_manager.write_state(&paths.state, state).await?;
+        write_planner_snapshot(paths, state).await?;
+        self.events
+            .stage(PipelineStage::Reconstructing, 1.0, "已选择最佳可用重建");
+        Ok((best.model_path.clone(), report, best, input_images))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_mapper_candidate(
+        &self,
+        paths: &ProjectPaths,
+        baseline_database: &Path,
+        images: &Path,
+        colmap_log: &Path,
+        input_images: u64,
+        id: String,
+        backend: MapperBackend,
+        rescue_round: u32,
+        calibrate: bool,
+    ) -> Result<ReconstructionCandidate> {
+        let attempt_database = paths.colmap.join(format!("database-{id}.db"));
+        tokio::fs::copy(baseline_database, &attempt_database).await?;
+        let output = paths.colmap.join("candidates").join(&id);
+        reset_directory(&output).await?;
+        if calibrate {
+            colmap::calibrate_view_graph(
+                &self.engines.colmap,
+                &attempt_database,
+                colmap_log.to_path_buf(),
+                &self.process_manager,
+                None,
+            )
+            .await?;
+        }
+        self.events.stage(
+            PipelineStage::Reconstructing,
+            0.05,
+            match backend {
+                MapperBackend::Global => "正在执行全局重建",
+                MapperBackend::Incremental => "正在执行增量重建",
+            },
+        );
+        let observer = Some(self.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            Some(input_images),
+            ObserverMode::Mapper,
+        ));
+        match backend {
+            MapperBackend::Incremental => {
+                colmap::map(
+                    &self.engines.colmap,
+                    &attempt_database,
+                    images,
+                    &output,
+                    colmap_log.to_path_buf(),
+                    &self.process_manager,
+                    observer,
+                )
+                .await?
+            }
+            MapperBackend::Global => {
+                colmap::map_global(
+                    &self.engines.colmap,
+                    &attempt_database,
+                    images,
+                    &output,
+                    colmap_log.to_path_buf(),
+                    &self.process_manager,
+                    observer,
+                )
+                .await?
+            }
+        }
+        let (model, _) = best_sparse_model(&paths.frames, &output).await?;
+        let analyzer =
+            colmap::analyze_model(&self.engines.colmap, &model, &self.process_manager).await?;
+        let model_count = count_sparse_models(&output).max(1);
+        let mut metrics = parse_model_analyzer(&analyzer, input_images, model_count);
+        metrics.finite_geometry &= validate_sparse_geometry(&model).unwrap_or(false);
+        let (decision, viability) = PlannerReconstructionValidator.classify(&metrics);
+        Ok(ReconstructionCandidate {
+            id,
+            mapper: backend,
+            model_path: model,
+            metrics,
+            decision,
+            viability,
+            rescue_round,
         })
     }
 
@@ -1233,11 +2616,33 @@ async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFi
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
     state.features_complete = frames_complete && state.features_complete && database_complete;
     state.matching_complete = state.features_complete && state.matching_complete;
+    let reconstruction_artifact_complete = if state.planner_enabled {
+        state
+            .planner
+            .as_ref()
+            .and_then(|planner| {
+                planner
+                    .best_reconstruction_id
+                    .as_ref()
+                    .map(|id| (planner, id))
+            })
+            .and_then(|(planner, id)| {
+                planner
+                    .reconstruction_candidates
+                    .iter()
+                    .find(|candidate| &candidate.id == id)
+            })
+            .is_some_and(|candidate| {
+                ReconstructionValidator::validate(&paths.frames, &candidate.model_path).is_ok()
+            })
+    } else {
+        best_sparse_model(&paths.frames, &paths.colmap.join("sparse"))
+            .await
+            .is_ok()
+    };
     state.reconstruction_complete = state.matching_complete
         && state.reconstruction_complete
-        && best_sparse_model(&paths.frames, &paths.colmap.join("sparse"))
-            .await
-            .is_ok();
+        && reconstruction_artifact_complete;
     state.brush_complete = state.reconstruction_complete
         && state.brush_complete
         && brush_candidate(&paths.brush)
@@ -1257,11 +2662,7 @@ async fn prepared_frames_from_checkpoint(
     let Some(extracted_frames) = frames.extracted_frames.filter(|count| *count > 0) else {
         return Ok(None);
     };
-    let plan = FramePlan {
-        retention_ratio: frames.retention_ratio,
-        sampling_fps: frames.sampling_fps,
-        estimated_frames: frames.estimated_frames,
-    };
+    let plan = frame_plan_from_state(frames);
     match state.input_type {
         ProjectInputType::Video => {
             let Some(video) = state.video.clone() else {
@@ -1292,6 +2693,10 @@ async fn prepared_frames_from_checkpoint(
                 image_format: extraction.image_format.as_str().into(),
                 mask_count: extraction.mask_count,
                 has_alpha: extraction.has_alpha,
+                capture_prior: state
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.capture_prior.clone()),
             }))
         }
         ProjectInputType::Images => {
@@ -1300,12 +2705,13 @@ async fn prepared_frames_from_checkpoint(
             };
             let frames_dir = paths.frames.clone();
             let masks_dir = paths.masks.clone();
+            let has_alpha = frames.has_alpha;
             let Ok(prepared) = tokio::task::spawn_blocking(move || {
                 validate_prepared_image_sequence(
                     &frames_dir,
                     &masks_dir,
                     extracted_frames,
-                    image_sequence.has_alpha,
+                    has_alpha,
                 )
                 .map(|prepared| (prepared, image_sequence))
             })
@@ -1330,8 +2736,41 @@ async fn prepared_frames_from_checkpoint(
                 image_format: "images".into(),
                 mask_count: prepared.mask_count,
                 has_alpha: prepared.has_alpha,
+                capture_prior: state
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.capture_prior.clone()),
             }))
         }
+    }
+}
+
+fn frame_plan_from_state(frames: &FrameState) -> FramePlan {
+    FramePlan {
+        quality: frames.quality,
+        retention_ratio: frames.retention_ratio,
+        sampling_fps: frames.sampling_fps,
+        actual_average_fps: if frames.actual_average_fps > 0.0 {
+            frames.actual_average_fps
+        } else {
+            frames.sampling_fps
+        },
+        target_fps: if frames.target_fps > 0.0 {
+            frames.target_fps
+        } else {
+            frames.sampling_fps
+        },
+        candidate_fps: if frames.candidate_fps > 0.0 {
+            frames.candidate_fps
+        } else {
+            frames.sampling_fps
+        },
+        estimated_frames: frames.estimated_frames,
+        planning_mode: frames.planning_mode,
+        preferred_fps: frames.preferred_fps,
+        selected_frames: frames.selected_frames.clone(),
+        candidate_frames: frames.candidate_frames.clone(),
+        minimum_frame_protection: frames.minimum_frame_protection.clone(),
     }
 }
 
@@ -1391,6 +2830,9 @@ fn best_sparse_model_blocking(
     sparse: &Path,
 ) -> Result<(PathBuf, ReconstructionReport)> {
     let mut best: Option<(PathBuf, ReconstructionReport)> = None;
+    if let Ok(report) = ReconstructionValidator::validate(frames, sparse) {
+        best = Some((sparse.to_path_buf(), report));
+    }
     for entry in std::fs::read_dir(sparse)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -1406,6 +2848,111 @@ fn best_sparse_model_blocking(
         }
     }
     best.ok_or_else(|| SplatError::Process("COLMAP 未生成完整的稀疏模型".into()))
+}
+
+fn recovery_action_completed(state: &PipelineStateFile, action: RescueAction) -> bool {
+    state.planner.as_ref().is_some_and(|planner| {
+        planner.rescue_history.iter().any(|record| {
+            record.mode == PlannerRecoveryMode::SuccessRecovery && record.action == action
+        })
+    })
+}
+
+async fn checkpoint_planner_candidates(
+    project_manager: &ProjectManager,
+    paths: &ProjectPaths,
+    state: &mut PipelineStateFile,
+    candidates: &[ReconstructionCandidate],
+) -> Result<()> {
+    if let Some(planner) = state.planner.as_mut() {
+        planner.reconstruction_candidates = candidates.to_vec();
+    }
+    project_manager.write_state(&paths.state, state).await?;
+    write_planner_snapshot(paths, state).await
+}
+
+fn count_sparse_models(root: &Path) -> u32 {
+    let root_is_model = ["cameras.bin", "images.bin", "points3D.bin"]
+        .iter()
+        .all(|name| root.join(name).is_file());
+    let children = std::fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry.path().is_dir()
+                && ["cameras.bin", "images.bin", "points3D.bin"]
+                    .iter()
+                    .all(|name| entry.path().join(name).is_file())
+        })
+        .count() as u32;
+    children + u32::from(root_is_model)
+}
+
+async fn write_planner_snapshot(paths: &ProjectPaths, state: &PipelineStateFile) -> Result<()> {
+    let Some(planner) = &state.planner else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec_pretty(planner).map_err(|error| {
+        SplatError::Process(format!("Unable to serialize Planner log: {error}"))
+    })?;
+    tokio::fs::write(paths.logs.join("planner.json"), bytes).await?;
+    Ok(())
+}
+
+async fn write_backfill_pairs(
+    frames: &Path,
+    new_names: &[String],
+    overlap: usize,
+    destination: &Path,
+) -> Result<()> {
+    let mut names = Vec::new();
+    let mut entries = tokio::fs::read_dir(frames).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("jpg")
+                    || extension.eq_ignore_ascii_case("jpeg")
+                    || extension.eq_ignore_ascii_case("png")
+            })
+        {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    let new_names: std::collections::HashSet<&str> = new_names.iter().map(String::as_str).collect();
+    let mut pairs = std::collections::BTreeSet::new();
+    for (position, name) in names.iter().enumerate() {
+        if !new_names.contains(name.as_str()) {
+            continue;
+        }
+        let start = position.saturating_sub(overlap);
+        let end = (position + overlap + 1).min(names.len());
+        for neighbor in &names[start..end] {
+            if neighbor == name {
+                continue;
+            }
+            let (left, right) = if name < neighbor {
+                (name, neighbor)
+            } else {
+                (neighbor, name)
+            };
+            pairs.insert(format!("{left} {right}"));
+        }
+    }
+    if pairs.is_empty() {
+        return Err(SplatError::Process(
+            "Planner backfill produced no related image pairs".into(),
+        ));
+    }
+    tokio::fs::write(
+        destination,
+        pairs.into_iter().collect::<Vec<_>>().join("\n"),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {
@@ -1454,9 +3001,18 @@ mod tests {
         assert_eq!(checkpoint_stage(&state), PipelineStage::Created);
 
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 15.0,
+            actual_average_fps: 15.0,
+            target_fps: 15.0,
+            candidate_fps: 15.0,
             estimated_frames: 100,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(100),
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
@@ -1475,9 +3031,18 @@ mod tests {
     fn terminal_state_preserves_every_checkpoint() {
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 15.0,
+            actual_average_fps: 15.0,
+            target_fps: 15.0,
+            candidate_fps: 15.0,
             estimated_frames: 100,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(100),
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
@@ -1500,6 +3065,40 @@ mod tests {
             assert!(terminal.reconstruction_complete);
             assert!(terminal.brush_complete);
         }
+    }
+
+    #[test]
+    fn resume_reuses_the_recorded_frame_plan_without_replanning() {
+        let mut state = PipelineStateFile::created(Quality::Fast);
+        state.planner_enabled = true;
+        state.frames = Some(FrameState {
+            quality: Some(Quality::Fast),
+            retention_ratio: 0.17,
+            sampling_fps: 5.1,
+            actual_average_fps: 5.1,
+            target_fps: 5.1,
+            candidate_fps: 12.0,
+            planning_mode: FramePlanningMode::Budgeted,
+            preferred_fps: 6.0,
+            selected_frames: vec![crate::video::PlannedFrame {
+                source_frame_index: 42,
+                timestamp_seconds: 1.4,
+            }],
+            candidate_frames: vec![crate::video::PlannedFrame {
+                source_frame_index: 42,
+                timestamp_seconds: 1.4,
+            }],
+            minimum_frame_protection: Default::default(),
+            estimated_frames: 1,
+            extracted_frames: None,
+            image_format: None,
+            mask_count: None,
+            has_alpha: false,
+        });
+        let restored = frame_plan_from_state(state.frames.as_ref().unwrap());
+        assert_eq!(restored.planning_mode, FramePlanningMode::Budgeted);
+        assert_eq!(restored.sampling_fps, 5.1);
+        assert_eq!(restored.selected_frames[0].source_frame_index, 42);
     }
 
     #[tokio::test]
@@ -1526,9 +3125,18 @@ mod tests {
             has_alpha: false,
         });
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 15.0,
+            actual_average_fps: 15.0,
+            target_fps: 15.0,
+            candidate_fps: 15.0,
             estimated_frames: 2,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(2),
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
@@ -1588,9 +3196,18 @@ mod tests {
             requires_large_sequence_confirmation: false,
         });
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 1.0,
             sampling_fps: 0.0,
+            actual_average_fps: 0.0,
+            target_fps: 0.0,
+            candidate_fps: 0.0,
             estimated_frames: 2,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(2),
             image_format: Some("images".into()),
             mask_count: Some(2),
@@ -1608,6 +3225,53 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn opaque_alpha_channel_checkpoint_does_not_require_masks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.masks).await.unwrap();
+        for name in ["frame_000001.png", "frame_000002.png"] {
+            tokio::fs::write(paths.frames.join(name), b"image")
+                .await
+                .unwrap();
+        }
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.image_sequence = Some(ImageSequenceInfo {
+            image_count: 2,
+            width: 1920,
+            height: 1080,
+            has_alpha: true,
+            requires_large_sequence_confirmation: false,
+        });
+        state.frames = Some(FrameState {
+            quality: None,
+            retention_ratio: 1.0,
+            sampling_fps: 0.0,
+            actual_average_fps: 0.0,
+            target_fps: 0.0,
+            candidate_fps: 0.0,
+            estimated_frames: 2,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
+            extracted_frames: Some(2),
+            image_format: Some("images".into()),
+            mask_count: Some(0),
+            has_alpha: false,
+        });
+
+        let prepared = prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!prepared.has_alpha);
+        assert_eq!(prepared.mask_count, 0);
     }
 
     #[tokio::test]
@@ -1635,9 +3299,18 @@ mod tests {
             has_alpha: true,
         });
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 15.0,
+            actual_average_fps: 15.0,
+            target_fps: 15.0,
+            candidate_fps: 15.0,
             estimated_frames: 1,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(1),
             image_format: Some("png".into()),
             mask_count: Some(1),
@@ -1685,9 +3358,18 @@ mod tests {
             has_alpha: false,
         });
         state.frames = Some(FrameState {
+            quality: None,
             retention_ratio: 0.5,
             sampling_fps: 15.0,
+            actual_average_fps: 15.0,
+            target_fps: 15.0,
+            candidate_fps: 15.0,
             estimated_frames: 1,
+            planning_mode: Default::default(),
+            preferred_fps: 0.0,
+            selected_frames: Vec::new(),
+            candidate_frames: Vec::new(),
+            minimum_frame_protection: Default::default(),
             extracted_frames: Some(1),
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
@@ -1701,6 +3383,79 @@ mod tests {
         assert!(!state.features_complete);
         assert!(!state.matching_complete);
         assert_eq!(state.stage, PipelineStage::ExtractingFrames);
+    }
+
+    #[tokio::test]
+    async fn planner_resume_validates_the_archived_best_candidate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
+        tokio::fs::write(paths.frames.join("frame_0000000001.jpg"), b"jpeg")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.colmap.join("database.db"), b"sqlite")
+            .await
+            .unwrap();
+        let model = paths.colmap.join("candidates").join("best").join("0");
+        tokio::fs::create_dir_all(&model).await.unwrap();
+        let mut one = 1_u64.to_le_bytes().to_vec();
+        one.push(0);
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            tokio::fs::write(model.join(name), &one).await.unwrap();
+        }
+        let mut state = PipelineStateFile::created(Quality::Fast);
+        state.planner_enabled = true;
+        state.video = Some(VideoInfo {
+            duration: 1.0,
+            width: 640,
+            height: 480,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        });
+        state.frames = Some(FrameState {
+            quality: Some(Quality::Fast),
+            retention_ratio: 0.1,
+            sampling_fps: 3.0,
+            actual_average_fps: 1.0,
+            target_fps: 4.0,
+            candidate_fps: 12.0,
+            estimated_frames: 1,
+            planning_mode: FramePlanningMode::Budgeted,
+            preferred_fps: 6.0,
+            selected_frames: vec![],
+            candidate_frames: vec![],
+            minimum_frame_protection: Default::default(),
+            extracted_frames: Some(1),
+            image_format: Some("jpeg".into()),
+            mask_count: Some(0),
+            has_alpha: false,
+        });
+        let mut planner =
+            PlannerCheckpoint::new(Quality::Fast.budget(), SuccessRecoveryPolicy::default());
+        planner.best_reconstruction_id = Some("best".into());
+        planner
+            .reconstruction_candidates
+            .push(ReconstructionCandidate {
+                id: "best".into(),
+                mapper: MapperBackend::Incremental,
+                model_path: model,
+                metrics: Default::default(),
+                decision: ReconstructionDecision::Warning,
+                viability: ReconstructionViability::Viable,
+                rescue_round: 0,
+            });
+        state.planner = Some(planner);
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.reconstruction_complete = true;
+
+        normalize_checkpoints(&paths, &mut state).await.unwrap();
+        assert!(state.reconstruction_complete);
     }
 
     #[test]

@@ -101,7 +101,7 @@ $tauriLinux = (Read-Utf8Text "src-tauri/tauri.linux.conf.json") | ConvertFrom-Js
 Assert-True ($tauriLinux.bundle.active -eq $true) "Linux Tauri bundling must be enabled."
 Assert-True (@($tauriLinux.bundle.targets) -contains "deb") "Linux Tauri targets must include deb."
 $linuxResources = @($tauriLinux.bundle.resources.PSObject.Properties.Name)
-foreach ($resource in "../engines/manifest.linux.json", "../engines/linux/brush/") {
+foreach ($resource in "../engines/manifest.linux.json", "../engines/linux/brush/", "../engines/linux/colmap/") {
     Assert-True ($linuxResources -contains $resource) "Linux Tauri resources are missing $resource."
 }
 foreach ($dependency in "ffmpeg", "colmap") {
@@ -117,6 +117,7 @@ foreach ($resource in "../engines/manifest.macos.json", "../engines/macos/arm64/
 $manifest = (Read-Utf8Text "engines/manifest.json") | ConvertFrom-Json
 Assert-True ($manifest.schemaVersion -ge 2) "Engine manifest schemaVersion must include license mappings."
 Assert-True ($manifest.engines.Count -eq 3) "License verification expects exactly the three direct native engines."
+Assert-True (@($manifest.runtimeAssets).Count -eq 1) "Windows manifest must contain the COLMAP loop-closure asset."
 
 $expectedEngines = @{
     "FFmpeg / FFprobe" = @{
@@ -158,6 +159,7 @@ Assert-Contains $thirdParty $windowsFfmpeg[0].sourceUrl "THIRD_PARTY_NOTICES.txt
 $linuxManifest = (Read-Utf8Text "engines/manifest.linux.json") | ConvertFrom-Json
 Assert-True ($linuxManifest.schemaVersion -ge 2) "Linux engine manifest schemaVersion must include license mappings."
 Assert-True ($linuxManifest.brush.version -eq "0.3.0") "Linux Brush version is incorrect."
+Assert-True ($linuxManifest.colmapVocabularyTree.sha256 -eq "96ca8ec8ea60b1f73465aaf2c401fd3b3ca75cdba2d3c50d6a2f6f760f275ddc") "Linux COLMAP vocabulary tree hash is incorrect."
 Assert-True ($linuxManifest.brush.sourceUrl -eq "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz") "Linux Brush release archive is incorrect."
 Assert-True ($linuxManifest.brush.license -eq "Apache-2.0") "Linux Brush license identifier is incorrect."
 Assert-True (@($linuxManifest.brush.licenseFiles).Count -eq 1) "Linux Brush must map to one direct license file."
@@ -169,6 +171,7 @@ foreach ($marker in "Ubuntu 24.04 Alpha, Linux x86_64 release archive", "brush-a
 $macosManifest = (Read-Utf8Text "engines/manifest.macos.json") | ConvertFrom-Json
 Assert-True ($macosManifest.schemaVersion -ge 1) "macOS engine manifest schemaVersion is missing."
 Assert-True ($macosManifest.platform -eq "macos") "macOS engine manifest platform is incorrect."
+Assert-True (@($macosManifest.runtimeAssets).Count -eq 1) "macOS manifest must contain the COLMAP loop-closure asset."
 Assert-True ($macosManifest.architecture -eq "arm64") "macOS engine manifest must be Apple arm64 only."
 Assert-True ($macosManifest.minimumSystemVersion -eq "15.0") "macOS engine manifest must target macOS 15.0."
 Assert-True ($macosManifest.buildEnvironment.homebrewCoreCommit -match '^[A-F0-9]{40}$') "macOS Homebrew/core build commit is not pinned."
@@ -213,6 +216,8 @@ Assert-Contains $ffmpegLicense "Version 2.1, February 1999" "FFmpeg license"
 Assert-True (-not $ffmpegLicense.Contains("Version 3, 29 June 2007")) "FFmpeg license still contains the LGPLv3 text."
 
 $colmapLicense = Read-Utf8Text "licenses/COLMAP-LICENSE.txt"
+Assert-Contains $thirdParty "vocab_tree_faiss_flickr100K_words256K.bin" "THIRD_PARTY_NOTICES.txt"
+Assert-Contains $thirdParty $manifest.runtimeAssets[0].sourceUrl "THIRD_PARTY_NOTICES.txt"
 Assert-Contains $colmapLicense "ETH Zurich and UNC Chapel Hill" "COLMAP license"
 Assert-Contains $colmapLicense "Redistributions of source code" "COLMAP license"
 Assert-Contains $colmapLicense "Redistributions in binary form" "COLMAP license"

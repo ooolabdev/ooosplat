@@ -61,6 +61,16 @@
       }
     }
   ],
+  "runtimeAssets": [
+    {
+      "name": "COLMAP loop-closure vocabulary tree",
+      "sourceUrl": "https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin",
+      "sha256": "96CA8EC8EA60B1F73465AAF2C401FD3B3CA75CDBA2D3C50D6A2F6F760F275DDC",
+      "cacheName": "vocab_tree_faiss_flickr100K_words256K.bin",
+      "destination": "engines/colmap/share/vocab_tree_faiss_flickr100K_words256K.bin",
+      "distribution": "Official COLMAP release asset used by sequential loop detection"
+    }
+  ],
   "requiredFiles": [
     { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "00D5996AE9E6DD4C5C11AB3040AE9CFBF78E0EC80492D8B5D2AF3559DAF41A0D" },
     { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "729402BBF566C6C616181D80ED8BEAD82F4858CD98058E347FBEE97DDE5C0EF9" },

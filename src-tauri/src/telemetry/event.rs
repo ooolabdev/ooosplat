@@ -178,6 +178,36 @@ pub enum TelemetryEvent {
         frame_count_bucket: FrameCountBucket,
         duration_bucket: Option<DurationBucket>,
     },
+    QualityMetricsRecorded {
+        actual_frame_count: u64,
+        actual_sfm_resolution: u32,
+        actual_feature_count: Option<u64>,
+        actual_brush_resolution: u32,
+        actual_brush_iterations: usize,
+        registered_images: u64,
+        reprojection_error: Option<f64>,
+        splat_count: u64,
+        peak_gpu_memory_mb: Option<u64>,
+    },
+    PlannerMetricsRecorded {
+        planner_version: u32,
+        capture_type: Option<String>,
+        pairing_planned: Option<String>,
+        pairing_actual: Option<String>,
+        mapper_planned: Option<String>,
+        mapper_actual: Option<String>,
+        largest_component_ratio: Option<f32>,
+        two_core_ratio: Option<f32>,
+        bridge_ratio: Option<f32>,
+        normal_rescue_rounds: u32,
+        success_recovery_rounds: u32,
+        normal_budget_exhausted: bool,
+        success_recovery_entered: bool,
+        budget_overridden_for_success: bool,
+        normal_duration_ms: u64,
+        recovery_duration_ms: u64,
+        reconstruction_quality: Option<String>,
+    },
     GenerationFailed {
         stage: Option<TelemetryStage>,
         error_code: TelemetryErrorCode,
@@ -194,6 +224,8 @@ enum TelemetryEventName {
     DailyActive,
     GenerationStarted,
     GenerationCompleted,
+    QualityMetricsRecorded,
+    PlannerMetricsRecorded,
     GenerationFailed,
     PipelineStageCompleted,
 }
@@ -215,6 +247,58 @@ struct TelemetryProperties {
     stage: Option<TelemetryStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<TelemetryErrorCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_frame_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_sfm_resolution: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_feature_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_brush_resolution: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_brush_iterations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registered_images: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reprojection_error: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    splat_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_gpu_memory_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planner_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_planned: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_actual: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapper_planned: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapper_actual: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    largest_component_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    two_core_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normal_rescue_rounds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success_recovery_rounds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normal_budget_exhausted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success_recovery_entered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_overridden_for_success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normal_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconstruction_quality: Option<String>,
 }
 
 impl TelemetryEvent {
@@ -247,6 +331,72 @@ impl TelemetryEvent {
                     duration_ms: Some(total_duration_ms.min(86_400_000)),
                     frame_count_bucket: Some(frame_count_bucket),
                     input_duration_bucket: duration_bucket,
+                    ..TelemetryProperties::default()
+                },
+            ),
+            Self::QualityMetricsRecorded {
+                actual_frame_count,
+                actual_sfm_resolution,
+                actual_feature_count,
+                actual_brush_resolution,
+                actual_brush_iterations,
+                registered_images,
+                reprojection_error,
+                splat_count,
+                peak_gpu_memory_mb,
+            } => (
+                TelemetryEventName::QualityMetricsRecorded,
+                TelemetryProperties {
+                    actual_frame_count: Some(actual_frame_count),
+                    actual_sfm_resolution: Some(actual_sfm_resolution),
+                    actual_feature_count,
+                    actual_brush_resolution: Some(actual_brush_resolution),
+                    actual_brush_iterations: Some(actual_brush_iterations),
+                    registered_images: Some(registered_images),
+                    reprojection_error,
+                    splat_count: Some(splat_count),
+                    peak_gpu_memory_mb,
+                    ..TelemetryProperties::default()
+                },
+            ),
+            Self::PlannerMetricsRecorded {
+                planner_version,
+                capture_type,
+                pairing_planned,
+                pairing_actual,
+                mapper_planned,
+                mapper_actual,
+                largest_component_ratio,
+                two_core_ratio,
+                bridge_ratio,
+                normal_rescue_rounds,
+                success_recovery_rounds,
+                normal_budget_exhausted,
+                success_recovery_entered,
+                budget_overridden_for_success,
+                normal_duration_ms,
+                recovery_duration_ms,
+                reconstruction_quality,
+            } => (
+                TelemetryEventName::PlannerMetricsRecorded,
+                TelemetryProperties {
+                    planner_version: Some(planner_version),
+                    capture_type,
+                    pairing_planned,
+                    pairing_actual,
+                    mapper_planned,
+                    mapper_actual,
+                    largest_component_ratio,
+                    two_core_ratio,
+                    bridge_ratio,
+                    normal_rescue_rounds: Some(normal_rescue_rounds),
+                    success_recovery_rounds: Some(success_recovery_rounds),
+                    normal_budget_exhausted: Some(normal_budget_exhausted),
+                    success_recovery_entered: Some(success_recovery_entered),
+                    budget_overridden_for_success: Some(budget_overridden_for_success),
+                    normal_duration_ms: Some(normal_duration_ms.min(86_400_000)),
+                    recovery_duration_ms: Some(recovery_duration_ms.min(86_400_000)),
+                    reconstruction_quality,
                     ..TelemetryProperties::default()
                 },
             ),
@@ -478,6 +628,28 @@ mod tests {
         assert_eq!(completed["properties"]["durationMs"], 123_000);
         assert_eq!(completed["properties"]["frameCountBucket"], "301-500");
         assert_eq!(completed["properties"]["inputDurationBucket"], "30-60s");
+
+        let metrics = serde_json::to_value(TelemetryPayload::new(
+            Uuid::nil(),
+            TelemetryEvent::QualityMetricsRecorded {
+                actual_frame_count: 240,
+                actual_sfm_resolution: 1_600,
+                actual_feature_count: None,
+                actual_brush_resolution: 2_400,
+                actual_brush_iterations: 30_000,
+                registered_images: 220,
+                reprojection_error: Some(0.42),
+                splat_count: 1_500_000,
+                peak_gpu_memory_mb: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(metrics["event"], "quality_metrics_recorded");
+        assert_eq!(metrics["properties"]["actualFrameCount"], 240);
+        assert_eq!(metrics["properties"]["actualBrushIterations"], 30_000);
+        assert!(metrics["properties"].get("actualFeatureCount").is_none());
+        assert!(metrics["properties"].get("peakGpuMemoryMb").is_none());
+        assert!(validate_privacy(&metrics));
 
         let failed = serde_json::to_value(TelemetryPayload::new(
             Uuid::nil(),

@@ -99,7 +99,7 @@ assert(
 const tauriLinux = JSON.parse(readText("src-tauri/tauri.linux.conf.json"));
 assert(tauriLinux.bundle?.active === true, "Linux Tauri bundling must be enabled.");
 assert(tauriLinux.bundle?.targets?.includes("deb"), "Linux Tauri targets must include deb.");
-for (const resource of ["../engines/manifest.linux.json", "../engines/linux/brush/"]) {
+for (const resource of ["../engines/manifest.linux.json", "../engines/linux/brush/", "../engines/linux/colmap/"]) {
   assert(Object.hasOwn(tauriLinux.bundle?.resources ?? {}, resource), `Linux Tauri resources are missing ${resource}.`);
 }
 for (const dependency of ["ffmpeg", "colmap"]) {
@@ -119,6 +119,7 @@ const expectedEngines = new Map([
 const manifest = JSON.parse(readText("engines/manifest.json"));
 assert(manifest.schemaVersion >= 2, "Engine manifest schemaVersion must include license mappings.");
 assert(manifest.engines?.length === 3, "License verification expects exactly the three direct native engines.");
+assert(manifest.runtimeAssets?.length === 1, "Windows manifest must contain the COLMAP loop-closure asset.");
 
 const thirdParty = readText("licenses/THIRD_PARTY_NOTICES.txt");
 assert(!thirdParty.includes("OOOSplat 0.2.0"), "Third-party notices still contain the obsolete 0.2.0 heading.");
@@ -148,6 +149,7 @@ assertContains(thirdParty, windowsFfmpeg.sourceUrl, "THIRD_PARTY_NOTICES.txt");
 const linuxManifest = JSON.parse(readText("engines/manifest.linux.json"));
 assert(linuxManifest.schemaVersion >= 2, "Linux engine manifest schemaVersion must include license mappings.");
 assert(linuxManifest.brush?.version === "0.3.0", "Linux Brush version is incorrect.");
+assert(linuxManifest.colmapVocabularyTree?.sha256 === "96ca8ec8ea60b1f73465aaf2c401fd3b3ca75cdba2d3c50d6a2f6f760f275ddc", "Linux COLMAP vocabulary tree hash is incorrect.");
 assert(
   linuxManifest.brush?.sourceUrl ===
     "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz",
@@ -169,6 +171,7 @@ for (const marker of [
 const macosManifest = JSON.parse(readText("engines/manifest.macos.json"));
 assert(macosManifest.schemaVersion >= 1, "macOS engine manifest schemaVersion is missing.");
 assert(macosManifest.platform === "macos", "macOS engine manifest platform is incorrect.");
+assert(macosManifest.runtimeAssets?.length === 1, "macOS manifest must contain the COLMAP loop-closure asset.");
 assert(macosManifest.architecture === "arm64", "macOS engine manifest must be Apple arm64 only.");
 assert(macosManifest.minimumSystemVersion === "15.0", "macOS engine manifest must target macOS 15.0.");
 assert(/^[A-F0-9]{40}$/.test(macosManifest.buildEnvironment?.homebrewCoreCommit), "macOS Homebrew/core build commit is not pinned.");
@@ -229,6 +232,8 @@ assertContains(ffmpegLicense, "Version 2.1, February 1999", "FFmpeg license");
 assert(!ffmpegLicense.includes("Version 3, 29 June 2007"), "FFmpeg license still contains the LGPLv3 text.");
 
 const colmapLicense = readText("licenses/COLMAP-LICENSE.txt");
+assertContains(thirdParty, "vocab_tree_faiss_flickr100K_words256K.bin", "THIRD_PARTY_NOTICES.txt");
+assertContains(thirdParty, manifest.runtimeAssets[0].sourceUrl, "THIRD_PARTY_NOTICES.txt");
 for (const marker of [
   "ETH Zurich and UNC Chapel Hill",
   "Redistributions of source code",

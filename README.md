@@ -160,13 +160,15 @@ sudo apt install ./OOOSplat-0.4.1-x64-linux.deb
 
 ## 质量档位
 
-| 档位 | 保留画面 | FFmpeg 抽帧率 | Brush iterations | 最大训练分辨率 |
+| 档位 | 目标 / 候选 FPS | SfM normal | Brush baseline | Planner 扩展上限 |
 | --- | ---: | ---: | ---: | ---: |
-| 快速 | 30% | 源视频 FPS × 0.30 | 8,000 | 1,200 |
-| 均衡 | 50% | 源视频 FPS × 0.50 | 15,000 | 1,600 |
-| 精细 | 100% | 源视频 FPS × 1.00 | 30,000 | 2,000 |
+| 快速 | 6 / 12 | 1600 / 4096 | 8k @ 1200 | 15k @ 1600 |
+| 均衡 | 8 / 20 | 1920 / 8192 | 15k @ 1600 | 30k @ 2000 |
+| 精细 | 10 / 30 | 2400 / 8192 | 30k @ 2000 | 50k @ Native/Auto |
 
-抽帧由 FFmpeg 完成，COLMAP 不负责减少帧数。程序不设置最大抽帧数量，也没有额外的 Splat 数量上限；最终 Splat 数量由素材、重建结果和 Brush 训练过程决定。
+Quality 只定义正常路径的资源预算，不直接选择 Mapper 或 Pairing 算法。Auto Reconstruction Planner Beta 开启后，会用低分辨率内存扫描完成非均匀选帧，依据 verified matches 分析 View Graph，并在隔离的数据库副本上选择 Global 或 Incremental Mapper。正常预算耗尽后，可进入有轮数上限的 Success Recovery；所有有效稀疏模型都会保留并参与最佳候选比较。进入 Brush 后仍只使用用户所选档位的 baseline，不会自动消费 Brush extension。
+
+Planner 默认为“每次生成时询问”。选择传统流程只影响当前任务且不会保存为永久关闭；设置中可改为“始终开启”。关闭 Planner 时，视频抽帧比例、COLMAP 默认特征参数、匹配方式、Incremental Mapper 和 Brush 参数完整沿用 main 的传统链路，作为稳定 A/B 基线。图片输入的 Quality v2 三代数据与 Planner 有效性分析见 [Quality v2 与 Planner 同素材图片基准](docs/quality-v2-benchmark-2026-09-19.md)，视频输入的第一轮实测见 [Planner Beta 同素材视频基准](docs/auto-reconstruction-planner-beta-benchmark-2026-09-20.md)。
 
 ## 项目与文件位置
 
@@ -227,7 +229,7 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | COLMAP | Windows 4.0.4 CUDA；macOS arm64 4.0.4 CPU CLI-only | 特征、匹配和相机重建 |
 | Brush | v0.3.0 Windows x64 / macOS arm64 | Gaussian Splatting 训练与 PLY 导出 |
 
-Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/manifest.json`](engines/manifest.json)、[`engines/manifest.linux.json`](engines/manifest.linux.json) 和 [`engines/manifest.macos.json`](engines/manifest.macos.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 恢复本地运行时。Release 打包前会校验来源、哈希、架构、动态库闭包和 Brush CLI 参数。
+Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/manifest.json`](engines/manifest.json)、[`engines/manifest.linux.json`](engines/manifest.linux.json) 和 [`engines/manifest.macos.json`](engines/manifest.macos.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 恢复本地运行时。Release 打包前会校验来源、哈希、架构、动态库闭包和 Brush CLI 参数。COLMAP 回环检测所需的词汇树也会预先校验并打包，生成期间不会从 GitHub 下载。
 
 第三方许可和通知位于 [`licenses/`](licenses/)：
 

@@ -64,11 +64,20 @@
       "licenseFiles": ["licenses/Brush-LICENSE.txt"]
     }
   ],
+  "runtimeAssets": [
+    {
+      "name": "COLMAP loop-closure vocabulary tree",
+      "sourceUrl": "https://github.com/colmap/colmap/releases/download/3.11.1/vocab_tree_faiss_flickr100K_words256K.bin",
+      "sha256": "96CA8EC8EA60B1F73465AAF2C401FD3B3CA75CDBA2D3C50D6A2F6F760F275DDC",
+      "destination": "share/colmap/vocab_tree_faiss_flickr100K_words256K.bin"
+    }
+  ],
   "requiredFiles": [
     "bin/ffmpeg",
     "bin/ffprobe",
     "bin/colmap",
     "bin/brush_app",
+    "share/colmap/vocab_tree_faiss_flickr100K_words256K.bin",
     "SHA256SUMS",
     "BUILD-INFO.json",
     "BUNDLED-COMPONENTS.json"

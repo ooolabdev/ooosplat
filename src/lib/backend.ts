@@ -49,8 +49,13 @@ export async function probeAndPlan(path: string, quality: Quality): Promise<Prob
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
 export async function getAppRuntimeStatus(): Promise<AppRuntimeStatus> { return invoke("get_app_runtime_status"); }
-export async function setProjectsRoot(projectsRoot: string): Promise<{ projectsRoot: string }> { return invoke("set_projects_root", { projectsRoot }); }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot }); }
+export type PlannerPreference = "askEachTime" | "alwaysOn";
+export interface AppSettings { projectsRoot: string; plannerEnabled: boolean; plannerPreference: PlannerPreference; }
+export async function getAppSettings(): Promise<AppSettings> { return invoke("get_app_settings"); }
+export async function setProjectsRoot(projectsRoot: string): Promise<AppSettings> { return invoke("set_projects_root", { projectsRoot }); }
+export async function setPlannerEnabled(enabled: boolean): Promise<AppSettings> { return invoke("set_planner_enabled", { enabled }); }
+export async function setPlannerPreference(preference: PlannerPreference): Promise<AppSettings> { return invoke("set_planner_preference", { preference }); }
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = false): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot, plannerEnabled }); }
 export async function resumePipeline(projectId: string): Promise<PipelineResult> { return invoke("resume_pipeline", { projectId }); }
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }
 export async function onPipelineEvent(handler: (event: PipelineEvent) => void): Promise<UnlistenFn> { return listen<PipelineEvent>("pipeline-event", ({ payload }) => handler(payload)); }

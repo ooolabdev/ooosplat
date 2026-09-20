@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     error::{Result, SplatError},
+    presets::{MatchingBudget, SfmBudget},
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
@@ -14,6 +15,8 @@ pub enum ColmapCliFamily {
     Legacy39,
     Modern4,
 }
+
+pub const VOCABULARY_TREE_FILE: &str = "vocab_tree_faiss_flickr100K_words256K.bin";
 
 impl ColmapCliFamily {
     pub const fn label(self) -> &'static str {
@@ -105,6 +108,14 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     }
 }
 
+pub fn require_vocabulary_tree(path: &Path) -> Result<()> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(SplatError::EngineMissing(path.display().to_string()))
+    }
+}
+
 async fn run_colmap(
     executable: &Path,
     args: Vec<OsString>,
@@ -148,6 +159,7 @@ pub async fn extract_features(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
+    budget: SfmBudget,
 ) -> Result<()> {
     let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
     run_colmap(
@@ -159,6 +171,75 @@ pub async fn extract_features(
             gpu_index,
             use_gpu_option,
             gpu_index_option,
+            budget,
+        ),
+        database.parent().unwrap_or(images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+/// Exact current-main feature extraction path: engine defaults, without
+/// Quality v2 SfM caps. This is the Planner-off A/B baseline.
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_features_legacy(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    masks: Option<&Path>,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
+    run_colmap(
+        executable,
+        feature_extraction_args_base(
+            database,
+            images,
+            masks,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+            None,
+            None,
+        ),
+        database.parent().unwrap_or(images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_features_for_list(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    masks: Option<&Path>,
+    image_list: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+    budget: SfmBudget,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
+    run_colmap(
+        executable,
+        feature_extraction_args_base(
+            database,
+            images,
+            masks,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+            Some(budget),
+            Some(image_list),
         ),
         database.parent().unwrap_or(images),
         log,
@@ -175,12 +256,19 @@ pub async fn match_sequential(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
+    budget: MatchingBudget,
 ) -> Result<()> {
     let (use_gpu_option, gpu_index_option) =
         matching_gpu_options(executable, "sequential_matcher", manager).await?;
     run_colmap(
         executable,
-        sequential_matching_args(database, gpu_index, use_gpu_option, gpu_index_option),
+        sequential_matching_args(
+            database,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+            budget.sequential_overlap,
+        ),
         database.parent().unwrap_or(Path::new(".")),
         log,
         manager,
@@ -216,6 +304,104 @@ pub async fn match_exhaustive(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn match_sequential_with_loop(
+    executable: &Path,
+    database: &Path,
+    vocabulary_tree: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+    budget: MatchingBudget,
+) -> Result<()> {
+    require_vocabulary_tree(vocabulary_tree)?;
+    let (use_gpu_option, gpu_index_option) =
+        matching_gpu_options(executable, "sequential_matcher", manager).await?;
+    let args = sequential_matching_with_loop_args(
+        database,
+        vocabulary_tree,
+        gpu_index,
+        use_gpu_option,
+        gpu_index_option,
+        budget.sequential_overlap,
+        budget.prefilter_neighbors,
+    );
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn match_prefilter(
+    executable: &Path,
+    database: &Path,
+    vocabulary_tree: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+    neighbors: u32,
+) -> Result<()> {
+    let budget = MatchingBudget {
+        sequential_overlap: neighbors.max(4),
+        prefilter_neighbors: neighbors.max(4),
+    };
+    match_sequential_with_loop(
+        executable,
+        database,
+        vocabulary_tree,
+        log,
+        manager,
+        observer,
+        gpu_index,
+        budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn match_pairs(
+    executable: &Path,
+    database: &Path,
+    pair_list: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) =
+        matching_gpu_options(executable, "matches_importer", manager).await?;
+    let mut args = matching_args(
+        "matches_importer",
+        database,
+        gpu_index,
+        use_gpu_option,
+        gpu_index_option,
+    );
+    args.extend([
+        OsString::from("--match_list_path"),
+        pair_list.into(),
+        OsString::from("--match_type"),
+        OsString::from("pairs"),
+    ]);
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 fn feature_extraction_args(
     database: &Path,
     images: &Path,
@@ -223,7 +409,36 @@ fn feature_extraction_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
+    budget: SfmBudget,
 ) -> Vec<OsString> {
+    feature_extraction_args_base(
+        database,
+        images,
+        masks,
+        gpu_index,
+        use_gpu_option,
+        gpu_index_option,
+        Some(budget),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn feature_extraction_args_base(
+    database: &Path,
+    images: &Path,
+    masks: Option<&Path>,
+    gpu_index: Option<u32>,
+    use_gpu_option: &str,
+    gpu_index_option: &str,
+    budget: Option<SfmBudget>,
+    image_list: Option<&Path>,
+) -> Vec<OsString> {
+    let max_image_size_option = if use_gpu_option.starts_with("--FeatureExtraction") {
+        "--FeatureExtraction.max_image_size"
+    } else {
+        "--SiftExtraction.max_image_size"
+    };
     let mut args = vec![
         "feature_extractor".into(),
         "--database_path".into(),
@@ -237,6 +452,14 @@ fn feature_extraction_args(
         use_gpu_option.into(),
         (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
+    if let Some(budget) = budget {
+        args.extend([
+            max_image_size_option.into(),
+            budget.max_image_size.to_string().into(),
+            "--SiftExtraction.max_num_features".into(),
+            budget.max_features.to_string().into(),
+        ]);
+    }
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -244,6 +467,10 @@ fn feature_extraction_args(
     if let Some(masks) = masks {
         args.push("--ImageReader.mask_path".into());
         args.push(masks.into());
+    }
+    if let Some(image_list) = image_list {
+        args.push("--image_list_path".into());
+        args.push(image_list.into());
     }
     args
 }
@@ -253,6 +480,7 @@ fn sequential_matching_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
+    sequential_overlap: u32,
 ) -> Vec<OsString> {
     let mut args = matching_args(
         "sequential_matcher",
@@ -263,7 +491,34 @@ fn sequential_matching_args(
     );
     args.extend([
         OsString::from("--SequentialMatching.overlap"),
-        OsString::from("10"),
+        sequential_overlap.to_string().into(),
+    ]);
+    args
+}
+
+fn sequential_matching_with_loop_args(
+    database: &Path,
+    vocabulary_tree: &Path,
+    gpu_index: Option<u32>,
+    use_gpu_option: &str,
+    gpu_index_option: &str,
+    sequential_overlap: u32,
+    loop_detection_num_images: u32,
+) -> Vec<OsString> {
+    let mut args = sequential_matching_args(
+        database,
+        gpu_index,
+        use_gpu_option,
+        gpu_index_option,
+        sequential_overlap,
+    );
+    args.extend([
+        OsString::from("--SequentialMatching.loop_detection"),
+        OsString::from("1"),
+        OsString::from("--SequentialMatching.loop_detection_num_images"),
+        loop_detection_num_images.to_string().into(),
+        OsString::from("--SequentialMatching.vocab_tree_path"),
+        vocabulary_tree.into(),
     ]);
     args
 }
@@ -318,9 +573,87 @@ pub async fn map(
     .await
 }
 
+pub async fn calibrate_view_graph(
+    executable: &Path,
+    database: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    run_colmap(
+        executable,
+        vec![
+            "view_graph_calibrator".into(),
+            "--database_path".into(),
+            database.into(),
+        ],
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+pub async fn map_global(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    tokio::fs::create_dir_all(output).await?;
+    run_colmap(
+        executable,
+        vec![
+            "global_mapper".into(),
+            "--database_path".into(),
+            database.into(),
+            "--image_path".into(),
+            images.into(),
+            "--output_path".into(),
+            output.into(),
+        ],
+        database.parent().unwrap_or(output),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+pub async fn analyze_model(
+    executable: &Path,
+    model: &Path,
+    manager: &ProcessManager,
+) -> Result<String> {
+    let output = manager
+        .run(ProcessSpec {
+            executable: executable.to_path_buf(),
+            args: vec!["model_analyzer".into(), "--path".into(), model.into()],
+            working_directory: model.parent().map(Path::to_path_buf),
+            log_path: None,
+            observer: None,
+        })
+        .await?;
+    if !output.success {
+        return Err(SplatError::Process(format!(
+            "COLMAP model_analyzer failed: {}",
+            output.failure_detail()
+        )));
+    }
+    Ok(format!("{}\n{}", output.stdout, output.stderr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sfm_budget() -> SfmBudget {
+        crate::presets::Quality::Balanced.budget().baseline.sfm
+    }
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()
@@ -337,6 +670,7 @@ mod tests {
             Some(2),
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            sfm_budget(),
         ));
         assert!(extraction
             .windows(2)
@@ -350,6 +684,7 @@ mod tests {
             Some(2),
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
+            15,
         ));
         assert!(matching
             .windows(2)
@@ -368,6 +703,7 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            sfm_budget(),
         ));
         assert!(extraction
             .windows(2)
@@ -381,6 +717,7 @@ mod tests {
             None,
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
+            15,
         ));
         assert!(matching
             .windows(2)
@@ -412,6 +749,28 @@ mod tests {
     }
 
     #[test]
+    fn loop_matching_uses_the_bundled_vocabulary_tree() {
+        let matching = strings(sequential_matching_with_loop_args(
+            Path::new("database.db"),
+            Path::new("engines/colmap/share/vocab.bin"),
+            Some(0),
+            "--FeatureMatching.use_gpu",
+            "--FeatureMatching.gpu_index",
+            20,
+            32,
+        ));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--SequentialMatching.loop_detection", "1"]));
+        assert!(matching.windows(2).any(|pair| {
+            pair == [
+                "--SequentialMatching.vocab_tree_path",
+                "engines/colmap/share/vocab.bin",
+            ]
+        }));
+    }
+
+    #[test]
     fn detects_supported_colmap_cli_families() {
         assert_eq!(
             detect_cli_family("--SiftExtraction.use_gpu", "--SiftMatching.use_gpu"),
@@ -433,6 +792,7 @@ mod tests {
             Some(0),
             "--SiftExtraction.use_gpu",
             "--SiftExtraction.gpu_index",
+            sfm_budget(),
         ));
         assert!(extraction
             .windows(2)
@@ -451,9 +811,58 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            sfm_budget(),
         ));
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
+    }
+
+    #[test]
+    fn legacy_feature_path_keeps_engine_defaults() {
+        let extraction = strings(feature_extraction_args_base(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+            None,
+            None,
+        ));
+        assert!(!extraction.iter().any(|arg| arg.contains("max_image_size")));
+        assert!(!extraction
+            .iter()
+            .any(|arg| arg.contains("max_num_features")));
+        assert!(!extraction.iter().any(|arg| arg == "--image_list_path"));
+    }
+
+    #[test]
+    fn feature_and_matching_budgets_reach_colmap_arguments() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+            sfm_budget(),
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.max_image_size", "1920"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--SiftExtraction.max_num_features", "8192"]));
+        let matching = strings(sequential_matching_args(
+            Path::new("database.db"),
+            None,
+            "--FeatureMatching.use_gpu",
+            "--FeatureMatching.gpu_index",
+            20,
+        ));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--SequentialMatching.overlap", "20"]));
     }
 }

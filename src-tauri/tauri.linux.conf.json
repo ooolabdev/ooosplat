@@ -8,7 +8,8 @@
     "targets": ["deb"],
     "resources": {
       "../engines/manifest.linux.json": "engines/manifest.linux.json",
-      "../engines/linux/brush/": "engines/linux/brush/"
+      "../engines/linux/brush/": "engines/linux/brush/",
+      "../engines/linux/colmap/": "engines/linux/colmap/"
     },
     "linux": {
       "deb": {

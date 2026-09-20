@@ -7,6 +7,7 @@ use crate::{
     error::SplatError,
     pipeline::{EventKind, PipelineEvent, PipelineStage},
     presets::Quality,
+    project::QualityRunMetrics,
 };
 
 pub use event::{
@@ -115,6 +116,41 @@ impl PipelineTelemetrySession {
             stage,
             error_code: safe_error_code(error, stage),
         });
+    }
+
+    pub fn quality_metrics_recorded(&self, metrics: &QualityRunMetrics) {
+        self.service.track(TelemetryEvent::QualityMetricsRecorded {
+            actual_frame_count: metrics.actual_frame_count,
+            actual_sfm_resolution: metrics.actual_sfm_resolution,
+            actual_feature_count: metrics.actual_feature_count,
+            actual_brush_resolution: metrics.actual_brush_resolution,
+            actual_brush_iterations: metrics.actual_brush_iterations,
+            registered_images: metrics.registered_images,
+            reprojection_error: metrics.reprojection_error,
+            splat_count: metrics.splat_count,
+            peak_gpu_memory_mb: metrics.peak_gpu_memory_mb,
+        });
+        if metrics.planner_enabled {
+            self.service.track(TelemetryEvent::PlannerMetricsRecorded {
+                planner_version: metrics.planner_version.unwrap_or(1),
+                capture_type: metrics.capture_type.clone(),
+                pairing_planned: metrics.pairing_planned.clone(),
+                pairing_actual: metrics.pairing_actual.clone(),
+                mapper_planned: metrics.mapper_planned.clone(),
+                mapper_actual: metrics.mapper_actual.clone(),
+                largest_component_ratio: metrics.largest_component_ratio,
+                two_core_ratio: metrics.two_core_ratio,
+                bridge_ratio: metrics.bridge_ratio,
+                normal_rescue_rounds: metrics.normal_rescue_rounds,
+                success_recovery_rounds: metrics.success_recovery_rounds,
+                normal_budget_exhausted: metrics.normal_budget_exhausted,
+                success_recovery_entered: metrics.success_recovery_entered,
+                budget_overridden_for_success: metrics.budget_overridden_for_success,
+                normal_duration_ms: metrics.normal_duration_ms,
+                recovery_duration_ms: metrics.recovery_duration_ms,
+                reconstruction_quality: metrics.reconstruction_quality.clone(),
+            });
+        }
     }
 
     pub fn elapsed_ms(&self) -> u64 {

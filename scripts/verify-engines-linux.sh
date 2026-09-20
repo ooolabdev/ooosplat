@@ -4,6 +4,8 @@ set -euo pipefail
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 managed_brush="$workspace/engines/linux/brush/brush_app"
 binary_sha="13d28ee06a388bc4e987774e890b594d60a75bba26064e82b4ee338a78f158a4"
+vocab="$workspace/engines/linux/colmap/vocab_tree_faiss_flickr100K_words256K.bin"
+vocab_sha="96ca8ec8ea60b1f73465aaf2c401fd3b3ca75cdba2d3c50d6a2f6f760f275ddc"
 
 for engine in ffmpeg ffprobe colmap; do
   command -v "$engine" >/dev/null || {
@@ -23,6 +25,8 @@ fi
 if [[ "$brush" == "$managed_brush" ]]; then
   echo "$binary_sha  $brush" | sha256sum --check --status
 fi
+[[ -f "$vocab" ]] || { echo "Missing bundled COLMAP vocabulary tree. Run 'npm run setup:engines' first." >&2; exit 1; }
+echo "$vocab_sha  $vocab" | sha256sum --check --status
 
 feature_help="$(colmap feature_extractor -h 2>&1)"
 matching_help="$(colmap sequential_matcher -h 2>&1)"
@@ -35,10 +39,14 @@ else
   echo "Unsupported COLMAP CLI: no recognized CPU SIFT options." >&2
   exit 1
 fi
+grep -q -- '--SequentialMatching.vocab_tree_path' <<<"$matching_help" || {
+  echo "COLMAP does not support an explicit local loop-closure vocabulary tree." >&2
+  exit 1
+}
 
 brush_help="$("$brush" --help 2>&1)"
 for flag in --total-steps --max-resolution --export-every --export-path --export-name; do
   grep -q -- "$flag" <<<"$brush_help" || { echo "Brush is missing $flag" >&2; exit 1; }
 done
 
-echo "Verified system FFmpeg/FFprobe/COLMAP and Brush v0.3.0. Brush selects its graphics backend at runtime."
+echo "Verified system FFmpeg/FFprobe/COLMAP, bundled offline loop-closure vocabulary tree, and Brush v0.3.0. Brush selects its graphics backend at runtime."
