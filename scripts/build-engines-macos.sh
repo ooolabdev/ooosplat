@@ -53,8 +53,6 @@ download_verified "$(engine_field COLMAP sourceUrl)" "$(engine_field COLMAP sour
 download_verified "$(engine_field Brush sourceUrl)" "$(engine_field Brush sourceSha256)" "$brush_archive"
 download_verified "$(read_manifest runtimeAssets.0.sourceUrl)" "$(read_manifest runtimeAssets.0.sha256)" "$vocab_asset"
 vocab_relative="$(read_manifest runtimeAssets.0.destination)"
-mkdir -p "$(dirname "$stage/$vocab_relative")"
-install -m 0644 "$vocab_asset" "$stage/$vocab_relative"
 
 mkdir -p "$build/ffmpeg-source"
 tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
@@ -121,6 +119,16 @@ cmake --build "$build/colmap" --parallel "$jobs"
 cmake --install "$build/colmap"
 rm -rf -- "$stage/include" "$stage/share" "$stage/lib/cmake" "$stage/lib/pkgconfig"
 find "$stage/lib" -type f -name '*.a' -delete
+
+# FFmpeg and COLMAP both install auxiliary files under share/, which are
+# removed above because the CLI runtime does not need them. Install runtime
+# data assets only after that cleanup so they survive into the archive.
+mkdir -p "$(dirname "$stage/$vocab_relative")"
+install -m 0644 "$vocab_asset" "$stage/$vocab_relative"
+[[ -f "$stage/$vocab_relative" ]] || {
+  echo "Missing staged runtime asset: $vocab_relative" >&2
+  exit 1
+}
 
 mkdir -p "$stage/licenses/colmap-thirdparty"
 install -m 0644 "$workspace/licenses/FFmpeg-LGPL-2.1.txt" "$stage/licenses/FFmpeg-LGPL-2.1.txt"
