@@ -12,6 +12,7 @@
 - [Quality v2 与 Planner 同素材图片基准记录](quality-v2-benchmark-2026-09-19.md)
 - [Auto Reconstruction Planner Beta 同素材视频测试记录](auto-reconstruction-planner-beta-benchmark-2026-09-20.md)
 - [Quality v2 + Planner 同素材视频 002 对照测试记录](quality-v2-planner-video-002-benchmark-2026-09-20.md)
+- [视频 001：Quality v2 + Planner / 无 Quality v2、无 Planner 对照测试记录](quality-v2-planner-video-001-after-before-benchmark-2026-09-21.md)
 
 上述基准包含旧参数和旧 Planner 路径，其中出现的自动 Global Mapper 已不代表当前生产策略。本文优先级高于历史测试文档中的策略描述。
 
