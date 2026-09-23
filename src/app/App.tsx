@@ -1,16 +1,16 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, FileBox, Images,
-  Download, Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Square, Trash2,
-  Languages, Settings2, X, Zap,
+  Copy, Download, Eye, FolderOpen, LoaderCircle, MapPin, Minus, Play, Plus, RefreshCw, RotateCcw, Square, Trash2,
+  Languages, Settings2, ShieldAlert, X, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
+  cancelPipeline, checkColmapAcceleration, checkEngines, confirmAndDeleteProject, confirmGpuConflictScript, confirmLargeImageSequence,
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
-  selectImageSequence, selectProjectsRoot, selectVideo,
+  getGpuConflictScript, runGpuConflictScript, selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
@@ -237,7 +237,15 @@ export function App() {
   const [telemetryPreferences, setTelemetryPreferences] = useState<TelemetryPreferencesState | null>(null);
   const [privacySettingsOpen, setPrivacySettingsOpen] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
+  const [gpuActionBusy, setGpuActionBusy] = useState<"recheck" | null>(null);
+  const [gpuScript, setGpuScript] = useState<string | null>(null);
+  const [gpuScriptBusy, setGpuScriptBusy] = useState<"load" | "copy" | "close" | "restore" | null>(null);
+  const [gpuScriptMessage, setGpuScriptMessage] = useState<string | null>(null);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
+  const gpuConflictNames = useMemo(
+    () => store.colmapAcceleration?.conflicts?.map((item) => item.name) ?? [],
+    [store.colmapAcceleration?.conflicts],
+  );
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
@@ -283,6 +291,75 @@ export function App() {
     store.setProjectsRoot(overview.projectsRoot);
     store.setProjects(overview.projects);
     return overview;
+  };
+
+  const recheckGpuAcceleration = async () => {
+    if (gpuActionBusy) return;
+    setGpuActionBusy("recheck");
+    try {
+      const [engines, acceleration] = await Promise.all([checkEngines(), checkColmapAcceleration()]);
+      store.setEngines(engines);
+      store.setColmapAcceleration(acceleration ?? engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+      setGpuScript(null);
+      setGpuScriptMessage(null);
+    } catch (error) {
+      store.setError(messageOf(error));
+    } finally {
+      setGpuActionBusy(null);
+    }
+  };
+
+  const loadGpuConflictScript = async () => {
+    if (gpuScriptBusy || gpuConflictNames.length === 0) return;
+    setGpuScriptBusy("load");
+    setGpuScriptMessage(null);
+    try {
+      setGpuScript(await getGpuConflictScript(gpuConflictNames));
+    } catch (error) {
+      setGpuScriptMessage(`${t("gpu.scriptFailed")}: ${messageOf(error)}`);
+    } finally {
+      setGpuScriptBusy(null);
+    }
+  };
+
+  const copyGpuConflictScript = async () => {
+    if (!gpuScript || gpuScriptBusy) return;
+    setGpuScriptBusy("copy");
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(gpuScript);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = gpuScript;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        if (!document.execCommand("copy")) throw new Error("Clipboard unavailable");
+        textarea.remove();
+      }
+      setGpuScriptMessage(t("gpu.scriptCopied"));
+    } catch (error) {
+      setGpuScriptMessage(`${t("gpu.scriptFailed")}: ${messageOf(error)}`);
+    } finally {
+      setGpuScriptBusy(null);
+    }
+  };
+
+  const executeGpuConflictScript = async (action: "Close" | "Restore") => {
+    if (!gpuScript || gpuScriptBusy || gpuConflictNames.length === 0) return;
+    if (!await confirmGpuConflictScript(action)) return;
+    setGpuScriptBusy(action === "Close" ? "close" : "restore");
+    setGpuScriptMessage(null);
+    try {
+      await runGpuConflictScript(gpuConflictNames, action);
+      setGpuScriptMessage(t("gpu.scriptLaunched"));
+    } catch (error) {
+      setGpuScriptMessage(`${t("gpu.scriptFailed")}: ${messageOf(error)}`);
+    } finally {
+      setGpuScriptBusy(null);
+    }
   };
 
   const reconcileRuntimeState = useCallback(async () => {
@@ -795,8 +872,49 @@ export function App() {
           <span>
             <strong>{store.colmapAcceleration == null ? t("gpu.detecting") : store.colmapAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
             <small>{store.colmapAcceleration == null ? t("gpu.reading") : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name}${store.colmapAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (store.colmapAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: store.colmapAcceleration.device.driverVersion })} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, store.colmapAcceleration.reason) : `${localizePipelineMessage(locale, store.colmapAcceleration.reason)} · ${t("gpu.requirements", { driver: store.colmapAcceleration.requirements.minimumDriverVersion, capability: store.colmapAcceleration.requirements.minimumComputeCapability })}`}</small>
+            <div className="acceleration-actions">
+              <button type="button" disabled={gpuActionBusy !== null} onClick={() => void recheckGpuAcceleration()}>
+                {gpuActionBusy === "recheck" ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}
+                {gpuActionBusy === "recheck" ? t("gpu.rechecking") : t("gpu.recheck")}
+              </button>
+            </div>
           </span>
         </div>
+        {(store.colmapAcceleration?.conflicts?.length ?? 0) > 0 && store.colmapAcceleration?.backend !== "gpu" && (
+          <div className="gpu-conflict-box" role="status">
+            <strong><ShieldAlert size={14} /> {t("gpu.conflictsTitle")}</strong>
+            <small>{t("gpu.conflictsHint")}</small>
+            <small><code>{store.colmapAcceleration?.conflicts?.map((item) => item.name).join(" · ")}</code></small>
+            <strong>{t("gpu.conflictAdviceTitle")}</strong>
+            <small>1. {t("gpu.conflictAdvice1")}</small>
+            <small>2. {t("gpu.conflictAdvice2")}</small>
+            <small>3. {t("gpu.conflictAdvice3")}</small>
+            <details className="gpu-script-panel">
+              <summary>{t("gpu.scriptTitle")}</summary>
+              <small>{t("gpu.scriptRisk")}</small>
+              <div className="gpu-script-actions">
+                <button type="button" disabled={gpuScriptBusy !== null} onClick={() => void loadGpuConflictScript()}>
+                  {gpuScriptBusy === "load" ? <LoaderCircle className="spin" size={13} /> : <Eye size={13} />}
+                  {gpuScriptBusy === "load" ? t("gpu.scriptLoading") : t("gpu.scriptGenerate")}
+                </button>
+                {gpuScript && <button type="button" disabled={gpuScriptBusy !== null} onClick={() => void copyGpuConflictScript()}>
+                  {gpuScriptBusy === "copy" ? <LoaderCircle className="spin" size={13} /> : <Copy size={13} />}
+                  {gpuScriptBusy === "copy" ? t("gpu.scriptCopying") : t("gpu.copyScript")}
+                </button>}
+                {gpuScript && <button type="button" disabled={gpuScriptBusy !== null} onClick={() => void executeGpuConflictScript("Close")}>
+                  {gpuScriptBusy === "close" ? <LoaderCircle className="spin" size={13} /> : <ShieldAlert size={13} />}
+                  {t("gpu.runClose")}
+                </button>}
+                {gpuScript && <button type="button" disabled={gpuScriptBusy !== null} onClick={() => void executeGpuConflictScript("Restore")}>
+                  {gpuScriptBusy === "restore" ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}
+                  {t("gpu.runRestore")}
+                </button>}
+              </div>
+              {gpuScript && <pre className="gpu-script-preview"><code>{gpuScript}</code></pre>}
+              {gpuScriptMessage && <small className="gpu-script-message" role="status">{gpuScriptMessage}</small>}
+            </details>
+          </div>
+        )}
 
         {(store.video || store.imageSequence) && store.plan && <div className="source-metrics">
           <span><small>{store.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{store.imageSequence ? t("common.images", { count: formatNumber(store.imageSequence.imageCount) }) : formatVideoDuration(store.video!.duration)}</b></span>

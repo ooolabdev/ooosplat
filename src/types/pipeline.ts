@@ -11,12 +11,14 @@ export type AccelerationReasonCode =
   | "computeCapabilityTooLow";
 export interface GpuDeviceInfo { index: number; name: string; driverVersion: string; computeCapability: string; totalMemoryMb?: number; }
 export interface AccelerationRequirements { minimumDriverVersion: string; minimumComputeCapability: string; }
+export interface GpuConflictModule { name: string; state: string; displayName: string; }
 export interface ColmapAccelerationStatus {
   backend: ColmapBackend;
   reasonCode: AccelerationReasonCode;
   reason: string;
   device: GpuDeviceInfo | null;
   requirements: AccelerationRequirements;
+  conflicts?: GpuConflictModule[];
 }
 export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; colmapCliFamily?: "legacy39" | "modern4"; detail: string; }
 export interface VideoInfo {

@@ -45,6 +45,22 @@ export async function selectProjectsRoot(current: string): Promise<string | null
 
 export async function checkEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("check_engines") : []; }
 export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus | null> { return inTauri() ? invoke("check_colmap_acceleration") : null; }
+export async function getGpuConflictScript(modules: string[]): Promise<string> { return invoke("get_gpu_conflict_script", { modules }); }
+export async function confirmGpuConflictScript(action: "Close" | "Restore"): Promise<boolean> {
+  const locale = getCurrentLocale();
+  return confirm(
+    translate(locale, action === "Close" ? "dialog.gpuScriptClose" : "dialog.gpuScriptRestore"),
+    {
+      title: translate(locale, "dialog.gpuScriptTitle"),
+      kind: "warning",
+      okLabel: translate(locale, "dialog.continue"),
+      cancelLabel: translate(locale, "common.cancel"),
+    },
+  );
+}
+export async function runGpuConflictScript(modules: string[], action: "Close" | "Restore"): Promise<void> {
+  return invoke("run_gpu_conflict_script", { modules, action });
+}
 export async function probeAndPlan(path: string, quality: Quality): Promise<ProbeAndPlan> { return invoke("probe_and_plan", { path, quality }); }
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }

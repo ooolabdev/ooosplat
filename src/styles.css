@@ -125,6 +125,24 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .acceleration-status.gpu .acceleration-icon, .acceleration-status.gpu strong { color: var(--blue); }
 .acceleration-status.warning .acceleration-icon, .acceleration-status.warning strong { color: var(--amber); }
 .acceleration-status + .source-metrics { margin-top: 20px; }
+.acceleration-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.acceleration-actions button { border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 8px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+.acceleration-actions button:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
+.acceleration-actions button:disabled { opacity: 0.55; cursor: default; }
+.acceleration-actions button.fix { border-color: var(--amber); color: var(--amber); }
+.gpu-conflict-box { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--amber); border-radius: 8px; background: #fff8eb; display: grid; gap: 6px; }
+.gpu-conflict-box strong { color: var(--amber); font-size: 12px; }
+.gpu-conflict-box small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.gpu-conflict-box code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+.gpu-script-panel { margin-top: 3px; padding-top: 5px; border-top: 1px solid rgba(154, 101, 0, .22); }
+.gpu-script-panel summary { color: #8b5b00; cursor: pointer; font-size: 11px; font-weight: 700; }
+.gpu-script-panel > small { display: block; margin-top: 6px; }
+.gpu-script-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.gpu-script-actions button { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #d8c18d; background: #fffdf7; color: #735000; border-radius: 7px; padding: 5px 8px; font-size: 11px; cursor: pointer; }
+.gpu-script-actions button:hover:not(:disabled) { border-color: var(--amber); color: #8b5b00; }
+.gpu-script-actions button:disabled { opacity: .55; cursor: default; }
+.gpu-script-preview { max-height: 210px; margin: 8px 0 0; padding: 8px; overflow: auto; color: #394150; background: #fff; border: 1px solid #eadfca; border-radius: 6px; font: 10px/1.4 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gpu-script-message { display: block; margin-top: 6px; color: #735000 !important; }
 
 .source-metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .source-metrics span { min-width: 0; padding: 13px 8px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
