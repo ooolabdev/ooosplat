@@ -1,20 +1,20 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-21",
+  "generatedAt": "2026-08-31",
   "engines": [
     {
       "name": "FFmpeg / FFprobe",
       "requestedSeries": "8.1",
-      "actualVersion": "n8.1.2-44-g7c533d0f86-20260821",
+      "actualVersion": "n8.1.2-50-g1a748fe2cd-20260831",
       "distribution": "BtbN win64 LGPL shared 8.1",
-      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
-      "archiveSha256": "e30201900132c0e3da178c63c7dac65aa0a0dcd971779546ae964b86b47bd499",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-lgpl-shared-8.1.zip",
+      "archiveSha256": "e9712ffbdb03ef71bbab660c75b835bfe698ef6fad0247c76d8d394a39a3db63",
       "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
       "licenseFiles": [
         "licenses/FFmpeg-LGPL-2.1.txt"
       ],
       "install": {
-        "archiveName": "ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
+        "archiveName": "ffmpeg-n8.1.2-50-g1a748fe2cd-win64-lgpl-shared-8.1.zip",
         "destination": "engines/ffmpeg",
         "anchorFile": "ffmpeg.exe",
         "rootFromAnchorParent": 0
@@ -62,8 +62,8 @@
     }
   ],
   "requiredFiles": [
-    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "00D5996AE9E6DD4C5C11AB3040AE9CFBF78E0EC80492D8B5D2AF3559DAF41A0D" },
-    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "729402BBF566C6C616181D80ED8BEAD82F4858CD98058E347FBEE97DDE5C0EF9" },
+    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "E8A54FC7F15C45B95AC898D4FC8FC8F39A89EE848C5B4DF888A4CC4512E15226" },
+    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "5BA069188D571FEE274B5C3C43EA94496DF3F5362B1E33BD815F68E32E975847" },
     { "path": "engines/colmap/bin/colmap.exe", "sha256": "41913EF963F725485B4D7A70AD5B3E8AD88CC4CEB4B48AAC0E5D1A6C61A6BD06" },
     { "path": "engines/colmap/bin/cudart64_12.dll", "sha256": "760C38928BBE5759F7B31ED6692599EB7EC83CEDD5702E84C2B72028A89837E1" },
     { "path": "engines/colmap/bin/curand64_10.dll", "sha256": "4D6D16C9941C4F7A7E49D5C43DF25D408A2A8503D8CC1EB9808E0E0C2CDE36D4" },
