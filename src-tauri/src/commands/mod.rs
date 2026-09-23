@@ -305,6 +305,89 @@ pub async fn check_colmap_acceleration(app: tauri::AppHandle) -> ColmapAccelerat
 }
 
 #[tauri::command]
+pub fn get_gpu_conflict_script(modules: Vec<String>) -> std::result::Result<String, SplatError> {
+    crate::engines::health::render_gpu_conflict_script(&modules).map_err(SplatError::Process)
+}
+
+#[tauri::command]
+pub fn run_gpu_conflict_script(
+    modules: Vec<String>,
+    action: String,
+) -> std::result::Result<(), SplatError> {
+    if !matches!(action.as_str(), "Close" | "Restore") {
+        return Err(SplatError::Process("不支持的 GPU 冲突脚本操作".to_string()));
+    }
+    let script = crate::engines::health::render_gpu_conflict_script(&modules)
+        .map_err(SplatError::Process)?;
+
+    #[cfg(windows)]
+    {
+        launch_gpu_conflict_script(&script, &action).map_err(SplatError::Process)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = script;
+        Err(SplatError::Process(
+            "GPU 冲突脚本仅支持 Windows".to_string(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn launch_gpu_conflict_script(script: &str, action: &str) -> std::result::Result<(), String> {
+    use base64::Engine as _;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let powershell = crate::engines::health::windows_powershell_path()
+        .ok_or_else(|| "无法定位受信任的 Windows PowerShell".to_string())?;
+    let script_b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let command = format!(
+        "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')); & ([scriptblock]::Create($s)) -Action '{}'",
+        script_b64, action
+    );
+    let command_bytes = command
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    let encoded_command = base64::engine::general_purpose::STANDARD.encode(command_bytes);
+    let file = powershell
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let verb = "runas"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let parameters =
+        format!("-NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded_command}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as usize) <= 32 {
+        Err(format!(
+            "无法打开管理员 PowerShell（ShellExecuteW={}）",
+            result as usize
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
 pub async fn probe_and_plan(
     app: tauri::AppHandle,
     path: String,
@@ -830,12 +913,12 @@ pub async fn begin_gaussian_edit_save(
     if let Some(crop) = edit_state.crop {
         crop.validate()?;
     }
-    if !state
+    if state
         .active
         .lock()
         .await
         .as_ref()
-        .is_some_and(|session| session.project_id == project_id)
+        .is_none_or(|session| session.project_id != project_id)
     {
         return Err(SplatError::Process(
             "项目当前未在预览中打开，无法保存编辑".into(),
@@ -881,9 +964,9 @@ pub async fn commit_gaussian_edit_save(
         }
     };
     let mut active = state.edit_save.lock().await;
-    if !active
+    if active
         .as_ref()
-        .is_some_and(|session| session.edit_id == edit_id)
+        .is_none_or(|session| session.edit_id != edit_id)
     {
         return Err(SplatError::Process(
             "Gaussian 编辑保存会话不存在或已结束".into(),

@@ -80,12 +80,22 @@ pub struct AccelerationRequirements {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GpuConflictModule {
+    pub name: String,
+    pub state: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ColmapAccelerationStatus {
     pub backend: ColmapBackend,
     pub reason_code: AccelerationReasonCode,
     pub reason: String,
     pub device: Option<GpuDeviceInfo>,
     pub requirements: AccelerationRequirements,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<GpuConflictModule>,
 }
 
 impl ColmapAccelerationStatus {
@@ -592,6 +602,7 @@ fn cpu_status(
         reason,
         device,
         requirements,
+        conflicts: Vec::new(),
     }
 }
 
@@ -609,9 +620,228 @@ async fn detect_acceleration(engines_root: &Path) -> ColmapAccelerationStatus {
     };
     let devices = match probe_gpu_devices().await {
         Ok(devices) => devices,
-        Err(error) => return probe_error_status(error, requirements),
+        Err(error) => return with_conflicts(probe_error_status(error, requirements)),
     };
-    choose_acceleration(devices, requirements)
+    let status = choose_acceleration(devices, requirements);
+    if status.use_gpu() {
+        status
+    } else {
+        with_conflicts(status)
+    }
+}
+
+fn with_conflicts(mut status: ColmapAccelerationStatus) -> ColmapAccelerationStatus {
+    status.conflicts = detect_gpu_conflicts();
+    status
+}
+
+/// Kernel / overlay modules that commonly break user-mode NVML on Windows
+/// (game anti-cheat and accelerator hooks). Matched as service-name prefixes only —
+/// never free-form path substrings — so unrelated drivers cannot be swept up.
+const GPU_CONFLICT_NAME_PREFIXES: &[&str] = &[
+    "ace-",
+    "wegame",
+    "uunetfilter",
+    "easyanticheat",
+    "eac-",
+    "vgk",
+    "bedaisy",
+    "nprotect",
+    "xunyou",
+];
+
+const GPU_CONFLICT_SCRIPT_TEMPLATE: &str =
+    include_str!("../../../scripts/windows/OOOSplat-GpuConflict.ps1");
+
+fn matches_gpu_conflict(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    GPU_CONFLICT_NAME_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+pub(crate) fn render_gpu_conflict_script(requested: &[String]) -> Result<String, String> {
+    let mut names = Vec::new();
+    for name in requested {
+        if !is_safe_service_name(name) || !matches_gpu_conflict(name) {
+            return Err(format!("不允许为该服务生成脚本：{name}"));
+        }
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        return Err("没有可用于生成脚本的已检测服务".to_string());
+    }
+
+    let service_names = names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("', '");
+    if !GPU_CONFLICT_SCRIPT_TEMPLATE.contains("{{SERVICE_NAMES}}") {
+        return Err("GPU 冲突脚本模板缺少服务名占位符".to_string());
+    }
+    Ok(GPU_CONFLICT_SCRIPT_TEMPLATE.replace("{{SERVICE_NAMES}}", &service_names))
+}
+
+#[cfg(windows)]
+fn detect_gpu_conflicts() -> Vec<GpuConflictModule> {
+    // Fixed script + absolute interpreter path: no PATH hijack, no user input.
+    // Run on a worker and time-box so a stuck WMI provider cannot hang the UI.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Some(powershell) = windows_powershell_path() else {
+            let _ = tx.send(Vec::new());
+            return;
+        };
+        let output = std::process::Command::new(powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_SystemDriver | Where-Object { $_.Name -match '^(ACE-|WeGame|uunetfilter|EasyAntiCheat|EAC-|vgk|BEDaisy|nProtect|XunYou)' } | ForEach-Object { '{0}`t{1}`t{2}' -f $_.Name,$_.State,$_.DisplayName }",
+            ])
+            .output();
+        let _ = tx.send(parse_gpu_conflict_lines(
+            &output
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default(),
+        ));
+    });
+    rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn windows_system_directory() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 {
+        return None;
+    }
+    if length >= buffer.len() {
+        buffer.resize(length + 1, 0);
+        let length =
+            unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(length);
+    } else {
+        buffer.truncate(length);
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+}
+
+#[cfg(windows)]
+fn windows_known_folder(folder: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{System::Com::CoTaskMemFree, UI::Shell::SHGetKnownFolderPath};
+
+    unsafe {
+        let mut raw = std::ptr::null_mut();
+        if SHGetKnownFolderPath(folder, 0, std::ptr::null_mut(), &mut raw) < 0 || raw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+            raw, len,
+        )));
+        CoTaskMemFree(raw as *const _);
+        Some(path)
+    }
+}
+
+#[cfg(windows)]
+fn windows_path_is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let attributes = GetFileAttributesW(wide.as_ptr());
+        attributes != INVALID_FILE_ATTRIBUTES && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+}
+
+#[cfg(windows)]
+fn trusted_windows_file(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_file() || windows_path_is_reparse_point(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_powershell_path() -> Option<PathBuf> {
+    windows_system_directory().and_then(|directory| {
+        trusted_windows_file(
+            directory
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn detect_gpu_conflicts() -> Vec<GpuConflictModule> {
+    Vec::new()
+}
+
+fn truncate_field(raw: &str) -> String {
+    const MAX: usize = 120;
+    let trimmed = raw.trim();
+    if trimmed.chars().count() > MAX {
+        trimmed.chars().take(MAX).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Service names must look like real Windows service names — blocks control/RTL chars.
+fn is_safe_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn parse_gpu_conflict_lines(output: &str) -> Vec<GpuConflictModule> {
+    let mut modules = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
+        if fields.is_empty() {
+            continue;
+        }
+        let name = truncate_field(fields[0]);
+        if !is_safe_service_name(&name) || !matches_gpu_conflict(&name) {
+            continue;
+        }
+        modules.push(GpuConflictModule {
+            name,
+            state: fields.get(1).map(|v| truncate_field(v)).unwrap_or_default(),
+            display_name: fields.get(2).map(|v| truncate_field(v)).unwrap_or_default(),
+        });
+    }
+    modules.sort_by(|left, right| left.name.cmp(&right.name));
+    modules.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+    modules
 }
 
 fn probe_error_status(
@@ -675,6 +905,7 @@ fn choose_acceleration(
             ),
             device: Some(device),
             requirements,
+            conflicts: Vec::new(),
         };
     }
 
@@ -801,17 +1032,32 @@ fn parse_version(value: &str) -> Option<NumericVersion> {
 fn nvidia_smi_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(windows)]
-    match std::env::var_os("SystemRoot") {
-        Some(root) => candidates.push(PathBuf::from(root).join("System32").join("nvidia-smi.exe")),
-        None => candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")),
+    {
+        if let Some(directory) = windows_system_directory() {
+            if let Some(path) = trusted_windows_file(directory.join("nvidia-smi.exe")) {
+                candidates.push(path);
+            }
+        }
+        if let Some(program_files) =
+            windows_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+        {
+            if let Some(path) = trusted_windows_file(
+                program_files
+                    .join("NVIDIA Corporation")
+                    .join("NVSMI")
+                    .join("nvidia-smi.exe"),
+            ) {
+                candidates.push(path);
+            }
+        }
     }
-    #[cfg(windows)]
-    let executable_name = "nvidia-smi.exe";
     #[cfg(not(windows))]
-    let executable_name = "nvidia-smi";
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join(executable_name));
+    {
+        let executable_name = "nvidia-smi";
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                candidates.push(dir.join(executable_name));
+            }
         }
     }
     candidates
@@ -881,6 +1127,38 @@ mod tests {
             compute_capability: compute.into(),
             total_memory_mb: Some(8_192),
         }
+    }
+
+    #[test]
+    fn parses_gpu_conflict_modules() {
+        let modules = parse_gpu_conflict_lines(
+            "ACE-CORE302706\tRunning\tACE core\nWeGameProcService\tStopped\tWeGame\nnotepad\tRunning\tNotepad\nuunetfilter\tRunning\tUU\n",
+        );
+        assert_eq!(modules.len(), 3);
+        assert_eq!(modules[0].name, "ACE-CORE302706");
+        assert_eq!(modules[2].name, "uunetfilter");
+        assert!(matches_gpu_conflict("ACE-BOOT"));
+        assert!(matches_gpu_conflict("uunetfilter"));
+        assert!(!matches_gpu_conflict("nvlddmkm"));
+        assert!(!matches_gpu_conflict("sysdiag"));
+        assert!(!matches_gpu_conflict("notepad"));
+        assert!(is_safe_service_name("ACE-CORE302706"));
+        assert!(!is_safe_service_name("bad name"));
+        assert!(!is_safe_service_name("evil\tsvc"));
+    }
+
+    #[test]
+    fn renders_only_allowlisted_gpu_conflict_services() {
+        let script = render_gpu_conflict_script(&[
+            "ACE-BOOT".to_string(),
+            "ace-boot".to_string(),
+            "WeGameProcService".to_string(),
+        ])
+        .unwrap();
+        assert!(script.contains("'ACE-BOOT', 'WeGameProcService'"));
+        assert!(!script.contains("{{SERVICE_NAMES}}"));
+        assert!(render_gpu_conflict_script(&["nvlddmkm".to_string()]).is_err());
+        assert!(render_gpu_conflict_script(&[]).is_err());
     }
 
     #[test]

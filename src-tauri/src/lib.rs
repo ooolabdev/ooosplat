@@ -19,6 +19,8 @@ pub fn run_app() {
         .invoke_handler(tauri::generate_handler![
             commands::check_engines,
             commands::check_colmap_acceleration,
+            commands::get_gpu_conflict_script,
+            commands::run_gpu_conflict_script,
             commands::probe_and_plan,
             commands::estimate_project_runtime,
             commands::start_pipeline,
