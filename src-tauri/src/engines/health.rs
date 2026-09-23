@@ -319,7 +319,13 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
                 detail: if output.success {
                     "引擎可启动".into()
                 } else {
-                    format!("帮助命令退出码：{:?}", output.exit_code)
+                    format!(
+                        "帮助命令退出码：{}\n{}",
+                        output
+                            .exit_code
+                            .map_or_else(|| "N/A".into(), |code| code.to_string()),
+                        output.failure_detail()
+                    )
                 },
             }
         }

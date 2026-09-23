@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { detectSystemLocale, LanguageProvider, readInitialLocale, translate, useI18n } from ".";
+import { detectSystemLocale, LanguageProvider, localizePipelineMessage, readInitialLocale, translate, useI18n } from ".";
 
 function Harness() {
   const { locale, t, toggleLocale, formatDuration } = useI18n();
@@ -15,6 +15,27 @@ function Harness() {
 }
 
 describe("interface language", () => {
+  it("preserves the log location without preventing error localization", () => {
+    expect(localizePipelineMessage("en", "找不到本地处理引擎：ffprobe.exe\nDiagnostic log: E:/logs/probe.log"))
+      .toBe("Local processing engine not found: ffprobe.exe\nDiagnostic log: E:/logs/probe.log");
+  });
+  it("explains a missing FFprobe DLL in English", () => {
+    const message = "本地处理引擎无法启动：ffprobe.exe（缺少运行所需的 DLL（退出码 0xC0000135）\nno diagnostic output）\nDiagnostic log: E:/logs/probe.log";
+    expect(localizePipelineMessage("en", message)).toBe("Local processing engine could not start: ffprobe.exe (required DLL missing, exit code 0xC0000135)\nno diagnostic output\nDiagnostic log: E:/logs/probe.log");
+  });
+  it("localizes engine health failures while keeping their diagnostic output", () => {
+    expect(localizePipelineMessage("en", "帮助命令退出码：1\nmissing dll"))
+      .toBe("Engine check exit code: 1\nmissing dll");
+    expect(localizePipelineMessage("en", "未找到 E:/engines/ffprobe.exe"))
+      .toBe("Not found: E:/engines/ffprobe.exe");
+  });
+  it("localizes FFprobe failures while preserving multiline diagnostics", () => {
+    const message = "外部进程执行失败：FFprobe 视频分析失败，退出码 1，引擎 engines/ffprobe.exe\nheader\nmoov atom not found";
+    expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+    expect(localizePipelineMessage("en", message)).toBe(
+      "FFprobe video analysis failed, exit code 1, executable engines/ffprobe.exe\nheader\nmoov atom not found",
+    );
+  });
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 

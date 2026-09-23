@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     engines::{
-        ffprobe::probe_video, health::check_colmap_acceleration as detect_colmap_acceleration,
+        ffprobe::{probe_video, probe_video_with_diagnostics},
+        health::check_colmap_acceleration as detect_colmap_acceleration,
         ColmapAccelerationStatus, EnginePaths, EngineStatus,
     },
     error::{Result, SplatError},
@@ -331,8 +332,20 @@ pub async fn probe_and_plan(
             estimate,
         })
     } else {
-        let video =
-            probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
+        let log_path = app
+            .path()
+            .app_log_dir()
+            .map_err(|error| {
+                SplatError::Process(format!("Cannot resolve diagnostic log directory: {error}"))
+            })?
+            .join("ffprobe-probe-latest.log");
+        let video = probe_video_with_diagnostics(
+            &engine_paths.ffprobe,
+            &input,
+            &log_path,
+            &ProcessManager::new(),
+        )
+        .await?;
         let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
         let estimate = estimate_runtime(&video, &plan, quality, &samples);
         Ok(ProbeAndPlan {

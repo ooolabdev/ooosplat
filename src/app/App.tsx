@@ -741,7 +741,15 @@ export function App() {
       <div className="topbar-actions">
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
         {telemetryPreferences && <button className="settings-action" type="button" onClick={() => setPrivacySettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>}
-        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
+        <details className="engine-diagnostics">
+          <summary className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length, names: missingEngines.map((engine) => engine.kind.toUpperCase()).join(" · ") }) : t("top.enginesReady")}<ChevronDown size={14} aria-hidden="true" /></summary>
+          <div className="engine-diagnostics-panel">
+            {store.engines.map((engine) => <section key={engine.kind}>
+              <strong>{engine.kind.toUpperCase()}</strong>
+              <pre>{t("top.enginePath")}: {engine.path}{"\n"}{t("top.engineExists")}: {t(engine.exists ? "top.yes" : "top.no")} · {t("top.engineCanStart")}: {t(engine.canStart ? "top.yes" : "top.no")}{"\n"}{localizePipelineMessage(locale, engine.detail)}</pre>
+            </section>)}
+          </div>
+        </details>
       </div>
     </header>
 

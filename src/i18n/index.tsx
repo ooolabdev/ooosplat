@@ -18,8 +18,13 @@ const zhCN = {
   "language.target": "EN",
   "top.settings": "设置",
   "top.checkingEngines": "正在检查内置引擎",
-  "top.engineIssues": "{count} 个引擎异常",
+  "top.engineIssues": "{count} 个引擎异常：{names}",
   "top.enginesReady": "FFmpeg · COLMAP · Brush 就绪",
+  "top.enginePath": "路径",
+  "top.engineExists": "文件存在",
+  "top.engineCanStart": "可启动",
+  "top.yes": "是",
+  "top.no": "否",
   "task.create": "01 创建新任务",
   "task.running": "运行中",
   "task.idle": "待命",
@@ -368,7 +373,7 @@ export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
-  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready",
+  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues: {names}", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "top.enginePath": "Path", "top.engineExists": "File exists", "top.engineCanStart": "Can start", "top.yes": "Yes", "top.no": "No",
   "task.create": "01 Create New Task", "task.running": "Running", "task.idle": "Standby", "task.console": "Generation console",
   "input.label": "Input media", "input.typeAria": "Choose input media type", "input.video": "Video", "input.images": "Images", "input.videoTypes": "MP4 or MOV", "input.imageTypes": "JPG, JPEG, or PNG folder", "input.selectImages": "Choose image sequence folder", "input.selectVideo": "Choose an MP4 or MOV video", "input.selectImagesHint": "Choose a folder containing JPG, JPEG, or PNG images", "input.selectVideoHint": "Choose a video file on this computer",
   "project.root": "Projects root", "project.readingRoot": "Reading default folder", "project.rootHint": "Each generation creates a separate project folder here, with final.ply saved at its root.",
@@ -536,6 +541,7 @@ const exactPipelineEnglish: Record<string, string> = {
   "正在校验并发布 final.ply": "Validating and publishing final.ply",
   "全部处理完成": "All processing completed",
   "任务已取消": "Task cancelled",
+  "引擎可启动": "Engine can start",
   "正在创建项目": "Creating project",
   "已有任务正在运行": "Another task is already running",
   "任务运行期间不能删除项目": "Projects cannot be deleted while a task is running",
@@ -564,9 +570,18 @@ const exactPipelineEnglish: Record<string, string> = {
 
 export function localizePipelineMessage(locale: Locale, message: string): string {
   if (locale === "zh-CN") return message;
+  const diagnosticSuffix = message.search(/\n(?:Diagnostic log:|Could not save diagnostic log:)/);
+  if (diagnosticSuffix >= 0) {
+    return localizePipelineMessage(locale, message.slice(0, diagnosticSuffix)) + message.slice(diagnosticSuffix);
+  }
   const exact = exactPipelineEnglish[message];
   if (exact) return exact;
   const patterns: Array<[RegExp, (...values: string[]) => string]> = [
+    [/^帮助命令退出码：([^\n]+)\n([\s\S]*)$/, (code, detail) => `Engine check exit code: ${code}\n${detail}`],
+    [/^未找到 ([\s\S]+)$/, (path) => `Not found: ${path}`],
+    [/^本地处理引擎无法启动：(.+)（缺少运行所需的 DLL（退出码 0xC0000135）\n([\s\S]*)）$/, (engine, detail) => `Local processing engine could not start: ${engine} (required DLL missing, exit code 0xC0000135)\n${detail}`],
+    [/^本地处理引擎无法启动：([\s\S]+)$/, (detail) => `Local processing engine could not start: ${detail}`],
+    [/^外部进程执行失败：FFprobe 视频分析失败，退出码 ([^，]+)，引擎 ([\s\S]+)$/, (code, detail) => `FFprobe video analysis failed, exit code ${code}, executable ${detail}`],
     [/^预计提取 ([\d,]+) 帧$/, (count) => `About ${count} frames will be extracted`],
     [/^已提取 ([\d,]+) 帧$/, (count) => `Extracted ${count} frames`],
     [/^已提取 ([\d,]+) 张透明 PNG 和 ([\d,]+) 张 Mask$/, (frames, masks) => `Extracted ${frames} transparent PNG frames and ${masks} masks`],
