@@ -139,6 +139,7 @@ impl PipelineTelemetrySession {
 
 fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> TelemetryErrorCode {
     match error {
+        SplatError::Diagnostic { source, .. } => safe_error_code(source, stage),
         SplatError::EngineMissing(_)
         | SplatError::EngineStart { .. }
         | SplatError::UnsupportedEngine(_) => TelemetryErrorCode::EngineUnavailable,

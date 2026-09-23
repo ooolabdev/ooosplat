@@ -14,14 +14,14 @@ transitive dependencies such as Qt, Boost, Ceres, or their dependencies.
 
 FFmpeg / FFprobe
 ----------------
-Version/build: n8.1.2-44-g7c533d0f86-20260821
+Version/build: n8.1.2-50-g1a748fe2cd-20260831
 Distribution: BtbN win64 LGPL shared 8.1
 License: GNU Lesser General Public License v2.1 or later
 SPDX identifier: LGPL-2.1-or-later
 License text: licenses/FFmpeg-LGPL-2.1.txt
 Upstream source: https://ffmpeg.org/download.html
 Build source and scripts: https://github.com/BtbN/FFmpeg-Builds
-Release archive: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip
+Release archive: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-lgpl-shared-8.1.zip
 
 macOS 15+ Apple Silicon arm64 distribution: OOOSplat-built FFmpeg and
 FFprobe 8.1.2 shared executables. The build uses the unmodified release source

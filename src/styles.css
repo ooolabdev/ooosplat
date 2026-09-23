@@ -50,6 +50,12 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .brand-name span { color: var(--blue); }
 .version-tag { margin-left: 10px; padding-left: 18px; color: #7b8596; border-left: 1px solid var(--line); font: 600 11px/1 "Cascadia Mono", monospace; letter-spacing: .1em; }
 .engine-summary { gap: 9px; color: var(--muted); font-size: 13px; }
+.engine-diagnostics { position: relative; }
+.engine-diagnostics > summary { cursor: pointer; }
+.engine-diagnostics[open] > summary svg { transform: rotate(180deg); }
+.engine-diagnostics-panel { position: absolute; right: 0; top: 100%; z-index: 20; width: min(480px, 80vw); max-height: 60vh; overflow: auto; padding: 16px; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; }
+.engine-diagnostics-panel section + section { margin-top: 16px; }
+.engine-diagnostics-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .topbar-actions { gap: 17px; }
 .settings-action { height: 32px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; color: #5b6679; background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 12px; font-weight: 650; white-space: nowrap; }
 .settings-action:hover { color: var(--blue); background: #edf2ff; border-color: #cbd7f7; }
@@ -214,6 +220,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .cancellation-status strong { display: block; margin-bottom: 7px; font-size: 15px; }
 .cancellation-status p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
+.inline-error span { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .inline-error button { color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
 
 .failure-guidance-backdrop { position: fixed; inset: 0; z-index: 130; display: grid; place-items: center; padding: 24px; background: rgba(16, 23, 36, .58); backdrop-filter: blur(3px); }

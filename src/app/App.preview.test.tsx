@@ -170,6 +170,28 @@ describe("App preview workspace", () => {
     window.localStorage.clear();
   });
 
+  it("exposes the specific failed engine and its diagnostics", async () => {
+    await act(async () => {
+      useAppStore.setState({ engines: [{
+        kind: "ffprobe", path: "E:\\engines\\ffprobe.exe", exists: true,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "exit code -1073741515\nMissing runtime dependency",
+      }, {
+        kind: "ffmpeg", path: "E:\\engines\\ffmpeg.exe", exists: false,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "Executable not found",
+      }] });
+    });
+    const details = container.querySelector<HTMLDetailsElement>(".engine-diagnostics")!;
+    expect(details.querySelector("summary")?.textContent).toContain("2 个引擎异常：FFPROBE · FFMPEG");
+    await act(async () => { details.querySelector("summary")!.click(); });
+    expect(details.open).toBe(true);
+    expect(details.textContent).toContain("FFPROBE");
+    expect(details.textContent).toContain("E:\\engines\\ffprobe.exe");
+    expect(details.textContent).toContain("可启动: 否");
+    expect(details.textContent).toContain("Missing runtime dependency");
+  });
+
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
     expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.4.1");

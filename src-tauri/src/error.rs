@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SplatError {
+    #[error("{source}\n{detail}")]
+    Diagnostic {
+        source: Box<SplatError>,
+        detail: String,
+    },
     #[error("找不到本地处理引擎：{0}")]
     EngineMissing(String),
     #[error("本地处理引擎无法启动：{engine}（{detail}）")]
