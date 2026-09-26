@@ -29,13 +29,17 @@ use crate::{
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
-        parse_model_analyzer, BudgetFramePlanner, CaptureAnalysis, CaptureAnalyzer, CapturePrior,
-        EstimatedMatchingCost, FailureAnalyzer, FramePlanner, GraphDecision, GraphQualityGate,
-        MapperBackend, MapperPlan, MinimumCapturePolicy, PairingPlan, PairingPlanner,
-        PairingStrategy, PairingThresholds, PlannerCheckpoint, PlannerReconstructionValidator,
-        PlannerRecoveryMode, ReconstructionCandidate, ReconstructionComparator,
-        ReconstructionDecision, ReconstructionViability, RescueAction, RescueRecord,
-        SuccessRecoveryPolicy, ViewGraphAnalyzer,
+        analyze_sparse_geometry, can_start_new_probe, geometry_probe_budget,
+        geometry_probe_reasons, parse_model_analyzer, plan_geometry_probe_backfill,
+        probe_candidate_acceptable, screening_applicable, BudgetFramePlanner, CaptureAnalysis,
+        CaptureAnalyzer, CapturePrior, EstimatedMatchingCost, FailureAnalyzer, FrameCandidate,
+        FramePlanner, GeometryProbeMetrics, GeometryProbeStatus, GeometryScreeningDecision,
+        GeometryScreeningThresholds, GraphDecision, GraphQualityGate, MapperBackend, MapperPlan,
+        MinimumCapturePolicy, PairingPlan, PairingPlanner, PairingStrategy, PairingThresholds,
+        PlannerCheckpoint, PlannerReconstructionValidator, PlannerRecoveryMode,
+        ReconstructionCandidate, ReconstructionComparator, ReconstructionDecision,
+        ReconstructionViability, RescueAction, RescueRecord, SuccessRecoveryPolicy,
+        ViewGraphAnalyzer,
     },
     presets::{BrushResolutionContext, MatchingBudget, Quality, ResolvedBrushBudget, SfmBudget},
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
@@ -859,6 +863,10 @@ impl PipelineRunner {
     ) -> Result<PipelineResult> {
         let quality = metadata.quality;
         let budget = quality.budget();
+        let colmap_tuning = colmap::ColmapQualityTuning::for_run(
+            quality,
+            colmap::ColmapQualityTuning::requested_from_environment(),
+        );
         if state.input_type != metadata.input_type {
             return Err(SplatError::Process(
                 "项目输入类型与检查点不一致，无法安全继续".into(),
@@ -866,6 +874,25 @@ impl PipelineRunner {
         }
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
+        let has_colmap_checkpoint = state.features_complete
+            || state.matching_complete
+            || state.reconstruction_complete
+            || state.brush_complete;
+        match state.colmap_high_quality_experiment {
+            Some(saved) if saved != colmap_tuning.enabled && has_colmap_checkpoint => {
+                return Err(SplatError::Process(format!(
+                    "COLMAP High Quality 实验开关与项目检查点不一致：检查点为 {saved}，当前为 {}。请使用新项目进行 A/B 测试。",
+                    colmap_tuning.enabled
+                )));
+            }
+            None if has_colmap_checkpoint && colmap_tuning.enabled => {
+                return Err(SplatError::Process(
+                    "旧项目检查点未记录 COLMAP High Quality 实验状态，不能在恢复时直接开启实验；请创建新项目。".into(),
+                ));
+            }
+            None => state.colmap_high_quality_experiment = Some(colmap_tuning.enabled),
+            _ => {}
+        }
         if state.planner_enabled && state.planner.is_none() {
             state.planner = Some(PlannerCheckpoint::new(
                 budget.clone(),
@@ -963,6 +990,23 @@ impl PipelineRunner {
         // moving any project data outside the project directory.
         let colmap_images = Path::new("../frames");
         let colmap_masks = prepared.has_alpha.then_some(Path::new("../masks"));
+        let sfm_budget = budget
+            .baseline
+            .sfm
+            .capped_for_source(sfm_source_size.0, sfm_source_size.1);
+
+        self.events.send(
+            PipelineStage::ExtractingFeatures,
+            Some(PipelineEngine::Colmap),
+            EventKind::Log,
+            EventLevel::Info,
+            None,
+            false,
+            colmap_tuning.log_summary(sfm_budget),
+            None,
+            None,
+            None,
+        );
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
         let gpu_index = acceleration.gpu_index();
@@ -995,10 +1039,8 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
-                    budget
-                        .baseline
-                        .sfm
-                        .capped_for_source(sfm_source_size.0, sfm_source_size.1),
+                    sfm_budget,
+                    colmap_tuning,
                 )
                 .await?;
             } else {
@@ -1011,6 +1053,7 @@ impl PipelineRunner {
                     &self.process_manager,
                     observer,
                     gpu_index,
+                    colmap_tuning,
                 )
                 .await?;
             }
@@ -1021,6 +1064,26 @@ impl PipelineRunner {
                 PipelineStage::ExtractingFeatures,
                 1.0,
                 format!("{backend_label} 特征提取完成"),
+            );
+        }
+        if let Ok(feature_metrics) = colmap::analyze_database(&database) {
+            self.events.send(
+                PipelineStage::ExtractingFeatures,
+                Some(PipelineEngine::Colmap),
+                EventKind::Log,
+                EventLevel::Info,
+                Some(1.0),
+                false,
+                format!(
+                    "特征统计：图片 {}，总特征 {}，平均 {:.2}/图，中位数 {:.1}/图",
+                    feature_metrics.image_count,
+                    feature_metrics.total_detected_features,
+                    feature_metrics.mean_features_per_image,
+                    feature_metrics.median_features_per_image,
+                ),
+                None,
+                None,
+                None,
             );
         }
 
@@ -1097,6 +1160,7 @@ impl PipelineRunner {
                         &self.process_manager,
                         observer,
                         gpu_index,
+                        colmap_tuning,
                     )
                     .await?
                 }
@@ -1112,6 +1176,7 @@ impl PipelineRunner {
                             sequential_overlap: pairing_plan.sequential_overlap,
                             prefilter_neighbors: pairing_plan.prefilter_neighbors,
                         },
+                        colmap_tuning,
                     )
                     .await?
                 }
@@ -1125,6 +1190,7 @@ impl PipelineRunner {
                         observer,
                         gpu_index,
                         budget.baseline.matching,
+                        colmap_tuning,
                     )
                     .await?
                 }
@@ -1138,6 +1204,7 @@ impl PipelineRunner {
                         observer,
                         gpu_index,
                         pairing_plan.prefilter_neighbors,
+                        colmap_tuning,
                     )
                     .await?
                 }
@@ -1150,6 +1217,27 @@ impl PipelineRunner {
             project_manager.write_state(&paths.state, &state).await?;
             self.events
                 .stage(PipelineStage::Matching, 1.0, format!("{pairing_label}完成"));
+        }
+        let database_metrics = colmap::analyze_database(&database).ok();
+        if let Some(database_metrics) = &database_metrics {
+            self.events.send(
+                PipelineStage::Matching,
+                Some(PipelineEngine::Colmap),
+                EventKind::Log,
+                EventLevel::Info,
+                Some(1.0),
+                false,
+                format!(
+                    "匹配统计：raw pairs {}，raw matches {}，verified pairs {}，verified correspondences {}",
+                    database_metrics.raw_match_pairs,
+                    database_metrics.raw_matches,
+                    database_metrics.geometrically_verified_pairs,
+                    database_metrics.verified_correspondences,
+                ),
+                None,
+                None,
+                None,
+            );
         }
 
         let (model, report, planner_candidate, actual_frame_count) = if state.planner_enabled {
@@ -1166,10 +1254,8 @@ impl PipelineRunner {
                     &pairing_plan,
                     &metadata.source_path,
                     prepared.has_alpha,
-                    budget
-                        .baseline
-                        .sfm
-                        .capped_for_source(sfm_source_size.0, sfm_source_size.1),
+                    sfm_budget,
+                    colmap_tuning,
                 )
                 .await?;
             (model, report, Some(candidate), actual_frame_count)
@@ -1194,6 +1280,7 @@ impl PipelineRunner {
                         Some(prepared.extracted_frames),
                         ObserverMode::Mapper,
                     )),
+                    colmap_tuning,
                 )
                 .await?;
                 state.stage = PipelineStage::Reconstructing;
@@ -1362,8 +1449,23 @@ impl PipelineRunner {
             } else {
                 source_width.max(source_height).min(1_920)
             },
-            // COLMAP currently does not emit a stable aggregate feature count.
-            actual_feature_count: None,
+            actual_feature_count: database_metrics
+                .as_ref()
+                .map(|metrics| metrics.total_detected_features),
+            mean_features_per_image: database_metrics
+                .as_ref()
+                .map(|metrics| metrics.mean_features_per_image),
+            median_features_per_image: database_metrics
+                .as_ref()
+                .map(|metrics| metrics.median_features_per_image),
+            raw_matches: database_metrics.as_ref().map(|metrics| metrics.raw_matches),
+            geometrically_verified_pairs: database_metrics
+                .as_ref()
+                .map(|metrics| metrics.geometrically_verified_pairs),
+            verified_correspondences: database_metrics
+                .as_ref()
+                .map(|metrics| metrics.verified_correspondences),
+            colmap_high_quality_experiment: colmap_tuning.enabled,
             actual_brush_resolution: brush_budget.max_resolution,
             actual_brush_iterations: brush_budget.iterations,
             registered_images: report.registered_images,
@@ -1478,6 +1580,14 @@ impl PipelineRunner {
                 }
                 .to_owned()
             }),
+            geometry_screening: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.geometry_screening_report.clone()),
+            geometry_probe: state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.geometry_probe_metrics.clone()),
         };
         metadata.output = Some(ProjectOutput {
             final_ply: final_ply.clone(),
@@ -1534,6 +1644,7 @@ impl PipelineRunner {
         source_video: &Path,
         has_alpha: bool,
         sfm_budget: SfmBudget,
+        colmap_tuning: colmap::ColmapQualityTuning,
     ) -> Result<(PathBuf, ReconstructionReport, ReconstructionCandidate, u64)> {
         let mut input_images = input_images;
         let planner_started = Instant::now();
@@ -1667,6 +1778,7 @@ impl PipelineRunner {
                         )),
                         gpu_index,
                         sfm_budget,
+                        colmap_tuning,
                     )
                     .await?;
                     let pair_list = paths.colmap.join("planner-backfill-pairs.txt");
@@ -1690,6 +1802,7 @@ impl PipelineRunner {
                             ObserverMode::BracketProgress,
                         )),
                         gpu_index,
+                        colmap_tuning,
                     )
                     .await?;
                     let previous_lcc = graph.largest_component_ratio;
@@ -1746,6 +1859,7 @@ impl PipelineRunner {
                     ObserverMode::BracketProgress,
                 )),
                 gpu_index,
+                colmap_tuning,
             )
             .await?;
             graph = ViewGraphAnalyzer.analyze_database(database)?;
@@ -1801,10 +1915,11 @@ impl PipelineRunner {
                     images,
                     colmap_log,
                     input_images,
-                    primary_id,
+                    primary_id.clone(),
                     mapper_plan.backend,
                     normal_rounds,
                     mapper_plan.calibrate_view_graph,
+                    colmap_tuning,
                 )
                 .await
             {
@@ -1813,10 +1928,69 @@ impl PipelineRunner {
         }
         checkpoint_planner_candidates(project_manager, paths, state, &candidates).await?;
 
+        let baseline_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == primary_id)
+            .filter(|candidate| candidate.viability != ReconstructionViability::NotViable)
+            .cloned();
+        let mut geometry_screening_handled_usable_reconstruction = false;
+        if state.preset == Quality::High {
+            if let Some(baseline) = baseline_candidate {
+                let remaining_candidates = state
+                    .frames
+                    .as_ref()
+                    .map(frame_plan_from_state)
+                    .map(|plan| {
+                        let selected: std::collections::HashSet<_> = plan
+                            .selected_frames
+                            .iter()
+                            .map(|frame| frame.source_frame_index)
+                            .collect();
+                        plan.candidate_frames
+                            .iter()
+                            .filter(|frame| !selected.contains(&frame.source_frame_index))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let applicable = screening_applicable(
+                    state.preset,
+                    state.planner_enabled,
+                    baseline.viability,
+                    remaining_candidates,
+                );
+                let checkpoint_exists = state.planner.as_ref().is_some_and(|planner| {
+                    planner.geometry_screening_complete
+                        && planner.geometry_probe_status != GeometryProbeStatus::NotEvaluated
+                });
+                if applicable || checkpoint_exists {
+                    geometry_screening_handled_usable_reconstruction = true;
+                    self.run_high_geometry_screening_and_probe(
+                        project_manager,
+                        paths,
+                        state,
+                        database,
+                        images,
+                        colmap_log,
+                        gpu_index,
+                        pairing_plan,
+                        source_video,
+                        has_alpha,
+                        sfm_budget,
+                        colmap_tuning,
+                        normal_rounds,
+                        &baseline,
+                        &mut candidates,
+                        &mut input_images,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         let has_pass = candidates
             .iter()
             .any(|candidate| candidate.decision == ReconstructionDecision::Pass);
-        if !has_pass {
+        if !has_pass && !geometry_screening_handled_usable_reconstruction {
             recovery_started = Some(Instant::now());
             let policy = state
                 .planner
@@ -1936,6 +2110,7 @@ impl PipelineRunner {
                             None,
                             gpu_index,
                             recovery_sfm,
+                            colmap_tuning,
                         )
                         .await?;
                         let pair_list = paths.colmap.join("planner-recovery-pairs.txt");
@@ -1954,6 +2129,7 @@ impl PipelineRunner {
                             &self.process_manager,
                             None,
                             gpu_index,
+                            colmap_tuning,
                         )
                         .await?;
                         recovery_round += 1;
@@ -1970,6 +2146,7 @@ impl PipelineRunner {
                                 mapper_plan.backend,
                                 normal_rounds + recovery_round,
                                 false,
+                                colmap_tuning,
                             )
                             .await
                         {
@@ -2043,6 +2220,7 @@ impl PipelineRunner {
                             ObserverMode::BracketProgress,
                         )),
                         gpu_index,
+                        colmap_tuning,
                     )
                     .await?;
                     PairingStrategy::Exhaustive
@@ -2061,6 +2239,7 @@ impl PipelineRunner {
                         )),
                         gpu_index,
                         recovery_matching.prefilter_neighbors,
+                        colmap_tuning,
                     )
                     .await?;
                     PairingStrategy::Prefilter
@@ -2079,6 +2258,7 @@ impl PipelineRunner {
                         mapper_plan.backend,
                         normal_rounds + recovery_round,
                         false,
+                        colmap_tuning,
                     )
                     .await
                 {
@@ -2138,6 +2318,7 @@ impl PipelineRunner {
                     )),
                     gpu_index,
                     escalated_sfm,
+                    colmap_tuning,
                 )
                 .await?;
                 let recovery_matching = MatchingBudget {
@@ -2155,6 +2336,7 @@ impl PipelineRunner {
                             &self.process_manager,
                             None,
                             gpu_index,
+                            colmap_tuning,
                         )
                         .await?;
                     }
@@ -2167,6 +2349,7 @@ impl PipelineRunner {
                             None,
                             gpu_index,
                             recovery_matching,
+                            colmap_tuning,
                         )
                         .await?;
                     }
@@ -2180,6 +2363,7 @@ impl PipelineRunner {
                             None,
                             gpu_index,
                             recovery_matching,
+                            colmap_tuning,
                         )
                         .await?;
                     }
@@ -2193,6 +2377,7 @@ impl PipelineRunner {
                             None,
                             gpu_index,
                             recovery_matching.prefilter_neighbors,
+                            colmap_tuning,
                         )
                         .await?;
                     }
@@ -2211,6 +2396,7 @@ impl PipelineRunner {
                         mapper_plan.backend,
                         normal_rounds + recovery_round,
                         false,
+                        colmap_tuning,
                     )
                     .await
                 {
@@ -2264,6 +2450,601 @@ impl PipelineRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn run_high_geometry_screening_and_probe(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        database: &Path,
+        images: &Path,
+        colmap_log: &Path,
+        gpu_index: Option<u32>,
+        pairing_plan: &PairingPlan,
+        source_video: &Path,
+        has_alpha: bool,
+        sfm_budget: SfmBudget,
+        colmap_tuning: colmap::ColmapQualityTuning,
+        normal_rounds: u32,
+        baseline: &ReconstructionCandidate,
+        candidates: &mut Vec<ReconstructionCandidate>,
+        input_images: &mut u64,
+    ) -> Result<()> {
+        let thresholds = GeometryScreeningThresholds::default();
+        let current_status = state
+            .planner
+            .as_ref()
+            .map(|planner| planner.geometry_probe_status)
+            .unwrap_or_default();
+        if matches!(
+            current_status,
+            GeometryProbeStatus::NotNeeded
+                | GeometryProbeStatus::RecommendedButNoBudget
+                | GeometryProbeStatus::Completed
+                | GeometryProbeStatus::FailedRolledBack
+        ) {
+            return Ok(());
+        }
+
+        if !state
+            .planner
+            .as_ref()
+            .is_some_and(|planner| planner.geometry_screening_complete)
+        {
+            let Some(frame_plan) = state.frames.as_ref().map(frame_plan_from_state) else {
+                return Ok(());
+            };
+            let report = match analyze_sparse_geometry(
+                &baseline.model_path,
+                database,
+                &frame_plan,
+                &baseline.metrics,
+                thresholds,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    self.events.send(
+                        PipelineStage::Reconstructing,
+                        Some(PipelineEngine::System),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        None,
+                        false,
+                        format!("[HighGeometryScreening] 分析失败，继续使用初始重建：{error}"),
+                        None,
+                        None,
+                        None,
+                    );
+                    if let Some(planner) = state.planner.as_mut() {
+                        planner.geometry_screening_complete = true;
+                        planner.geometry_probe_status = GeometryProbeStatus::FailedRolledBack;
+                        planner.geometry_probe_before_candidate_id = Some(baseline.id.clone());
+                    }
+                    project_manager.write_state(&paths.state, state).await?;
+                    return Ok(());
+                }
+            };
+            self.events.send(
+                PipelineStage::Reconstructing,
+                Some(PipelineEngine::System),
+                EventKind::Log,
+                EventLevel::Info,
+                None,
+                false,
+                format!(
+                    "[HighGeometryScreening] thresholdProfile={} points3D={} observations={} meanTrackLength={:.3} pointDiversity={:.5} medianTriangulationRatio={:.5} p25TriangulationRatio={:.5} weakIntervals={} triangulationUnderfilled={} trackRedundancyHigh={} continuousWeakRegion={} decision={:?}",
+                    report.threshold_profile,
+                    report.points_3d,
+                    report.observations,
+                    report.mean_track_length,
+                    report.point_diversity_ratio,
+                    report.median_triangulation_ratio,
+                    report.p25_triangulation_ratio,
+                    report.weak_geometry_intervals.len(),
+                    report.triangulation_underfilled,
+                    report.track_redundancy_high,
+                    report.continuous_weak_region,
+                    report.decision,
+                ),
+                None,
+                None,
+                None,
+            );
+            if let Some(planner) = state.planner.as_mut() {
+                planner.geometry_screening_complete = true;
+                planner.geometry_screening_report = Some(report.clone());
+                planner.geometry_probe_before_candidate_id = Some(baseline.id.clone());
+                if report.decision == GeometryScreeningDecision::NoProbe {
+                    planner.geometry_probe_status = GeometryProbeStatus::NotNeeded;
+                }
+            }
+            project_manager.write_state(&paths.state, state).await?;
+            if report.decision == GeometryScreeningDecision::NoProbe {
+                return Ok(());
+            }
+        }
+
+        let status = state
+            .planner
+            .as_ref()
+            .map(|planner| planner.geometry_probe_status)
+            .unwrap_or_default();
+        if status != GeometryProbeStatus::Running {
+            let Some(frame_plan) = state.frames.as_ref().map(frame_plan_from_state) else {
+                return Ok(());
+            };
+            let selected: std::collections::HashSet<_> = frame_plan
+                .selected_frames
+                .iter()
+                .map(|frame| frame.source_frame_index)
+                .collect();
+            let remaining = frame_plan
+                .candidate_frames
+                .iter()
+                .filter(|frame| !selected.contains(&frame.source_frame_index))
+                .count();
+            let duration = state
+                .video
+                .as_ref()
+                .map(|video| video.duration)
+                .unwrap_or(0.0);
+            let max_fps = state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.quality_budget_snapshot.as_ref())
+                .map(|budget| budget.frame.max_fps)
+                .unwrap_or(15.0);
+            let budget =
+                geometry_probe_budget(&frame_plan, duration, max_fps, remaining, thresholds);
+            if budget.available == 0 {
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.geometry_probe_status = GeometryProbeStatus::RecommendedButNoBudget;
+                    planner.geometry_probe_metrics = Some(GeometryProbeMetrics {
+                        triggered_reasons: planner
+                            .geometry_screening_report
+                            .as_ref()
+                            .map(geometry_probe_reasons)
+                            .unwrap_or_default(),
+                        requested_additional_frames: budget.requested,
+                        baseline_points: baseline.metrics.points_3d,
+                        baseline_observations: baseline.metrics.observations,
+                        baseline_track_length: baseline.metrics.mean_track_length,
+                        baseline_reprojection_error: baseline.metrics.mean_reprojection_error,
+                        ..GeometryProbeMetrics::default()
+                    });
+                }
+                project_manager.write_state(&paths.state, state).await?;
+                self.events.send(
+                    PipelineStage::Reconstructing,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Info,
+                    None,
+                    false,
+                    "[HighGeometryProbe] ProbeRecommendedButNoBudget：已达到 High 15fps 上限或候选池耗尽",
+                    None,
+                    None,
+                    None,
+                );
+                return Ok(());
+            }
+            let candidate_bytes =
+                match tokio::fs::read(paths.work.join("planner").join("frame-candidates.json"))
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.record_geometry_probe_failure(
+                            project_manager,
+                            paths,
+                            state,
+                            format!("无法读取候选帧：{error}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let frame_candidates: Vec<FrameCandidate> =
+                match serde_json::from_slice(&candidate_bytes) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        self.record_geometry_probe_failure(
+                            project_manager,
+                            paths,
+                            state,
+                            format!("无法恢复候选帧：{error}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let report = state
+                .planner
+                .as_ref()
+                .and_then(|planner| planner.geometry_screening_report.as_ref())
+                .cloned();
+            let Some(report) = report else {
+                self.record_geometry_probe_failure(
+                    project_manager,
+                    paths,
+                    state,
+                    "筛查 checkpoint 缺失".into(),
+                )
+                .await?;
+                return Ok(());
+            };
+            let additions = plan_geometry_probe_backfill(
+                &frame_plan,
+                &frame_candidates,
+                &report,
+                budget.available,
+                thresholds,
+            );
+            if additions.is_empty() {
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.geometry_probe_status = GeometryProbeStatus::RecommendedButNoBudget;
+                }
+                project_manager.write_state(&paths.state, state).await?;
+                return Ok(());
+            }
+            let reasons = geometry_probe_reasons(&report);
+            let strategy = if report.continuous_weak_region {
+                "ContinuousWeakRegion"
+            } else if report.triangulation_underfilled {
+                "LowTriangulationRegions"
+            } else {
+                "LargestTemporalGap"
+            };
+            self.events.send(
+                PipelineStage::Reconstructing,
+                Some(PipelineEngine::System),
+                EventKind::Log,
+                EventLevel::Info,
+                None,
+                false,
+                format!(
+                    "[HighGeometryProbe] reason={reasons:?} selectedBefore={} requestedAdditional={} actualAdditional={} selectionStrategy={strategy}",
+                    frame_plan.selected_frames.len(),
+                    budget.requested,
+                    additions.len(),
+                ),
+                None,
+                None,
+                None,
+            );
+            if let Some(planner) = state.planner.as_mut() {
+                if !can_start_new_probe(
+                    planner.geometry_probe_attempted,
+                    planner.geometry_probe_status,
+                ) {
+                    return Ok(());
+                }
+                planner.geometry_probe_attempted = true;
+                planner.geometry_probe_status = GeometryProbeStatus::Running;
+                planner.geometry_probe_added_frames = additions.len();
+                planner.geometry_probe_frame_indices = additions
+                    .iter()
+                    .map(|frame| frame.source_frame_index)
+                    .collect();
+                planner.geometry_probe_metrics = Some(GeometryProbeMetrics {
+                    triggered_reasons: reasons,
+                    requested_additional_frames: budget.requested,
+                    actual_additional_frames: additions.len(),
+                    baseline_points: baseline.metrics.points_3d,
+                    baseline_observations: baseline.metrics.observations,
+                    baseline_track_length: baseline.metrics.mean_track_length,
+                    baseline_reprojection_error: baseline.metrics.mean_reprojection_error,
+                    ..GeometryProbeMetrics::default()
+                });
+            }
+            project_manager.write_state(&paths.state, state).await?;
+        }
+
+        let probe_started = Instant::now();
+        let original_plan = state.frames.as_ref().map(frame_plan_from_state);
+        let Some(original_plan) = original_plan else {
+            self.record_geometry_probe_failure(
+                project_manager,
+                paths,
+                state,
+                "画面计划 checkpoint 缺失".into(),
+            )
+            .await?;
+            return Ok(());
+        };
+        let probe_indices: std::collections::HashSet<u64> = state
+            .planner
+            .as_ref()
+            .map(|planner| {
+                planner
+                    .geometry_probe_frame_indices
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut additions: Vec<_> = original_plan
+            .candidate_frames
+            .iter()
+            .filter(|frame| probe_indices.contains(&frame.source_frame_index))
+            .cloned()
+            .collect();
+        additions.sort_by_key(|frame| frame.source_frame_index);
+        additions.dedup_by_key(|frame| frame.source_frame_index);
+        if additions.len() != probe_indices.len() {
+            self.record_geometry_probe_failure(
+                project_manager,
+                paths,
+                state,
+                "新增帧列表无法从 checkpoint 精确恢复".into(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut full_plan = original_plan.clone();
+        full_plan.selected_frames.extend(additions.clone());
+        full_plan
+            .selected_frames
+            .sort_by_key(|frame| frame.source_frame_index);
+        full_plan
+            .selected_frames
+            .dedup_by_key(|frame| frame.source_frame_index);
+        full_plan.estimated_frames = full_plan.selected_frames.len() as u64;
+        full_plan.actual_average_fps = full_plan.selected_frames.len() as f64
+            / state
+                .video
+                .as_ref()
+                .map(|video| video.duration)
+                .unwrap_or(0.0)
+                .max(0.001);
+        full_plan.sampling_fps = full_plan.actual_average_fps;
+
+        let extension = if has_alpha { "png" } else { "jpg" };
+        let names: Vec<String> = additions
+            .iter()
+            .map(|frame| format!("frame_{:010}.{extension}", frame.source_frame_index))
+            .collect();
+        let missing: Vec<_> = additions
+            .iter()
+            .filter(|frame| {
+                !paths
+                    .frames
+                    .join(format!(
+                        "frame_{:010}.{extension}",
+                        frame.source_frame_index
+                    ))
+                    .is_file()
+            })
+            .cloned()
+            .collect();
+        let probe_result: Result<ReconstructionCandidate> = async {
+            if !missing.is_empty() {
+                let mut addition_plan = full_plan.clone();
+                addition_plan.selected_frames = missing;
+                addition_plan.estimated_frames = addition_plan.selected_frames.len() as u64;
+                let extraction = extract_additional_frames(
+                    &self.engines.ffmpeg,
+                    source_video,
+                    &paths.frames,
+                    &paths.masks,
+                    &addition_plan,
+                    has_alpha,
+                    Some(paths.logs.join("ffmpeg-geometry-probe.log")),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::ExtractingFrames,
+                        PipelineEngine::Ffmpeg,
+                        Some(addition_plan.estimated_frames),
+                        ObserverMode::Ffmpeg,
+                    )),
+                )
+                .await?;
+                *input_images = extraction.frame_count;
+            } else {
+                *input_images = full_plan.selected_frames.len() as u64;
+            }
+            let image_list = paths.colmap.join("geometry-probe-images.txt");
+            tokio::fs::write(&image_list, names.join("\n")).await?;
+            colmap::extract_features_for_list(
+                &self.engines.colmap,
+                database,
+                images,
+                has_alpha.then_some(Path::new("../masks")),
+                &image_list,
+                paths.logs.join("colmap-geometry-probe.log"),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(additions.len() as u64),
+                    ObserverMode::BracketProgress,
+                )),
+                gpu_index,
+                sfm_budget,
+                colmap_tuning,
+            )
+            .await?;
+            let pair_list = paths.colmap.join("geometry-probe-pairs.txt");
+            write_backfill_pairs(
+                &paths.frames,
+                &names,
+                pairing_plan.sequential_overlap.max(4) as usize,
+                &pair_list,
+            )
+            .await?;
+            colmap::match_pairs(
+                &self.engines.colmap,
+                database,
+                &pair_list,
+                paths.logs.join("colmap-geometry-probe.log"),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Matching,
+                    PipelineEngine::Colmap,
+                    Some(additions.len() as u64),
+                    ObserverMode::BracketProgress,
+                )),
+                gpu_index,
+                colmap_tuning,
+            )
+            .await?;
+            self.execute_mapper_candidate(
+                paths,
+                database,
+                images,
+                colmap_log,
+                *input_images,
+                "geometry-probe-incremental".into(),
+                MapperBackend::Incremental,
+                normal_rounds,
+                false,
+                colmap_tuning,
+            )
+            .await
+        }
+        .await;
+
+        match probe_result {
+            Ok(probe) => {
+                let accepted = probe_candidate_acceptable(baseline, &probe, thresholds);
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.geometry_probe_after_candidate_id = Some(probe.id.clone());
+                    planner.geometry_probe_status = if accepted {
+                        GeometryProbeStatus::Completed
+                    } else {
+                        GeometryProbeStatus::FailedRolledBack
+                    };
+                    if let Some(metrics) = planner.geometry_probe_metrics.as_mut() {
+                        metrics.probe_points = Some(probe.metrics.points_3d);
+                        metrics.point_gain_ratio =
+                            signed_gain_ratio(probe.metrics.points_3d, metrics.baseline_points);
+                        metrics.probe_observations = Some(probe.metrics.observations);
+                        metrics.observation_gain_ratio = signed_gain_ratio(
+                            probe.metrics.observations,
+                            metrics.baseline_observations,
+                        );
+                        metrics.probe_track_length = probe.metrics.mean_track_length;
+                        metrics.probe_reprojection_error = probe.metrics.mean_reprojection_error;
+                        metrics.duration_ms = probe_started.elapsed().as_millis() as u64;
+                    }
+                }
+                if accepted {
+                    if let Some(existing) = candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.id == probe.id)
+                    {
+                        *existing = probe.clone();
+                    } else {
+                        candidates.push(probe.clone());
+                    }
+                    if let Some(frames) = state.frames.as_mut() {
+                        *frames = FrameState::from(&full_plan);
+                        frames.extracted_frames = Some(*input_images);
+                        frames.image_format = Some(if has_alpha { "png" } else { "jpeg" }.into());
+                        frames.mask_count = Some(if has_alpha { *input_images } else { 0 });
+                        frames.has_alpha = has_alpha;
+                    }
+                    if let Some(planner) = state.planner.as_mut() {
+                        planner.frame_plan = Some(full_plan.clone());
+                        planner.actual_selected_frames = full_plan
+                            .selected_frames
+                            .iter()
+                            .map(|frame| frame.source_frame_index)
+                            .collect();
+                    }
+                } else {
+                    rollback_geometry_probe_frames(paths, &additions, has_alpha).await;
+                    *input_images = baseline.metrics.input_images;
+                }
+                let probe_metrics = state
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.geometry_probe_metrics.as_ref());
+                self.events.send(
+                    PipelineStage::Reconstructing,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    if accepted {
+                        EventLevel::Info
+                    } else {
+                        EventLevel::Warning
+                    },
+                    None,
+                    false,
+                    format!(
+                        "[HighGeometryProbeResult] accepted={} pointsBefore={} pointsAfter={} pointGain={:?} observationsBefore={} observationsAfter={} observationGain={:?} trackBefore={:?} trackAfter={:?} reprojectionBefore={:?} reprojectionAfter={:?}",
+                        accepted,
+                        baseline.metrics.points_3d,
+                        probe.metrics.points_3d,
+                        probe_metrics.and_then(|metrics| metrics.point_gain_ratio),
+                        baseline.metrics.observations,
+                        probe.metrics.observations,
+                        probe_metrics.and_then(|metrics| metrics.observation_gain_ratio),
+                        baseline.metrics.mean_track_length,
+                        probe.metrics.mean_track_length,
+                        baseline.metrics.mean_reprojection_error,
+                        probe.metrics.mean_reprojection_error,
+                    ),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            Err(error) => {
+                rollback_geometry_probe_frames(paths, &additions, has_alpha).await;
+                *input_images = baseline.metrics.input_images;
+                if let Some(planner) = state.planner.as_mut() {
+                    planner.geometry_probe_status = GeometryProbeStatus::FailedRolledBack;
+                    if let Some(metrics) = planner.geometry_probe_metrics.as_mut() {
+                        metrics.duration_ms = probe_started.elapsed().as_millis() as u64;
+                    }
+                }
+                self.events.send(
+                    PipelineStage::Reconstructing,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Warning,
+                    None,
+                    false,
+                    format!("[HighGeometryProbeResult] Probe 失败，已回退初始重建：{error}"),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+        checkpoint_planner_candidates(project_manager, paths, state, candidates).await?;
+        write_planner_snapshot(paths, state).await?;
+        Ok(())
+    }
+
+    async fn record_geometry_probe_failure(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        detail: String,
+    ) -> Result<()> {
+        if let Some(planner) = state.planner.as_mut() {
+            planner.geometry_screening_complete = true;
+            planner.geometry_probe_status = GeometryProbeStatus::FailedRolledBack;
+        }
+        project_manager.write_state(&paths.state, state).await?;
+        self.events.send(
+            PipelineStage::Reconstructing,
+            Some(PipelineEngine::System),
+            EventKind::Log,
+            EventLevel::Warning,
+            None,
+            false,
+            format!("[HighGeometryProbeResult] {detail}，已保留初始重建"),
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_mapper_candidate(
         &self,
         paths: &ProjectPaths,
@@ -2275,6 +3056,7 @@ impl PipelineRunner {
         backend: MapperBackend,
         rescue_round: u32,
         calibrate: bool,
+        colmap_tuning: colmap::ColmapQualityTuning,
     ) -> Result<ReconstructionCandidate> {
         let attempt_database = paths.colmap.join(format!("database-{id}.db"));
         tokio::fs::copy(baseline_database, &attempt_database).await?;
@@ -2314,6 +3096,7 @@ impl PipelineRunner {
                     colmap_log.to_path_buf(),
                     &self.process_manager,
                     observer,
+                    colmap_tuning,
                 )
                 .await?
             }
@@ -2901,6 +3684,35 @@ async fn write_planner_snapshot(paths: &ProjectPaths, state: &PipelineStateFile)
     Ok(())
 }
 
+fn signed_gain_ratio(after: u64, before: u64) -> Option<f64> {
+    (before > 0).then(|| (after as f64 - before as f64) / before as f64)
+}
+
+async fn rollback_geometry_probe_frames(
+    paths: &ProjectPaths,
+    additions: &[crate::video::PlannedFrame],
+    has_alpha: bool,
+) {
+    let extension = if has_alpha { "png" } else { "jpg" };
+    for frame in additions {
+        let image = paths.frames.join(format!(
+            "frame_{:010}.{extension}",
+            frame.source_frame_index
+        ));
+        if image.is_file() {
+            let _ = tokio::fs::remove_file(image).await;
+        }
+        if has_alpha {
+            let mask = paths
+                .masks
+                .join(format!("frame_{:010}.png.png", frame.source_frame_index));
+            if mask.is_file() {
+                let _ = tokio::fs::remove_file(mask).await;
+            }
+        }
+    }
+}
+
 async fn write_backfill_pairs(
     frames: &Path,
     new_names: &[String],
@@ -2987,6 +3799,34 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_geometry_probe_removes_only_its_added_frames() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.masks).await.unwrap();
+        let original = paths.frames.join("frame_0000000001.png");
+        let added = paths.frames.join("frame_0000000002.png");
+        let mask = paths.masks.join("frame_0000000002.png.png");
+        tokio::fs::write(&original, b"original").await.unwrap();
+        tokio::fs::write(&added, b"probe").await.unwrap();
+        tokio::fs::write(&mask, b"mask").await.unwrap();
+
+        rollback_geometry_probe_frames(
+            &paths,
+            &[crate::video::PlannedFrame {
+                source_frame_index: 2,
+                timestamp_seconds: 0.2,
+            }],
+            true,
+        )
+        .await;
+
+        assert!(original.is_file());
+        assert!(!added.exists());
+        assert!(!mask.exists());
+    }
 
     #[test]
     fn parses_ffmpeg_progress() {

@@ -6,7 +6,7 @@ use crate::{
     presets::QualityPreset, reconstruction::validator::ReconstructionReport, video::FramePlan,
 };
 
-pub const PLANNER_VERSION: u32 = 2;
+pub const PLANNER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +188,97 @@ pub struct ReconstructionCandidate {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum GeometryScreeningDecision {
+    #[default]
+    NoProbe,
+    ProbeRecommended,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GeometryImageMetric {
+    pub image_id: u32,
+    pub source_frame_index: u64,
+    pub timestamp_seconds: Option<f64>,
+    pub detected_features: u64,
+    pub observed_points: u64,
+    pub triangulation_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WeakGeometryInterval {
+    pub start_source_frame_index: u64,
+    pub end_source_frame_index: u64,
+    pub start_timestamp: Option<f64>,
+    pub end_timestamp: Option<f64>,
+    pub image_count: usize,
+    pub median_observed_points: f64,
+    pub median_triangulation_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GeometryScreeningReport {
+    pub threshold_profile: String,
+    pub registered_images: usize,
+    pub points_3d: u64,
+    pub observations: u64,
+    pub mean_track_length: f64,
+    pub point_diversity_ratio: f64,
+    pub median_triangulation_ratio: f64,
+    pub p25_triangulation_ratio: f64,
+    pub minimum_triangulation_ratio: f64,
+    pub median_observed_points: f64,
+    pub weak_geometry_intervals: Vec<WeakGeometryInterval>,
+    pub per_image: Vec<GeometryImageMetric>,
+    pub triangulation_underfilled: bool,
+    pub track_redundancy_high: bool,
+    pub continuous_weak_region: bool,
+    pub decision: GeometryScreeningDecision,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GeometryProbeStatus {
+    #[default]
+    NotEvaluated,
+    NotNeeded,
+    RecommendedButNoBudget,
+    Running,
+    Completed,
+    FailedRolledBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GeometryProbeReason {
+    TriangulationUnderfilled,
+    TrackRedundancy,
+    ContinuousWeakRegion,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GeometryProbeMetrics {
+    pub triggered_reasons: Vec<GeometryProbeReason>,
+    pub requested_additional_frames: usize,
+    pub actual_additional_frames: usize,
+    pub baseline_points: u64,
+    pub probe_points: Option<u64>,
+    pub point_gain_ratio: Option<f64>,
+    pub baseline_observations: u64,
+    pub probe_observations: Option<u64>,
+    pub observation_gain_ratio: Option<f64>,
+    pub baseline_track_length: Option<f64>,
+    pub probe_track_length: Option<f64>,
+    pub baseline_reprojection_error: Option<f64>,
+    pub probe_reprojection_error: Option<f64>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PlannerRecoveryMode {
     #[default]
     Normal,
@@ -284,6 +375,15 @@ pub struct PlannerCheckpoint {
     pub budget_overridden_for_success: bool,
     pub normal_duration_ms: u64,
     pub recovery_duration_ms: u64,
+    pub geometry_screening_complete: bool,
+    pub geometry_screening_report: Option<GeometryScreeningReport>,
+    pub geometry_probe_attempted: bool,
+    pub geometry_probe_added_frames: usize,
+    pub geometry_probe_frame_indices: Vec<u64>,
+    pub geometry_probe_before_candidate_id: Option<String>,
+    pub geometry_probe_after_candidate_id: Option<String>,
+    pub geometry_probe_status: GeometryProbeStatus,
+    pub geometry_probe_metrics: Option<GeometryProbeMetrics>,
 }
 
 impl PlannerCheckpoint {
@@ -301,6 +401,7 @@ impl PlannerCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presets::Quality;
 
     #[test]
     fn older_recovery_policy_snapshots_receive_robust_sfm_ceilings() {
@@ -332,5 +433,22 @@ mod tests {
             vec!["production_incremental_only".to_string()]
         );
         assert!(!SuccessRecoveryPolicy::default().allow_alternate_mapper);
+    }
+
+    #[test]
+    fn geometry_probe_frame_list_round_trips_for_exact_resume() {
+        let mut checkpoint =
+            PlannerCheckpoint::new(Quality::High.budget(), SuccessRecoveryPolicy::default());
+        checkpoint.geometry_screening_complete = true;
+        checkpoint.geometry_probe_attempted = true;
+        checkpoint.geometry_probe_status = GeometryProbeStatus::Running;
+        checkpoint.geometry_probe_frame_indices = vec![12, 48, 96, 144];
+
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let restored: PlannerCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        assert!(restored.geometry_screening_complete);
+        assert!(restored.geometry_probe_attempted);
+        assert_eq!(restored.geometry_probe_status, GeometryProbeStatus::Running);
+        assert_eq!(restored.geometry_probe_frame_indices, vec![12, 48, 96, 144]);
     }
 }

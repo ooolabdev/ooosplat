@@ -6,6 +6,7 @@ use std::{sync::Mutex, time::Instant};
 use crate::{
     error::SplatError,
     pipeline::{EventKind, PipelineEvent, PipelineStage},
+    planner::{GeometryProbeReason, GeometryScreeningDecision},
     presets::Quality,
     project::QualityRunMetrics,
 };
@@ -149,6 +150,62 @@ impl PipelineTelemetrySession {
                 normal_duration_ms: metrics.normal_duration_ms,
                 recovery_duration_ms: metrics.recovery_duration_ms,
                 reconstruction_quality: metrics.reconstruction_quality.clone(),
+            });
+        }
+        if let Some(screening) = &metrics.geometry_screening {
+            self.service
+                .track(TelemetryEvent::GeometryScreeningRecorded {
+                    geometry_threshold_profile: screening.threshold_profile.clone(),
+                    points_3d: screening.points_3d,
+                    observations: screening.observations,
+                    mean_track_length: screening.mean_track_length,
+                    point_diversity_ratio: screening.point_diversity_ratio,
+                    median_triangulation_ratio: screening.median_triangulation_ratio,
+                    p25_triangulation_ratio: screening.p25_triangulation_ratio,
+                    minimum_triangulation_ratio: screening.minimum_triangulation_ratio,
+                    weak_geometry_interval_count: screening.weak_geometry_intervals.len(),
+                    weak_geometry_image_count: screening
+                        .weak_geometry_intervals
+                        .iter()
+                        .map(|interval| interval.image_count)
+                        .sum(),
+                    triangulation_underfilled: screening.triangulation_underfilled,
+                    track_redundancy_high: screening.track_redundancy_high,
+                    continuous_weak_region: screening.continuous_weak_region,
+                    geometry_screening_decision: match screening.decision {
+                        GeometryScreeningDecision::NoProbe => "no_probe",
+                        GeometryScreeningDecision::ProbeRecommended => "probe_recommended",
+                    }
+                    .into(),
+                });
+        }
+        if let Some(probe) = &metrics.geometry_probe {
+            self.service.track(TelemetryEvent::GeometryProbeRecorded {
+                geometry_probe_reasons: probe
+                    .triggered_reasons
+                    .iter()
+                    .map(|reason| match reason {
+                        GeometryProbeReason::TriangulationUnderfilled => {
+                            "triangulation_underfilled"
+                        }
+                        GeometryProbeReason::TrackRedundancy => "track_redundancy",
+                        GeometryProbeReason::ContinuousWeakRegion => "continuous_weak_region",
+                    })
+                    .map(str::to_owned)
+                    .collect(),
+                requested_additional_frames: probe.requested_additional_frames,
+                actual_additional_frames: probe.actual_additional_frames,
+                baseline_points: probe.baseline_points,
+                probe_points: probe.probe_points,
+                point_gain_ratio: probe.point_gain_ratio,
+                baseline_observations: probe.baseline_observations,
+                probe_observations: probe.probe_observations,
+                observation_gain_ratio: probe.observation_gain_ratio,
+                baseline_track_length: probe.baseline_track_length,
+                probe_track_length: probe.probe_track_length,
+                baseline_reprojection_error: probe.baseline_reprojection_error,
+                probe_reprojection_error: probe.probe_reprojection_error,
+                geometry_probe_duration_ms: probe.duration_ms,
             });
         }
     }

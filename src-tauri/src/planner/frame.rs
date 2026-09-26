@@ -325,7 +325,7 @@ impl FramePlanner for BudgetFramePlanner {
     }
 }
 
-fn candidate_score(candidate: &FrameCandidate) -> f32 {
+pub(crate) fn candidate_score(candidate: &FrameCandidate) -> f32 {
     candidate.sharpness_score * 0.42
         + candidate.exposure_score * 0.28
         + candidate.view_change_score * 0.20

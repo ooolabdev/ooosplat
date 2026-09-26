@@ -208,6 +208,38 @@ pub enum TelemetryEvent {
         recovery_duration_ms: u64,
         reconstruction_quality: Option<String>,
     },
+    GeometryScreeningRecorded {
+        geometry_threshold_profile: String,
+        points_3d: u64,
+        observations: u64,
+        mean_track_length: f64,
+        point_diversity_ratio: f64,
+        median_triangulation_ratio: f64,
+        p25_triangulation_ratio: f64,
+        minimum_triangulation_ratio: f64,
+        weak_geometry_interval_count: usize,
+        weak_geometry_image_count: usize,
+        triangulation_underfilled: bool,
+        track_redundancy_high: bool,
+        continuous_weak_region: bool,
+        geometry_screening_decision: String,
+    },
+    GeometryProbeRecorded {
+        geometry_probe_reasons: Vec<String>,
+        requested_additional_frames: usize,
+        actual_additional_frames: usize,
+        baseline_points: u64,
+        probe_points: Option<u64>,
+        point_gain_ratio: Option<f64>,
+        baseline_observations: u64,
+        probe_observations: Option<u64>,
+        observation_gain_ratio: Option<f64>,
+        baseline_track_length: Option<f64>,
+        probe_track_length: Option<f64>,
+        baseline_reprojection_error: Option<f64>,
+        probe_reprojection_error: Option<f64>,
+        geometry_probe_duration_ms: u64,
+    },
     GenerationFailed {
         stage: Option<TelemetryStage>,
         error_code: TelemetryErrorCode,
@@ -226,6 +258,8 @@ enum TelemetryEventName {
     GenerationCompleted,
     QualityMetricsRecorded,
     PlannerMetricsRecorded,
+    GeometryScreeningRecorded,
+    GeometryProbeRecorded,
     GenerationFailed,
     PipelineStageCompleted,
 }
@@ -299,6 +333,62 @@ struct TelemetryProperties {
     recovery_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reconstruction_quality: Option<String>,
+    #[serde(rename = "points3D", skip_serializing_if = "Option::is_none")]
+    points_3d: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_track_length: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_diversity_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    median_triangulation_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p25_triangulation_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_triangulation_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weak_geometry_interval_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weak_geometry_image_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triangulation_underfilled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track_redundancy_high: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuous_weak_region: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geometry_screening_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geometry_threshold_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geometry_probe_reasons: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_additional_frames: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_additional_frames: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_points: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_points: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_gain_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_observations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_observations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_gain_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_track_length: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_track_length: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_reprojection_error: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_reprojection_error: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geometry_probe_duration_ms: Option<u64>,
 }
 
 impl TelemetryEvent {
@@ -397,6 +487,76 @@ impl TelemetryEvent {
                     normal_duration_ms: Some(normal_duration_ms.min(86_400_000)),
                     recovery_duration_ms: Some(recovery_duration_ms.min(86_400_000)),
                     reconstruction_quality,
+                    ..TelemetryProperties::default()
+                },
+            ),
+            Self::GeometryScreeningRecorded {
+                geometry_threshold_profile,
+                points_3d,
+                observations,
+                mean_track_length,
+                point_diversity_ratio,
+                median_triangulation_ratio,
+                p25_triangulation_ratio,
+                minimum_triangulation_ratio,
+                weak_geometry_interval_count,
+                weak_geometry_image_count,
+                triangulation_underfilled,
+                track_redundancy_high,
+                continuous_weak_region,
+                geometry_screening_decision,
+            } => (
+                TelemetryEventName::GeometryScreeningRecorded,
+                TelemetryProperties {
+                    geometry_threshold_profile: Some(geometry_threshold_profile),
+                    points_3d: Some(points_3d),
+                    observations: Some(observations),
+                    mean_track_length: Some(mean_track_length),
+                    point_diversity_ratio: Some(point_diversity_ratio),
+                    median_triangulation_ratio: Some(median_triangulation_ratio),
+                    p25_triangulation_ratio: Some(p25_triangulation_ratio),
+                    minimum_triangulation_ratio: Some(minimum_triangulation_ratio),
+                    weak_geometry_interval_count: Some(weak_geometry_interval_count),
+                    weak_geometry_image_count: Some(weak_geometry_image_count),
+                    triangulation_underfilled: Some(triangulation_underfilled),
+                    track_redundancy_high: Some(track_redundancy_high),
+                    continuous_weak_region: Some(continuous_weak_region),
+                    geometry_screening_decision: Some(geometry_screening_decision),
+                    ..TelemetryProperties::default()
+                },
+            ),
+            Self::GeometryProbeRecorded {
+                geometry_probe_reasons,
+                requested_additional_frames,
+                actual_additional_frames,
+                baseline_points,
+                probe_points,
+                point_gain_ratio,
+                baseline_observations,
+                probe_observations,
+                observation_gain_ratio,
+                baseline_track_length,
+                probe_track_length,
+                baseline_reprojection_error,
+                probe_reprojection_error,
+                geometry_probe_duration_ms,
+            } => (
+                TelemetryEventName::GeometryProbeRecorded,
+                TelemetryProperties {
+                    geometry_probe_reasons: Some(geometry_probe_reasons),
+                    requested_additional_frames: Some(requested_additional_frames),
+                    actual_additional_frames: Some(actual_additional_frames),
+                    baseline_points: Some(baseline_points),
+                    probe_points,
+                    point_gain_ratio,
+                    baseline_observations: Some(baseline_observations),
+                    probe_observations,
+                    observation_gain_ratio,
+                    baseline_track_length,
+                    probe_track_length,
+                    baseline_reprojection_error,
+                    probe_reprojection_error,
+                    geometry_probe_duration_ms: Some(geometry_probe_duration_ms.min(86_400_000)),
                     ..TelemetryProperties::default()
                 },
             ),
@@ -650,6 +810,34 @@ mod tests {
         assert!(metrics["properties"].get("actualFeatureCount").is_none());
         assert!(metrics["properties"].get("peakGpuMemoryMb").is_none());
         assert!(validate_privacy(&metrics));
+
+        let geometry = serde_json::to_value(TelemetryPayload::new(
+            Uuid::nil(),
+            TelemetryEvent::GeometryScreeningRecorded {
+                geometry_threshold_profile: "provisional_video002_v1".into(),
+                points_3d: 48_689,
+                observations: 980_482,
+                mean_track_length: 20.138,
+                point_diversity_ratio: 0.04966,
+                median_triangulation_ratio: 0.32,
+                p25_triangulation_ratio: 0.18,
+                minimum_triangulation_ratio: 0.01,
+                weak_geometry_interval_count: 1,
+                weak_geometry_image_count: 5,
+                triangulation_underfilled: false,
+                track_redundancy_high: true,
+                continuous_weak_region: true,
+                geometry_screening_decision: "probe_recommended".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(geometry["event"], "geometry_screening_recorded");
+        assert_eq!(geometry["properties"]["points3D"], 48_689);
+        assert_eq!(
+            geometry["properties"]["geometryThresholdProfile"],
+            "provisional_video002_v1"
+        );
+        assert!(validate_privacy(&geometry));
 
         let failed = serde_json::to_value(TelemetryPayload::new(
             Uuid::nil(),

@@ -246,3 +246,183 @@ Planner 的 Pairing 决策在时间维度上表现不佳：Sequential with Loop 
 从几何指标看，组合方案维持了完整注册，平均轨迹长度更高，重投影误差只增加约 0.065 px；但重复轨迹会天然强化 Loop Closure、长距离边和已有点的 track length，这些健康指标没有反映独立表面点密度。B 的三维点只有 A 的 12.9%，最终 Splat 只有 A 的 16.4%，而 Brush 没有在相同 30,000 次训练内补回差距。
 
 人工视觉验收已经确认 A 的外观明显优于 B，因此本案例不再只是“视觉等价性未被证明”，而是已经观察到明确的质量回退。更准确的综合判断为：**Planner 显著提高了时间效率并保持了重建成功，但当前针对重复同高度环绕素材的均匀降帧过度压缩了局部观测与稀疏几何密度；Graph Healthy 和 100% 注册未能预测这一外观损失，Pairing 还额外增加了 Matching 时间。**
+
+## 12. 当前 High 与 COLMAP-style High 严格对照实验（2026-09-25）
+
+本节在上述 B 组 `Quality v2 High + Planner v2` 基础上，单独验证 COLMAP High Quality 风格参数是否能改善 422 帧方案的稀疏几何密度。为避免与本文原有 A/B 组别混淆，本节将两组记为：
+
+- H0：当前 OOOSplat High，沿用项目 `20260920-190836_002` 的结果；
+- H1：当前 OOOSplat High + Affine SIFT + Guided Matching + 更充分 BA。
+
+### 12.1 控制变量与实验参数
+
+H1 直接复用 H0 已生成的 422 张 PNG 及 422 张 Alpha Mask，没有重新运行 Capture Analyzer、Frame Planner 或 Smart Frame Filter。两组使用相同的图片文件、相机模型、Pairing 策略、Sequential overlap、Loop Closure、Vocabulary Tree、Incremental Mapper、Brush 参数和引擎二进制。
+
+源图最长边为 1920，因此 High 的 `max_image_size = 2400` 预算在两组中的实际执行值均被源分辨率限制为 `1920`；`max_num_features` 均为 `8192`。
+
+| 参数 | H0：当前 High | H1：COLMAP-style High |
+|---|---:|---:|
+| SfM frames | 422 | 422 |
+| SIFT max image size（实际） | 1920 | 1920 |
+| SIFT max features | 8192 | 8192 |
+| `SiftExtraction.estimate_affine_shape` | 默认 `0` | `1` |
+| `SiftExtraction.domain_size_pooling` | 默认 `0` | `0` |
+| `FeatureMatching.guided_matching` | 默认 `0` | `1` |
+| `Mapper.ba_local_max_num_iterations` | 默认 `25` | `30` |
+| `Mapper.ba_local_max_refinements` | 默认 `2` | `3` |
+| `Mapper.ba_global_max_num_iterations` | 默认 `50` | `75` |
+| Pairing | Sequential + Loop Closure | 相同 |
+| Sequential overlap / loop images | 20 / 32 | 20 / 32 |
+| Mapper | Incremental | Incremental |
+| Brush | 30000 @ 1920 | 30000 @ 1920 |
+
+本次参数名均由当前打包 COLMAP 4.x 的实际 `-h` 输出确认。实验没有启用 DSP-SIFT、Global Mapper、额外补帧、更多 neighbors、Rescue 或其他重建阈值修改。
+
+工程中的实验开关为环境变量 `OOOSPLAT_COLMAP_HIGH_QUALITY_EXPERIMENT`，默认关闭。只有值为 `1`、`true`、`yes` 或 `on` 且 Quality 为 High 时，才应用 H1 参数；其他情况保持 H0 行为。实验状态会写入项目检查点，恢复任务时若环境开关与检查点不一致，流水线会拒绝混用参数。
+
+### 12.2 Feature Extraction 与 Matching
+
+| 指标 | H0：当前 High | H1：COLMAP-style High | 变化 |
+|---|---:|---:|---:|
+| Detected features | 1,351,683 | 1,580,026 | `+16.9%` |
+| Mean features / image | 3,203.040 | 3,744.137 | `+16.9%` |
+| Median features / image | 3,281.5 | 3,865.5 | `+17.8%` |
+| Raw match pairs | 3,151 | 3,033 | `-3.7%` |
+| Raw matches | 2,547,587 | 3,053,771 | `+19.9%` |
+| Geometrically verified pairs | 2,931 | 2,961 | `+1.0%` |
+| Verified correspondences | 2,524,443 | 3,509,273 | `+39.0%` |
+
+Affine SIFT 使每图检测特征数增加约 16.9%。Guided Matching 没有显著扩大已验证图像对的数量，verified pairs 只增加 30 对；它的主要收益是让已匹配图像对中的有效对应关系更密集，verified correspondences 增加约 98.5 万，增幅 39.0%。
+
+H1 的 raw match pairs 比 H0 少 118 对，但 raw matches 增加约 50.6 万。该结果表明实验参数没有通过增加 Pairing 范围获得收益，而是在基本相同的图连接范围内增加单对图片的特征对应密度，符合本次控制变量要求。
+
+### 12.3 稀疏重建结果
+
+两组 Incremental Mapper 均产生两个模型，流水线口径均选择注册图片最多的完整模型。H1 的另一个模型只注册 2 张图片，因此未参与 Brush。
+
+| 指标 | H0：当前 High | H1：COLMAP-style High | 变化 |
+|---|---:|---:|---:|
+| Registered images | 422 / 422 | 422 / 422 | 均为 `100%` |
+| Sparse 3D Points | 48,689 | 54,980 | `+12.9%` |
+| Observations | 980,482 | 1,271,600 | `+29.7%` |
+| Mean track length | 20.138 | 23.128 | `+14.9%` |
+| Mean observations / image | 2,323.417 | 3,013.270 | `+29.7%` |
+| Mean reprojection error | 0.3917 px | 0.7244 px | `+84.9%` |
+
+H1 在不增加帧数和 Pairing 范围的情况下新增 6,291 个稀疏点，并显著增加 Observations 和平均轨迹长度。说明 Affine SIFT、Guided Matching 与更充分 BA 确实提高了这组 422 帧数据的稀疏几何密度和多视角支持强度。
+
+但密度提升伴随明显更高的平均重投影误差：从 `0.3917 px` 增至 `0.7244 px`。H1 仍完成 100% 注册，且误差绝对值低于 1 px，但新增几何并没有保持 H0 的拟合精度。因此，本实验得到的是“更密但更松”的稀疏模型，而不是所有质量指标同时改善。
+
+### 12.4 阶段耗时与最终输出
+
+| 指标 | H0：当前 High | H1：COLMAP-style High | 变化 |
+|---|---:|---:|---:|
+| Feature Extraction | 20.232 秒 | 56.046 秒 | `+177.0%` |
+| Matching | 119.383 秒 | 126.227 秒 | `+5.7%` |
+| Incremental Mapper | 327.902 秒 | 604.403 秒 | `+84.3%` |
+| COLMAP total | 467.517 秒 | 786.676 秒 | `+68.3%` |
+| Brush | 1,564.033 秒 | 928.989 秒 | `-40.6%` |
+| COLMAP + Brush | 2,031.550 秒 | 1,715.665 秒 | `-15.6%` |
+| Final splats | 62,293 | 67,221 | `+7.9%` |
+| PLY bytes | 14,702,698 | 15,865,706 | `+7.9%` |
+
+COLMAP 本身的成本明显上升：Feature Extraction 增加 35.814 秒，Mapper 增加 276.501 秒，COLMAP 合计增加 319.159 秒，即 68.3%。其中 Guided Matching 只增加 6.844 秒；主要成本来自 Affine SIFT 和更充分 BA。
+
+H1 的 Brush 实测比 H0 快约 10分35秒，因此本次手工固定帧对照的 `COLMAP + Brush` 合计反而缩短 15.6%。这一变化不能归因于 COLMAP High 参数：两组 Brush 配置相同，而 GPU 运行状态、缓存与 Brush autotune 状态并未作为独立变量锁定。可靠的耗时结论仅限于 COLMAP 阶段增加 68.3%；Brush 和合计耗时只记录实测值，不作为实验参数带来加速的证据。本节也没有重新执行素材导入和画面准备，因此不将合计值称为完整端到端耗时。
+
+最终 Splat 增加 4,928 个，增幅 7.9%，低于稀疏点的 12.9% 增幅。H0 从 48,689 个稀疏点增长到 62,293 个 Splat，增幅约 27.9%；H1 从 54,980 个稀疏点增长到 67,221 个 Splat，增幅约 22.3%。这说明新增稀疏点有一部分传递到了最终高斯数量，但 Brush 没有按同等比例放大其收益。
+
+### 12.5 实验结论
+
+在 video 002 固定 422 帧的严格对照下，COLMAP-style High 参数对“Sparse Geometry Density”有效：Detected features 增加 16.9%，Verified correspondences 增加 39.0%，Sparse 3D Points 增加 12.9%，Observations 增加 29.7%，最终 Splat 增加 7.9%。这些收益不是由更多帧、更大 Pairing 范围、Global Mapper 或 Brush 参数变化造成的。
+
+代价同样明确：COLMAP 总耗时增加 68.3%，而平均重投影误差增加 84.9%。相对于约 5.3 分钟的额外 COLMAP 时间，得到约 6,291 个额外稀疏点和 4,928 个额外 Splat。就本素材而言，几何密度收益真实存在，但低于耗时增幅，并伴随拟合精度下降。
+
+本次没有生成与 H0 完全一致观察视角的人工外观截图，因此只能确认稀疏几何和最终表达数量增加，不能仅凭 Splat 数断言高斯泼溅外观已经改善。结合本文原有结论，H1 仍只有历史 1686 帧基线三维点数量的约 14.5% 和最终 Splat 数量的约 17.7%，COLMAP-style High 能部分补回 Planner 降帧造成的密度损失，但没有恢复到历史全帧结果的规模。
+
+## 13. High Geometry Screening + Probe 实测（2026-09-26）
+
+本节记录 High 档加入一次性 Geometry Screening + Probe 后，对同一 video 002 素材的首次完整端到端运行。实验工程为 `20260926-113010_002`，Planner version 为 `3`，COLMAP-style High 实验开关关闭；因此本次新增变量是 Geometry Screening 与定向补帧 Probe，而不是 Affine SIFT、Guided Matching 或更高 BA 参数。
+
+为避免跨次运行的小幅非确定性干扰，本节优先使用本次工程 checkpoint 中保存的 Initial reconstruction 与 Geometry Probe reconstruction 做内部前后对照；同时以 H0 工程 `20260920-190836_002` 作为最终输出和端到端耗时参考。
+
+### 13.1 Screening 判定
+
+第一次 Incremental Mapper 使用 422 帧得到可用 reconstruction，422 帧全部注册。Geometry Screening 的聚合结果如下：
+
+| 指标 | Initial 实测值 | Provisional threshold | 判定 |
+|---|---:|---:|---|
+| Sparse 3D Points | 48,679 | — | — |
+| Observations | 980,579 | — | — |
+| Mean track length | 20.144 | `> 14.0` | Track 条件命中 |
+| Point diversity ratio | 0.04964 | `< 0.06` | Diversity 条件命中 |
+| Median triangulation ratio | 0.73285 | `< 0.30` | 未命中 |
+| P25 triangulation ratio | 0.69276 | `< 0.15` | 未命中 |
+| Minimum triangulation ratio | 0.41009 | 仅 telemetry | 不参与单点触发 |
+| Continuous weak intervals | 0 | 至少一段达到连续长度门槛 | 未命中 |
+
+本次 `triangulation_underfilled=false`、`continuous_weak_region=false`，说明 422 帧模型并不存在全局特征三角化不足，也没有检测到连续的几何薄弱时间区间。实际唯一触发项为：
+
+`point_diversity_ratio < 0.06 AND mean_track_length > 14.0`
+
+因此 `track_redundancy_high=true`，Screening 决策为 `ProbeRecommended`。这与此前对 video 002 的判断一致：重复的同高度 360° 环绕使大量 observations 反复支持相对有限的一批独立三维点；Graph Healthy、100% 注册和较长 Track 并不能代表独立表面点已经足够丰富。
+
+### 13.2 Probe 执行结果
+
+Probe 预算按当前 422 帧的 12% 计算，`ceil(422 × 0.12) = 51`。High 的 15 fps 上限在 56.2 秒素材上允许约 843 帧，因此此次 51 帧补充未触碰 Quality v2 上限。由于只命中 Track Redundancy，Targeted Backfill 使用 Largest Temporal Gap 策略，将新增帧分散插入原有选帧的较大时间间隔，而不是按 Candidate Pool 顺序连续取帧。
+
+| Probe 状态 | 实测值 |
+|---|---:|
+| Triggered reason | `trackRedundancy` |
+| Selected before | 422 |
+| Requested additional | 51 |
+| Actual additional | 51 |
+| Selected after | 473 |
+| Probe status | `completed` |
+| Probe duration | 425.918 秒 |
+| Mapper | Incremental |
+
+只对 51 张新增帧执行的画面提取、Feature Extraction 和局部 Matching 分别耗时 3.045 秒、3.044 秒和 2.038 秒；Probe Incremental Mapper 耗时 417.018 秒。Probe 的绝大部分成本来自重新构建 473 帧 sparse model，而不是新增帧解码、特征提取或局部匹配。
+
+### 13.3 Initial 与 Probe reconstruction 对照
+
+| 指标 | Initial（422 帧） | Geometry Probe（473 帧） | 变化 |
+|---|---:|---:|---:|
+| Registered images | 422 / 422 | 473 / 473 | 均为 `100%` |
+| Sparse 3D Points | 48,679 | 53,247 | `+9.4%` |
+| Observations | 980,579 | 1,118,578 | `+14.1%` |
+| Mean track length | 20.144 | 21.007 | `+4.3%` |
+| Mean reprojection error | 0.3916 px | 0.3851 px | `-1.7%` |
+
+新增帧数量增加 12.1%，Sparse 3D Points 增加 9.4%，Observations 增加 14.1%。点数增幅略低于帧数增幅，但新增帧不只是重复增加相同点的观测：独立三维点实际增加了 4,568 个，同时 observations 增加 137,999 个。平均 Track Length 继续提高，而平均重投影误差由 0.3916 px 小幅降至 0.3851 px，说明本次几何增量没有以注册率或拟合精度恶化为代价。
+
+Probe reconstruction 通过现有可用性校验，473 帧全部注册，最终工程保存的 `53,247` 个 Sparse 3D Points 与 Probe candidate 一致，说明流水线实际采用了 Probe 结果，没有回退到 Initial reconstruction。本次只执行了一轮 Probe，没有进入循环式 enrichment。
+
+### 13.4 最终输出与耗时
+
+| 指标 | H0：原 High + Planner | H2：High Geometry Probe | 变化 |
+|---|---:|---:|---:|
+| SfM frames | 422 | 473 | `+12.1%` |
+| Sparse 3D Points | 48,689 | 53,247 | `+9.4%` |
+| Final splats | 62,293 | 65,703 | `+5.5%` |
+| PLY bytes | 14,702,698 | 15,507,458 | `+5.5%` |
+| Brush | 1,564.033 秒 | 919.514 秒 | `-41.2%` |
+| 完整端到端耗时 | 2,042.036 秒（34分02秒） | 1,796.101 秒（29分56秒） | `-12.0%` |
+
+最终 Splat 增加 3,410 个，增幅 5.5%，低于 Sparse 3D Points 的 9.4% 增幅，说明 Probe 增加的稀疏几何只有一部分继续转化为最终高斯数量。最终 PLY 为 15,507,458 bytes，界面显示约 14.8 MB。
+
+虽然 H2 加入 Probe 后端到端实测反而比 H0 短约 4分06秒，但这不能解释为 Probe 带来了加速。Probe 自身明确增加了 425.918 秒；合计时间下降主要来自本次 Brush 比 H0 快约 10分45秒。两次 Brush 参数相同，GPU 状态、缓存和 autotune 状态并未作为独立变量锁定，因此 Brush 波动和端到端缩短只能作为本次运行记录，不能归因于 Geometry Probe。
+
+### 13.5 与 H1 COLMAP-style High 的关系
+
+H1 在固定 422 帧上通过 Affine SIFT、Guided Matching 和更充分 BA 得到 54,980 个 Sparse 3D Points 与 67,221 个最终 Splat；H2 使用默认 High COLMAP 参数，通过增加 51 张定向帧得到 53,247 个 Sparse 3D Points 与 65,703 个最终 Splat。H2 分别比 H1 少约 3.2% 和 2.3%，但平均重投影误差为 0.3851 px，明显低于 H1 的 0.7244 px。
+
+两组实验改变的变量不同，不能据此宣称其中一种方案在所有素材上更优；但对 video 002 而言，一次 12% 的定向补帧在不启用更激进 COLMAP 参数的情况下，已经获得接近 H1 的稀疏点和最终 Splat 规模，并保持了 H0 水平的低重投影误差。
+
+### 13.6 实验结论
+
+本次 High Geometry Screening 正确识别了 video 002 的核心模式：问题不是 Feature 大量未三角化，也不是连续时间区间完全缺少几何，而是 observations 过度集中于较少的独立三维点。由 Track Redundancy 触发的一次 Largest Temporal Gap Probe 成功增加 51 帧，并使 Sparse 3D Points、Observations 和最终 Splat 分别提高 9.4%、14.1% 和 5.5%；注册率保持 100%，重投影误差还小幅下降。
+
+因此，从可直接测量的几何指标看，本次实验对 High 档有效：它在保持 bounded、只执行一次 Probe 的前提下，补回了部分均匀降帧造成的几何密度损失，而且没有破坏已有可用 reconstruction。收益仍然有限：H2 的 Sparse 3D Points 仅为历史 1686 帧基线的约 14.1%，最终 Splat 约为历史基线的 17.3%，远未恢复全帧模型规模。
+
+本次用户提供的截图是项目结果卡片，只能确认工程完成、耗时、档位与 PLY 大小，没有提供与 H0 相同观察视角的高斯泼溅渲染对比。因此本节可以确认 Geometry Probe 带来了定量几何增益，但不能仅凭点数、Splat 数或文件大小断言外观质量已有可见改善。

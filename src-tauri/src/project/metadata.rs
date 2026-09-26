@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     pipeline::PipelineStage,
-    planner::PlannerCheckpoint,
+    planner::{GeometryProbeMetrics, GeometryScreeningReport, PlannerCheckpoint},
     presets::Quality,
     video::{
         FramePlan, FramePlanningMode, ImageSequenceInfo, MinimumFrameProtection, PlannedFrame,
@@ -176,6 +176,12 @@ pub struct QualityRunMetrics {
     pub actual_frame_count: u64,
     pub actual_sfm_resolution: u32,
     pub actual_feature_count: Option<u64>,
+    pub mean_features_per_image: Option<f64>,
+    pub median_features_per_image: Option<f64>,
+    pub raw_matches: Option<u64>,
+    pub geometrically_verified_pairs: Option<u64>,
+    pub verified_correspondences: Option<u64>,
+    pub colmap_high_quality_experiment: bool,
     pub actual_brush_resolution: u32,
     pub actual_brush_iterations: usize,
     pub registered_images: u64,
@@ -201,6 +207,8 @@ pub struct QualityRunMetrics {
     pub normal_duration_ms: u64,
     pub recovery_duration_ms: u64,
     pub reconstruction_quality: Option<String>,
+    pub geometry_screening: Option<GeometryScreeningReport>,
+    pub geometry_probe: Option<GeometryProbeMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +332,10 @@ pub struct PipelineStateFile {
     /// Old checkpoints migrate to `None` and continue through the legacy path.
     #[serde(default)]
     pub planner: Option<PlannerCheckpoint>,
+    /// Snapshotted experimental COLMAP tuning so resumed work cannot mix A/B
+    /// parameters within one database or sparse reconstruction.
+    #[serde(default)]
+    pub colmap_high_quality_experiment: Option<bool>,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -345,6 +357,7 @@ impl PipelineStateFile {
             frames: None,
             planner_enabled: false,
             planner: None,
+            colmap_high_quality_experiment: None,
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
