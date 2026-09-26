@@ -5,7 +5,8 @@ export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "
 
 export type ColmapBackend = "cpu" | "gpu";
 export type AccelerationReasonCode =
-  | "gpuReady" | "macOsCpuOnly" | "colmapUnavailable" | "colmapCudaUnavailable" | "requirementsUnavailable"
+  | "gpuReady" | "zludaReady" | "zludaNotStaged" | "directmlReady" | "directmlNotStaged" | "colmapGpuDisabled"
+  | "macOsCpuOnly" | "colmapUnavailable" | "colmapCudaUnavailable" | "requirementsUnavailable"
   | "nvidiaSmiNotFound" | "probeFailed" | "probeTimeout" | "noNvidiaGpu"
   | "driverVersionUnknown" | "driverTooOld" | "computeCapabilityUnknown"
   | "computeCapabilityTooLow";

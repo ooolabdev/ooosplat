@@ -24,6 +24,35 @@ impl ColmapCliFamily {
     }
 }
 
+/// Feature extraction / matching backend selected for the COLMAP stage.
+///
+/// `Sift` is the classic GPU-accelerated SIFT pipeline (NVIDIA CUDA or ZLUDA).
+/// `Onnx` switches to learned features (ALIKED) + LightGlue matching, which run
+/// through COLMAP's bundled ONNX Runtime. A DirectML-enabled COLMAP build then
+/// accelerates these on AMD/Intel GPUs without CUDA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ColmapFeatureMode {
+    Sift,
+    Onnx,
+}
+
+impl ColmapFeatureMode {
+    pub const fn feature_type(self) -> &'static str {
+        match self {
+            Self::Sift => "SIFT",
+            Self::Onnx => "ALIKED_N16ROT",
+        }
+    }
+
+    pub const fn matcher_type(self) -> &'static str {
+        match self {
+            Self::Sift => "SIFT_BRUTEFORCE",
+            Self::Onnx => "ALIKED_LIGHTGLUE",
+        }
+    }
+}
+
 pub fn detect_cli_family(feature_help: &str, matching_help: &str) -> Option<ColmapCliFamily> {
     if feature_help.contains("--FeatureExtraction.use_gpu")
         && matching_help.contains("--FeatureMatching.use_gpu")
@@ -147,6 +176,8 @@ pub async fn extract_features(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
@@ -156,6 +187,8 @@ pub async fn extract_features(
             database,
             images,
             masks,
+            feature_mode,
+            use_gpu,
             gpu_index,
             use_gpu_option,
             gpu_index_option,
@@ -174,13 +207,22 @@ pub async fn match_sequential(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     let (use_gpu_option, gpu_index_option) =
         matching_gpu_options(executable, "sequential_matcher", manager).await?;
     run_colmap(
         executable,
-        sequential_matching_args(database, gpu_index, use_gpu_option, gpu_index_option),
+        sequential_matching_args(
+            database,
+            feature_mode,
+            use_gpu,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+        ),
         database.parent().unwrap_or(Path::new(".")),
         log,
         manager,
@@ -195,6 +237,8 @@ pub async fn match_exhaustive(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     let (use_gpu_option, gpu_index_option) =
@@ -204,6 +248,8 @@ pub async fn match_exhaustive(
         matching_args(
             "exhaustive_matcher",
             database,
+            feature_mode,
+            use_gpu,
             gpu_index,
             use_gpu_option,
             gpu_index_option,
@@ -220,6 +266,8 @@ fn feature_extraction_args(
     database: &Path,
     images: &Path,
     masks: Option<&Path>,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
@@ -234,9 +282,19 @@ fn feature_extraction_args(
         "SIMPLE_RADIAL".into(),
         "--ImageReader.single_camera".into(),
         "1".into(),
-        use_gpu_option.into(),
-        (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
+    if feature_mode == ColmapFeatureMode::Onnx {
+        // Only COLMAP 4.x exposes the learned feature types; the classic SIFT
+        // path keeps the default type so legacy 3.9 CLIs still work unchanged.
+        args.push("--FeatureExtraction.type".into());
+        args.push(feature_mode.feature_type().into());
+        // ALIKED learns more keypoints by default than SIFT; cap to keep the
+        // descriptor workload and memory bounded on commodity GPUs.
+        args.push("--AlikedExtraction.max_num_features".into());
+        args.push("4096".into());
+    }
+    args.push(use_gpu_option.into());
+    args.push((if use_gpu { "1" } else { "0" }).into());
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -250,6 +308,8 @@ fn feature_extraction_args(
 
 fn sequential_matching_args(
     database: &Path,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
@@ -257,6 +317,8 @@ fn sequential_matching_args(
     let mut args = matching_args(
         "sequential_matcher",
         database,
+        feature_mode,
+        use_gpu,
         gpu_index,
         use_gpu_option,
         gpu_index_option,
@@ -271,6 +333,8 @@ fn sequential_matching_args(
 fn matching_args(
     matcher: &str,
     database: &Path,
+    feature_mode: ColmapFeatureMode,
+    use_gpu: bool,
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
@@ -279,9 +343,13 @@ fn matching_args(
         matcher.into(),
         "--database_path".into(),
         database.into(),
-        use_gpu_option.into(),
-        (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
+    if feature_mode == ColmapFeatureMode::Onnx {
+        args.push("--FeatureMatching.type".into());
+        args.push(feature_mode.matcher_type().into());
+    }
+    args.push(use_gpu_option.into());
+    args.push((if use_gpu { "1" } else { "0" }).into());
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -334,6 +402,8 @@ mod tests {
             Path::new("database.db"),
             Path::new("frames"),
             None,
+            ColmapFeatureMode::Sift,
+            true,
             Some(2),
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
@@ -347,6 +417,8 @@ mod tests {
 
         let matching = strings(sequential_matching_args(
             Path::new("database.db"),
+            ColmapFeatureMode::Sift,
+            true,
             Some(2),
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
@@ -360,11 +432,48 @@ mod tests {
     }
 
     #[test]
+    fn zluda_mode_sets_use_gpu_without_passing_index() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+            ColmapFeatureMode::Sift,
+            true,
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.use_gpu", "1"]));
+        assert!(!extraction
+            .iter()
+            .any(|arg| arg == "--FeatureExtraction.gpu_index"));
+
+        let matching = strings(sequential_matching_args(
+            Path::new("database.db"),
+            ColmapFeatureMode::Sift,
+            true,
+            None,
+            "--FeatureMatching.use_gpu",
+            "--FeatureMatching.gpu_index",
+        ));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.use_gpu", "1"]));
+        assert!(!matching
+            .iter()
+            .any(|arg| arg == "--FeatureMatching.gpu_index"));
+    }
+
+    #[test]
     fn cpu_mode_disables_gpu_without_passing_an_index() {
         let extraction = strings(feature_extraction_args(
             Path::new("database.db"),
             Path::new("frames"),
             None,
+            ColmapFeatureMode::Sift,
+            false,
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
@@ -378,6 +487,8 @@ mod tests {
 
         let matching = strings(sequential_matching_args(
             Path::new("database.db"),
+            ColmapFeatureMode::Sift,
+            false,
             None,
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
@@ -395,6 +506,8 @@ mod tests {
         let matching = strings(matching_args(
             "exhaustive_matcher",
             Path::new("database.db"),
+            ColmapFeatureMode::Sift,
+            true,
             Some(1),
             "--FeatureMatching.use_gpu",
             "--FeatureMatching.gpu_index",
@@ -430,6 +543,8 @@ mod tests {
             Path::new("database.db"),
             Path::new("frames"),
             None,
+            ColmapFeatureMode::Sift,
+            true,
             Some(0),
             "--SiftExtraction.use_gpu",
             "--SiftExtraction.gpu_index",
@@ -448,6 +563,8 @@ mod tests {
             Path::new("database.db"),
             Path::new("../frames"),
             Some(Path::new("../masks")),
+            ColmapFeatureMode::Sift,
+            false,
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
@@ -455,5 +572,47 @@ mod tests {
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
+    }
+
+    #[test]
+    fn onnx_mode_emits_learned_feature_and_matcher_types() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+            ColmapFeatureMode::Onnx,
+            true,
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.type", "ALIKED_N16ROT"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--AlikedExtraction.max_num_features", "4096"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.use_gpu", "1"]));
+
+        let matching = strings(matching_args(
+            "exhaustive_matcher",
+            Path::new("database.db"),
+            ColmapFeatureMode::Onnx,
+            true,
+            None,
+            "--FeatureMatching.use_gpu",
+            "--FeatureMatching.gpu_index",
+        ));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.type", "ALIKED_LIGHTGLUE"]));
+        assert!(matching
+            .windows(2)
+            .any(|pair| pair == ["--FeatureMatching.use_gpu", "1"]));
+        assert!(!matching
+            .iter()
+            .any(|arg| arg == "--FeatureMatching.gpu_index"));
     }
 }

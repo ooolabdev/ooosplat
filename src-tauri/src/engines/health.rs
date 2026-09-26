@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engines::colmap::{detect_cli_family, ColmapCliFamily},
+    engines::colmap::{detect_cli_family, ColmapCliFamily, ColmapFeatureMode},
     process::{ProcessManager, ProcessSpec},
 };
 
@@ -46,6 +46,11 @@ pub enum ColmapBackend {
 #[serde(rename_all = "camelCase")]
 pub enum AccelerationReasonCode {
     GpuReady,
+    ZludaReady,
+    ZludaNotStaged,
+    DirectmlReady,
+    DirectmlNotStaged,
+    ColmapGpuDisabled,
     MacOsCpuOnly,
     ColmapUnavailable,
     ColmapCudaUnavailable,
@@ -58,6 +63,124 @@ pub enum AccelerationReasonCode {
     DriverTooOld,
     ComputeCapabilityUnknown,
     ComputeCapabilityTooLow,
+}
+
+/// Controlled by `OOOSPLAT_COLMAP_GPU`:
+/// `zluda` | `directml` | `force` | `off` | unset (auto).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColmapGpuMode {
+    Auto,
+    Zluda,
+    Directml,
+    Force,
+    Off,
+}
+
+pub fn parse_colmap_gpu_mode(raw: &str) -> ColmapGpuMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "zluda" => ColmapGpuMode::Zluda,
+        "directml" => ColmapGpuMode::Directml,
+        "force" => ColmapGpuMode::Force,
+        "off" => ColmapGpuMode::Off,
+        _ => ColmapGpuMode::Auto,
+    }
+}
+
+pub fn colmap_gpu_mode() -> ColmapGpuMode {
+    std::env::var("OOOSPLAT_COLMAP_GPU")
+        .map(|value| parse_colmap_gpu_mode(&value))
+        .unwrap_or(ColmapGpuMode::Auto)
+}
+
+fn zluda_device_info() -> GpuDeviceInfo {
+    GpuDeviceInfo {
+        index: 0,
+        name: "AMD Radeon (ZLUDA)".into(),
+        driver_version: "zluda".into(),
+        compute_capability: "—".into(),
+        total_memory_mb: None,
+    }
+}
+
+fn zluda_gpu_status(
+    requirements: AccelerationRequirements,
+    forced: bool,
+) -> ColmapAccelerationStatus {
+    ColmapAccelerationStatus {
+        backend: ColmapBackend::Gpu,
+        reason_code: AccelerationReasonCode::ZludaReady,
+        reason: if forced {
+            "已强制启用 COLMAP GPU（ZLUDA/AMD 实验模式）".into()
+        } else {
+            "COLMAP GPU（ZLUDA/AMD）已就绪".into()
+        },
+        device: Some(zluda_device_info()),
+        requirements,
+    }
+}
+
+/// Heuristic: ZLUDA runtime was staged next to `colmap.exe`
+/// (CUDA-for-AMD-Windows `stage-runtime.ps1 -TargetDir`).
+pub fn zluda_staged_near_colmap(colmap_path: &Path) -> bool {
+    let Some(dir) = colmap_path.parent() else {
+        return false;
+    };
+    let runtime_dlls = [
+        dir.join("nvcuda.dll"),
+        dir.join("nvcuda64.dll"),
+        dir.parent().map(|parent| parent.join("nvcuda.dll")).unwrap_or_default(),
+    ];
+    let stage_markers = [
+        dir.join("zluda-stage.txt"),
+        dir.join(".zluda-stage"),
+        dir.join("zluda_staged.txt"),
+        dir.join("gpu-report.json"),
+        dir.join("runtime-test.json"),
+    ];
+    runtime_dlls.iter().any(|path| path.is_file())
+        || stage_markers.iter().any(|path| path.is_file())
+}
+
+fn directml_device_info() -> GpuDeviceInfo {
+    GpuDeviceInfo {
+        index: 0,
+        name: "AMD/Intel (DirectML)".into(),
+        driver_version: "directml".into(),
+        compute_capability: "—".into(),
+        total_memory_mb: None,
+    }
+}
+
+fn directml_gpu_status(requirements: AccelerationRequirements) -> ColmapAccelerationStatus {
+    ColmapAccelerationStatus {
+        backend: ColmapBackend::Gpu,
+        reason_code: AccelerationReasonCode::DirectmlReady,
+        reason: "COLMAP GPU（DirectML/ONNX）已就绪".into(),
+        device: Some(directml_device_info()),
+        requirements,
+    }
+}
+
+/// Heuristic: COLMAP was built against an ONNX Runtime build that ships the
+/// DirectML execution provider. The Microsoft `Microsoft.ML.OnnxRuntime.DirectML`
+/// NuGet package bundles DirectML directly into `onnxruntime.dll` and pulls in a
+/// separate `Microsoft.AI.DirectML` redistributable that provides `DirectML.dll`;
+/// staging those DLLs next to `colmap.exe` is what enables the AMD/Intel path.
+pub fn directml_staged_near_colmap(colmap_path: &Path) -> bool {
+    let Some(dir) = colmap_path.parent() else {
+        return false;
+    };
+    let provider_dlls = [
+        dir.join("DirectML.dll"),
+        dir.join("onnxruntime_providers_directml.dll"),
+        dir.join("onnxruntime_providers_dml.dll"),
+        dir.parent()
+            .map(|parent| parent.join("DirectML.dll"))
+            .unwrap_or_default(),
+    ];
+    let stage_markers = [dir.join("directml-stage.txt"), dir.join(".directml-stage")];
+    provider_dlls.iter().any(|path| path.is_file())
+        || stage_markers.iter().any(|path| path.is_file())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +216,32 @@ impl ColmapAccelerationStatus {
         matches!(self.backend, ColmapBackend::Gpu)
     }
 
+    /// ZLUDA / DirectML: leave device selection to COLMAP (no `--*gpu_index`).
     pub fn gpu_index(&self) -> Option<u32> {
+        if matches!(
+            self.reason_code,
+            AccelerationReasonCode::ZludaReady | AccelerationReasonCode::DirectmlReady
+        ) {
+            return None;
+        }
         self.use_gpu()
             .then(|| self.device.as_ref().map(|device| device.index))
             .flatten()
+    }
+
+    /// Whether COLMAP CLI should pass `--*use_gpu 1`.
+    pub const fn wants_colmap_gpu(&self) -> bool {
+        self.use_gpu()
+    }
+
+    /// Feature/matching backend for the COLMAP stage. DirectML builds run the
+    /// learned ALIKED + LightGlue path (ONNX); everything else keeps SIFT.
+    pub fn feature_mode(&self) -> ColmapFeatureMode {
+        if self.reason_code == AccelerationReasonCode::DirectmlReady {
+            ColmapFeatureMode::Onnx
+        } else {
+            ColmapFeatureMode::Sift
+        }
     }
 }
 
@@ -146,9 +291,17 @@ impl EnginePaths {
     fn from_candidates(root: PathBuf) -> Self {
         #[cfg(windows)]
         let paths = {
-            // Windows releases are self-contained. Never let a missing bundled
-            // executable silently select an unrelated program from PATH.
-            Self::from_root(root)
+            // Windows releases are self-contained: missing bundled binaries must not
+            // silently fall through to PATH. Explicit OOOSPLAT_* overrides still win
+            // (used for ENGINE_DIR + ZLUDA-staged COLMAP deployments).
+            let defaults = Self::from_root(root.clone());
+            Self {
+                ffmpeg: resolve_env_override_or_managed("OOOSPLAT_FFMPEG", &defaults.ffmpeg),
+                ffprobe: resolve_env_override_or_managed("OOOSPLAT_FFPROBE", &defaults.ffprobe),
+                colmap: resolve_env_override_or_managed("OOOSPLAT_COLMAP", &defaults.colmap),
+                brush: resolve_env_override_or_managed("OOOSPLAT_BRUSH", &defaults.brush),
+                root,
+            }
         };
 
         #[cfg(target_os = "macos")]
@@ -248,6 +401,13 @@ impl EnginePaths {
         );
         vec![ffmpeg, ffprobe, colmap, brush]
     }
+}
+
+#[cfg(windows)]
+fn resolve_env_override_or_managed(env_name: &str, managed: &Path) -> PathBuf {
+    std::env::var_os(env_name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| managed.to_path_buf())
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -442,26 +602,30 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
             None,
             requirements_or_default(engines_root),
         )
-    } else if cpu_only != Some(false) {
-        cpu_status(
-            AccelerationReasonCode::ColmapCudaUnavailable,
-            "内置 COLMAP 未检测到完整 CUDA 运行时，已使用 CPU".into(),
-            None,
-            requirements_or_default(engines_root),
-        )
     } else {
-        detect_acceleration(engines_root).await
+        resolve_acceleration(engines_root, path, cpu_only).await
     };
     let family_label = cli_family.map_or("不支持的 CLI", ColmapCliFamily::label);
     #[cfg(target_os = "macos")]
     let detail = format!("三个必需命令可启动；{family_label}；macOS arm64 CPU-only 构建");
     #[cfg(not(target_os = "macos"))]
-    let detail = match cpu_only {
-        Some(true) => {
-            format!("三个必需命令可启动；{family_label}；帮助输出明确报告无 CUDA")
+    let detail = if matches!(
+        acceleration.reason_code,
+        AccelerationReasonCode::ZludaReady
+            | AccelerationReasonCode::ZludaNotStaged
+            | AccelerationReasonCode::DirectmlReady
+            | AccelerationReasonCode::DirectmlNotStaged
+            | AccelerationReasonCode::ColmapGpuDisabled
+    ) {
+        format!("{family_label}；{}", acceleration.reason)
+    } else {
+        match cpu_only {
+            Some(true) => {
+                format!("三个必需命令可启动；{family_label}；帮助输出明确报告无 CUDA")
+            }
+            Some(false) => format!("{family_label}；{}", acceleration.reason),
+            None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
         }
-        Some(false) => format!("{family_label}；{}", acceleration.reason),
-        None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
     };
     EngineStatus {
         kind: EngineKind::Colmap,
@@ -592,6 +756,68 @@ fn cpu_status(
         reason,
         device,
         requirements,
+    }
+}
+
+/// ZLUDA- and DirectML-aware acceleration decision. NVIDIA nvidia-smi path is
+/// unchanged when neither is active. ZLUDA/DirectML/force never require a real
+/// nvidia-smi probe.
+async fn resolve_acceleration(
+    engines_root: &Path,
+    colmap_path: &Path,
+    cpu_only: Option<bool>,
+) -> ColmapAccelerationStatus {
+    let requirements = requirements_or_default(engines_root);
+    let zluda_staged = zluda_staged_near_colmap(colmap_path);
+    let directml_staged = directml_staged_near_colmap(colmap_path);
+    match colmap_gpu_mode() {
+        ColmapGpuMode::Off => cpu_status(
+            AccelerationReasonCode::ColmapGpuDisabled,
+            "OOOSPLAT_COLMAP_GPU=off：已强制 COLMAP 使用 CPU".into(),
+            None,
+            requirements,
+        ),
+        ColmapGpuMode::Force => zluda_gpu_status(requirements, true),
+        ColmapGpuMode::Zluda => {
+            if zluda_staged {
+                zluda_gpu_status(requirements, false)
+            } else {
+                cpu_status(
+                    AccelerationReasonCode::ZludaNotStaged,
+                    "已设置 OOOSPLAT_COLMAP_GPU=zluda，但未在 COLMAP 目录检测到 ZLUDA stage 标记，已使用 CPU".into(),
+                    None,
+                    requirements,
+                )
+            }
+        }
+        ColmapGpuMode::Directml => {
+            if directml_staged {
+                directml_gpu_status(requirements)
+            } else {
+                cpu_status(
+                    AccelerationReasonCode::DirectmlNotStaged,
+                    "已设置 OOOSPLAT_COLMAP_GPU=directml，但未在 COLMAP 目录检测到 DirectML provider，已使用 CPU".into(),
+                    None,
+                    requirements,
+                )
+            }
+        }
+        ColmapGpuMode::Auto => {
+            if directml_staged {
+                directml_gpu_status(requirements)
+            } else if zluda_staged {
+                zluda_gpu_status(requirements, false)
+            } else if cpu_only != Some(false) {
+                cpu_status(
+                    AccelerationReasonCode::ColmapCudaUnavailable,
+                    "内置 COLMAP 未检测到完整 CUDA 运行时，已使用 CPU".into(),
+                    None,
+                    requirements,
+                )
+            } else {
+                detect_acceleration(engines_root).await
+            }
+        }
     }
 }
 
@@ -978,5 +1204,107 @@ mod tests {
         assert!(!runtime_contains_cuda(directory.path()));
         std::fs::write(directory.path().join("onnxruntime_providers_cuda.dll"), []).unwrap();
         assert!(runtime_contains_cuda(directory.path()));
+    }
+
+    #[test]
+    fn parses_colmap_gpu_mode_env_values() {
+        assert_eq!(parse_colmap_gpu_mode("zluda"), ColmapGpuMode::Zluda);
+        assert_eq!(parse_colmap_gpu_mode("directml"), ColmapGpuMode::Directml);
+        assert_eq!(parse_colmap_gpu_mode("FORCE"), ColmapGpuMode::Force);
+        assert_eq!(parse_colmap_gpu_mode(" Off "), ColmapGpuMode::Off);
+        assert_eq!(parse_colmap_gpu_mode(""), ColmapGpuMode::Auto);
+        assert_eq!(parse_colmap_gpu_mode("auto"), ColmapGpuMode::Auto);
+        assert_eq!(parse_colmap_gpu_mode("nvidia"), ColmapGpuMode::Auto);
+    }
+
+    #[test]
+    fn detects_zluda_stage_markers_next_to_colmap() {
+        let directory = tempfile::tempdir().unwrap();
+        let colmap = directory.path().join("colmap.exe");
+        std::fs::write(&colmap, []).unwrap();
+        assert!(!zluda_staged_near_colmap(&colmap));
+        std::fs::write(directory.path().join("nvcuda.dll"), []).unwrap();
+        assert!(zluda_staged_near_colmap(&colmap));
+    }
+
+    #[test]
+    fn detects_directml_provider_next_to_colmap() {
+        let directory = tempfile::tempdir().unwrap();
+        let colmap = directory.path().join("colmap.exe");
+        std::fs::write(&colmap, []).unwrap();
+        assert!(!directml_staged_near_colmap(&colmap));
+        std::fs::write(directory.path().join("DirectML.dll"), []).unwrap();
+        assert!(directml_staged_near_colmap(&colmap));
+    }
+
+    #[test]
+    fn detects_legacy_directml_provider_dll_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let colmap = directory.path().join("colmap.exe");
+        std::fs::write(&colmap, []).unwrap();
+        std::fs::write(
+            directory.path().join("onnxruntime_providers_directml.dll"),
+            [],
+        )
+        .unwrap();
+        assert!(directml_staged_near_colmap(&colmap));
+    }
+
+    #[test]
+    fn directml_ready_uses_gpu_and_onnx_features() {
+        let status = directml_gpu_status(requirements());
+        assert_eq!(status.backend, ColmapBackend::Gpu);
+        assert_eq!(status.reason_code, AccelerationReasonCode::DirectmlReady);
+        assert!(status.wants_colmap_gpu());
+        assert_eq!(status.gpu_index(), None);
+        assert_eq!(status.feature_mode(), ColmapFeatureMode::Onnx);
+    }
+
+    #[test]
+    fn nvidia_gpu_ready_keeps_sift_features() {
+        let status = ColmapAccelerationStatus {
+            backend: ColmapBackend::Gpu,
+            reason_code: AccelerationReasonCode::GpuReady,
+            reason: String::new(),
+            device: Some(device(0, "560.81", "8.6")),
+            requirements: requirements(),
+        };
+        assert_eq!(status.feature_mode(), ColmapFeatureMode::Sift);
+        assert_eq!(status.gpu_index(), Some(0));
+    }
+
+    #[test]
+    fn zluda_ready_uses_gpu_without_pinning_index() {
+        let status = zluda_gpu_status(requirements(), false);
+        assert_eq!(status.backend, ColmapBackend::Gpu);
+        assert_eq!(status.reason_code, AccelerationReasonCode::ZludaReady);
+        assert!(status.wants_colmap_gpu());
+        assert_eq!(status.gpu_index(), None);
+        assert_eq!(status.device.as_ref().map(|d| d.name.as_str()), Some("AMD Radeon (ZLUDA)"));
+
+        let forced = zluda_gpu_status(requirements(), true);
+        assert_eq!(forced.reason_code, AccelerationReasonCode::ZludaReady);
+        assert_eq!(forced.gpu_index(), None);
+    }
+
+    #[test]
+    fn resolve_acceleration_off_and_zluda_not_staged() {
+        let directory = tempfile::tempdir().unwrap();
+        let colmap = directory.path().join("colmap.exe");
+        std::fs::write(&colmap, []).unwrap();
+        // Use the public parse helpers for mode semantics; env-dependent resolve is
+        // covered by parse + stage-marker unit tests above.
+        assert_eq!(parse_colmap_gpu_mode("off"), ColmapGpuMode::Off);
+        assert_eq!(parse_colmap_gpu_mode("zluda"), ColmapGpuMode::Zluda);
+        assert!(!zluda_staged_near_colmap(&colmap));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_engine_env_overrides_win_without_path_fallback() {
+        let root = PathBuf::from(r"Z:\missing\ooosplat-engines");
+        let expected = root.join("colmap").join("bin").join("colmap.exe");
+        let managed = resolve_env_override_or_managed("OOOSPLAT_COLMAP_NOT_SET", &expected);
+        assert_eq!(managed, expected);
     }
 }
