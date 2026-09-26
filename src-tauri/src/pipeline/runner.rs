@@ -685,7 +685,9 @@ impl PipelineRunner {
         let colmap_masks = prepared.has_alpha.then_some(Path::new("../masks"));
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
+        let use_gpu = acceleration.wants_colmap_gpu();
         let gpu_index = acceleration.gpu_index();
+        let feature_mode = acceleration.feature_mode();
         if state.features_complete {
             self.events.stage(
                 PipelineStage::ExtractingFeatures,
@@ -712,6 +714,8 @@ impl PipelineRunner {
                     Some(prepared.extracted_frames),
                     ObserverMode::BracketProgress,
                 )),
+                feature_mode,
+                use_gpu,
                 gpu_index,
             )
             .await?;
@@ -761,6 +765,8 @@ impl PipelineRunner {
                     colmap_log.clone(),
                     &self.process_manager,
                     observer,
+                    feature_mode,
+                    use_gpu,
                     gpu_index,
                 )
                 .await?;
@@ -771,6 +777,8 @@ impl PipelineRunner {
                     colmap_log.clone(),
                     &self.process_manager,
                     observer,
+                    feature_mode,
+                    use_gpu,
                     gpu_index,
                 )
                 .await?;

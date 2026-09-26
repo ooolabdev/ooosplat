@@ -1,0 +1,233 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cf9df83..f575647 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,6 +51,7 @@ if(HIP_ENABLED)
+     cmake_minimum_required(VERSION 3.21)
+ endif()
+ option(ONNX_ENABLED "Whether to enable ONNX, if available" ON)
++option(DML_ENABLED "Whether to enable the ONNX DirectML execution provider (Windows AMD/Intel GPUs)" OFF)
+ option(GUI_ENABLED "Whether to enable the graphical UI" ON)
+ option(MVS_ENABLED "Whether to enable the Multi-View Stereo module" ON)
+ option(OPENGL_ENABLED "Whether to enable OpenGL, if available" ON)
+@@ -102,7 +103,7 @@ endif()
+ if(CUDA_ENABLED)
+     list(APPEND VCPKG_MANIFEST_FEATURES "cuda")
+ endif()
+-if(ONNX_ENABLED AND NOT FETCH_ONNX)
++if(ONNX_ENABLED AND NOT FETCH_ONNX AND NOT DML_ENABLED)
+     list(APPEND VCPKG_MANIFEST_FEATURES "onnx")
+ endif()
+ if(GUI_ENABLED)
+diff --git a/cmake/FindDependencies.cmake b/cmake/FindDependencies.cmake
+index 29bc95a..b2820ed 100644
+--- a/cmake/FindDependencies.cmake
++++ b/cmake/FindDependencies.cmake
+@@ -574,6 +574,12 @@ if(TARGET onnxruntime::onnxruntime)
+         list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_COREML_ENABLED)
+         message(STATUS "Enabling ONNX CoreML execution provider")
+     endif()
++    # Enable the DirectML execution provider for ONNX inference on Windows
++    # AMD/Intel GPUs (requires a DirectML-capable onnxruntime, no CUDA).
++    if(DML_ENABLED)
++        list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_DML_ENABLED)
++        message(STATUS "Enabling ONNX DirectML execution provider")
++    endif()
+ endif()
+ 
+ if(GUI_ENABLED)
+diff --git a/src/colmap/feature/aliked.cc b/src/colmap/feature/aliked.cc
+index 8f11d3d..a001a5d 100644
+--- a/src/colmap/feature/aliked.cc
++++ b/src/colmap/feature/aliked.cc
+@@ -150,7 +150,11 @@ class AlikedFeatureExtractor : public FeatureExtractor {
+                        model_.output_shapes()[1],
+                        {-1, -1, -1});
+     descriptor_dim_ = static_cast<int>(model_.output_shapes()[1][2]);
+-    THROW_CHECK_GT(descriptor_dim_, 0);
++    // ALIKED descriptors are 128-dimensional, but some execution providers
++    // (e.g. DirectML) report the static descriptor dimension as dynamic (-1).
++    // Accept a dynamic dimension here and resolve the actual value from the
++    // output tensor at extraction time.
++    THROW_CHECK(descriptor_dim_ == -1 || descriptor_dim_ > 0);
+     VLOG(2) << "ALIKED descriptor dimension: " << descriptor_dim_;
+     ThrowCheckONNXNode(model_.output_names()[2],
+                        "scores",
+@@ -228,7 +232,11 @@ class AlikedFeatureExtractor : public FeatureExtractor {
+     THROW_CHECK_EQ(descriptors_shape.size(), 3);
+     THROW_CHECK_EQ(descriptors_shape[0], 1);
+     THROW_CHECK_EQ(descriptors_shape[1], num_keypoints);
+-    THROW_CHECK_EQ(descriptors_shape[2], descriptor_dim_);
++    const int descriptor_dim = static_cast<int>(descriptors_shape[2]);
++    THROW_CHECK_GT(descriptor_dim, 0);
++    if (descriptor_dim_ > 0) {
++      THROW_CHECK_EQ(descriptor_dim, descriptor_dim_);
++    }
+ 
+     // Parse scores shape: [1, K].
+     const std::vector<int64_t> scores_shape =
+@@ -273,15 +281,15 @@ class AlikedFeatureExtractor : public FeatureExtractor {
+     const int num_valid = static_cast<int>(valid_keypoints.size());
+     keypoints->resize(num_valid);
+     descriptors->type = options_.type;
+-    descriptors->data.resize(num_valid, descriptor_dim_ * sizeof(float));
++    descriptors->data.resize(num_valid, descriptor_dim * sizeof(float));
+     for (int j = 0; j < num_valid; ++j) {
+       const auto& kp = valid_keypoints[j];
+       (*keypoints)[j].x = kp.x;
+       (*keypoints)[j].y = kp.y;
+       std::memcpy(
+-          descriptors->data.data() + j * descriptor_dim_ * sizeof(float),
+-          descriptors_data + kp.index * descriptor_dim_,
+-          descriptor_dim_ * sizeof(float));
++          descriptors->data.data() + j * descriptor_dim * sizeof(float),
++          descriptors_data + kp.index * descriptor_dim,
++          descriptor_dim * sizeof(float));
+     }
+ 
+     return true;
+diff --git a/src/colmap/feature/extractor.cc b/src/colmap/feature/extractor.cc
+index 632b163..f9a0969 100644
+--- a/src/colmap/feature/extractor.cc
++++ b/src/colmap/feature/extractor.cc
+@@ -152,9 +152,10 @@ bool FeatureExtractionOptions::Check() const {
+   CHECK_OPTION_GT(EffMaxImageSize(), 0);
+   if (use_gpu) {
+     CHECK_OPTION_GT(CSVToVector<int>(gpu_index).size(), 0);
+-#if !defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_CUDA_ENABLED)
+-    LOG(ERROR) << "Cannot use GPU feature extraction without CUDA or OpenGL "
+-                  "support. Consider setting use_gpu to false.";
++#if !defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_CUDA_ENABLED) && \
++    !defined(COLMAP_DML_ENABLED)
++    LOG(ERROR) << "Cannot use GPU feature extraction without CUDA, OpenGL, or "
++                  "DirectML support. Consider setting use_gpu to false.";
+     return false;
+ #endif
+   }
+diff --git a/src/colmap/feature/loma.cc b/src/colmap/feature/loma.cc
+index cde400a..2a41fcd 100644
+--- a/src/colmap/feature/loma.cc
++++ b/src/colmap/feature/loma.cc
+@@ -223,7 +223,11 @@ class LomaFeatureExtractor : public FeatureExtractor {
+     const auto& desc_out_shape = descriptor_.output_shapes()[0];
+     THROW_CHECK_EQ(desc_out_shape.size(), 3);
+     descriptor_dim_ = static_cast<int>(desc_out_shape[2]);
+-    THROW_CHECK_GT(descriptor_dim_, 0);
++    // LoMa descriptors have a fixed dimension, but some execution providers
++    // (e.g. DirectML) report the static descriptor dimension as dynamic (-1).
++    // Accept a dynamic dimension here and resolve the actual value from the
++    // output tensor at extraction time.
++    THROW_CHECK(descriptor_dim_ == -1 || descriptor_dim_ > 0);
+     VLOG(2) << "LoMa descriptor dimension: " << descriptor_dim_;
+   }
+ 
+@@ -286,6 +290,12 @@ class LomaFeatureExtractor : public FeatureExtractor {
+     const std::vector<Ort::Value> desc_outputs = descriptor_.Run(desc_inputs);
+     THROW_CHECK_EQ(desc_outputs.size(), 1);
+     const float* desc_data = desc_outputs[0].GetTensorData<float>();
++    const int descriptor_dim =
++        descriptor_dim_ > 0
++            ? descriptor_dim_
++            : static_cast<int>(
++                  desc_outputs[0].GetTensorTypeAndShapeInfo().GetShape()[2]);
++    THROW_CHECK_GT(descriptor_dim, 0);
+ 
+     // Convert normalized [-1, 1] keypoints to pixel coordinates in the
+     // original image, and filter by min_score, same convention as
+@@ -309,14 +319,14 @@ class LomaFeatureExtractor : public FeatureExtractor {
+     const int num_valid = static_cast<int>(valid.size());
+     keypoints->resize(num_valid);
+     descriptors->type = options_.type;
+-    descriptors->data.resize(num_valid, descriptor_dim_ * sizeof(float));
++    descriptors->data.resize(num_valid, descriptor_dim * sizeof(float));
+     for (int j = 0; j < num_valid; ++j) {
+       (*keypoints)[j].x = valid[j].x;
+       (*keypoints)[j].y = valid[j].y;
+       std::memcpy(
+-          descriptors->data.data() + j * descriptor_dim_ * sizeof(float),
+-          desc_data + valid[j].index * descriptor_dim_,
+-          descriptor_dim_ * sizeof(float));
++          descriptors->data.data() + j * descriptor_dim * sizeof(float),
++          desc_data + valid[j].index * descriptor_dim,
++          descriptor_dim * sizeof(float));
+     }
+     return true;
+   }
+diff --git a/src/colmap/feature/matcher.cc b/src/colmap/feature/matcher.cc
+index ae3ca5a..e6cdcf2 100644
+--- a/src/colmap/feature/matcher.cc
++++ b/src/colmap/feature/matcher.cc
+@@ -118,9 +118,9 @@ bool FeatureMatchingOptions::RequiresOpenGL() const {
+ bool FeatureMatchingOptions::Check() const {
+   if (use_gpu) {
+     CHECK_OPTION_GT(CSVToVector<int>(gpu_index).size(), 0);
+-#ifndef COLMAP_GPU_ENABLED
+-    LOG(ERROR) << "Cannot use GPU feature matching without CUDA or OpenGL "
+-                  "support. Set use_gpu or use_gpu to false.";
++#if !defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_DML_ENABLED)
++    LOG(ERROR) << "Cannot use GPU feature matching without CUDA, OpenGL, or "
++                  "DirectML support. Set use_gpu to false.";
+     return false;
+ #endif
+   }
+diff --git a/src/colmap/feature/onnx_utils.cc b/src/colmap/feature/onnx_utils.cc
+index ddd1eaf..5bd5f2c 100644
+--- a/src/colmap/feature/onnx_utils.cc
++++ b/src/colmap/feature/onnx_utils.cc
+@@ -43,6 +43,9 @@
+ #ifdef COLMAP_COREML_ENABLED
+ #include <coreml_provider_factory.h>
+ #endif
++#ifdef COLMAP_DML_ENABLED
++#include <dml_provider_factory.h>
++#endif
+ 
+ namespace colmap {
+ 
+@@ -78,6 +81,8 @@ ONNXExecutionProvider SelectONNXExecutionProvider(bool use_gpu) {
+   return ONNXExecutionProvider::CUDA;
+ #elif defined(COLMAP_COREML_ENABLED)
+   return ONNXExecutionProvider::COREML;
++#elif defined(COLMAP_DML_ENABLED)
++  return ONNXExecutionProvider::DML;
+ #else
+   return ONNXExecutionProvider::CPU;
+ #endif
+@@ -201,6 +206,25 @@ void ONNXModel::InitializeSession(const std::string& model_path,
+   }
+ #endif
+ 
++  // On Windows AMD/Intel GPUs, map use_gpu onto DirectML, which accelerates
++  // ONNX inference via DX12 (no CUDA required). device_id 0 selects the
++  // default adapter (usually the primary display GPU). We use the OrtDmlApi
++  // obtained via GetExecutionProviderApi: the legacy global
++  // OrtSessionOptionsAppendExecutionProvider_DML export is deprecated in
++  // modern ONNX Runtime and can crash.
++  const bool use_dml = execution_provider_ == ONNXExecutionProvider::DML;
++#ifdef COLMAP_DML_ENABLED
++  if (use_dml) {
++    VLOG(2) << "Enabling DirectML execution provider";
++    const OrtApi* ort_api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
++    const OrtDmlApi* dml_api = nullptr;
++    Ort::ThrowOnError(ort_api->GetExecutionProviderApi(
++        "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dml_api)));
++    Ort::ThrowOnError(dml_api->SessionOptionsAppendExecutionProvider_DML(
++        static_cast<OrtSessionOptions*>(session_options_), /*device_id=*/0));
++  }
++#endif
++
+   VLOG(2) << "Loading ONNX model from " << model_path;
+ #ifdef _WIN32
+   const unsigned int code_page = GetACP();
+diff --git a/src/colmap/feature/onnx_utils.h b/src/colmap/feature/onnx_utils.h
+index f4621f6..be6cfae 100644
+--- a/src/colmap/feature/onnx_utils.h
++++ b/src/colmap/feature/onnx_utils.h
+@@ -43,6 +43,7 @@ enum class ONNXExecutionProvider {
+   CPU,
+   CUDA,
+   COREML,
++  DML,
+ };
+ 
+ // Resolve the execution provider requested by `use_gpu` for this build.

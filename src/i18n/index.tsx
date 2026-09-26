@@ -46,6 +46,10 @@ const zhCN = {
   "quality.highHint": "更充分地利用视频画面细节",
   "gpu.detecting": "正在检测 COLMAP GPU 加速…",
   "gpu.enabled": "COLMAP GPU 加速已开启",
+  "gpu.zludaEnabled": "COLMAP GPU（ZLUDA/AMD）",
+  "gpu.zludaHint": "设备由 COLMAP/ZLUDA 自动选择",
+  "gpu.directmlEnabled": "COLMAP GPU（DirectML/ONNX）",
+  "gpu.directmlHint": "ALIKED + LightGlue 经 DirectML 加速",
   "gpu.cpu": "COLMAP 使用 CPU",
   "gpu.reading": "正在读取 COLMAP 加速能力",
   "gpu.memory": "{value} GB 显存",
@@ -373,7 +377,7 @@ const en: Record<TranslationKey, string> = {
   "input.label": "Input media", "input.typeAria": "Choose input media type", "input.video": "Video", "input.images": "Images", "input.videoTypes": "MP4 or MOV", "input.imageTypes": "JPG, JPEG, or PNG folder", "input.selectImages": "Choose image sequence folder", "input.selectVideo": "Choose an MP4 or MOV video", "input.selectImagesHint": "Choose a folder containing JPG, JPEG, or PNG images", "input.selectVideoHint": "Choose a video file on this computer",
   "project.root": "Projects root", "project.readingRoot": "Reading default folder", "project.rootHint": "Each generation creates a separate project folder here, with final.ply saved at its root.",
   "quality.label": "Generation quality", "quality.fast": "Fast", "quality.fastHint": "Quickly validate the media and capture path", "quality.balanced": "Balanced", "quality.balancedHint": "Recommended balance of quality and processing time", "quality.high": "Detailed", "quality.highHint": "Use more of the source image detail",
-  "gpu.detecting": "Detecting COLMAP GPU acceleration…", "gpu.enabled": "COLMAP GPU acceleration enabled", "gpu.cpu": "COLMAP is using the CPU", "gpu.reading": "Reading COLMAP acceleration capabilities", "gpu.memory": "{value} GB VRAM", "gpu.driver": "Driver {value}", "gpu.requirements": "Minimum: driver {driver}, Compute Capability {capability}",
+  "gpu.detecting": "Detecting COLMAP GPU acceleration…", "gpu.enabled": "COLMAP GPU acceleration enabled", "gpu.zludaEnabled": "COLMAP GPU (ZLUDA/AMD)", "gpu.zludaHint": "Device selected automatically by COLMAP/ZLUDA", "gpu.directmlEnabled": "COLMAP GPU (DirectML/ONNX)", "gpu.directmlHint": "ALIKED + LightGlue accelerated via DirectML", "gpu.cpu": "COLMAP is using the CPU", "gpu.reading": "Reading COLMAP acceleration capabilities", "gpu.memory": "{value} GB VRAM", "gpu.driver": "Driver {value}", "gpu.requirements": "Minimum: driver {driver}, Compute Capability {capability}",
   "metrics.imageCount": "Image count", "metrics.duration": "Media duration", "metrics.resolution": "Resolution", "metrics.processingImages": "Images processed", "metrics.estimatedFrames": "Estimated frames", "metrics.keepAll": "Keep all", "metrics.approx": "About {value}", "metrics.estimate": "Estimated duration", "metrics.analyzing": "Analyzing",
   "alpha.imagesTitle": "Transparent images detected", "alpha.videoTitle": "Alpha channel detected", "alpha.imagesHint": "PNG alpha will be preserved and COLMAP masks generated automatically", "alpha.videoHint": "Transparent frames and COLMAP masks will be extracted automatically · {format}",
   "sequence.title": "Large image sequence", "sequence.hint": "More than 500 images can require much more time and disk space for exhaustive matching. OOOSplat will ask again before generation starts.",
@@ -560,6 +564,12 @@ const exactPipelineEnglish: Record<string, string> = {
   "无法读取 COLMAP 加速状态，已使用 CPU": "COLMAP acceleration status could not be read, so the CPU is being used",
   "COLMAP 必需命令无法正常启动，不能启用 GPU 加速": "Required COLMAP commands could not start, so GPU acceleration is unavailable",
   "macOS Alpha 当前内置 COLMAP CPU 构建；Brush 仍会使用可用的 Metal 后端": "The macOS Alpha bundles a CPU-only COLMAP build; Brush will still use an available Metal backend",
+  "COLMAP GPU（ZLUDA/AMD）已就绪": "COLMAP GPU (ZLUDA/AMD) is ready",
+  "已强制启用 COLMAP GPU（ZLUDA/AMD 实验模式）": "COLMAP GPU forced on (ZLUDA/AMD experimental mode)",
+  "OOOSPLAT_COLMAP_GPU=off：已强制 COLMAP 使用 CPU": "OOOSPLAT_COLMAP_GPU=off: COLMAP forced to CPU",
+  "已设置 OOOSPLAT_COLMAP_GPU=zluda，但未在 COLMAP 目录检测到 ZLUDA stage 标记，已使用 CPU": "OOOSPLAT_COLMAP_GPU=zluda is set, but no ZLUDA stage marker was found next to COLMAP; using CPU",
+  "COLMAP GPU（DirectML/ONNX）已就绪": "COLMAP GPU (DirectML/ONNX) ready",
+  "已设置 OOOSPLAT_COLMAP_GPU=directml，但未在 COLMAP 目录检测到 DirectML provider，已使用 CPU": "OOOSPLAT_COLMAP_GPU=directml is set, but no DirectML provider was found next to COLMAP; using CPU",
 };
 
 export function localizePipelineMessage(locale: Locale, message: string): string {
