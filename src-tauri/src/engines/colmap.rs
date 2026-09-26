@@ -159,6 +159,43 @@ pub async fn extract_features(
             gpu_index,
             use_gpu_option,
             gpu_index_option,
+            None,
+            None,
+        ),
+        database.parent().unwrap_or(images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_features_quality_v2(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    masks: Option<&Path>,
+    image_list: Option<&Path>,
+    max_image_size: u32,
+    max_features: u32,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
+    run_colmap(
+        executable,
+        feature_extraction_args(
+            database,
+            images,
+            masks,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+            Some((max_image_size, max_features)),
+            image_list,
         ),
         database.parent().unwrap_or(images),
         log,
@@ -216,6 +253,43 @@ pub async fn match_exhaustive(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn match_pairs(
+    executable: &Path,
+    database: &Path,
+    pair_list: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) =
+        matching_gpu_options(executable, "matches_importer", manager).await?;
+    let mut args = matching_args(
+        "matches_importer",
+        database,
+        gpu_index,
+        use_gpu_option,
+        gpu_index_option,
+    );
+    args.extend([
+        "--match_list_path".into(),
+        pair_list.into(),
+        "--match_type".into(),
+        "pairs".into(),
+    ]);
+    run_colmap(
+        executable,
+        args,
+        database.parent().unwrap_or(Path::new(".")),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 fn feature_extraction_args(
     database: &Path,
     images: &Path,
@@ -223,6 +297,8 @@ fn feature_extraction_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
+    quality_limits: Option<(u32, u32)>,
+    image_list: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = vec![
         "feature_extractor".into(),
@@ -237,6 +313,19 @@ fn feature_extraction_args(
         use_gpu_option.into(),
         (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
+    if let Some((max_image_size, max_features)) = quality_limits {
+        let max_image_size_option = if use_gpu_option.starts_with("--FeatureExtraction") {
+            "--FeatureExtraction.max_image_size"
+        } else {
+            "--SiftExtraction.max_image_size"
+        };
+        args.extend([
+            max_image_size_option.into(),
+            max_image_size.to_string().into(),
+            "--SiftExtraction.max_num_features".into(),
+            max_features.to_string().into(),
+        ]);
+    }
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -244,6 +333,10 @@ fn feature_extraction_args(
     if let Some(masks) = masks {
         args.push("--ImageReader.mask_path".into());
         args.push(masks.into());
+    }
+    if let Some(image_list) = image_list {
+        args.push("--image_list_path".into());
+        args.push(image_list.into());
     }
     args
 }
@@ -301,21 +394,61 @@ pub async fn map(
     tokio::fs::create_dir_all(output).await?;
     run_colmap(
         executable,
-        vec![
-            "mapper".into(),
-            "--database_path".into(),
-            database.into(),
-            "--image_path".into(),
-            images.into(),
-            "--output_path".into(),
-            output.into(),
-        ],
+        mapper_args(database, images, None, output),
         database.parent().unwrap_or(output),
         log,
         manager,
         observer,
     )
     .await
+}
+
+/// Continues the Incremental Mapper from an existing sparse model. The
+/// baseline model is never overwritten; COLMAP writes the continued model to
+/// a separate output directory so the caller can safely roll back.
+#[allow(clippy::too_many_arguments)]
+pub async fn map_from_existing(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    input_model: &Path,
+    output: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    tokio::fs::create_dir_all(output).await?;
+    run_colmap(
+        executable,
+        mapper_args(database, images, Some(input_model), output),
+        database.parent().unwrap_or(output),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+fn mapper_args(
+    database: &Path,
+    images: &Path,
+    input_model: Option<&Path>,
+    output: &Path,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "mapper".into(),
+        "--database_path".into(),
+        database.into(),
+        "--image_path".into(),
+        images.into(),
+    ];
+    if let Some(input_model) = input_model {
+        args.push("--input_path".into());
+        args.push(input_model.into());
+    }
+    args.push("--output_path".into());
+    args.push(output.into());
+    args
 }
 
 #[cfg(test)]
@@ -337,6 +470,8 @@ mod tests {
             Some(2),
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            None,
+            None,
         ));
         assert!(extraction
             .windows(2)
@@ -368,6 +503,8 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            None,
+            None,
         ));
         assert!(extraction
             .windows(2)
@@ -433,6 +570,8 @@ mod tests {
             Some(0),
             "--SiftExtraction.use_gpu",
             "--SiftExtraction.gpu_index",
+            None,
+            None,
         ));
         assert!(extraction
             .windows(2)
@@ -451,9 +590,49 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            None,
+            None,
         ));
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
+    }
+
+    #[test]
+    fn quality_v2_feature_limits_and_image_list_reach_colmap() {
+        let extraction = strings(feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("frames"),
+            None,
+            None,
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+            Some((1600, 4096)),
+            Some(Path::new("bridge-images.txt")),
+        ));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.max_image_size", "1600"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--SiftExtraction.max_num_features", "4096"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--image_list_path", "bridge-images.txt"]));
+    }
+
+    #[test]
+    fn incremental_mapper_arguments_include_the_baseline_model() {
+        let args = strings(mapper_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            Some(Path::new("sparse/0")),
+            Path::new("sparse-bridge"),
+        ));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--input_path", "sparse/0"]));
+        assert_eq!(args[0], "mapper");
+        assert!(!args.iter().any(|arg| arg == "global_mapper"));
     }
 }

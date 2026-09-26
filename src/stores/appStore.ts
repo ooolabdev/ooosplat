@@ -5,6 +5,7 @@ interface AppState {
   inputPath: string | null;
   inputType: InputType;
   projectsRoot: string;
+  plannerEnabled: boolean;
   projects: ProjectSummary[];
   quality: Quality;
   colmapAcceleration: ColmapAccelerationStatus | null;
@@ -22,6 +23,7 @@ interface AppState {
   error: string | null;
   setInputPath: (path: string | null, inputType: InputType) => void;
   setProjectsRoot: (path: string) => void;
+  setPlannerEnabled: (enabled: boolean) => void;
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
@@ -39,6 +41,7 @@ export const useAppStore = create<AppState>((set) => ({
   inputPath: null,
   inputType: "video",
   projectsRoot: "",
+  plannerEnabled: true,
   projects: [],
   quality: "balanced",
   colmapAcceleration: null,
@@ -70,6 +73,9 @@ export const useAppStore = create<AppState>((set) => ({
     error: null,
   }),
   setProjectsRoot: (projectsRoot) => set({ projectsRoot }),
+  setPlannerEnabled: (plannerEnabled) => set((state) => state.plannerEnabled === plannerEnabled
+    ? state
+    : { plannerEnabled, plan: null, estimate: null, result: null, error: null }),
   setProjects: (projects) => set({ projects }),
   setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null }),
   setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),

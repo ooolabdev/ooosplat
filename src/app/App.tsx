@@ -11,7 +11,7 @@ import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
-  setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
+  setPlannerEnabled, setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, setTelemetryConsent, resumePipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
@@ -281,6 +281,7 @@ export function App() {
   const refreshProjects = async () => {
     const overview = await getProjectOverview();
     store.setProjectsRoot(overview.projectsRoot);
+    store.setPlannerEnabled(overview.plannerEnabled ?? true);
     store.setProjects(overview.projects);
     return overview;
   };
@@ -310,11 +311,12 @@ export function App() {
       .then(([engines, overview]) => {
         store.setEngines(engines);
         store.setProjectsRoot(overview.projectsRoot);
+        store.setPlannerEnabled(overview.plannerEnabled ?? true);
         store.setProjects(overview.projects);
         store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
       })
       .catch((error) => store.setError(messageOf(error)));
-  }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setColmapAcceleration, store.setError]);
+  }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setPlannerEnabled, store.setColmapAcceleration, store.setError]);
 
   useEffect(() => {
     if (viewMode === "tasks") void reconcileRuntimeState().catch(() => undefined);
@@ -418,11 +420,11 @@ export function App() {
     }
   };
 
-  const analyze = async (path: string, quality: Quality) => {
+  const analyze = async (path: string, quality: Quality, plannerEnabled = store.plannerEnabled) => {
     store.setPhase("analyzing");
     store.setError(null);
     try {
-      const result = await probeAndPlan(path, quality);
+      const result = await probeAndPlan(path, quality, plannerEnabled);
       store.setAnalysis(result.inputType, result.video, result.imageSequence, result.plan, result.estimate);
       store.setPhase("idle");
     } catch (error) {
@@ -454,6 +456,7 @@ export function App() {
     try {
       const settings = await setProjectsRoot(selected);
       store.setProjectsRoot(settings.projectsRoot);
+      store.setPlannerEnabled(settings.plannerEnabled);
       await refreshProjects();
     } catch (error) { store.setError(messageOf(error)); }
   };
@@ -461,6 +464,18 @@ export function App() {
   const chooseQuality = async (quality: Quality) => {
     store.setQuality(quality);
     if (store.inputPath) await analyze(store.inputPath, quality);
+  };
+
+  const changePlannerEnabled = async () => {
+    if (isRunning) return;
+    const enabled = !store.plannerEnabled;
+    try {
+      const settings = await setPlannerEnabled(enabled);
+      store.setPlannerEnabled(settings.plannerEnabled);
+      if (store.inputPath) await analyze(store.inputPath, store.quality, settings.plannerEnabled);
+    } catch (error) {
+      store.setError(messageOf(error));
+    }
   };
 
   const requestCancellation = async () => {
@@ -493,7 +508,7 @@ export function App() {
     pipelineCommandPending.current = true;
     store.beginRun();
     try {
-      const result = await startPipeline(store.inputPath, store.quality, store.projectsRoot);
+      const result = await startPipeline(store.inputPath, store.quality, store.projectsRoot, store.plannerEnabled);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -788,6 +803,10 @@ export function App() {
               <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
             </button>)}
           </div>
+          <button className="planner-switch" type="button" role="switch" aria-checked={store.plannerEnabled} disabled={isRunning} onClick={() => void changePlannerEnabled()}>
+            <span><strong>{t("planner.label")}</strong><small>{store.plannerEnabled ? t("planner.enabledHint") : t("planner.disabledHint")}</small></span>
+            <i aria-hidden="true"><span /></i>
+          </button>
         </div>
 
         <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">

@@ -231,6 +231,7 @@ mod tests {
             retention_ratio: 0.5,
             sampling_fps: 30.0,
             estimated_frames: 533,
+            ..FramePlan::default()
         };
         let base_total = base_estimate_ms(plan.estimated_frames, Quality::Balanced);
         let sample = RuntimeSample {
@@ -251,6 +252,7 @@ mod tests {
             retention_ratio: 0.064,
             sampling_fps: 3.83,
             estimated_frames: 48,
+            ..FramePlan::default()
         };
         let sample = RuntimeSample {
             quality: Quality::Fast,
@@ -276,6 +278,7 @@ mod tests {
             retention_ratio: 0.5,
             sampling_fps: 30.0,
             estimated_frames: 533,
+            ..FramePlan::default()
         };
         let samples = [
             RuntimeSample {
@@ -307,6 +310,7 @@ mod tests {
             retention_ratio: 0.3,
             sampling_fps: 9.0,
             estimated_frames: 320,
+            ..FramePlan::default()
         };
         let samples = [
             RuntimeSample {

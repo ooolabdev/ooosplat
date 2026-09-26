@@ -6,8 +6,9 @@ use uuid::Uuid;
 
 use crate::{
     pipeline::PipelineStage,
+    planner::BridgeBackfillCheckpoint,
     presets::Quality,
-    video::{FramePlan, ImageSequenceInfo, VideoInfo},
+    video::{FramePlan, ImageSequenceInfo, PlannedFrame, VideoInfo},
 };
 
 pub const PROJECT_APP_ID: &str = "studio.ooo.splat";
@@ -162,7 +163,7 @@ pub struct ProjectOutput {
     pub points_3d: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMetadata {
     #[serde(default = "schema_version")]
@@ -202,14 +203,14 @@ pub struct ProjectMetadata {
 }
 
 pub const fn schema_version() -> u32 {
-    5
+    6
 }
 
 fn default_model() -> String {
     "final.ply".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameState {
     pub retention_ratio: f64,
@@ -222,6 +223,14 @@ pub struct FrameState {
     pub mask_count: Option<u64>,
     #[serde(default)]
     pub has_alpha: bool,
+    #[serde(default)]
+    pub initial_extracted_frames: u64,
+    #[serde(default)]
+    pub selected_frames: Vec<PlannedFrame>,
+    #[serde(default)]
+    pub candidate_frames: Vec<PlannedFrame>,
+    #[serde(default)]
+    pub rescue_max_frames: u64,
 }
 
 impl From<&FramePlan> for FrameState {
@@ -234,6 +243,10 @@ impl From<&FramePlan> for FrameState {
             image_format: None,
             mask_count: None,
             has_alpha: false,
+            initial_extracted_frames: plan.estimated_frames,
+            selected_frames: plan.selected_frames.clone(),
+            candidate_frames: plan.candidate_frames.clone(),
+            rescue_max_frames: plan.rescue_max_frames,
         }
     }
 }
@@ -249,6 +262,12 @@ pub struct PipelineStateFile {
     #[serde(default)]
     pub image_sequence: Option<ImageSequenceInfo>,
     pub frames: Option<FrameState>,
+    /// Missing on pre-v2 projects, which deliberately resume through the
+    /// legacy pipeline rather than silently changing their reconstruction.
+    #[serde(default)]
+    pub planner_enabled: bool,
+    #[serde(default)]
+    pub bridge_backfill: BridgeBackfillCheckpoint,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -268,6 +287,8 @@ impl PipelineStateFile {
             input_type,
             image_sequence: None,
             frames: None,
+            planner_enabled: true,
+            bridge_backfill: BridgeBackfillCheckpoint::default(),
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
@@ -310,6 +331,11 @@ mod tests {
         assert_eq!(frames.image_format, None);
         assert_eq!(frames.mask_count, None);
         assert!(!frames.has_alpha);
+        assert!(!state.planner_enabled);
+        assert_eq!(
+            state.bridge_backfill.status,
+            crate::planner::BridgeBackfillStatus::NotEvaluated
+        );
     }
 
     #[test]

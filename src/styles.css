@@ -116,6 +116,15 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .quality-option > span:last-child { min-width: 0; display: grid; align-content: start; gap: 5px; }
 .quality-option strong { font-size: 13px; }
 .quality-option small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.planner-switch { width: 100%; margin-top: 10px; padding: 11px 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: var(--ink); text-align: left; background: var(--panel); border: 1px solid var(--line); cursor: pointer; }
+.planner-switch > span { display: grid; gap: 3px; }
+.planner-switch strong { font-size: 12px; }
+.planner-switch small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.planner-switch > i { position: relative; flex: 0 0 auto; width: 32px; height: 18px; border-radius: 10px; background: var(--line); transition: background .16s ease; }
+.planner-switch > i span { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: white; transition: transform .16s ease; }
+.planner-switch[aria-checked="true"] > i { background: var(--blue); }
+.planner-switch[aria-checked="true"] > i span { transform: translateX(14px); }
+.planner-switch:disabled { cursor: not-allowed; opacity: .62; }
 
 .acceleration-status { min-height: 64px; padding: 14px 0; display: grid; grid-template-columns: 25px minmax(0, 1fr); align-items: center; gap: 10px; color: #526078; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .acceleration-icon { width: 25px; height: 25px; display: grid; place-items: center; color: var(--muted); }

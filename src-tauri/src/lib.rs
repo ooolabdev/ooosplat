@@ -2,6 +2,7 @@ pub mod commands;
 pub mod engines;
 pub mod error;
 pub mod pipeline;
+pub mod planner;
 pub mod presets;
 pub mod process;
 pub mod project;
@@ -29,6 +30,7 @@ pub fn run_app() {
             commands::export_ply,
             commands::get_project_overview,
             commands::set_projects_root,
+            commands::set_planner_enabled,
             commands::delete_project,
             commands::prepare_gaussian_preview,
             commands::release_gaussian_preview,

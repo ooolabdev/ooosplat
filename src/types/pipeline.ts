@@ -38,7 +38,16 @@ export interface ImageSequenceInfo {
   hasAlpha: boolean;
   requiresLargeSequenceConfirmation: boolean;
 }
-export interface FramePlan { retentionRatio: number; samplingFps: number; estimatedFrames: number; }
+export interface PlannedFrame { sourceFrameIndex: number; timestampSeconds: number; }
+export interface FramePlan {
+  retentionRatio: number;
+  samplingFps: number;
+  estimatedFrames: number;
+  selectedFrames?: PlannedFrame[];
+  candidateFrames?: PlannedFrame[];
+  rescueMaxFrames?: number;
+  minimumFrameOverrideApplied?: boolean;
+}
 export interface RuntimeEstimate {
   estimatedMs: number;
   lowerBoundMs: number;
@@ -107,7 +116,8 @@ export interface ProjectSummary {
   failureMessage: string | null;
 }
 
-export interface ProjectOverview { projectsRoot: string; projects: ProjectSummary[]; }
+export interface AppSettings { schemaVersion: number; projectsRoot: string; plannerEnabled: boolean; }
+export interface ProjectOverview { projectsRoot: string; plannerEnabled: boolean; projects: ProjectSummary[]; }
 export interface AppRuntimeStatus { pipelineRunning: boolean; previewProjectId: string | null; }
 
 export type GaussianFormat = "ply" | "sog" | "spz";

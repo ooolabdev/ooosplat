@@ -71,6 +71,12 @@ fn runtime_sample_frame_count(
 pub struct AppSettings {
     pub schema_version: u32,
     pub projects_root: PathBuf,
+    #[serde(default = "default_planner_enabled")]
+    pub planner_enabled: bool,
+}
+
+const fn default_planner_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +117,7 @@ pub struct ProjectSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOverview {
     pub projects_root: PathBuf,
+    pub planner_enabled: bool,
     pub projects: Vec<ProjectSummary>,
 }
 
@@ -183,8 +190,9 @@ pub async fn load_settings() -> Result<AppSettings> {
         }
     }
     Ok(AppSettings {
-        schema_version: 1,
+        schema_version: 2,
         projects_root: default_projects_root()?,
+        planner_enabled: true,
     })
 }
 
@@ -201,6 +209,14 @@ pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
     crate::project::ProjectManager::validate_root(&root).await?;
     let mut settings = load_settings().await?;
     settings.projects_root = root;
+    save_settings(&settings).await?;
+    Ok(settings)
+}
+
+pub async fn save_planner_enabled(enabled: bool) -> Result<AppSettings> {
+    let mut settings = load_settings().await?;
+    settings.schema_version = settings.schema_version.max(2);
+    settings.planner_enabled = enabled;
     save_settings(&settings).await?;
     Ok(settings)
 }
@@ -351,6 +367,7 @@ pub async fn get_overview() -> Result<ProjectOverview> {
     save_index(&index).await?;
     Ok(ProjectOverview {
         projects_root: settings.projects_root,
+        planner_enabled: settings.planner_enabled,
         projects: summaries,
     })
 }
@@ -493,6 +510,7 @@ mod tests {
     fn default_summary_shape_is_serializable() {
         let value = AppSettings {
             schema_version: 1,
+            planner_enabled: true,
             projects_root: PathBuf::from("C:/项目 Root"),
         };
         assert!(serde_json::to_string(&value)
@@ -507,6 +525,7 @@ mod tests {
     fn legacy_acceleration_setting_is_ignored() {
         let json = r#"{"schemaVersion":1,"projectsRoot":"C:/旧目录","colmapAcceleration":"gpu"}"#;
         let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(parsed.planner_enabled);
         assert_eq!(parsed.projects_root, PathBuf::from("C:/旧目录"));
         assert!(!serde_json::to_string(&parsed)
             .unwrap()

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -13,7 +14,10 @@ use serde::Serialize;
 use crate::{
     engines::{
         brush, colmap,
-        ffmpeg::{extract_uniform_frames, validate_extraction},
+        ffmpeg::{
+            extract_additional_frames, extract_selected_frames, extract_uniform_frames,
+            validate_extraction,
+        },
         ffprobe::probe_video,
         EngineKind, EnginePaths,
     },
@@ -24,6 +28,10 @@ use crate::{
         },
         progress::stage_progress_range,
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
+    },
+    planner::{
+        plan_bridge_backfill, read_registered_source_indices, write_bridge_pair_list,
+        BridgeBackfillStatus, BRIDGE_TRIGGER_RATIO,
     },
     presets::Quality,
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
@@ -37,7 +45,8 @@ use crate::{
     },
     video::{
         prepare_image_sequence, validate_prepared_image_sequence, FramePlan,
-        FrameSelectionStrategy, ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
+        FrameSelectionStrategy, ImageSequenceInfo, PlannedFrame, QualityV2FrameSelection,
+        UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -234,10 +243,19 @@ pub struct PipelineRunner {
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
+    planner_enabled: bool,
 }
 
 impl PipelineRunner {
     pub fn new(engines: EnginePaths, emit: impl Fn(PipelineEvent) + Send + Sync + 'static) -> Self {
+        Self::new_with_planner(engines, true, emit)
+    }
+
+    pub fn new_with_planner(
+        engines: EnginePaths,
+        planner_enabled: bool,
+        emit: impl Fn(PipelineEvent) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             engines,
             process_manager: ProcessManager::new(),
@@ -250,6 +268,7 @@ impl PipelineRunner {
                 started: Instant::now(),
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
+            planner_enabled,
         }
     }
 
@@ -320,6 +339,7 @@ impl PipelineRunner {
         output: &Path,
         masks: &Path,
         logs: Option<&Path>,
+        planner_enabled: bool,
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
@@ -346,7 +366,11 @@ impl PipelineRunner {
 
         self.events
             .stage(PipelineStage::PlanningFrames, 0.0, "正在规划均匀抽帧");
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        let plan = if planner_enabled {
+            QualityV2FrameSelection.create_plan(&video, &quality.preset())
+        } else {
+            UniformRatioFrameSelection.create_plan(&video, &quality.preset())
+        };
         self.events.stage(
             PipelineStage::PlanningFrames,
             1.0,
@@ -368,18 +392,33 @@ impl PipelineRunner {
             Some(plan.estimated_frames),
             ObserverMode::Ffmpeg,
         );
-        let extraction = extract_uniform_frames(
-            &self.engines.ffmpeg,
-            input,
-            output,
-            masks,
-            &plan,
-            video.has_alpha,
-            logs.map(|path| path.join("ffmpeg.log")),
-            &self.process_manager,
-            Some(observer),
-        )
-        .await?;
+        let extraction = if planner_enabled {
+            extract_selected_frames(
+                &self.engines.ffmpeg,
+                input,
+                output,
+                masks,
+                &plan.selected_frames,
+                video.has_alpha,
+                logs.map(|path| path.join("ffmpeg.log")),
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?
+        } else {
+            extract_uniform_frames(
+                &self.engines.ffmpeg,
+                input,
+                output,
+                masks,
+                &plan,
+                video.has_alpha,
+                logs.map(|path| path.join("ffmpeg.log")),
+                &self.process_manager,
+                Some(observer),
+            )
+            .await?
+        };
         self.events.stage(
             PipelineStage::ExtractingFrames,
             1.0,
@@ -517,7 +556,8 @@ impl PipelineRunner {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
         let (paths, mut metadata) = project_manager.create(input, quality).await?;
-        let state = PipelineStateFile::created_for(quality, metadata.input_type);
+        let mut state = PipelineStateFile::created_for(quality, metadata.input_type);
+        state.planner_enabled = self.planner_enabled;
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
     }
@@ -625,7 +665,7 @@ impl PipelineRunner {
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
-        let prepared = if let Some(prepared) =
+        let mut prepared = if let Some(prepared) =
             prepared_frames_from_checkpoint(paths, &state).await?
         {
             self.events.stage(
@@ -647,6 +687,7 @@ impl PipelineRunner {
                         &paths.frames,
                         &paths.masks,
                         Some(&paths.logs),
+                        state.planner_enabled,
                     )
                     .await?
                 }
@@ -660,6 +701,7 @@ impl PipelineRunner {
             state.image_sequence = prepared.image_sequence.clone();
             let mut frames = FrameState::from(&prepared.plan);
             frames.extracted_frames = Some(prepared.extracted_frames);
+            frames.initial_extracted_frames = prepared.extracted_frames;
             frames.image_format = Some(prepared.image_format.clone());
             frames.mask_count = Some(prepared.mask_count);
             frames.has_alpha = prepared.has_alpha;
@@ -677,6 +719,7 @@ impl PipelineRunner {
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
         let colmap_log = paths.logs.join("colmap.log");
+        let preset = quality.preset();
         // COLMAP's bundled bitmap loader cannot reliably open non-ASCII absolute
         // paths on Windows. The process working directory is work/colmap, so this
         // ASCII-only relative path preserves Unicode/UNC project roots without
@@ -699,22 +742,40 @@ impl PipelineRunner {
                 0.0,
                 format!("COLMAP 正在使用 {backend_label} 提取特征"),
             );
-            colmap::extract_features(
-                &self.engines.colmap,
-                &database,
-                colmap_images,
-                colmap_masks,
-                colmap_log.clone(),
-                &self.process_manager,
-                Some(self.process_observer(
-                    PipelineStage::ExtractingFeatures,
-                    PipelineEngine::Colmap,
-                    Some(prepared.extracted_frames),
-                    ObserverMode::BracketProgress,
-                )),
-                gpu_index,
-            )
-            .await?;
+            let observer = Some(self.process_observer(
+                PipelineStage::ExtractingFeatures,
+                PipelineEngine::Colmap,
+                Some(prepared.extracted_frames),
+                ObserverMode::BracketProgress,
+            ));
+            if state.planner_enabled {
+                colmap::extract_features_quality_v2(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    colmap_masks,
+                    None,
+                    preset.sfm_max_image_size,
+                    preset.sfm_max_features,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    observer,
+                    gpu_index,
+                )
+                .await?;
+            } else {
+                colmap::extract_features(
+                    &self.engines.colmap,
+                    &database,
+                    colmap_images,
+                    colmap_masks,
+                    colmap_log.clone(),
+                    &self.process_manager,
+                    observer,
+                    gpu_index,
+                )
+                .await?;
+            }
             state.stage = PipelineStage::ExtractingFeatures;
             state.features_complete = true;
             project_manager.write_state(&paths.state, &state).await?;
@@ -801,7 +862,7 @@ impl PipelineRunner {
                 &database,
                 colmap_images,
                 &sparse,
-                colmap_log,
+                colmap_log.clone(),
                 &self.process_manager,
                 Some(self.process_observer(
                     PipelineStage::Reconstructing,
@@ -823,7 +884,30 @@ impl PipelineRunner {
             0.0,
             "正在核验注册率和三维点",
         );
-        let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+        let initial_input_images = state
+            .frames
+            .as_ref()
+            .map(|frames| frames.initial_extracted_frames)
+            .filter(|count| *count > 0)
+            .unwrap_or(prepared.extracted_frames);
+        let (initial_model, initial_report) =
+            best_sparse_model_with_input_count(&sparse, initial_input_images).await?;
+        let (model, report) = self
+            .maybe_run_bridge_backfill(
+                project_manager,
+                paths,
+                metadata,
+                &mut state,
+                &mut prepared,
+                &database,
+                colmap_images,
+                colmap_masks,
+                &colmap_log,
+                gpu_index,
+                initial_model,
+                initial_report,
+            )
+            .await?;
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
@@ -839,7 +923,6 @@ impl PipelineRunner {
             ),
         );
 
-        let preset = quality.preset();
         let candidate = if state.brush_complete {
             self.events.stage(
                 PipelineStage::TrainingSplats,
@@ -963,6 +1046,474 @@ impl PipelineRunner {
             logs_directory: paths.logs.clone(),
             source_duration_seconds,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_run_bridge_backfill(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        metadata: &ProjectMetadata,
+        state: &mut PipelineStateFile,
+        prepared: &mut PreparedFrames,
+        database: &Path,
+        colmap_images: &Path,
+        colmap_masks: Option<&Path>,
+        colmap_log: &Path,
+        gpu_index: Option<u32>,
+        initial_model: PathBuf,
+        initial_report: ReconstructionReport,
+    ) -> Result<(PathBuf, ReconstructionReport)> {
+        if !state.planner_enabled || prepared.input_type != ProjectInputType::Video {
+            return Ok((initial_model, initial_report));
+        }
+
+        match state.bridge_backfill.status {
+            BridgeBackfillStatus::NotNeeded
+            | BridgeBackfillStatus::NoBudget
+            | BridgeBackfillStatus::FailedRolledBack => {
+                return Ok((initial_model, initial_report));
+            }
+            BridgeBackfillStatus::Completed => {
+                if let Some(relative) = state.bridge_backfill.selected_model.as_deref() {
+                    let model = paths.colmap.join(relative);
+                    if let Ok(report) = ReconstructionValidator::validate_with_input_images(
+                        prepared.extracted_frames,
+                        &model,
+                    ) {
+                        return Ok((model, report));
+                    }
+                }
+                state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+                project_manager.write_state(&paths.state, state).await?;
+                return Ok((initial_model, initial_report));
+            }
+            BridgeBackfillStatus::NotEvaluated | BridgeBackfillStatus::Running => {}
+        }
+
+        if initial_report.registered_ratio >= BRIDGE_TRIGGER_RATIO {
+            state.bridge_backfill.status = BridgeBackfillStatus::NotNeeded;
+            project_manager.write_state(&paths.state, state).await?;
+            self.events.stage(
+                PipelineStage::ValidatingReconstruction,
+                1.0,
+                format!(
+                    "初始注册 {}/{} 张（{:.1}%）达到 80% 阈值，无需 Bridge Backfill",
+                    initial_report.registered_images,
+                    initial_report.input_images,
+                    initial_report.registered_ratio * 100.0
+                ),
+            );
+            return Ok((initial_model, initial_report));
+        }
+
+        let bridge_plan = if state.bridge_backfill.status == BridgeBackfillStatus::Running {
+            state.bridge_backfill.plan.clone().unwrap_or_default()
+        } else {
+            let registered = match read_registered_source_indices(&initial_model) {
+                Ok(indices) => indices,
+                Err(error) => {
+                    state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+                    project_manager.write_state(&paths.state, state).await?;
+                    self.events.send(
+                        PipelineStage::ValidatingReconstruction,
+                        Some(PipelineEngine::System),
+                        EventKind::Log,
+                        EventLevel::Warning,
+                        Some(1.0),
+                        false,
+                        format!(
+                            "Bridge Backfill 无法读取初始注册时间线，继续使用初始模型：{error}"
+                        ),
+                        None,
+                        None,
+                        None,
+                    );
+                    return Ok((initial_model, initial_report));
+                }
+            };
+            let plan = plan_bridge_backfill(
+                &prepared.plan,
+                &registered,
+                initial_report.registered_images,
+            );
+            state.bridge_backfill.plan = Some(plan.clone());
+            state.bridge_backfill.initial_model = Some(relative_model_path(paths, &initial_model));
+            if plan.selected_frame_indices.is_empty() {
+                state.bridge_backfill.status = BridgeBackfillStatus::NoBudget;
+                project_manager.write_state(&paths.state, state).await?;
+                self.events.send(
+                    PipelineStage::ValidatingReconstruction,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Warning,
+                    Some(1.0),
+                    false,
+                    format!(
+                        "初始注册 {}/{} 张（{:.1}%）低于 80%，但 Bridge Backfill 没有可用补帧预算",
+                        initial_report.registered_images,
+                        initial_report.input_images,
+                        initial_report.registered_ratio * 100.0
+                    ),
+                    None,
+                    None,
+                    None,
+                );
+                return Ok((initial_model, initial_report));
+            }
+            state.bridge_backfill.status = BridgeBackfillStatus::Running;
+            project_manager.write_state(&paths.state, state).await?;
+            plan
+        };
+
+        let additional = bridge_plan
+            .selected_frame_indices
+            .iter()
+            .filter_map(|index| {
+                prepared
+                    .plan
+                    .candidate_frames
+                    .iter()
+                    .find(|frame| frame.source_frame_index == *index)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if additional.len() != bridge_plan.selected_frame_indices.len() {
+            state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+            project_manager.write_state(&paths.state, state).await?;
+            self.events.send(
+                PipelineStage::ValidatingReconstruction,
+                Some(PipelineEngine::System),
+                EventKind::Log,
+                EventLevel::Warning,
+                Some(1.0),
+                false,
+                "Bridge Backfill 检查点与候选池不一致，继续使用初始模型",
+                None,
+                None,
+                None,
+            );
+            return Ok((initial_model, initial_report));
+        }
+
+        if let Some(first) = bridge_plan.selection_trace.first() {
+            self.events.send(
+                PipelineStage::ValidatingReconstruction,
+                Some(PipelineEngine::System),
+                EventKind::Log,
+                EventLevel::Info,
+                Some(0.0),
+                false,
+                format!(
+                    "Bridge Backfill 最长未注册区 {}..{}，选择中点候选帧 {}",
+                    first.gap_start_frame_index,
+                    first.gap_end_frame_index,
+                    first.selected_frame_index
+                ),
+                Some(1),
+                Some(additional.len() as u64),
+                Some("frames"),
+            );
+        }
+        self.events.send(
+            PipelineStage::ValidatingReconstruction,
+            Some(PipelineEngine::System),
+            EventKind::Log,
+            EventLevel::Warning,
+            Some(0.0),
+            false,
+            format!(
+                "Bridge Backfill 已触发：初始注册={}/{}（{:.1}%），剩余预算={}，补帧={}，内部桥接={}，边缘延伸={}",
+                bridge_plan.initial_registered_images,
+                bridge_plan.initial_input_images,
+                bridge_plan.initial_registration_ratio * 100.0,
+                bridge_plan.available_budget,
+                additional.len(),
+                bridge_plan.internal_bridge_count,
+                bridge_plan.edge_extension_count
+            ),
+            Some(additional.len() as u64),
+            Some(bridge_plan.available_budget),
+            Some("frames"),
+        );
+
+        let bridge_started = Instant::now();
+        let attempt = self
+            .execute_bridge_attempt(
+                project_manager,
+                paths,
+                metadata,
+                state,
+                prepared,
+                database,
+                colmap_images,
+                colmap_masks,
+                colmap_log,
+                gpu_index,
+                &initial_model,
+                &initial_report,
+                &additional,
+            )
+            .await;
+        match attempt {
+            Ok((model, report)) => {
+                let bridge_duration_ms = bridge_started.elapsed().as_millis() as u64;
+                state.bridge_backfill.status = BridgeBackfillStatus::Completed;
+                state.bridge_backfill.selected_model = Some(relative_model_path(paths, &model));
+                state.bridge_backfill.final_registered_images = Some(report.registered_images);
+                state.bridge_backfill.final_points_3d = Some(report.points_3d);
+                project_manager.write_state(&paths.state, state).await?;
+                self.events.send(
+                    PipelineStage::ValidatingReconstruction,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Info,
+                    Some(1.0),
+                    false,
+                    format!(
+                        "Bridge Backfill 完成：注册 {}（{:.1}%）→ {}（{:.1}%），三维点 {} → {}，耗时 {}；采用增量模型",
+                        initial_report.registered_images,
+                        initial_report.registered_ratio * 100.0,
+                        report.registered_images,
+                        report.registered_ratio * 100.0,
+                        initial_report.points_3d,
+                        report.points_3d,
+                        format_duration(bridge_duration_ms)
+                    ),
+                    Some(report.registered_images),
+                    Some(report.input_images),
+                    Some("images"),
+                );
+                Ok((model, report))
+            }
+            Err(error) => {
+                let bridge_duration_ms = bridge_started.elapsed().as_millis() as u64;
+                remove_bridge_outputs(&paths.frames, &paths.masks, &additional, prepared.has_alpha)
+                    .await;
+                let added = additional
+                    .iter()
+                    .map(|frame| frame.source_frame_index)
+                    .collect::<HashSet<_>>();
+                prepared
+                    .plan
+                    .selected_frames
+                    .retain(|frame| !added.contains(&frame.source_frame_index));
+                prepared.extracted_frames = bridge_plan.initial_input_images;
+                prepared.mask_count = if prepared.has_alpha {
+                    bridge_plan.initial_input_images
+                } else {
+                    0
+                };
+                prepared.plan.estimated_frames = bridge_plan.initial_input_images;
+                if let Some(video) = prepared.video.as_ref() {
+                    prepared.plan.retention_ratio =
+                        bridge_plan.initial_input_images as f64 / video.total_frames.max(1) as f64;
+                    prepared.plan.sampling_fps =
+                        bridge_plan.initial_input_images as f64 / video.duration.max(0.001);
+                }
+                update_frame_checkpoint(state, prepared);
+                state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+                state.bridge_backfill.selected_model = state.bridge_backfill.initial_model.clone();
+                project_manager.write_state(&paths.state, state).await?;
+                self.events.send(
+                    PipelineStage::ValidatingReconstruction,
+                    Some(PipelineEngine::System),
+                    EventKind::Log,
+                    EventLevel::Warning,
+                    Some(1.0),
+                    false,
+                    format!(
+                        "Bridge Backfill 失败并回退可用初始模型（耗时 {}）：{error}",
+                        format_duration(bridge_duration_ms)
+                    ),
+                    Some(initial_report.registered_images),
+                    Some(initial_report.input_images),
+                    Some("images"),
+                );
+                Ok((initial_model, initial_report))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_bridge_attempt(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        metadata: &ProjectMetadata,
+        state: &mut PipelineStateFile,
+        prepared: &mut PreparedFrames,
+        database: &Path,
+        colmap_images: &Path,
+        colmap_masks: Option<&Path>,
+        colmap_log: &Path,
+        gpu_index: Option<u32>,
+        initial_model: &Path,
+        initial_report: &ReconstructionReport,
+        additional: &[PlannedFrame],
+    ) -> Result<(PathBuf, ReconstructionReport)> {
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            0.0,
+            format!("Bridge Backfill 正在提取 {} 张新增帧", additional.len()),
+        );
+        let extraction = extract_additional_frames(
+            &self.engines.ffmpeg,
+            &metadata.source_path,
+            &paths.frames,
+            &paths.masks,
+            additional,
+            prepared.has_alpha,
+            Some(paths.logs.join("ffmpeg-bridge.log")),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ValidatingReconstruction,
+                PipelineEngine::Ffmpeg,
+                Some(additional.len() as u64),
+                ObserverMode::Ffmpeg,
+            )),
+        )
+        .await?;
+        for frame in additional {
+            if !prepared
+                .plan
+                .selected_frames
+                .iter()
+                .any(|selected| selected.source_frame_index == frame.source_frame_index)
+            {
+                prepared.plan.selected_frames.push(frame.clone());
+            }
+        }
+        prepared
+            .plan
+            .selected_frames
+            .sort_by_key(|frame| frame.source_frame_index);
+        prepared.extracted_frames = extraction.frame_count;
+        prepared.mask_count = extraction.mask_count;
+        prepared.plan.estimated_frames = extraction.frame_count;
+        prepared.plan.retention_ratio = prepared
+            .video
+            .as_ref()
+            .map(|video| extraction.frame_count as f64 / video.total_frames.max(1) as f64)
+            .unwrap_or(prepared.plan.retention_ratio);
+        if let Some(video) = prepared.video.as_ref() {
+            prepared.plan.sampling_fps = extraction.frame_count as f64 / video.duration.max(0.001);
+        }
+        update_frame_checkpoint(state, prepared);
+        project_manager.write_state(&paths.state, state).await?;
+
+        let extension = if prepared.has_alpha { "png" } else { "jpg" };
+        let image_list = paths.colmap.join("bridge-images.txt");
+        let image_list_text = additional
+            .iter()
+            .map(|frame| format!("frame_{:010}.{extension}", frame.source_frame_index))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        tokio::fs::write(&image_list, image_list_text).await?;
+        let preset = metadata.quality.preset();
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            0.0,
+            format!(
+                "Bridge Backfill 正在为 {} 张新增帧提取特征",
+                additional.len()
+            ),
+        );
+        colmap::extract_features_quality_v2(
+            &self.engines.colmap,
+            database,
+            colmap_images,
+            colmap_masks,
+            Some(&image_list),
+            preset.sfm_max_image_size,
+            preset.sfm_max_features,
+            paths.logs.join("colmap-bridge-features.log"),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ValidatingReconstruction,
+                PipelineEngine::Colmap,
+                Some(additional.len() as u64),
+                ObserverMode::BracketProgress,
+            )),
+            gpu_index,
+        )
+        .await?;
+
+        let all_indices = prepared
+            .plan
+            .selected_frames
+            .iter()
+            .map(|frame| frame.source_frame_index)
+            .collect::<Vec<_>>();
+        let added_indices = additional
+            .iter()
+            .map(|frame| frame.source_frame_index)
+            .collect::<Vec<_>>();
+        let pair_list = paths.colmap.join("bridge-pairs.txt");
+        let pair_count =
+            write_bridge_pair_list(&pair_list, &all_indices, &added_indices, prepared.has_alpha)?;
+        if pair_count == 0 {
+            return Err(SplatError::Process(
+                "Bridge Backfill did not produce any local matching pairs".into(),
+            ));
+        }
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            0.0,
+            format!("Bridge Backfill 正在匹配 {pair_count} 组局部帧对"),
+        );
+        colmap::match_pairs(
+            &self.engines.colmap,
+            database,
+            &pair_list,
+            paths.logs.join("colmap-bridge-matching.log"),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ValidatingReconstruction,
+                PipelineEngine::Colmap,
+                Some(pair_count as u64),
+                ObserverMode::BracketProgress,
+            )),
+            gpu_index,
+        )
+        .await?;
+
+        let bridge_sparse = paths.colmap.join("sparse-bridge");
+        reset_directory(&bridge_sparse).await?;
+        self.events.stage(
+            PipelineStage::ValidatingReconstruction,
+            0.0,
+            "Bridge Backfill 正在复用初始模型继续增量重建",
+        );
+        let input_model = initial_model
+            .strip_prefix(&paths.colmap)
+            .unwrap_or(initial_model);
+        colmap::map_from_existing(
+            &self.engines.colmap,
+            database,
+            colmap_images,
+            input_model,
+            &bridge_sparse,
+            colmap_log.with_file_name("colmap-bridge-mapper.log"),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::ValidatingReconstruction,
+                PipelineEngine::Colmap,
+                Some(prepared.extracted_frames),
+                ObserverMode::Mapper,
+            )),
+        )
+        .await?;
+        let (model, report) =
+            best_sparse_model_with_input_count(&bridge_sparse, prepared.extracted_frames).await?;
+        if report.registered_images < initial_report.registered_images {
+            return Err(SplatError::Process(format!(
+                "Bridge model registered fewer images than the initial model ({} < {})",
+                report.registered_images, initial_report.registered_images
+            )));
+        }
+        Ok((model, report))
     }
 
     fn process_observer(
@@ -1226,6 +1777,7 @@ async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFi
         state.video = None;
         state.image_sequence = None;
         state.frames = None;
+        state.bridge_backfill = Default::default();
     }
 
     let database_complete = tokio::fs::metadata(paths.colmap.join("database.db"))
@@ -1261,6 +1813,10 @@ async fn prepared_frames_from_checkpoint(
         retention_ratio: frames.retention_ratio,
         sampling_fps: frames.sampling_fps,
         estimated_frames: frames.estimated_frames,
+        selected_frames: frames.selected_frames.clone(),
+        candidate_frames: frames.candidate_frames.clone(),
+        rescue_max_frames: frames.rescue_max_frames,
+        ..FramePlan::default()
     };
     match state.input_type {
         ProjectInputType::Video => {
@@ -1386,11 +1942,25 @@ async fn best_sparse_model(
         .map_err(|error| SplatError::Process(format!("稀疏模型校验任务失败：{error}")))?
 }
 
+async fn best_sparse_model_with_input_count(
+    sparse: &Path,
+    input_images: u64,
+) -> Result<(PathBuf, ReconstructionReport)> {
+    let sparse = sparse.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        best_sparse_model_with_input_count_blocking(&sparse, input_images)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("Sparse model validation task failed: {error}")))?
+}
+
 fn best_sparse_model_blocking(
     frames: &Path,
     sparse: &Path,
 ) -> Result<(PathBuf, ReconstructionReport)> {
-    let mut best: Option<(PathBuf, ReconstructionReport)> = None;
+    let mut best = ReconstructionValidator::validate(frames, sparse)
+        .ok()
+        .map(|report| (sparse.to_path_buf(), report));
     for entry in std::fs::read_dir(sparse)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -1406,6 +1976,68 @@ fn best_sparse_model_blocking(
         }
     }
     best.ok_or_else(|| SplatError::Process("COLMAP 未生成完整的稀疏模型".into()))
+}
+
+fn best_sparse_model_with_input_count_blocking(
+    sparse: &Path,
+    input_images: u64,
+) -> Result<(PathBuf, ReconstructionReport)> {
+    let mut best = ReconstructionValidator::validate_with_input_images(input_images, sparse)
+        .ok()
+        .map(|report| (sparse.to_path_buf(), report));
+    for entry in std::fs::read_dir(sparse)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Ok(report) = ReconstructionValidator::validate_with_input_images(input_images, &path)
+        {
+            if best
+                .as_ref()
+                .is_none_or(|(_, current)| report.registered_images > current.registered_images)
+            {
+                best = Some((path, report));
+            }
+        }
+    }
+    best.ok_or_else(|| SplatError::Process("COLMAP did not produce a usable sparse model".into()))
+}
+
+fn relative_model_path(paths: &ProjectPaths, model: &Path) -> String {
+    model
+        .strip_prefix(&paths.colmap)
+        .unwrap_or(model)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFrames) {
+    if let Some(frames) = state.frames.as_mut() {
+        frames.extracted_frames = Some(prepared.extracted_frames);
+        frames.estimated_frames = prepared.extracted_frames;
+        frames.retention_ratio = prepared.plan.retention_ratio;
+        frames.sampling_fps = prepared.plan.sampling_fps;
+        frames.selected_frames = prepared.plan.selected_frames.clone();
+        frames.candidate_frames = prepared.plan.candidate_frames.clone();
+        frames.rescue_max_frames = prepared.plan.rescue_max_frames;
+        frames.mask_count = Some(prepared.mask_count);
+    }
+}
+
+async fn remove_bridge_outputs(
+    frames: &Path,
+    masks: &Path,
+    additional: &[PlannedFrame],
+    has_alpha: bool,
+) {
+    let extension = if has_alpha { "png" } else { "jpg" };
+    for frame in additional {
+        let name = format!("frame_{:010}.{extension}", frame.source_frame_index);
+        let _ = tokio::fs::remove_file(frames.join(&name)).await;
+        if has_alpha {
+            let _ = tokio::fs::remove_file(masks.join(format!("{name}.png"))).await;
+        }
+    }
 }
 
 async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {
@@ -1461,6 +2093,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            ..FrameState::default()
         });
         state.features_complete = true;
         state.matching_complete = true;
@@ -1482,6 +2115,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            ..FrameState::default()
         });
         state.features_complete = true;
         state.matching_complete = true;
@@ -1533,6 +2167,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            ..FrameState::default()
         });
 
         assert!(prepared_frames_from_checkpoint(&paths, &state)
@@ -1595,6 +2230,7 @@ mod tests {
             image_format: Some("images".into()),
             mask_count: Some(2),
             has_alpha: true,
+            ..FrameState::default()
         });
 
         assert!(prepared_frames_from_checkpoint(&paths, &state)
@@ -1642,6 +2278,7 @@ mod tests {
             image_format: Some("png".into()),
             mask_count: Some(1),
             has_alpha: true,
+            ..FrameState::default()
         });
 
         let prepared = prepared_frames_from_checkpoint(&paths, &state)
@@ -1692,6 +2329,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            ..FrameState::default()
         });
         state.features_complete = true;
         state.matching_complete = true;

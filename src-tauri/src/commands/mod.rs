@@ -42,7 +42,7 @@ use crate::{
     },
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
-        ImageSequenceInfo, UniformRatioFrameSelection, VideoInfo,
+        ImageSequenceInfo, QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -309,6 +309,7 @@ pub async fn probe_and_plan(
     app: tauri::AppHandle,
     path: String,
     quality: Quality,
+    planner_enabled: Option<bool>,
 ) -> std::result::Result<ProbeAndPlan, SplatError> {
     let engine_paths = paths_for_app(&app);
     let samples = catalog::runtime_samples().await;
@@ -333,7 +334,11 @@ pub async fn probe_and_plan(
     } else {
         let video =
             probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
-        let plan = UniformRatioFrameSelection.create_plan(&video, &quality.preset());
+        let plan = if planner_enabled.unwrap_or(true) {
+            QualityV2FrameSelection.create_plan(&video, &quality.preset())
+        } else {
+            UniformRatioFrameSelection.create_plan(&video, &quality.preset())
+        };
         let estimate = estimate_runtime(&video, &plan, quality, &samples);
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
@@ -381,6 +386,10 @@ pub async fn estimate_project_runtime(
             .extracted_frames
             .unwrap_or(frames.estimated_frames)
             .max(1),
+        selected_frames: frames.selected_frames.clone(),
+        candidate_frames: frames.candidate_frames.clone(),
+        rescue_max_frames: frames.rescue_max_frames,
+        ..FramePlan::default()
     });
     let samples = catalog::runtime_samples().await;
     let mut estimate = match metadata.input_type {
@@ -459,6 +468,11 @@ pub async fn set_projects_root(
 }
 
 #[tauri::command]
+pub async fn set_planner_enabled(enabled: bool) -> std::result::Result<AppSettings, SplatError> {
+    catalog::save_planner_enabled(enabled).await
+}
+
+#[tauri::command]
 pub async fn initialize_telemetry(
     telemetry: State<'_, TelemetryService>,
 ) -> std::result::Result<TelemetryPreferences, SplatError> {
@@ -481,6 +495,7 @@ pub async fn start_pipeline(
     path: String,
     quality: Quality,
     projects_root: String,
+    planner_enabled: Option<bool>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
     let emitter = app.clone();
     let telemetry_session = Arc::new(PipelineTelemetrySession::new(
@@ -493,10 +508,14 @@ pub async fn start_pipeline(
         },
     ));
     let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
-        event_telemetry.observe(&event);
-        let _ = emitter.emit("pipeline-event", event);
-    }));
+    let runner = Arc::new(PipelineRunner::new_with_planner(
+        paths_for_app(&app),
+        planner_enabled.unwrap_or(true),
+        move |event| {
+            event_telemetry.observe(&event);
+            let _ = emitter.emit("pipeline-event", event);
+        },
+    ));
     {
         let mut active = state.active.lock().await;
         if active.is_some() {

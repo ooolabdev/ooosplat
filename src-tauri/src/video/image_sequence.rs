@@ -97,6 +97,8 @@ pub fn create_plan(info: &ImageSequenceInfo, _preset: &QualityPreset) -> FramePl
         retention_ratio: 1.0,
         sampling_fps: 0.0,
         estimated_frames: info.image_count,
+        rescue_max_frames: info.image_count,
+        ..FramePlan::default()
     }
 }
 

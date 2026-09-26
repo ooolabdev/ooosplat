@@ -4,6 +4,9 @@ export type Locale = "zh-CN" | "en";
 export type TranslationParams = Record<string, string | number>;
 
 const zhCN = {
+  "planner.label": "自动重建 Planner",
+  "planner.enabledHint": "已启用 Quality v2 与低注册率桥接补帧",
+  "planner.disabledHint": "已关闭，将使用旧版质量与重建流程",
   "common.close": "关闭",
   "common.cancel": "取消",
   "common.retry": "重试",
@@ -367,6 +370,7 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
+  "planner.label": "Auto Reconstruction Planner", "planner.enabledHint": "Quality v2 and low-registration Bridge Backfill are enabled", "planner.disabledHint": "Disabled; the legacy quality and reconstruction pipeline will be used",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
   "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready",
   "task.create": "01 Create New Task", "task.running": "Running", "task.idle": "Standby", "task.console": "Generation console",
@@ -531,6 +535,8 @@ const exactPipelineEnglish: Record<string, string> = {
   "正在增量重建相机轨迹": "Incrementally reconstructing camera poses",
   "增量重建完成": "Incremental reconstruction completed",
   "正在核验注册率和三维点": "Validating registered images and 3D points",
+  "Bridge Backfill 检查点与候选池不一致，继续使用初始模型": "The Bridge Backfill checkpoint does not match the candidate pool; continuing with the initial model",
+  "Bridge Backfill 正在复用初始模型继续增量重建": "Bridge Backfill is continuing incremental reconstruction from the initial model",
   "已复用 Brush 训练检查点": "Reused Brush training checkpoint",
   "Brush 训练完成": "Brush training completed",
   "正在校验并发布 final.ply": "Validating and publishing final.ply",
@@ -596,6 +602,16 @@ export function localizePipelineMessage(locale: Locale, message: string): string
     [/^无法解析引擎输出：(.+)$/, (detail) => `Could not parse engine output: ${detail}`],
     [/^注册 ([\d,]+)\/([\d,]+) 张 · 三维点 ([\d,]+)$/, (registered, total, points) => `Registered ${registered}/${total} images · ${points} 3D points`],
     [/^注册率 ([\d.]+)%：低于 80%，将继续训练，但结果质量可能受影响$/, (ratio) => `Registration rate ${ratio}% is below 80%. Training will continue, but result quality may be affected`],
+    [/^初始注册 ([\d,]+)\/([\d,]+) 张（([\d.]+)%）达到 80% 阈值，无需 Bridge Backfill$/, (registered, total, ratio) => `Initial registration ${registered}/${total} (${ratio}%) meets the 80% threshold; Bridge Backfill is not needed`],
+    [/^初始注册 ([\d,]+)\/([\d,]+) 张（([\d.]+)%）低于 80%，但 Bridge Backfill 没有可用补帧预算$/, (registered, total, ratio) => `Initial registration ${registered}/${total} (${ratio}%) is below 80%, but Bridge Backfill has no actionable frame budget`],
+    [/^Bridge Backfill 无法读取初始注册时间线，继续使用初始模型：(.+)$/, (detail) => `Bridge Backfill could not read the initial registration timeline; continuing with the initial model: ${detail}`],
+    [/^Bridge Backfill 最长未注册区 ([\d,]+)\.\.([\d,]+)，选择中点候选帧 ([\d,]+)$/, (start, end, selected) => `Bridge Backfill longest unregistered interval ${start}..${end}; selected midpoint candidate ${selected}`],
+    [/^Bridge Backfill 已触发：初始注册=([\d,]+)\/([\d,]+)（([\d.]+)%），剩余预算=([\d,]+)，补帧=([\d,]+)，内部桥接=([\d,]+)，边缘延伸=([\d,]+)$/, (registered, total, ratio, budget, selected, internal, edge) => `Bridge Backfill triggered: initial registration=${registered}/${total} (${ratio}%), remaining budget=${budget}, added frames=${selected}, internal bridges=${internal}, edge extensions=${edge}`],
+    [/^Bridge Backfill 正在提取 ([\d,]+) 张新增帧$/, (count) => `Bridge Backfill is extracting ${count} additional frames`],
+    [/^Bridge Backfill 正在为 ([\d,]+) 张新增帧提取特征$/, (count) => `Bridge Backfill is extracting features for ${count} new frames`],
+    [/^Bridge Backfill 正在匹配 ([\d,]+) 组局部帧对$/, (count) => `Bridge Backfill is matching ${count} local frame pairs`],
+    [/^Bridge Backfill 完成：注册 ([\d,]+)（([\d.]+)%）→ ([\d,]+)（([\d.]+)%），三维点 ([\d,]+) → ([\d,]+)，耗时 (.+)；采用增量模型$/, (before, beforeRatio, after, afterRatio, pointsBefore, pointsAfter, duration) => `Bridge Backfill completed: registered ${before} (${beforeRatio}%) → ${after} (${afterRatio}%), 3D points ${pointsBefore} → ${pointsAfter}, duration ${duration}; using the continued model`],
+    [/^Bridge Backfill 失败并回退可用初始模型（耗时 (.+)）：(.+)$/, (duration, detail) => `Bridge Backfill failed and rolled back to the usable initial model (duration ${duration}): ${detail}`],
     [/^根据 ([\d,]+) 张输入图片和质量档位估算；完成任务后会自动校准$/, (count) => `Estimated from ${count} input images and the quality preset; it will calibrate automatically after completed tasks`],
     [/^根据 ([\d,]+) 张输入图片、质量档位和本机 ([\d,]+) 个历史任务校准$/, (count, samples) => `Calibrated from ${count} input images, the quality preset, and ${samples} local completed tasks`],
     [/^根据输入 ([\d,]+) 总帧、预计处理 ([\d,]+) 帧和质量档位估算；完成任务后会自动校准$/, (total, planned) => `Estimated from ${total} source frames, ${planned} planned frames, and the quality preset; it will calibrate automatically after completed tasks`],

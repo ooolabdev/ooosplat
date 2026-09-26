@@ -27,6 +27,13 @@ pub struct ReconstructionValidator;
 
 impl ReconstructionValidator {
     pub fn validate(frames: &Path, sparse_model: &Path) -> Result<ReconstructionReport> {
+        Self::validate_with_input_images(count_input_images(frames)?, sparse_model)
+    }
+
+    pub fn validate_with_input_images(
+        input_images: u64,
+        sparse_model: &Path,
+    ) -> Result<ReconstructionReport> {
         let cameras = sparse_model.join("cameras.bin");
         let images = sparse_model.join("images.bin");
         let points = sparse_model.join("points3D.bin");
@@ -38,7 +45,6 @@ impl ReconstructionValidator {
                 )));
             }
         }
-        let input_images = count_input_images(frames)?;
         let registered_images = read_colmap_count(&images)?;
         let points_3d = read_colmap_count(&points)?;
         if input_images == 0 || registered_images == 0 || points_3d == 0 {
