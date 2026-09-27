@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -9,7 +9,8 @@ use std::{
 };
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     engines::{
@@ -25,6 +26,7 @@ use crate::{
     pipeline::{
         estimate::{
             estimate_calibrated_brush_stage_ms, estimate_calibrated_brush_stage_ms_for_images,
+            estimate_runtime, estimate_runtime_for_images, RuntimeEstimate,
         },
         progress::stage_progress_range,
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
@@ -36,17 +38,21 @@ use crate::{
     presets::{resolve_brush_training_preset, Quality, ResolvedBrushTrainingPreset},
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
-        catalog, manager::atomic_replace_file, FrameState, PipelineStateFile, ProjectInputType,
-        ProjectManager, ProjectMetadata, ProjectOutput, ProjectPaths, ProjectStatus,
+        catalog, manager::atomic_replace_file, FrameState, PipelineStateFile,
+        ProjectImportObserver, ProjectInputType, ProjectManager, ProjectMetadata, ProjectOutput,
+        ProjectPaths, ProjectStatus, ReshootProvenance, ReshootState,
     },
     reconstruction::{
+        colmap_model::{read_registered_images, read_single_camera, required_model_files},
         ply::inspect_gaussian_ply,
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
     video::{
-        prepare_image_sequence, validate_prepared_image_sequence, FramePlan,
-        FrameSelectionStrategy, ImageSequenceInfo, PlannedFrame, QualityV2FrameSelection,
-        UniformRatioFrameSelection, VideoInfo,
+        prepare_scanned_image_sequence, prepared_video_dimensions, scan_image_sequence,
+        validate_prepared_image_sequence, validate_reshoot_image_sequence, FramePlan,
+        FrameSelectionStrategy, ImagePreparationObserver, ImagePreparationPhase, ImageSequenceInfo,
+        ImageSequenceNaming, PlannedFrame, QualityV2FrameSelection, UniformRatioFrameSelection,
+        VideoInfo,
     },
 };
 
@@ -79,6 +85,44 @@ pub struct PipelineResult {
     pub logs_directory: PathBuf,
     #[serde(skip)]
     pub(crate) source_duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshootSourceInfo {
+    pub project_id: String,
+    pub project_name: String,
+    pub quality: Quality,
+    pub camera_id: u32,
+    pub camera_model: String,
+    pub width: u64,
+    pub height: u64,
+    pub source_image_count: u64,
+    pub eligible: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReshootInputType {
+    Video,
+    Images,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshootInputInfo {
+    pub input_type: ReshootInputType,
+    pub image_count: Option<u64>,
+    pub duration: Option<f64>,
+    pub prepared_width: u32,
+    pub prepared_height: u32,
+    pub estimated_frames: u64,
+    pub has_alpha: bool,
+    pub mask_count: u64,
+    pub compatible: bool,
+    pub incompatibility_reason: Option<String>,
+    pub estimate: RuntimeEstimate,
 }
 
 #[derive(Clone)]
@@ -455,14 +499,19 @@ impl PipelineRunner {
         quality: Quality,
         output: &Path,
         masks: &Path,
+        probe_already_complete: bool,
     ) -> Result<PreparedFrames> {
-        self.events
-            .stage(PipelineStage::ProbingVideo, 0.0, "正在分析图片序列");
+        if !probe_already_complete {
+            self.events
+                .stage(PipelineStage::ProbingVideo, 0.0, "正在快速读取图片头");
+        }
         let source = input.to_path_buf();
-        let image_sequence =
-            tokio::task::spawn_blocking(move || crate::video::analyze_image_sequence(&source))
+        let cancellation = self.process_manager.child_token();
+        let scan =
+            tokio::task::spawn_blocking(move || scan_image_sequence(&source, Some(&cancellation)))
                 .await
                 .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
+        let image_sequence = scan.info.clone();
         self.events.stage(
             PipelineStage::ProbingVideo,
             1.0,
@@ -472,7 +521,7 @@ impl PipelineRunner {
                 image_sequence.width,
                 image_sequence.height,
                 if image_sequence.has_alpha {
-                    " · 检测到透明区域"
+                    " · 检测到 Alpha 通道"
                 } else {
                     ""
                 }
@@ -488,16 +537,56 @@ impl PipelineRunner {
             PipelineStage::ExtractingFrames,
             0.0,
             if image_sequence.has_alpha {
-                "正在准备原始图片并生成 COLMAP Alpha Mask"
+                "正在建立画面链接并检查 Alpha 通道"
             } else {
-                "正在准备图片序列"
+                "正在建立画面链接"
             },
         );
-        let source = input.to_path_buf();
         let frames = output.to_path_buf();
         let mask_root = masks.to_path_buf();
+        let events = self.events.clone();
+        let observer: ImagePreparationObserver = Arc::new(move |progress| {
+            let message = match progress.phase {
+                ImagePreparationPhase::LinkingFrames => format!(
+                    "正在建立画面链接或复制 {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::InspectingAlpha => format!(
+                    "正在检测 Alpha 并生成 Mask {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::WritingOpaqueMasks => format!(
+                    "正在补全不透明 Mask {}/{} 张",
+                    progress.current, progress.total
+                ),
+                ImagePreparationPhase::Validating if progress.current == progress.total => {
+                    "图片与 Mask 完整性校验完成".into()
+                }
+                ImagePreparationPhase::Validating => "正在校验图片与 Mask".into(),
+            };
+            events.send(
+                PipelineStage::ExtractingFrames,
+                Some(PipelineEngine::System),
+                EventKind::Stage,
+                EventLevel::Info,
+                Some(progress.stage_progress),
+                false,
+                message,
+                Some(progress.current),
+                Some(progress.total),
+                Some("images"),
+            );
+        });
+        let cancellation = self.process_manager.child_token();
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_image_sequence(&source, &frames, &mask_root)
+            prepare_scanned_image_sequence(
+                scan,
+                &frames,
+                &mask_root,
+                ImageSequenceNaming::Primary,
+                Some(observer),
+                Some(&cancellation),
+            )
         })
         .await
         .map_err(|error| SplatError::Process(format!("图片序列准备任务失败：{error}")))??;
@@ -561,9 +650,316 @@ impl PipelineRunner {
     ) -> Result<PipelineResult> {
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
-        let (paths, mut metadata) = project_manager.create(input, quality).await?;
-        let mut state = PipelineStateFile::created_for(quality, metadata.input_type);
+        let (paths, mut metadata) = if input.is_dir() {
+            self.events
+                .stage(PipelineStage::ProbingVideo, 0.0, "正在快速读取图片头");
+            let events = self.events.clone();
+            let observer: ProjectImportObserver = Arc::new(move |progress| {
+                let ratio = if progress.total == 0 {
+                    1.0
+                } else {
+                    progress.current as f32 / progress.total as f32
+                };
+                events.send(
+                    PipelineStage::ProbingVideo,
+                    Some(PipelineEngine::System),
+                    EventKind::Stage,
+                    EventLevel::Info,
+                    Some(0.1 + 0.9 * ratio),
+                    false,
+                    format!("正在导入图片 {}/{} 张", progress.current, progress.total),
+                    Some(progress.current),
+                    Some(progress.total),
+                    Some("images"),
+                );
+            });
+            project_manager
+                .create_with_progress(
+                    input,
+                    quality,
+                    Some(observer),
+                    Some(self.process_manager.child_token()),
+                )
+                .await?
+        } else {
+            project_manager.create(input, quality).await?
+        };
+        let mut state = project_manager.read_state(&paths.state).await?;
         state.planner_enabled = self.planner_enabled;
+        project_manager.write_state(&paths.state, &state).await?;
+        self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
+            .await
+    }
+
+    /// 从已完成项目派生一个高清补拍项目。
+    ///
+    /// 源项目**只读**：它的输入画面与 final.ply 从不会被移动或覆盖。派生项目拥有自己的
+    /// 画面目录，由"源项目的画面 + 用户提供的补拍素材"融合而成，随后重跑整条重建流水线。
+    pub async fn inspect_reshoot_source(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> Result<ReshootSourceInfo> {
+        let (project, metadata) = catalog::load_registered_project(project_id).await?;
+        let mut info = ReshootSourceInfo {
+            project_id: project_id.to_string(),
+            project_name: metadata.name.clone(),
+            quality: metadata.quality,
+            camera_id: 0,
+            camera_model: String::new(),
+            width: 0,
+            height: 0,
+            source_image_count: 0,
+            eligible: false,
+            reason: None,
+        };
+        if !catalog::project_is_durably_completed(&project, &metadata).await {
+            info.reason = Some("只有已完成且结果完整的项目可以进行高清补拍".into());
+            return Ok(info);
+        }
+        let frames = project.join("work/frames");
+        let database = project.join("work/colmap/database.db");
+        if !database.is_file()
+            || std::fs::metadata(&database).map_or(true, |value| value.len() == 0)
+        {
+            info.reason = Some("原项目缺少相机重建数据库，无法进行增量补拍".into());
+            return Ok(info);
+        }
+        let sparse = project.join("work/colmap/sparse");
+        let (model, _) = match best_sparse_model(&frames, &sparse).await {
+            Ok(value) => value,
+            Err(error) => {
+                info.reason = Some(format!("原项目的相机重建结果不可用：{error}"));
+                return Ok(info);
+            }
+        };
+        let parsed = tokio::task::spawn_blocking(move || {
+            let camera = read_single_camera(&model)?;
+            let images = read_registered_images(&model)?;
+            Ok::<_, SplatError>((camera, images))
+        })
+        .await
+        .map_err(|error| SplatError::Process(format!("读取原项目相机信息失败：{error}")))??;
+        if parsed.1.iter().any(|image| image.camera_id != parsed.0.id) {
+            info.reason = Some("原项目包含多个相机，暂时不能进行同相机增量补拍".into());
+            return Ok(info);
+        }
+        info.camera_id = parsed.0.id;
+        info.camera_model = parsed.0.model;
+        info.width = parsed.0.width;
+        info.height = parsed.0.height;
+        info.source_image_count = parsed.1.len() as u64;
+        info.eligible = true;
+        Ok(info)
+    }
+
+    pub async fn probe_reshoot_input(
+        &self,
+        project_id: uuid::Uuid,
+        input: &Path,
+        input_type: ReshootInputType,
+    ) -> Result<ReshootInputInfo> {
+        let source = self.inspect_reshoot_source(project_id).await?;
+        if !source.eligible {
+            return Err(SplatError::Process(
+                source
+                    .reason
+                    .unwrap_or_else(|| "原项目不能进行高清补拍".into()),
+            ));
+        }
+        let (source_project, source_metadata) =
+            catalog::load_registered_project(project_id).await?;
+        ensure_reshoot_input_is_new(
+            &source_project,
+            &source_metadata.source_path,
+            input,
+            input_type,
+        )
+        .await?;
+        let samples = catalog::runtime_samples().await;
+        let (image_count, duration, width, height, estimated_frames, has_alpha, estimate) =
+            match input_type {
+                ReshootInputType::Images => {
+                    let path = input.to_path_buf();
+                    let images = tokio::task::spawn_blocking(move || {
+                        crate::video::analyze_image_sequence(&path)
+                    })
+                    .await
+                    .map_err(|error| SplatError::Process(format!("分析补拍图片失败：{error}")))??;
+                    let plan = crate::video::create_image_plan(&images, &source.quality.preset());
+                    let estimate = estimate_runtime_for_images(
+                        source.source_image_count + images.image_count,
+                        images.width.max(images.height),
+                        &FramePlan {
+                            retention_ratio: 1.0,
+                            sampling_fps: 0.0,
+                            estimated_frames: source.source_image_count + images.image_count,
+                            ..FramePlan::default()
+                        },
+                        source.quality,
+                        &samples,
+                    );
+                    (
+                        Some(images.image_count),
+                        None,
+                        images.width,
+                        images.height,
+                        plan.estimated_frames,
+                        images.has_alpha,
+                        estimate,
+                    )
+                }
+                ReshootInputType::Video => {
+                    let video =
+                        probe_video(&self.engines.ffprobe, input, None, &self.process_manager)
+                            .await?;
+                    let plan =
+                        UniformRatioFrameSelection.create_plan(&video, &source.quality.preset());
+                    let dimensions = prepared_video_dimensions(&video);
+                    let estimate = estimate_runtime(
+                        &video,
+                        &FramePlan {
+                            retention_ratio: plan.retention_ratio,
+                            sampling_fps: plan.sampling_fps,
+                            estimated_frames: source.source_image_count + plan.estimated_frames,
+                            ..FramePlan::default()
+                        },
+                        source.quality,
+                        &samples,
+                    );
+                    (
+                        None,
+                        Some(video.duration),
+                        dimensions.0,
+                        dimensions.1,
+                        plan.estimated_frames,
+                        video.has_alpha,
+                        estimate,
+                    )
+                }
+            };
+        let compatible = u64::from(width) == source.width && u64::from(height) == source.height;
+        Ok(ReshootInputInfo {
+            input_type,
+            image_count,
+            duration,
+            prepared_width: width,
+            prepared_height: height,
+            estimated_frames,
+            has_alpha,
+            mask_count: if has_alpha { estimated_frames } else { 0 },
+            compatible,
+            incompatibility_reason: (!compatible).then(|| {
+                format!(
+                    "补拍画面必须与原项目保持相同分辨率：需要 {}×{}，当前为 {}×{}",
+                    source.width, source.height, width, height
+                )
+            }),
+            estimate,
+        })
+    }
+
+    pub async fn generate_incremental_reshoot(
+        &self,
+        source_project_id: uuid::Uuid,
+        reshoot_input: &Path,
+        input_type: ReshootInputType,
+        projects_root: &Path,
+    ) -> Result<PipelineResult> {
+        let source = self.inspect_reshoot_source(source_project_id).await?;
+        if !source.eligible {
+            return Err(SplatError::Process(
+                source
+                    .reason
+                    .unwrap_or_else(|| "原项目不能进行高清补拍".into()),
+            ));
+        }
+        if input_type == ReshootInputType::Images {
+            self.events
+                .stage(PipelineStage::ProbingVideo, 0.0, "正在快速读取补拍图片头");
+        }
+        let input = self
+            .probe_reshoot_input(source_project_id, reshoot_input, input_type)
+            .await?;
+        if !input.compatible {
+            return Err(SplatError::Process(
+                input
+                    .incompatibility_reason
+                    .unwrap_or_else(|| "补拍素材与原项目相机尺寸不一致".into()),
+            ));
+        }
+        let acceleration = self.verify_pipeline_engines().await?;
+        self.events.acceleration(acceleration.clone());
+        let (source_root, source_metadata) =
+            catalog::load_registered_project(source_project_id).await?;
+        let project_manager = ProjectManager::with_root(projects_root.to_path_buf());
+        let (paths, mut metadata) = if input_type == ReshootInputType::Images {
+            let events = self.events.clone();
+            let observer: ProjectImportObserver = Arc::new(move |progress| {
+                let ratio = if progress.total == 0 {
+                    1.0
+                } else {
+                    progress.current as f32 / progress.total as f32
+                };
+                events.send(
+                    PipelineStage::ProbingVideo,
+                    Some(PipelineEngine::System),
+                    EventKind::Stage,
+                    EventLevel::Info,
+                    Some(0.1 + 0.9 * ratio),
+                    false,
+                    format!(
+                        "正在导入补拍图片 {}/{} 张",
+                        progress.current, progress.total
+                    ),
+                    Some(progress.current),
+                    Some(progress.total),
+                    Some("images"),
+                );
+            });
+            project_manager
+                .create_with_progress(
+                    reshoot_input,
+                    source_metadata.quality,
+                    Some(observer),
+                    Some(self.process_manager.child_token()),
+                )
+                .await?
+        } else {
+            project_manager
+                .create(reshoot_input, source_metadata.quality)
+                .await?
+        };
+        let stored_source = metadata.source_path.clone();
+        metadata.name = format!("{}_高清补拍", source_metadata.name);
+        metadata.transform = source_metadata.transform;
+        metadata.editing = Default::default();
+        metadata.reshoot = Some(ReshootProvenance {
+            source_project_id,
+            source_project_path: source_root.clone(),
+            source_final_ply: source_root.join("final.ply"),
+            reshoot_source_path: stored_source,
+            camera_id: source.camera_id,
+            camera_model: source.camera_model,
+            width: source.width,
+            height: source.height,
+            has_alpha: input.has_alpha,
+            mask_count: input.mask_count,
+            source_image_count: source.source_image_count,
+            reshoot_frame_count: input.estimated_frames,
+            registered_reshoot_count: 0,
+        });
+        project_manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await?;
+        let mut state = project_manager.read_state(&paths.state).await?;
+        state.reshoot = Some(ReshootState {
+            source_image_count: source.source_image_count,
+            reshoot_frame_count: input.estimated_frames,
+            mask_count: input.mask_count,
+            has_alpha: input.has_alpha,
+            ..Default::default()
+        });
+        project_manager.write_state(&paths.state, &state).await?;
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
     }
@@ -624,9 +1020,19 @@ impl PipelineRunner {
         project_manager
             .write_metadata(&paths.metadata, metadata)
             .await?;
-        let result = self
-            .run_project(&project_manager, &paths, metadata, state, acceleration)
-            .await;
+        let result = if metadata.reshoot.is_some() {
+            self.run_incremental_reshoot_project(
+                &project_manager,
+                &paths,
+                metadata,
+                state,
+                acceleration,
+            )
+            .await
+        } else {
+            self.run_project(&project_manager, &paths, metadata, state, acceleration)
+                .await
+        };
 
         if let Err(error) = &result {
             let cancelled = matches!(error, SplatError::Cancelled);
@@ -654,6 +1060,484 @@ impl PipelineRunner {
         result
     }
 
+    async fn run_incremental_reshoot_project(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        metadata: &mut ProjectMetadata,
+        mut state: PipelineStateFile,
+        acceleration: &crate::engines::ColmapAccelerationStatus,
+    ) -> Result<PipelineResult> {
+        let provenance = metadata
+            .reshoot
+            .clone()
+            .ok_or_else(|| SplatError::Process("补拍项目缺少来源信息".into()))?;
+        let mut checkpoint = state.reshoot.clone().unwrap_or_default();
+        let source_frames = provenance.source_project_path.join("work/frames");
+        let source_database = provenance
+            .source_project_path
+            .join("work/colmap/database.db");
+        let base_model = paths.colmap.join("base-model");
+        let database = paths.colmap.join("database.db");
+        let base_database = paths.colmap.join("base-database.db");
+        let reshoot_masks = paths.work.join("reshoot-masks");
+        let reshoot_list = paths.colmap.join("reshoot-images.txt");
+        let mapper_list = paths.colmap.join("mapper-images.txt");
+
+        let snapshot_frames_valid = count_image_files(&paths.frames)
+            .await
+            .is_ok_and(|count| count >= provenance.source_image_count);
+        let snapshot_database_valid = tokio::fs::metadata(&database)
+            .await
+            .is_ok_and(|value| value.is_file() && value.len() > 0);
+        let base_database_valid = tokio::fs::metadata(&base_database)
+            .await
+            .is_ok_and(|value| value.is_file() && value.len() > 0);
+        if !checkpoint.source_snapshot_complete
+            || !snapshot_frames_valid
+            || !snapshot_database_valid
+            || !base_database_valid
+            || required_model_files(&base_model)
+                .iter()
+                .any(|path| !path.is_file())
+        {
+            let source_sparse = provenance.source_project_path.join("work/colmap/sparse");
+            let (source_model, _) = best_sparse_model(&source_frames, &source_sparse).await?;
+            self.events.stage(
+                PipelineStage::ExtractingFrames,
+                0.0,
+                "正在复用原项目的相机与重建结果",
+            );
+            reset_directory(&paths.frames).await?;
+            reset_directory(&paths.colmap).await?;
+            reset_directory(&reshoot_masks).await?;
+            copy_image_files(&source_frames, &paths.frames).await?;
+            tokio::fs::copy(&source_database, &base_database).await?;
+            tokio::fs::copy(&base_database, &database).await?;
+            tokio::fs::create_dir_all(&base_model).await?;
+            for source in required_model_files(&source_model) {
+                let name = source.file_name().expect("model file has name");
+                tokio::fs::copy(&source, base_model.join(name)).await?;
+            }
+            checkpoint = ReshootState {
+                source_snapshot_complete: true,
+                source_image_count: provenance.source_image_count,
+                reshoot_frame_count: provenance.reshoot_frame_count,
+                mask_count: provenance.mask_count,
+                has_alpha: provenance.has_alpha,
+                ..Default::default()
+            };
+            state.reshoot = Some(checkpoint.clone());
+            project_manager.write_state(&paths.state, &state).await?;
+        }
+
+        if checkpoint.supplemental_frames_complete
+            && validate_reshoot_image_sequence(
+                &paths.frames,
+                &reshoot_masks,
+                checkpoint.reshoot_frame_count,
+                checkpoint.has_alpha,
+            )
+            .is_err()
+        {
+            checkpoint.supplemental_frames_complete = false;
+            checkpoint.supplemental_features_complete = false;
+            checkpoint.incremental_matching_complete = false;
+            checkpoint.incremental_reconstruction_complete = false;
+            state.brush_complete = false;
+        }
+        let prepared = if checkpoint.supplemental_frames_complete {
+            validate_reshoot_image_sequence(
+                &paths.frames,
+                &reshoot_masks,
+                checkpoint.reshoot_frame_count,
+                checkpoint.has_alpha,
+            )?
+        } else {
+            remove_reshoot_images(&paths.frames).await?;
+            reset_directory(&reshoot_masks).await?;
+            self.events.stage(
+                PipelineStage::ExtractingFrames,
+                0.0,
+                if provenance.has_alpha {
+                    "正在检查补拍 Alpha 通道并按需生成 Mask"
+                } else {
+                    "正在准备补拍画面"
+                },
+            );
+            let prepared = match metadata.input_type {
+                ProjectInputType::Images => {
+                    let source = metadata.source_path.clone();
+                    let cancellation = self.process_manager.child_token();
+                    let scan = tokio::task::spawn_blocking(move || {
+                        scan_image_sequence(&source, Some(&cancellation))
+                    })
+                    .await
+                    .map_err(|error| SplatError::Process(format!("补拍图片扫描失败：{error}")))??;
+                    let frames = paths.frames.clone();
+                    let masks = reshoot_masks.clone();
+                    let events = self.events.clone();
+                    let observer: ImagePreparationObserver = Arc::new(move |progress| {
+                        let message = match progress.phase {
+                            ImagePreparationPhase::LinkingFrames => format!(
+                                "正在建立补拍画面链接或复制 {}/{} 张",
+                                progress.current, progress.total
+                            ),
+                            ImagePreparationPhase::InspectingAlpha => format!(
+                                "正在检测补拍 Alpha 并生成 Mask {}/{} 张",
+                                progress.current, progress.total
+                            ),
+                            ImagePreparationPhase::WritingOpaqueMasks => format!(
+                                "正在补全补拍不透明 Mask {}/{} 张",
+                                progress.current, progress.total
+                            ),
+                            ImagePreparationPhase::Validating
+                                if progress.current == progress.total =>
+                            {
+                                "补拍图片与 Mask 完整性校验完成".into()
+                            }
+                            ImagePreparationPhase::Validating => "正在校验补拍图片与 Mask".into(),
+                        };
+                        events.send(
+                            PipelineStage::ExtractingFrames,
+                            Some(PipelineEngine::System),
+                            EventKind::Stage,
+                            EventLevel::Info,
+                            Some(progress.stage_progress),
+                            false,
+                            message,
+                            Some(progress.current),
+                            Some(progress.total),
+                            Some("images"),
+                        );
+                    });
+                    let cancellation = self.process_manager.child_token();
+                    tokio::task::spawn_blocking(move || {
+                        prepare_scanned_image_sequence(
+                            scan,
+                            &frames,
+                            &masks,
+                            ImageSequenceNaming::Reshoot,
+                            Some(observer),
+                            Some(&cancellation),
+                        )
+                    })
+                    .await
+                    .map_err(|error| SplatError::Process(format!("补拍图片准备失败：{error}")))??
+                }
+                ProjectInputType::Video => {
+                    let temporary = paths.work.join("reshoot-extract");
+                    let temporary_masks = paths.work.join("reshoot-extract-masks");
+                    reset_directory(&temporary).await?;
+                    reset_directory(&temporary_masks).await?;
+                    let extracted = self
+                        .prepare_frames(
+                            &metadata.source_path,
+                            metadata.quality,
+                            &temporary,
+                            &temporary_masks,
+                            Some(&paths.logs),
+                            state.planner_enabled,
+                        )
+                        .await?;
+                    move_extracted_reshoot(
+                        &temporary,
+                        &temporary_masks,
+                        &paths.frames,
+                        &reshoot_masks,
+                        extracted.has_alpha,
+                    )
+                    .await?;
+                    validate_reshoot_image_sequence(
+                        &paths.frames,
+                        &reshoot_masks,
+                        extracted.extracted_frames,
+                        extracted.has_alpha,
+                    )?
+                }
+            };
+            validate_image_dimensions(
+                &paths.frames,
+                "reshoot_",
+                provenance.width,
+                provenance.height,
+            )
+            .await?;
+            checkpoint.supplemental_frames_complete = true;
+            checkpoint.reshoot_frame_count = prepared.image_count;
+            checkpoint.mask_count = prepared.mask_count;
+            checkpoint.has_alpha = prepared.has_alpha;
+            if let Some(reshoot) = metadata.reshoot.as_mut() {
+                reshoot.reshoot_frame_count = prepared.image_count;
+                reshoot.mask_count = prepared.mask_count;
+                reshoot.has_alpha = prepared.has_alpha;
+            }
+            state.stage = PipelineStage::ExtractingFrames;
+            state.reshoot = Some(checkpoint.clone());
+            project_manager.write_state(&paths.state, &state).await?;
+            project_manager
+                .write_metadata(&paths.metadata, metadata)
+                .await?;
+            self.events.send(
+                PipelineStage::ExtractingFrames,
+                Some(PipelineEngine::System),
+                EventKind::Progress,
+                EventLevel::Info,
+                Some(1.0),
+                false,
+                format!("补拍画面准备完成 · {} 张", prepared.image_count),
+                Some(prepared.image_count),
+                Some(prepared.image_count),
+                Some("images"),
+            );
+            prepared
+        };
+        let reshoot_names = image_names_with_prefix(&paths.frames, "reshoot_").await?;
+        write_image_list(&reshoot_list, &reshoot_names).await?;
+
+        let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
+        if !checkpoint.supplemental_features_complete {
+            tokio::fs::copy(&base_database, &database).await?;
+            self.events.stage(
+                PipelineStage::ExtractingFeatures,
+                0.0,
+                format!("正在使用 {backend_label} 提取补拍画面的信息"),
+            );
+            colmap::extract_incremental_features(
+                &self.engines.colmap,
+                &database,
+                Path::new("../frames"),
+                Path::new("reshoot-images.txt"),
+                provenance.camera_id,
+                prepared.has_alpha.then_some(Path::new("../reshoot-masks")),
+                paths.logs.join("colmap.log"),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::ExtractingFeatures,
+                    PipelineEngine::Colmap,
+                    Some(prepared.image_count),
+                    ObserverMode::BracketProgress,
+                )),
+                acceleration.gpu_index(),
+            )
+            .await?;
+            checkpoint.supplemental_features_complete = true;
+            state.stage = PipelineStage::ExtractingFeatures;
+            state.reshoot = Some(checkpoint.clone());
+            project_manager.write_state(&paths.state, &state).await?;
+        }
+
+        if !checkpoint.incremental_matching_complete {
+            self.events
+                .stage(PipelineStage::Matching, 0.0, "正在补充新旧画面之间的联系");
+            colmap::match_exhaustive(
+                &self.engines.colmap,
+                &database,
+                paths.logs.join("colmap.log"),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Matching,
+                    PipelineEngine::Colmap,
+                    Some(prepared.image_count),
+                    ObserverMode::Matching,
+                )),
+                acceleration.gpu_index(),
+            )
+            .await?;
+            self.events.send(
+                PipelineStage::Matching,
+                Some(PipelineEngine::Colmap),
+                EventKind::Progress,
+                EventLevel::Info,
+                Some(1.0),
+                false,
+                "补拍图像匹配完成",
+                None,
+                None,
+                None,
+            );
+            checkpoint.incremental_matching_complete = true;
+            state.stage = PipelineStage::Matching;
+            state.reshoot = Some(checkpoint.clone());
+            project_manager.write_state(&paths.state, &state).await?;
+        }
+
+        let sparse = paths.colmap.join("sparse");
+        if checkpoint.incremental_reconstruction_complete
+            && best_sparse_model(&paths.frames, &sparse).await.is_err()
+        {
+            checkpoint.incremental_reconstruction_complete = false;
+            state.brush_complete = false;
+        }
+        if !checkpoint.incremental_reconstruction_complete {
+            let base = base_model.clone();
+            let original_names = tokio::task::spawn_blocking(move || read_registered_images(&base))
+                .await
+                .map_err(|error| SplatError::Process(format!("读取原项目画面列表失败：{error}")))??
+                .into_iter()
+                .map(|image| image.name)
+                .collect::<Vec<_>>();
+            let mut mapper_names = original_names;
+            mapper_names.extend(reshoot_names.iter().cloned());
+            write_image_list(&mapper_list, &mapper_names).await?;
+            reset_directory(&sparse).await?;
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                0.0,
+                "正在把补拍画面注册到原相机重建中",
+            );
+            colmap::map_incremental(
+                &self.engines.colmap,
+                &database,
+                Path::new("../frames"),
+                Path::new("base-model"),
+                &sparse,
+                Path::new("mapper-images.txt"),
+                paths.logs.join("colmap.log"),
+                &self.process_manager,
+                Some(self.process_observer(
+                    PipelineStage::Reconstructing,
+                    PipelineEngine::Colmap,
+                    Some(mapper_names.len() as u64),
+                    ObserverMode::Mapper,
+                )),
+            )
+            .await?;
+            checkpoint.incremental_reconstruction_complete = true;
+            state.stage = PipelineStage::Reconstructing;
+            state.reshoot = Some(checkpoint.clone());
+            project_manager.write_state(&paths.state, &state).await?;
+        }
+
+        let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
+        let model_copy = model.clone();
+        let registered_reshoot_count =
+            tokio::task::spawn_blocking(move || read_registered_images(&model_copy))
+                .await
+                .map_err(|error| SplatError::Process(format!("读取补拍注册结果失败：{error}")))??
+                .into_iter()
+                .filter(|image| image.name.starts_with("reshoot_"))
+                .count() as u64;
+        if registered_reshoot_count == 0 {
+            return Err(SplatError::Process("补拍画面没有成功加入原项目。请使用同一设备和镜头重新拍摄，并确保新画面与原画面有足够重叠。".into()));
+        }
+        checkpoint.registered_reshoot_count = registered_reshoot_count;
+        state.reconstruction_complete = true;
+        state.reshoot = Some(checkpoint.clone());
+        project_manager.write_state(&paths.state, &state).await?;
+        if let Some(provenance) = metadata.reshoot.as_mut() {
+            provenance.registered_reshoot_count = registered_reshoot_count;
+            provenance.reshoot_frame_count = prepared.image_count;
+            provenance.mask_count = prepared.mask_count;
+            provenance.has_alpha = prepared.has_alpha;
+        }
+
+        if state.brush_complete && brush_candidate(&paths.brush).is_none() {
+            state.brush_complete = false;
+        }
+        let candidate = if state.brush_complete {
+            brush_candidate(&paths.brush)
+                .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失".into()))?
+        } else {
+            reset_directory(&paths.brush).await?;
+            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let source_long_edge = provenance
+                .width
+                .max(provenance.height)
+                .min(u64::from(u32::MAX)) as u32;
+            let resolved_brush = state.brush_training.resolved.unwrap_or_else(|| {
+                resolve_brush_training_preset(
+                    metadata.quality,
+                    state.planner_enabled,
+                    acceleration.usable_gpu_total_memory_mb(),
+                    source_long_edge,
+                    report.points_3d,
+                )
+            });
+            state.brush_training.resolved = Some(resolved_brush);
+            project_manager.write_state(&paths.state, &state).await?;
+            self.events.send(
+                PipelineStage::TrainingSplats,
+                Some(PipelineEngine::Brush),
+                EventKind::Stage,
+                EventLevel::Info,
+                None,
+                true,
+                "正在使用全部已注册画面重新训练高斯",
+                Some(0),
+                Some(resolved_brush.preset.total_steps as u64),
+                Some("iterations"),
+            );
+            let candidate = self
+                .train_brush_with_oom_retry(
+                    project_manager,
+                    paths,
+                    &mut state,
+                    metadata.quality,
+                    &dataset,
+                    report.points_3d,
+                    resolved_brush,
+                    crate::pipeline::estimate::estimate_brush_stage_ms(metadata.quality),
+                )
+                .await?;
+            state.brush_complete = true;
+            state.stage = PipelineStage::TrainingSplats;
+            project_manager.write_state(&paths.state, &state).await?;
+            candidate
+        };
+
+        let ply = inspect_gaussian_ply(&candidate)?;
+        let final_ply = paths.project.join("final.ply");
+        atomic_replace_file(&candidate, &final_ply).await?;
+        state.stage = PipelineStage::Completed;
+        project_manager.write_state(&paths.state, &state).await?;
+        let completed_at = Utc::now();
+        let duration_ms = metadata.duration_ms.unwrap_or(0).saturating_add(
+            metadata
+                .started_at
+                .map(|started| (completed_at - started).num_milliseconds().max(0) as u64)
+                .unwrap_or(0),
+        );
+        let reshoot_ratio = registered_reshoot_count as f64 / prepared.image_count.max(1) as f64;
+        let warning = (reshoot_ratio < 0.8).then(|| format!(
+            "补拍画面成功加入 {registered_reshoot_count}/{}，结果已生成，但部分补拍画面未能找到与原项目的联系。",
+            prepared.image_count
+        ));
+        metadata.status = ProjectStatus::Completed;
+        metadata.completed_at = Some(completed_at);
+        metadata.duration_ms = Some(duration_ms);
+        metadata.output = Some(ProjectOutput {
+            final_ply: final_ply.clone(),
+            file_size: ply.file_size,
+            splat_count: ply.splat_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+        });
+        project_manager
+            .write_metadata(&paths.metadata, metadata)
+            .await?;
+        self.events
+            .stage(PipelineStage::Completed, 1.0, "高清补拍处理完成");
+        Ok(PipelineResult {
+            project_id: paths.id.to_string(),
+            project_path: paths.project.clone(),
+            final_ply,
+            file_size: ply.file_size,
+            splat_count: ply.splat_count,
+            input_images: report.input_images,
+            registered_images: report.registered_images,
+            registered_ratio: report.registered_ratio,
+            points_3d: report.points_3d,
+            duration_ms,
+            completed_at,
+            warning,
+            logs_directory: paths.logs.clone(),
+            source_duration_seconds: None,
+        })
+    }
+
     async fn run_project(
         &self,
         project_manager: &ProjectManager,
@@ -671,55 +1555,60 @@ impl PipelineRunner {
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
-        let mut prepared = if let Some(prepared) =
-            prepared_frames_from_checkpoint(paths, &state).await?
-        {
-            self.events.stage(
-                PipelineStage::ExtractingFrames,
-                1.0,
-                format!("已复用 {} 帧检查点", prepared.extracted_frames),
-            );
-            prepared
-        } else {
-            reset_directory(&paths.frames).await?;
-            reset_directory(&paths.masks).await?;
-            reset_directory(&paths.colmap).await?;
-            reset_directory(&paths.brush).await?;
-            let prepared = match metadata.input_type {
-                ProjectInputType::Video => {
-                    self.prepare_frames(
-                        &metadata.source_path,
-                        quality,
-                        &paths.frames,
-                        &paths.masks,
-                        Some(&paths.logs),
-                        state.planner_enabled,
-                    )
-                    .await?
-                }
-                ProjectInputType::Images => {
-                    self.prepare_images(&metadata.source_path, quality, &paths.frames, &paths.masks)
+        let mut prepared =
+            if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
+                self.events.stage(
+                    PipelineStage::ExtractingFrames,
+                    1.0,
+                    format!("已复用 {} 帧检查点", prepared.extracted_frames),
+                );
+                prepared
+            } else {
+                reset_directory(&paths.frames).await?;
+                reset_directory(&paths.masks).await?;
+                reset_directory(&paths.colmap).await?;
+                reset_directory(&paths.brush).await?;
+                let prepared = match metadata.input_type {
+                    ProjectInputType::Video => {
+                        self.prepare_frames(
+                            &metadata.source_path,
+                            quality,
+                            &paths.frames,
+                            &paths.masks,
+                            Some(&paths.logs),
+                            state.planner_enabled,
+                        )
                         .await?
-                }
+                    }
+                    ProjectInputType::Images => {
+                        self.prepare_images(
+                            &metadata.source_path,
+                            quality,
+                            &paths.frames,
+                            &paths.masks,
+                            state.image_sequence.is_some(),
+                        )
+                        .await?
+                    }
+                };
+                state.input_type = prepared.input_type;
+                state.video = prepared.video.clone();
+                state.image_sequence = prepared.image_sequence.clone();
+                let mut frames = FrameState::from(&prepared.plan);
+                frames.extracted_frames = Some(prepared.extracted_frames);
+                frames.initial_extracted_frames = prepared.extracted_frames;
+                frames.image_format = Some(prepared.image_format.clone());
+                frames.mask_count = Some(prepared.mask_count);
+                frames.has_alpha = prepared.has_alpha;
+                state.frames = Some(frames);
+                state.features_complete = false;
+                state.matching_complete = false;
+                state.reconstruction_complete = false;
+                state.brush_complete = false;
+                state.stage = PipelineStage::ExtractingFrames;
+                project_manager.write_state(&paths.state, &state).await?;
+                prepared
             };
-            state.input_type = prepared.input_type;
-            state.video = prepared.video.clone();
-            state.image_sequence = prepared.image_sequence.clone();
-            let mut frames = FrameState::from(&prepared.plan);
-            frames.extracted_frames = Some(prepared.extracted_frames);
-            frames.initial_extracted_frames = prepared.extracted_frames;
-            frames.image_format = Some(prepared.image_format.clone());
-            frames.mask_count = Some(prepared.mask_count);
-            frames.has_alpha = prepared.has_alpha;
-            state.frames = Some(frames);
-            state.features_complete = false;
-            state.matching_complete = false;
-            state.reconstruction_complete = false;
-            state.brush_complete = false;
-            state.stage = PipelineStage::ExtractingFrames;
-            project_manager.write_state(&paths.state, &state).await?;
-            prepared
-        };
         let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
 
         let database = paths.colmap.join("database.db");
@@ -1709,6 +2598,7 @@ impl PipelineRunner {
         let events = self.events.clone();
         let mapper_count = Arc::new(AtomicU64::new(0));
         let brush_progress_basis_points = Arc::new(AtomicU64::new(0));
+        let matching_heartbeat_bucket = Arc::new(AtomicU64::new(0));
         Arc::new(move |update| match update {
             ProcessUpdate::Started { process_id } => events.send(
                 stage,
@@ -1746,6 +2636,24 @@ impl PipelineRunner {
                         expected_total,
                         Some("estimated_progress"),
                     );
+                } else if mode == ObserverMode::Matching {
+                    let bucket = elapsed_ms / 10_000;
+                    if bucket > 0
+                        && matching_heartbeat_bucket.fetch_max(bucket, Ordering::Relaxed) < bucket
+                    {
+                        events.send(
+                            stage,
+                            Some(engine),
+                            EventKind::Heartbeat,
+                            EventLevel::Info,
+                            None,
+                            true,
+                            format!("补拍图像匹配中 · 已用时 {}", format_duration(elapsed_ms)),
+                            None,
+                            expected_total,
+                            None,
+                        );
+                    }
                 }
             }
             ProcessUpdate::Line { stream: _, line } => {
@@ -1760,7 +2668,7 @@ impl PipelineRunner {
                             format!("FFmpeg 已输出 {current} 帧"),
                         )
                     }),
-                    ObserverMode::BracketProgress => {
+                    ObserverMode::BracketProgress | ObserverMode::Matching => {
                         parse_bracket_progress(&line).map(|(current, total)| {
                             (current, Some(total), friendly_engine_line(&line))
                         })
@@ -1824,6 +2732,7 @@ impl PipelineRunner {
 enum ObserverMode {
     Ffmpeg,
     BracketProgress,
+    Matching,
     Mapper,
     Brush { estimated_duration_ms: u64 },
 }
@@ -1955,6 +2864,133 @@ fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
     }
 }
 
+async fn count_image_files(directory: &Path) -> Result<u64> {
+    let directory = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Ok::<u64, SplatError>(crate::video::list_images(&directory)?.len() as u64)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("无法统计输入画面：{error}")))?
+}
+
+async fn ensure_reshoot_input_is_new(
+    source_project: &Path,
+    stored_source: &Path,
+    input: &Path,
+    input_type: ReshootInputType,
+) -> Result<()> {
+    let canonical_input = tokio::fs::canonicalize(input).await.ok();
+    let canonical_project = tokio::fs::canonicalize(source_project).await.ok();
+    if canonical_input
+        .as_ref()
+        .zip(canonical_project.as_ref())
+        .is_some_and(|(input, project)| input.starts_with(project))
+    {
+        return Err(original_reshoot_input_error());
+    }
+
+    let is_original = match input_type {
+        ReshootInputType::Video => {
+            stored_source.is_file() && files_have_same_content(stored_source, input).await?
+        }
+        ReshootInputType::Images => {
+            let same_as_source = stored_source.is_dir()
+                && image_sequences_share_content(stored_source, input).await?;
+            if same_as_source {
+                true
+            } else {
+                let prepared_source_frames = source_project.join("work/frames");
+                prepared_source_frames.is_dir()
+                    && image_sequences_share_content(&prepared_source_frames, input).await?
+            }
+        }
+    };
+    if is_original {
+        Err(original_reshoot_input_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn original_reshoot_input_error() -> SplatError {
+    SplatError::Process("补拍时不能再次使用原素材，请选择新拍摄的视频或图片序列。".into())
+}
+
+async fn image_sequences_share_content(left: &Path, right: &Path) -> Result<bool> {
+    if !left.is_dir() || !right.is_dir() {
+        return Ok(false);
+    }
+    let left = left.to_path_buf();
+    let right = right.to_path_buf();
+    let (left, right) = tokio::task::spawn_blocking(move || {
+        Ok::<_, SplatError>((
+            crate::video::list_images(&left)?,
+            crate::video::list_images(&right)?,
+        ))
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("比较补拍素材失败：{error}")))??;
+    let mut source_fingerprints: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
+    for path in left {
+        source_fingerprints
+            .entry(file_fingerprint(&path).await?)
+            .or_default()
+            .push(path);
+    }
+    for path in right {
+        if let Some(candidates) = source_fingerprints.get(&file_fingerprint(&path).await?) {
+            for source in candidates {
+                if files_have_same_content(source, &path).await? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn file_fingerprint(path: &Path) -> Result<(u64, u64)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let length = file.metadata().await?.len();
+    let mut hash = 0xcbf29ce484222325_u64;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((length, hash));
+        }
+        for byte in &buffer[..read] {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+async fn files_have_same_content(left: &Path, right: &Path) -> Result<bool> {
+    if !left.is_file() || !right.is_file() {
+        return Ok(false);
+    }
+    let left_metadata = tokio::fs::metadata(left).await?;
+    let right_metadata = tokio::fs::metadata(right).await?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+
+    let mut left_file = tokio::fs::File::open(left).await?;
+    let mut right_file = tokio::fs::File::open(right).await?;
+    let mut left_buffer = vec![0_u8; 256 * 1024];
+    let mut right_buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let left_read = left_file.read(&mut left_buffer).await?;
+        let right_read = right_file.read(&mut right_buffer).await?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 fn mark_state_terminal(mut state: PipelineStateFile, cancelled: bool) -> PipelineStateFile {
     state.stage = if cancelled {
         PipelineStage::Cancelled
@@ -1962,6 +2998,131 @@ fn mark_state_terminal(mut state: PipelineStateFile, cancelled: bool) -> Pipelin
         PipelineStage::Failed
     };
     state
+}
+
+async fn copy_image_files(source: &Path, destination: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(destination).await?;
+    for image in crate::video::list_images(source)? {
+        let name = image
+            .file_name()
+            .ok_or_else(|| SplatError::InvalidPath(image.clone()))?;
+        tokio::fs::copy(&image, destination.join(name)).await?;
+    }
+    Ok(())
+}
+
+async fn remove_reshoot_images(directory: &Path) -> Result<()> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name().to_string_lossy().starts_with("reshoot_") && entry.path().is_file() {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn move_extracted_reshoot(
+    extracted_frames: &Path,
+    extracted_masks: &Path,
+    frames: &Path,
+    masks: &Path,
+    has_alpha: bool,
+) -> Result<()> {
+    tokio::fs::create_dir_all(frames).await?;
+    if has_alpha {
+        tokio::fs::create_dir_all(masks).await?;
+    }
+    for (index, source) in crate::video::list_images(extracted_frames)?
+        .iter()
+        .enumerate()
+    {
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("jpg");
+        let old_name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| SplatError::InvalidPath(source.clone()))?;
+        let new_name = format!("reshoot_{:06}.{extension}", index + 1);
+        tokio::fs::rename(source, frames.join(&new_name)).await?;
+        if has_alpha {
+            tokio::fs::rename(
+                extracted_masks.join(format!("{old_name}.png")),
+                masks.join(format!("{new_name}.png")),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn image_names_with_prefix(directory: &Path, prefix: &str) -> Result<Vec<String>> {
+    Ok(crate::video::list_images(directory)?
+        .into_iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+        })
+        .filter(|name| name.starts_with(prefix))
+        .collect())
+}
+
+async fn write_image_list(path: &Path, names: &[String]) -> Result<()> {
+    let mut value = names.join("\n");
+    value.push('\n');
+    tokio::fs::write(path, value).await?;
+    Ok(())
+}
+
+async fn validate_image_dimensions(
+    directory: &Path,
+    prefix: &str,
+    expected_width: u64,
+    expected_height: u64,
+) -> Result<()> {
+    let directory = directory.to_path_buf();
+    let prefix = prefix.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use image::GenericImageView;
+        for path in crate::video::list_images(&directory)? {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let dimensions = image::ImageReader::open(&path)
+                .map_err(|error| {
+                    SplatError::Process(format!("无法读取补拍画面 {}：{error}", path.display()))
+                })?
+                .with_guessed_format()
+                .map_err(|error| {
+                    SplatError::Process(format!("无法识别补拍画面 {}：{error}", path.display()))
+                })?
+                .decode()
+                .map_err(|error| {
+                    SplatError::Process(format!("补拍画面损坏 {}：{error}", path.display()))
+                })?
+                .dimensions();
+            if u64::from(dimensions.0) != expected_width
+                || u64::from(dimensions.1) != expected_height
+            {
+                return Err(SplatError::Process(format!(
+                    "补拍画面 {} 的分辨率为 {}×{}，需要与原项目保持 {}×{}",
+                    name, dimensions.0, dimensions.1, expected_width, expected_height
+                )));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("补拍画面校验失败：{error}")))?
 }
 
 async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFile) -> Result<()> {
@@ -2054,12 +3215,13 @@ async fn prepared_frames_from_checkpoint(
             };
             let frames_dir = paths.frames.clone();
             let masks_dir = paths.masks.clone();
+            let has_alpha = frames.has_alpha;
             let Ok(prepared) = tokio::task::spawn_blocking(move || {
                 validate_prepared_image_sequence(
                     &frames_dir,
                     &masks_dir,
                     extracted_frames,
-                    image_sequence.has_alpha,
+                    has_alpha,
                 )
                 .map(|prepared| (prepared, image_sequence))
             })
@@ -2156,6 +3318,10 @@ fn best_sparse_model_blocking(
     frames: &Path,
     sparse: &Path,
 ) -> Result<(PathBuf, ReconstructionReport)> {
+    // COLMAP normally writes numbered children such as `sparse/0`, while
+    // continuation from `--input_path` may write directly to the requested
+    // directory. Accept both layouts and keep the model with most registered
+    // images.
     let mut best = ReconstructionValidator::validate(frames, sparse)
         .ok()
         .map(|report| (sparse.to_path_buf(), report));
@@ -2270,6 +3436,175 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_preparation_emits_monotonic_phase_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let frames = temporary.path().join("frames");
+        let masks = temporary.path().join("masks");
+        std::fs::create_dir_all(&source).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(source.join("1.jpg"))
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 0]))
+            .save(source.join("2.png"))
+            .unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let runner = PipelineRunner::new(EnginePaths::from_root(temporary.path()), move |event| {
+            captured.lock().unwrap().push(event);
+        });
+
+        let prepared = runner
+            .prepare_images(&source, Quality::Balanced, &frames, &masks, false)
+            .await
+            .unwrap();
+
+        assert!(prepared.has_alpha);
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.message.starts_with("正在建立画面链接或复制")));
+        assert!(events
+            .iter()
+            .any(|event| event.message.starts_with("正在检测 Alpha 并生成 Mask")));
+        assert!(events
+            .iter()
+            .any(|event| event.message == "图片与 Mask 完整性校验完成"));
+        let progress = events
+            .iter()
+            .filter(|event| event.stage == PipelineStage::ExtractingFrames)
+            .map(|event| event.stage_progress.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(
+            progress.windows(2).all(|pair| pair[0] <= pair[1]),
+            "stage progress regressed: {progress:?}"
+        );
+        assert!(events.iter().any(|event| {
+            event.unit.as_deref() == Some("images")
+                && event.current.is_some()
+                && event.total.is_some()
+        }));
+    }
+
+    fn write_validator_model(root: &Path, registered: u64, points: u64) {
+        std::fs::create_dir_all(root).unwrap();
+        for (name, count) in [
+            ("cameras.bin", 1_u64),
+            ("images.bin", registered),
+            ("points3D.bin", points),
+        ] {
+            let mut bytes = count.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0_u8; 8]);
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn incremental_sparse_model_is_found_at_the_output_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("frames");
+        let sparse = temporary.path().join("sparse");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(frames.join("frame_000001.jpg"), b"one").unwrap();
+        std::fs::write(frames.join("reshoot_000001.png"), b"two").unwrap();
+        write_validator_model(&sparse, 2, 50);
+
+        let (model, report) = best_sparse_model_blocking(&frames, &sparse).unwrap();
+
+        assert_eq!(model, sparse);
+        assert_eq!(report.registered_images, 2);
+        assert_eq!(report.points_3d, 50);
+    }
+
+    #[test]
+    fn fresh_sparse_model_is_still_found_in_a_numbered_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("frames");
+        let sparse = temporary.path().join("sparse");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(frames.join("frame_000001.jpg"), b"one").unwrap();
+        write_validator_model(&sparse.join("0"), 1, 25);
+
+        let (model, report) = best_sparse_model_blocking(&frames, &sparse).unwrap();
+
+        assert_eq!(model, sparse.join("0"));
+        assert_eq!(report.registered_images, 1);
+    }
+
+    #[tokio::test]
+    async fn reshoot_rejects_the_original_video_by_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let stored = project.join("source/input.mov");
+        let original = temporary.path().join("original.mov");
+        let fresh = temporary.path().join("fresh.mov");
+        tokio::fs::create_dir_all(stored.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stored, b"same-video").await.unwrap();
+        tokio::fs::write(&original, b"same-video").await.unwrap();
+        tokio::fs::write(&fresh, b"new-video!").await.unwrap();
+
+        assert!(
+            ensure_reshoot_input_is_new(&project, &stored, &original, ReshootInputType::Video,)
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_reshoot_input_is_new(&project, &stored, &fresh, ReshootInputType::Video,)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn reshoot_rejects_the_original_image_sequence_by_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let stored = project.join("source/images");
+        let original = temporary.path().join("original-images");
+        let fresh = temporary.path().join("fresh-images");
+        let mixed = temporary.path().join("mixed-images");
+        for directory in [&stored, &original, &fresh, &mixed] {
+            tokio::fs::create_dir_all(directory).await.unwrap();
+        }
+        for (name, bytes) in [("1.jpg", b"one".as_slice()), ("2.png", b"two".as_slice())] {
+            tokio::fs::write(stored.join(name), bytes).await.unwrap();
+            tokio::fs::write(original.join(name), bytes).await.unwrap();
+            tokio::fs::write(fresh.join(name), bytes).await.unwrap();
+        }
+        tokio::fs::write(fresh.join("1.jpg"), b"fresh-one")
+            .await
+            .unwrap();
+        tokio::fs::write(fresh.join("2.png"), b"fresh-two")
+            .await
+            .unwrap();
+        tokio::fs::write(mixed.join("1.jpg"), b"one").await.unwrap();
+        tokio::fs::write(mixed.join("2.png"), b"fresh-two")
+            .await
+            .unwrap();
+
+        assert!(ensure_reshoot_input_is_new(
+            &project,
+            &stored,
+            &original,
+            ReshootInputType::Images,
+        )
+        .await
+        .is_err());
+        assert!(
+            ensure_reshoot_input_is_new(&project, &stored, &mixed, ReshootInputType::Images,)
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_reshoot_input_is_new(&project, &stored, &fresh, ReshootInputType::Images,)
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn parses_ffmpeg_progress() {
@@ -2442,6 +3777,44 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn opaque_alpha_channel_sequence_reuses_a_maskless_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        for name in ["frame_000001.png", "frame_000002.png"] {
+            tokio::fs::write(paths.frames.join(name), b"image")
+                .await
+                .unwrap();
+        }
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.image_sequence = Some(ImageSequenceInfo {
+            image_count: 2,
+            width: 1920,
+            height: 1080,
+            has_alpha: true,
+            requires_large_sequence_confirmation: false,
+        });
+        state.frames = Some(FrameState {
+            retention_ratio: 1.0,
+            sampling_fps: 0.0,
+            estimated_frames: 2,
+            extracted_frames: Some(2),
+            image_format: Some("images".into()),
+            mask_count: Some(0),
+            has_alpha: false,
+            ..FrameState::default()
+        });
+
+        let prepared = prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .expect("opaque alpha-channel images should reuse the maskless checkpoint");
+
+        assert!(!prepared.has_alpha);
+        assert_eq!(prepared.mask_count, 0);
     }
 
     #[tokio::test]

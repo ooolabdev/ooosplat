@@ -53,6 +53,13 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .topbar-actions { gap: 17px; }
 .settings-action { height: 32px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; color: #5b6679; background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 12px; font-weight: 650; white-space: nowrap; }
 .settings-action:hover { color: var(--blue); background: #edf2ff; border-color: #cbd7f7; }
+.update-action, .update-progress { height: 32px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; }
+.update-action { color: #fff; background: var(--blue); border: 1px solid var(--blue); cursor: pointer; }
+.update-action:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+.update-action:disabled { color: #5b6474; background: #e7eaf0; border-color: #d4d9e2; cursor: not-allowed; }
+.update-progress { color: var(--blue); border: 1px solid #cbd7f7; background: #edf2ff; }
+.update-check-action { color: var(--green); }
+.update-check-action:hover { color: var(--green); }
 .language-action { min-width: 48px; justify-content: center; }
 .status-light { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(45,153,101,.1); }
 .status-light.warning { background: var(--amber); box-shadow: 0 0 0 4px rgba(199,131,20,.12); }
@@ -197,6 +204,34 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
   background: rgba(19, 26, 39, .54);
   backdrop-filter: blur(3px);
 }
+.reshoot-input-backdrop { position: fixed; inset: 0; z-index: 130; display: grid; place-items: center; padding: 24px; background: rgba(19, 26, 39, .54); backdrop-filter: blur(3px); }
+.reshoot-input-dialog { width: min(520px, calc(100vw - 48px)); padding: 24px; color: var(--ink); background: #f8f9fb; border: 1px solid var(--line-dark); box-shadow: 0 24px 60px rgba(10, 17, 29, .3); }
+.reshoot-input-dialog h2 { margin: 0 0 8px; font-size: 18px; }
+.reshoot-input-dialog > p { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.reshoot-input-options { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.reshoot-input-options button { min-height: 108px; padding: 14px; display: grid; justify-items: start; align-content: center; gap: 6px; text-align: left; color: var(--ink); background: #eef2f8; border: 1px solid #c4cfdd; cursor: pointer; }
+.reshoot-input-options button:hover { background: #e3edff; border-color: var(--blue); }
+.reshoot-input-options small { color: var(--muted); }
+.reshoot-input-cancel { margin-top: 14px; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
+.reshoot-workflow-dialog { width: min(680px, calc(100vw - 48px)); }
+.reshoot-dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.reshoot-dialog-heading small { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; }
+.reshoot-dialog-heading button { padding: 5px; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
+.reshoot-capture-tips { margin: -5px 0 16px; padding-left: 18px; color: #45536a; font-size: 11px; line-height: 1.7; }
+.reshoot-source-summary { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0 0 16px; border: 1px solid var(--line); }
+.reshoot-source-summary div { min-width: 0; padding: 9px 11px; border-right: 1px solid var(--line); }
+.reshoot-source-summary div:last-child { border-right: 0; }
+.reshoot-source-summary dt { color: var(--muted); font-size: 9px; }
+.reshoot-source-summary dd { margin: 4px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 700; }
+.reshoot-analysis { display: flex; align-items: center; gap: 7px; margin-top: 14px !important; }
+.reshoot-plan { display: grid; gap: 5px; margin-top: 14px; padding: 11px 12px; background: #eef4ff; border: 1px solid #b9cdf7; font-size: 10px; }
+.reshoot-plan span { color: var(--muted); }
+.reshoot-plan.incompatible { background: #fff1ef; border-color: #e6a49d; }
+.reshoot-plan.incompatible b { color: #a6382e; }
+.reshoot-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.reshoot-dialog-actions button { display: inline-flex; align-items: center; gap: 6px; min-width: 100px; justify-content: center; padding: 8px 13px; cursor: pointer; }
+.reshoot-dialog-actions .primary { color: #fff; background: var(--blue); border: 1px solid var(--blue); }
+.reshoot-dialog-actions .secondary { color: var(--ink); background: transparent; border: 1px solid var(--line-dark); }
 .cancellation-status {
   width: min(420px, calc(100vw - 48px));
   min-height: 112px;
@@ -224,6 +259,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .cancellation-status p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
 .inline-error button { color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.reshoot-inline-error { margin: 0; grid-template-columns: 18px 1fr; }
 
 .failure-guidance-backdrop { position: fixed; inset: 0; z-index: 130; display: grid; place-items: center; padding: 24px; background: rgba(16, 23, 36, .58); backdrop-filter: blur(3px); }
 .failure-guidance-dialog { width: min(540px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow-y: auto; color: var(--ink); background: #f8f9fb; border: 1px solid #b9c3d1; box-shadow: 0 28px 76px rgba(5, 12, 24, .34); }
@@ -298,6 +334,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .project-actions button:hover:not(:disabled) { color: var(--blue); }
 .project-actions .preview-link { color: var(--blue); font-weight: 700; }
 .project-actions .resume-link { color: var(--blue); font-weight: 700; }
+.project-actions .reshoot-link { color: #7a5af8; font-weight: 700; }
 .project-actions .danger-link:hover:not(:disabled) { color: var(--red); }
 
 .preview-mode { background: #e7ebf1; }
@@ -550,3 +587,12 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 @media (max-width: 700px) {
   .privacy-columns { grid-template-columns: 1fr; }
 }
+
+/* Sparse reconstruction live preview overlay */
+.sparse-preview-overlay { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: rgba(9, 12, 18, .98); color: #dbe5f4; }
+.sparse-preview-toolbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid rgba(125, 153, 205, .32); font-size: 13px; }
+.sparse-preview-toolbar .mono { color: #91a4c4; font: 11px/1 "Cascadia Mono", monospace; }
+.sparse-preview-toolbar button { margin-left: auto; }
+.sparse-preview-canvas { flex: 1; width: 100%; height: 100%; display: block; touch-action: none; }
+.sparse-preview-error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #f3b7b7; }
+.sparse-preview-hint { padding: 8px 16px; color: #91a4c4; font-size: 11px; }

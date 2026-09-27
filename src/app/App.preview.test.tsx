@@ -19,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   getAppRuntimeStatus: vi.fn(),
   getProjectOverview: vi.fn(),
   initializeTelemetry: vi.fn(),
+  inspectReshootSource: vi.fn(),
+  probeReshootInput: vi.fn(),
+  startReshootPipeline: vi.fn(),
   setTelemetryConsent: vi.fn(),
   selectVideo: vi.fn(),
   selectImageSequence: vi.fn(),
@@ -40,6 +43,8 @@ vi.mock("../lib/backend", () => ({
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
   initializeTelemetry: mocks.initializeTelemetry,
+  inspectReshootSource: mocks.inspectReshootSource,
+  probeReshootInput: mocks.probeReshootInput,
   onPipelineEvent: vi.fn().mockResolvedValue(() => undefined),
   prepareGaussianPreview: mocks.prepareGaussianPreview,
   probeAndPlan: mocks.probeAndPlan,
@@ -54,6 +59,7 @@ vi.mock("../lib/backend", () => ({
   setProjectsRoot: vi.fn(),
   setTelemetryConsent: mocks.setTelemetryConsent,
   startPipeline: mocks.startPipeline,
+  startReshootPipeline: mocks.startReshootPipeline,
 }));
 
 vi.mock("../components/GaussianViewer", () => ({
@@ -138,6 +144,20 @@ describe("App preview workspace", () => {
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [project] });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
+    mocks.inspectReshootSource.mockReset().mockResolvedValue({
+      projectId: project.id,
+      projectName: project.name,
+      quality: project.quality,
+      cameraId: 1,
+      cameraModel: "SIMPLE_RADIAL",
+      width: 1920,
+      height: 1080,
+      sourceImageCount: 100,
+      eligible: true,
+      reason: null,
+    });
+    mocks.probeReshootInput.mockReset();
+    mocks.startReshootPipeline.mockReset();
     mocks.setTelemetryConsent.mockReset().mockResolvedValue({ analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured" });
     mocks.selectVideo.mockReset().mockResolvedValue(null);
     mocks.selectImageSequence.mockReset().mockResolvedValue(null);
@@ -176,6 +196,85 @@ describe("App preview workspace", () => {
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);
+  });
+
+  it("offers a reshoot entry on a completed project and opens the incremental reshoot dialog", async () => {
+    // Selected by class rather than by label: the row is translated, so asserting
+    // on text would couple this test to the active interface language.
+    const reshootButton = container.querySelector<HTMLButtonElement>(".reshoot-link");
+    expect(reshootButton).not.toBeNull();
+
+    await act(async () => { reshootButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(mocks.inspectReshootSource).toHaveBeenCalledWith(project.id);
+    expect(mocks.prepareGaussianPreview).not.toHaveBeenCalled();
+    expect(container.querySelector(".reshoot-workflow-dialog")).not.toBeNull();
+    expect(container.querySelector(".reshoot-source-summary")?.textContent).toContain("1920 × 1080");
+  });
+
+  it("probes Alpha reshoot media and blocks a mismatched camera resolution", async () => {
+    mocks.selectVideo.mockResolvedValue("E:\\Capture\\reshoot.mov");
+    mocks.probeReshootInput.mockResolvedValue({
+      inputType: "video",
+      imageCount: null,
+      duration: 12,
+      preparedWidth: 1080,
+      preparedHeight: 1920,
+      estimatedFrames: 180,
+      hasAlpha: true,
+      maskCount: 180,
+      compatible: false,
+      incompatibilityReason: "补拍画面必须与原项目保持相同分辨率",
+      estimate: { estimatedMs: 120_000, lowerBoundMs: 90_000, upperBoundMs: 180_000, confidence: "low", sampleCount: 0, basis: "素材规模" },
+    });
+    const reshootButton = container.querySelector<HTMLButtonElement>(".reshoot-link");
+    await act(async () => { reshootButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+    const videoButton = container.querySelector<HTMLButtonElement>(".reshoot-input-options button");
+    await act(async () => { videoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(mocks.probeReshootInput).toHaveBeenCalledWith(project.id, "E:\\Capture\\reshoot.mov", "video");
+    expect(container.querySelector(".reshoot-plan.incompatible")?.textContent).toContain("1080 × 1920");
+    expect(container.querySelector<HTMLButtonElement>(".reshoot-dialog-actions .primary")?.disabled).toBe(true);
+  });
+
+  it("shows the original-media rejection inside the reshoot dialog", async () => {
+    mocks.selectVideo.mockResolvedValue("E:\\Capture\\original.mov");
+    mocks.probeReshootInput.mockRejectedValue(
+      new Error("补拍时不能再次使用原素材，请选择新拍摄的视频或图片序列。"),
+    );
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".reshoot-link")?.click();
+    });
+    await flush();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".reshoot-input-options button")?.click();
+    });
+    await flush();
+
+    expect(container.querySelector(".reshoot-inline-error")?.textContent).toContain(
+      "补拍时不能再次使用原素材",
+    );
+    expect(container.querySelector<HTMLButtonElement>(".reshoot-dialog-actions .primary")?.disabled).toBe(true);
+  });
+
+  it("opens a plain preview without the reshoot workflow", async () => {
+    const previewButton = container.querySelector<HTMLButtonElement>(".preview-link");
+
+    await act(async () => { previewButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flush();
+
+    expect(container.querySelector(".preview-workspace")).not.toBeNull();
+  });
+
+  it("keeps the reshoot entry away from unfinished projects", async () => {
+    const unfinished = { ...project, status: "cancelled" as const, finalPly: null, completedAt: null };
+    await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
+
+    expect(container.querySelector(".reshoot-link")).toBeNull();
+    expect(container.querySelector(".resume-link")).not.toBeNull();
   });
 
   it("switches the complete task workspace to English without reloading", async () => {
@@ -633,7 +732,7 @@ describe("App preview workspace", () => {
 
     expect(mocks.selectImageSequence).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("24 张");
-    expect(container.textContent).toContain("将保留 PNG Alpha");
+    expect(container.textContent).toContain("生成时将精确检测透明度");
     expect(container.querySelectorAll(".input-picker")).toHaveLength(1);
   });
 

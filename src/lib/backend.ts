@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, Quality, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import { getCurrentLocale, translate } from "../i18n";
 import { previewAssetUrl } from "./previewAssetUrl";
@@ -22,6 +22,7 @@ export async function selectImageSequence(): Promise<string | null> {
   const selected = await open({ title: translate(locale, "dialog.selectImagesTitle"), multiple: false, directory: true });
   return typeof selected === "string" ? selected : null;
 }
+
 
 export async function confirmLargeImageSequence(imageCount: number): Promise<boolean> {
   const locale = getCurrentLocale();
@@ -53,6 +54,11 @@ export async function setProjectsRoot(projectsRoot: string): Promise<AppSettings
 export async function setPlannerEnabled(enabled: boolean): Promise<AppSettings> { return invoke("set_planner_enabled", { enabled }); }
 export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot, plannerEnabled }); }
 export async function resumePipeline(projectId: string): Promise<PipelineResult> { return invoke("resume_pipeline", { projectId }); }
+export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId }); }
+export async function probeReshootInput(projectId: string, path: string, inputType: InputType): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType }); }
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string }): Promise<PipelineResult> {
+  return invoke("start_incremental_reshoot_pipeline", { request });
+}
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }
 export async function onPipelineEvent(handler: (event: PipelineEvent) => void): Promise<UnlistenFn> { return listen<PipelineEvent>("pipeline-event", ({ payload }) => handler(payload)); }
 export async function initializeTelemetry(): Promise<TelemetryPreferences> { return invoke("initialize_telemetry"); }

@@ -81,6 +81,7 @@ import type {
 } from "../../types/pipeline";
 import { PLY_TO_ENGINE_ROTATION } from "./CoordinateSystem";
 import {
+  copyFlippedRgbaRows,
   copyRgbaReadbackRows,
   normalizedCaptureRegion,
   verticalFovForCapture,
@@ -138,6 +139,8 @@ interface SplatSceneApi {
   deactivateCrop: () => void;
   alignView: (view: GaussianOrthographicView) => void;
   initializeCrop: (kind: "sphere" | "box", previous: GaussianCrop) => Exclude<GaussianCrop, null> | null;
+  /** Current view as top-down RGBA pixels, used to draw a reshoot guide. */
+  /** Model-space point to image pixels, so the guide can circle the region. */
   exportVideo: (options: {
     signal: AbortSignal;
     onProgress: (progress: GaussianVideoEncodingProgress) => void;
