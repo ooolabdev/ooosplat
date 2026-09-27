@@ -9,8 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     error::{Result, SplatError},
-    pipeline::{estimate::RuntimeSample, PipelineStage},
-    project::{manager::atomic_write_json, ProjectMetadata, ProjectStatus, PROJECT_APP_ID},
+    pipeline::{
+        estimate::{RuntimeInputKind, RuntimeSample},
+        PipelineStage,
+    },
+    project::{
+        manager::atomic_write_json, PipelineStateFile, ProjectMetadata, ProjectStatus,
+        PROJECT_APP_ID,
+    },
     reconstruction::ply::inspect_gaussian_ply,
 };
 
@@ -33,6 +39,12 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
             continue;
         };
         let state_bytes = tokio::fs::read(item.path.join("state.json")).await.ok();
+        let state = state_bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<PipelineStateFile>(bytes).ok());
+        let brush = state
+            .as_ref()
+            .and_then(|state| state.brush_training.resolved);
         let Some(extracted_frames) = runtime_sample_frame_count(
             state_bytes.as_deref(),
             metadata.output.as_ref().map(|output| output.input_images),
@@ -41,8 +53,28 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
         };
         samples.push(RuntimeSample {
             quality: metadata.quality,
+            input_kind: match metadata.input_type {
+                crate::project::ProjectInputType::Video => RuntimeInputKind::Video,
+                crate::project::ProjectInputType::Images => RuntimeInputKind::Images,
+            },
+            source_long_edge: state
+                .as_ref()
+                .and_then(|state| {
+                    state
+                        .video
+                        .as_ref()
+                        .map(|video| video.width.max(video.height))
+                        .or_else(|| {
+                            state
+                                .image_sequence
+                                .as_ref()
+                                .map(|images| images.width.max(images.height))
+                        })
+                })
+                .unwrap_or(1),
             extracted_frames,
             duration_ms,
+            brush,
         });
         if samples.len() == 20 {
             break;

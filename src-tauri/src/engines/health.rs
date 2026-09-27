@@ -93,6 +93,19 @@ impl ColmapAccelerationStatus {
         matches!(self.backend, ColmapBackend::Gpu)
     }
 
+    /// Returns total VRAM only for a GPU that passed the existing NVIDIA
+    /// compatibility checks. CPU fallbacks may still retain diagnostic device
+    /// information, but must not opt Brush into a higher-memory profile.
+    pub fn usable_gpu_total_memory_mb(&self) -> Option<u64> {
+        self.use_gpu()
+            .then(|| {
+                self.device
+                    .as_ref()
+                    .and_then(|device| device.total_memory_mb)
+            })
+            .flatten()
+    }
+
     pub fn gpu_index(&self) -> Option<u32> {
         self.use_gpu()
             .then(|| self.device.as_ref().map(|device| device.index))
@@ -920,6 +933,7 @@ mod tests {
         let status = choose_acceleration(vec![device(0, "528.33", "5.0")], requirements());
         assert_eq!(status.backend, ColmapBackend::Gpu);
         assert_eq!(status.reason_code, AccelerationReasonCode::GpuReady);
+        assert_eq!(status.usable_gpu_total_memory_mb(), Some(8_192));
     }
 
     #[test]
@@ -927,6 +941,11 @@ mod tests {
         let old_driver = choose_acceleration(vec![device(0, "528.32", "8.6")], requirements());
         assert_eq!(old_driver.backend, ColmapBackend::Cpu);
         assert_eq!(old_driver.reason_code, AccelerationReasonCode::DriverTooOld);
+        assert_eq!(
+            old_driver.device.as_ref().unwrap().total_memory_mb,
+            Some(8_192)
+        );
+        assert_eq!(old_driver.usable_gpu_total_memory_mb(), None);
 
         let old_gpu = choose_acceleration(vec![device(0, "560.81", "4.9")], requirements());
         assert_eq!(old_gpu.backend, ColmapBackend::Cpu);

@@ -33,7 +33,7 @@ use crate::{
         plan_bridge_backfill, read_registered_source_indices, write_bridge_pair_list,
         BridgeBackfillStatus, BRIDGE_TRIGGER_RATIO,
     },
-    presets::Quality,
+    presets::{resolve_brush_training_preset, Quality, ResolvedBrushTrainingPreset},
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
         catalog, manager::atomic_replace_file, FrameState, PipelineStateFile, ProjectInputType,
@@ -374,7 +374,13 @@ impl PipelineRunner {
         self.events.stage(
             PipelineStage::PlanningFrames,
             1.0,
-            format!("预计提取 {} 帧", plan.estimated_frames),
+            format!(
+                "预计提取 {} 帧（目标 {:.2} FPS，候选池 {} 帧 / 最高约 {:.2} FPS）",
+                plan.estimated_frames,
+                plan.sampling_fps,
+                plan.candidate_frames.len(),
+                plan.candidate_frames.len() as f64 / video.duration.max(f64::EPSILON)
+            ),
         );
 
         self.events.stage(
@@ -855,13 +861,22 @@ impl PipelineRunner {
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
         } else {
             reset_directory(&sparse).await?;
-            self.events
-                .stage(PipelineStage::Reconstructing, 0.0, "正在增量重建相机轨迹");
+            let allow_two_view_tracks = state.planner_enabled && preset.sfm_allow_two_view_tracks;
+            self.events.stage(
+                PipelineStage::Reconstructing,
+                0.0,
+                if allow_two_view_tracks {
+                    "正在增量重建相机轨迹（High：允许两视图三角化）"
+                } else {
+                    "正在增量重建相机轨迹"
+                },
+            );
             colmap::map(
                 &self.engines.colmap,
                 &database,
                 colmap_images,
                 &sparse,
+                allow_two_view_tracks,
                 colmap_log.clone(),
                 &self.process_manager,
                 Some(self.process_observer(
@@ -934,6 +949,29 @@ impl PipelineRunner {
         } else {
             reset_directory(&paths.brush).await?;
             let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let source_long_edge = prepared
+                .video
+                .as_ref()
+                .map(|video| video.width.max(video.height))
+                .or_else(|| {
+                    prepared
+                        .image_sequence
+                        .as_ref()
+                        .map(|images| images.width.max(images.height))
+                })
+                .unwrap_or(1);
+            let detected_total_memory_mb = acceleration.usable_gpu_total_memory_mb();
+            let resolved_brush = state.brush_training.resolved.unwrap_or_else(|| {
+                resolve_brush_training_preset(
+                    quality,
+                    state.planner_enabled,
+                    detected_total_memory_mb,
+                    source_long_edge,
+                    report.points_3d,
+                )
+            });
+            state.brush_training.resolved = Some(resolved_brush);
+            project_manager.write_state(&paths.state, &state).await?;
             let runtime_samples = catalog::runtime_samples().await;
             let estimated_brush_duration_ms = match (&prepared.video, &prepared.image_sequence) {
                 (Some(video), _) => estimate_calibrated_brush_stage_ms(
@@ -941,12 +979,15 @@ impl PipelineRunner {
                     &prepared.plan,
                     quality,
                     &runtime_samples,
+                    Some(&resolved_brush),
                 ),
                 (_, Some(images)) => estimate_calibrated_brush_stage_ms_for_images(
                     images.image_count,
+                    images.width.max(images.height),
                     &prepared.plan,
                     quality,
                     &runtime_samples,
+                    Some(&resolved_brush),
                 ),
                 _ => return Err(SplatError::Process("项目输入信息不完整".into())),
             };
@@ -959,31 +1000,26 @@ impl PipelineRunner {
                 true,
                 format!(
                     "Brush 训练开始（使用可用图形后端）· {} iterations · 最大分辨率 {} · 预计约 {}",
-                    preset.brush_iterations,
-                    preset.brush_max_resolution,
+                    resolved_brush.preset.total_steps,
+                    resolved_brush.preset.max_resolution,
                     format_duration(estimated_brush_duration_ms)
                 ),
                 Some(0),
-                Some(preset.brush_iterations as u64),
+                Some(resolved_brush.preset.total_steps as u64),
                 Some("iterations"),
             );
-            let candidate = brush::train(
-                &self.engines.brush,
-                &dataset,
-                &paths.brush,
-                preset,
-                paths.logs.join("brush.log"),
-                &self.process_manager,
-                Some(self.process_observer(
-                    PipelineStage::TrainingSplats,
-                    PipelineEngine::Brush,
-                    Some(preset.brush_iterations as u64),
-                    ObserverMode::Brush {
-                        estimated_duration_ms: estimated_brush_duration_ms,
-                    },
-                )),
-            )
-            .await?;
+            let candidate = self
+                .train_brush_with_oom_retry(
+                    project_manager,
+                    paths,
+                    &mut state,
+                    quality,
+                    &dataset,
+                    report.points_3d,
+                    resolved_brush,
+                    estimated_brush_duration_ms,
+                )
+                .await?;
             state.stage = PipelineStage::TrainingSplats;
             state.brush_complete = true;
             project_manager.write_state(&paths.state, &state).await?;
@@ -1046,6 +1082,153 @@ impl PipelineRunner {
             logs_directory: paths.logs.clone(),
             source_duration_seconds,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn train_brush_with_oom_retry(
+        &self,
+        project_manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        quality: Quality,
+        dataset: &Path,
+        initial_sfm_points: u64,
+        resolved: ResolvedBrushTrainingPreset,
+        estimated_duration_ms: u64,
+    ) -> Result<PathBuf> {
+        self.log_brush_profile("BrushProfile", &resolved, EventLevel::Info);
+        let first_log = if state.brush_training.oom_retry_used {
+            paths.logs.join("brush-retry.log")
+        } else {
+            paths.logs.join("brush.log")
+        };
+        let first = brush::train(
+            &self.engines.brush,
+            dataset,
+            &paths.brush,
+            resolved.preset,
+            first_log,
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::TrainingSplats,
+                PipelineEngine::Brush,
+                Some(resolved.preset.total_steps as u64),
+                ObserverMode::Brush {
+                    estimated_duration_ms,
+                },
+            )),
+        )
+        .await;
+
+        match first {
+            Ok(candidate) => Ok(candidate),
+            Err(SplatError::BrushOutOfMemory(detail))
+                if quality == Quality::High
+                    && state.planner_enabled
+                    && !state.brush_training.oom_retry_used =>
+            {
+                let Some(downgraded) = brush_oom_fallback(
+                    quality,
+                    state.planner_enabled,
+                    state.brush_training.oom_retry_used,
+                    resolved,
+                    initial_sfm_points,
+                ) else {
+                    return Err(SplatError::BrushOutOfMemory(detail));
+                };
+                state.brush_training.oom_retry_used = true;
+                state.brush_training.resolved = Some(downgraded);
+                project_manager.write_state(&paths.state, state).await?;
+                self.events.send(
+                    PipelineStage::TrainingSplats,
+                    Some(PipelineEngine::Brush),
+                    EventKind::Log,
+                    EventLevel::Warning,
+                    None,
+                    true,
+                    format!(
+                        "[BrushRetry] reason=OutOfMemory from={} to={}，复用现有 SfM 和训练数据重试一次",
+                        resolved.profile.label(),
+                        downgraded.profile.label()
+                    ),
+                    None,
+                    None,
+                    None,
+                );
+                self.log_brush_profile("BrushRetryProfile", &downgraded, EventLevel::Warning);
+                let resolution_ratio = downgraded.preset.max_resolution as f64
+                    / resolved.preset.max_resolution.max(1) as f64;
+                let retry_estimate = (estimated_duration_ms as f64 * resolution_ratio.powf(1.35))
+                    .round()
+                    .max(1_000.0) as u64;
+                brush::train(
+                    &self.engines.brush,
+                    dataset,
+                    &paths.brush,
+                    downgraded.preset,
+                    paths.logs.join("brush-retry.log"),
+                    &self.process_manager,
+                    Some(self.process_observer(
+                        PipelineStage::TrainingSplats,
+                        PipelineEngine::Brush,
+                        Some(downgraded.preset.total_steps as u64),
+                        ObserverMode::Brush {
+                            estimated_duration_ms: retry_estimate,
+                        },
+                    )),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn log_brush_profile(
+        &self,
+        label: &str,
+        resolved: &ResolvedBrushTrainingPreset,
+        level: EventLevel,
+    ) {
+        let densification = resolved.preset.densification;
+        self.events.send(
+            PipelineStage::TrainingSplats,
+            Some(PipelineEngine::Brush),
+            EventKind::Log,
+            level,
+            None,
+            true,
+            format!(
+                "[{label}] profile={} vramMiB={} resolution={} steps={} threshold={} fraction={} growthStop={} configuredMaxSplats={} effectiveMaxSplats={}",
+                resolved.profile.label(),
+                resolved
+                    .detected_total_memory_mb
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                resolved.preset.max_resolution,
+                resolved.preset.total_steps,
+                densification
+                    .map(|value| value.growth_grad_threshold.to_string())
+                    .unwrap_or_else(|| "default".into()),
+                densification
+                    .map(|value| value.growth_select_fraction.to_string())
+                    .unwrap_or_else(|| "default".into()),
+                densification
+                    .map(|value| value.growth_stop_iter.to_string())
+                    .unwrap_or_else(|| "default".into()),
+                resolved
+                    .configured_max_splats
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "default".into()),
+                resolved
+                    .preset
+                    .max_splats
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "default".into()),
+            ),
+            None,
+            None,
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1739,6 +1922,18 @@ fn format_duration(milliseconds: u64) -> String {
     )
 }
 
+fn brush_oom_fallback(
+    quality: Quality,
+    planner_enabled: bool,
+    retry_used: bool,
+    resolved: ResolvedBrushTrainingPreset,
+    initial_sfm_points: u64,
+) -> Option<ResolvedBrushTrainingPreset> {
+    (quality == Quality::High && planner_enabled && !retry_used)
+        .then(|| resolved.downgrade_after_oom(initial_sfm_points))
+        .flatten()
+}
+
 fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
     if state.brush_complete {
         PipelineStage::TrainingSplats
@@ -1790,6 +1985,9 @@ async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFi
         && best_sparse_model(&paths.frames, &paths.colmap.join("sparse"))
             .await
             .is_ok();
+    if !state.reconstruction_complete {
+        state.brush_training = Default::default();
+    }
     state.brush_complete = state.reconstruction_complete
         && state.brush_complete
         && brush_candidate(&paths.brush)
@@ -2433,6 +2631,20 @@ mod tests {
     #[test]
     fn brush_estimated_progress_handles_an_invalid_duration() {
         assert_eq!(estimated_brush_progress(10_000, 0), 0.0);
+    }
+
+    #[test]
+    fn brush_oom_fallback_is_high_only_and_can_be_used_once() {
+        let resolved =
+            resolve_brush_training_preset(Quality::High, true, Some(12_288), 7_680, 60_000);
+        let fallback = brush_oom_fallback(Quality::High, true, false, resolved, 60_000).unwrap();
+        assert_eq!(
+            fallback.profile,
+            crate::presets::BrushTrainingProfile::HighStandard
+        );
+        assert!(brush_oom_fallback(Quality::High, true, true, fallback, 60_000).is_none());
+        assert!(brush_oom_fallback(Quality::Balanced, true, false, resolved, 60_000).is_none());
+        assert!(brush_oom_fallback(Quality::High, false, false, resolved, 60_000).is_none());
     }
 
     #[test]

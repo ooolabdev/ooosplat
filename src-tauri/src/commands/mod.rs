@@ -17,11 +17,13 @@ use crate::{
     },
     error::{Result, SplatError},
     pipeline::{
-        estimate::{estimate_runtime, estimate_runtime_for_images, RuntimeEstimate},
+        estimate::{
+            estimate_runtime_for_images_with_brush, estimate_runtime_with_brush, RuntimeEstimate,
+        },
         runner::{PipelineFailureContext, PipelineResult, PipelineRunner},
         PipelineEngine, PipelineStage,
     },
-    presets::Quality,
+    presets::{resolve_brush_training_preset, Quality},
     process::ProcessManager,
     project::{
         catalog::{self, AppSettings, ProjectOverview},
@@ -314,6 +316,7 @@ pub async fn probe_and_plan(
     let engine_paths = paths_for_app(&app);
     let samples = catalog::runtime_samples().await;
     let input = PathBuf::from(path);
+    let planner_enabled = planner_enabled.unwrap_or(true);
     if input.is_dir() {
         let image_sequence = tokio::task::spawn_blocking({
             let input = input.clone();
@@ -322,8 +325,22 @@ pub async fn probe_and_plan(
         .await
         .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let plan = create_image_plan(&image_sequence, &quality.preset());
-        let estimate =
-            estimate_runtime_for_images(image_sequence.image_count, &plan, quality, &samples);
+        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let brush = resolve_brush_training_preset(
+            quality,
+            planner_enabled,
+            acceleration.usable_gpu_total_memory_mb(),
+            image_sequence.width.max(image_sequence.height),
+            0,
+        );
+        let estimate = estimate_runtime_for_images_with_brush(
+            image_sequence.image_count,
+            image_sequence.width.max(image_sequence.height),
+            &plan,
+            quality,
+            &samples,
+            Some(&brush),
+        );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Images,
             video: None,
@@ -334,12 +351,20 @@ pub async fn probe_and_plan(
     } else {
         let video =
             probe_video(&engine_paths.ffprobe, &input, None, &ProcessManager::new()).await?;
-        let plan = if planner_enabled.unwrap_or(true) {
+        let plan = if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
-        let estimate = estimate_runtime(&video, &plan, quality, &samples);
+        let acceleration = detect_colmap_acceleration(&engine_paths).await;
+        let brush = resolve_brush_training_preset(
+            quality,
+            planner_enabled,
+            acceleration.usable_gpu_total_memory_mb(),
+            video.width.max(video.height),
+            0,
+        );
+        let estimate = estimate_runtime_with_brush(&video, &plan, quality, &samples, Some(&brush));
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
             video: Some(video),
@@ -392,6 +417,8 @@ pub async fn estimate_project_runtime(
         ..FramePlan::default()
     });
     let samples = catalog::runtime_samples().await;
+    let acceleration = detect_colmap_acceleration(&paths_for_app(&app)).await;
+    let detected_total_memory_mb = acceleration.usable_gpu_total_memory_mb();
     let mut estimate = match metadata.input_type {
         ProjectInputType::Video => {
             let video = match state.video.clone() {
@@ -409,7 +436,20 @@ pub async fn estimate_project_runtime(
             let plan = saved_plan.unwrap_or_else(|| {
                 UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
             });
-            estimate_runtime(&video, &plan, metadata.quality, &samples)
+            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+                resolve_brush_training_preset(
+                    metadata.quality,
+                    state.planner_enabled,
+                    detected_total_memory_mb,
+                    video.width.max(video.height),
+                    metadata
+                        .output
+                        .as_ref()
+                        .map(|output| output.points_3d)
+                        .unwrap_or(0),
+                )
+            });
+            estimate_runtime_with_brush(&video, &plan, metadata.quality, &samples, Some(&brush))
         }
         ProjectInputType::Images => {
             let image_sequence = match state.image_sequence.clone() {
@@ -423,11 +463,26 @@ pub async fn estimate_project_runtime(
             };
             let plan = saved_plan
                 .unwrap_or_else(|| create_image_plan(&image_sequence, &metadata.quality.preset()));
-            estimate_runtime_for_images(
+            let brush = state.brush_training.resolved.unwrap_or_else(|| {
+                resolve_brush_training_preset(
+                    metadata.quality,
+                    state.planner_enabled,
+                    detected_total_memory_mb,
+                    image_sequence.width.max(image_sequence.height),
+                    metadata
+                        .output
+                        .as_ref()
+                        .map(|output| output.points_3d)
+                        .unwrap_or(0),
+                )
+            });
+            estimate_runtime_for_images_with_brush(
                 image_sequence.image_count,
+                image_sequence.width.max(image_sequence.height),
                 &plan,
                 metadata.quality,
                 &samples,
+                Some(&brush),
             )
         }
     };

@@ -14,6 +14,8 @@ pub enum SplatError {
     Cancelled,
     #[error("外部进程执行失败：{0}")]
     Process(String),
+    #[error("Brush 显存不足：{0}")]
+    BrushOutOfMemory(String),
     #[error("当前引擎版本不支持安全接入：{0}")]
     UnsupportedEngine(String),
     #[error("文件读写失败：{0}")]

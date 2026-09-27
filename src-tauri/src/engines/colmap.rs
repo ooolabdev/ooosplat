@@ -382,11 +382,13 @@ fn matching_args(
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn map(
     executable: &Path,
     database: &Path,
     images: &Path,
     output: &Path,
+    allow_two_view_tracks: bool,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -394,7 +396,7 @@ pub async fn map(
     tokio::fs::create_dir_all(output).await?;
     run_colmap(
         executable,
-        mapper_args(database, images, None, output),
+        mapper_args(database, images, None, output, allow_two_view_tracks),
         database.parent().unwrap_or(output),
         log,
         manager,
@@ -420,7 +422,7 @@ pub async fn map_from_existing(
     tokio::fs::create_dir_all(output).await?;
     run_colmap(
         executable,
-        mapper_args(database, images, Some(input_model), output),
+        mapper_args(database, images, Some(input_model), output, false),
         database.parent().unwrap_or(output),
         log,
         manager,
@@ -434,6 +436,7 @@ fn mapper_args(
     images: &Path,
     input_model: Option<&Path>,
     output: &Path,
+    allow_two_view_tracks: bool,
 ) -> Vec<OsString> {
     let mut args = vec![
         "mapper".into(),
@@ -448,6 +451,10 @@ fn mapper_args(
     }
     args.push("--output_path".into());
     args.push(output.into());
+    if allow_two_view_tracks {
+        args.push("--Mapper.tri_ignore_two_view_tracks".into());
+        args.push("0".into());
+    }
     args
 }
 
@@ -628,11 +635,37 @@ mod tests {
             Path::new("../frames"),
             Some(Path::new("sparse/0")),
             Path::new("sparse-bridge"),
+            false,
         ));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--input_path", "sparse/0"]));
         assert_eq!(args[0], "mapper");
         assert!(!args.iter().any(|arg| arg == "global_mapper"));
+    }
+
+    #[test]
+    fn high_mapper_can_triangulate_two_view_tracks() {
+        let args = strings(mapper_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            None,
+            Path::new("sparse"),
+            true,
+        ));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--Mapper.tri_ignore_two_view_tracks", "0"]));
+
+        let default_args = strings(mapper_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            None,
+            Path::new("sparse"),
+            false,
+        ));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg == "--Mapper.tri_ignore_two_view_tracks"));
     }
 }

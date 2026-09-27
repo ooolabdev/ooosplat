@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     pipeline::PipelineStage,
     planner::BridgeBackfillCheckpoint,
-    presets::Quality,
+    presets::{Quality, ResolvedBrushTrainingPreset},
     video::{FramePlan, ImageSequenceInfo, PlannedFrame, VideoInfo},
 };
 
@@ -233,6 +233,15 @@ pub struct FrameState {
     pub rescue_max_frames: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrushTrainingCheckpoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedBrushTrainingPreset>,
+    #[serde(default)]
+    pub oom_retry_used: bool,
+}
+
 impl From<&FramePlan> for FrameState {
     fn from(plan: &FramePlan) -> Self {
         Self {
@@ -268,6 +277,8 @@ pub struct PipelineStateFile {
     pub planner_enabled: bool,
     #[serde(default)]
     pub bridge_backfill: BridgeBackfillCheckpoint,
+    #[serde(default)]
+    pub brush_training: BrushTrainingCheckpoint,
     pub features_complete: bool,
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
@@ -289,6 +300,7 @@ impl PipelineStateFile {
             frames: None,
             planner_enabled: true,
             bridge_backfill: BridgeBackfillCheckpoint::default(),
+            brush_training: BrushTrainingCheckpoint::default(),
             features_complete: false,
             matching_complete: false,
             reconstruction_complete: false,
@@ -336,6 +348,26 @@ mod tests {
             state.bridge_backfill.status,
             crate::planner::BridgeBackfillStatus::NotEvaluated
         );
+        assert!(state.brush_training.resolved.is_none());
+        assert!(!state.brush_training.oom_retry_used);
+    }
+
+    #[test]
+    fn brush_training_checkpoint_round_trips_resolved_retry_state() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.brush_training.resolved = Some(crate::presets::resolve_brush_training_preset(
+            Quality::High,
+            true,
+            Some(12_288),
+            7_680,
+            350_000,
+        ));
+        state.brush_training.oom_retry_used = true;
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: PipelineStateFile = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.brush_training, state.brush_training);
     }
 
     #[test]

@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn quality_v2_uses_fixed_fast_and_balanced_targets() {
+    fn quality_v2_uses_fixed_target_and_candidate_rates() {
         let video = thirty_fps_video();
         let fast = QualityV2FrameSelection.create_plan(&video, &Quality::Fast.preset());
         let balanced = QualityV2FrameSelection.create_plan(&video, &Quality::Balanced.preset());
@@ -245,8 +245,8 @@ mod tests {
         assert_eq!(fast.rescue_max_frames, 540);
         assert_eq!(balanced.estimated_frames, 480);
         assert_eq!(balanced.rescue_max_frames, 720);
-        assert_eq!(high.estimated_frames, 1_800);
-        assert_eq!(high.rescue_max_frames, 1_800);
+        assert_eq!(high.estimated_frames, 720);
+        assert_eq!(high.rescue_max_frames, 900);
     }
 
     #[test]
@@ -270,5 +270,28 @@ mod tests {
         let plan = QualityV2FrameSelection.create_plan(&short, &Quality::Fast.preset());
         assert_eq!(plan.estimated_frames, 20);
         assert_eq!(plan.selected_frames.len(), 20);
+    }
+
+    #[test]
+    fn high_no_longer_keeps_every_video_frame() {
+        let video = thirty_fps_video();
+        let plan = QualityV2FrameSelection.create_plan(&video, &Quality::High.preset());
+        assert_eq!(plan.sampling_fps, 12.0);
+        assert_eq!(plan.selected_frames.len(), 720);
+        assert_eq!(plan.candidate_frames.len(), 900);
+        assert!(plan.selected_frames.len() < video.total_frames as usize);
+    }
+
+    #[test]
+    fn source_fps_below_targets_keeps_every_available_frame() {
+        let video = VideoInfo {
+            fps: 8.0,
+            duration: 10.0,
+            total_frames: 80,
+            ..thirty_fps_video()
+        };
+        let plan = QualityV2FrameSelection.create_plan(&video, &Quality::High.preset());
+        assert_eq!(plan.estimated_frames, 80);
+        assert_eq!(plan.rescue_max_frames, 80);
     }
 }

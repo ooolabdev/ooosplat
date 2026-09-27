@@ -154,6 +154,7 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         }
         SplatError::Json(_) => TelemetryErrorCode::Unknown,
         SplatError::Cancelled => TelemetryErrorCode::Unknown,
+        SplatError::BrushOutOfMemory(_) => TelemetryErrorCode::BrushOutOfMemory,
         SplatError::Process(detail) => {
             let normalized = detail.to_ascii_lowercase();
             if normalized.contains("out of memory")
