@@ -55,6 +55,33 @@ export interface ProbeAndPlan {
   estimate: RuntimeEstimate;
 }
 
+export interface ReshootSourceInfo {
+  projectId: string;
+  projectName: string;
+  quality: Quality;
+  cameraId: number;
+  cameraModel: string;
+  width: number;
+  height: number;
+  sourceImageCount: number;
+  eligible: boolean;
+  reason: string | null;
+}
+
+export interface ReshootInputInfo {
+  inputType: InputType;
+  imageCount: number | null;
+  duration: number | null;
+  preparedWidth: number;
+  preparedHeight: number;
+  estimatedFrames: number;
+  hasAlpha: boolean;
+  maskCount: number;
+  compatible: boolean;
+  incompatibilityReason: string | null;
+  estimate: RuntimeEstimate;
+}
+
 export interface PipelineEvent {
   sequence: number;
   timestamp: string;

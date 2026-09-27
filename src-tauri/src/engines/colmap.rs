@@ -168,6 +168,40 @@ pub async fn extract_features(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_incremental_features(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    image_list: &Path,
+    existing_camera_id: u32,
+    masks: Option<&Path>,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
+) -> Result<()> {
+    let (use_gpu_option, gpu_index_option) = feature_gpu_options(executable, manager).await?;
+    run_colmap(
+        executable,
+        incremental_feature_extraction_args(
+            database,
+            images,
+            image_list,
+            existing_camera_id,
+            masks,
+            gpu_index,
+            use_gpu_option,
+            gpu_index_option,
+        ),
+        database.parent().unwrap_or(images),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
 pub async fn match_sequential(
     executable: &Path,
     database: &Path,
@@ -234,6 +268,41 @@ fn feature_extraction_args(
         "SIMPLE_RADIAL".into(),
         "--ImageReader.single_camera".into(),
         "1".into(),
+        use_gpu_option.into(),
+        (if gpu_index.is_some() { "1" } else { "0" }).into(),
+    ];
+    if let Some(index) = gpu_index {
+        args.push(gpu_index_option.into());
+        args.push(index.to_string().into());
+    }
+    if let Some(masks) = masks {
+        args.push("--ImageReader.mask_path".into());
+        args.push(masks.into());
+    }
+    args
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incremental_feature_extraction_args(
+    database: &Path,
+    images: &Path,
+    image_list: &Path,
+    existing_camera_id: u32,
+    masks: Option<&Path>,
+    gpu_index: Option<u32>,
+    use_gpu_option: &str,
+    gpu_index_option: &str,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "feature_extractor".into(),
+        "--database_path".into(),
+        database.into(),
+        "--image_path".into(),
+        images.into(),
+        "--image_list_path".into(),
+        image_list.into(),
+        "--ImageReader.existing_camera_id".into(),
+        existing_camera_id.to_string().into(),
         use_gpu_option.into(),
         (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
@@ -316,6 +385,60 @@ pub async fn map(
         observer,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn map_incremental(
+    executable: &Path,
+    database: &Path,
+    images: &Path,
+    input: &Path,
+    output: &Path,
+    image_list: &Path,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<()> {
+    tokio::fs::create_dir_all(output).await?;
+    run_colmap(
+        executable,
+        incremental_mapper_args(database, images, input, output, image_list),
+        database.parent().unwrap_or(output),
+        log,
+        manager,
+        observer,
+    )
+    .await
+}
+
+fn incremental_mapper_args(
+    database: &Path,
+    images: &Path,
+    input: &Path,
+    output: &Path,
+    image_list: &Path,
+) -> Vec<OsString> {
+    vec![
+        "mapper".into(),
+        "--database_path".into(),
+        database.into(),
+        "--image_path".into(),
+        images.into(),
+        "--input_path".into(),
+        input.into(),
+        "--output_path".into(),
+        output.into(),
+        "--Mapper.image_list_path".into(),
+        image_list.into(),
+        "--Mapper.fix_existing_frames".into(),
+        "1".into(),
+        "--Mapper.ba_refine_focal_length".into(),
+        "0".into(),
+        "--Mapper.ba_refine_principal_point".into(),
+        "0".into(),
+        "--Mapper.ba_refine_extra_params".into(),
+        "0".into(),
+    ]
 }
 
 #[cfg(test)]
@@ -455,5 +578,45 @@ mod tests {
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
+    }
+
+    #[test]
+    fn incremental_features_reuse_the_existing_camera_and_only_new_images() {
+        let args = strings(incremental_feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            Path::new("reshoot-images.txt"),
+            7,
+            Some(Path::new("../reshoot-masks")),
+            Some(0),
+            "--FeatureExtraction.use_gpu",
+            "--FeatureExtraction.gpu_index",
+        ));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--image_list_path", "reshoot-images.txt"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ImageReader.existing_camera_id", "7"]));
+        assert!(!args.iter().any(|arg| arg == "--ImageReader.single_camera"));
+    }
+
+    #[test]
+    fn incremental_mapper_keeps_existing_frames_and_intrinsics_fixed() {
+        let args = strings(incremental_mapper_args(
+            Path::new("database.db"),
+            Path::new("../frames"),
+            Path::new("base-model"),
+            Path::new("incremental-model"),
+            Path::new("mapper-images.txt"),
+        ));
+        for pair in [
+            ["--Mapper.fix_existing_frames", "1"],
+            ["--Mapper.ba_refine_focal_length", "0"],
+            ["--Mapper.ba_refine_principal_point", "0"],
+            ["--Mapper.ba_refine_extra_params", "0"],
+        ] {
+            assert!(args.windows(2).any(|window| window == pair));
+        }
     }
 }

@@ -18,7 +18,10 @@ use crate::{
     error::{Result, SplatError},
     pipeline::{
         estimate::{estimate_runtime, estimate_runtime_for_images, RuntimeEstimate},
-        runner::{PipelineFailureContext, PipelineResult, PipelineRunner},
+        runner::{
+            PipelineFailureContext, PipelineResult, PipelineRunner, ReshootInputInfo,
+            ReshootInputType, ReshootSourceInfo,
+        },
         PipelineEngine, PipelineStage,
     },
     presets::Quality,
@@ -1394,4 +1397,94 @@ mod tests {
         assert!(!session.destination.exists());
         assert!(!session.temporary.exists());
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalReshootRequest {
+    source_project_id: String,
+    reshoot_path: String,
+    input_type: ReshootInputType,
+    projects_root: String,
+}
+
+#[tauri::command]
+pub async fn inspect_reshoot_source(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> std::result::Result<ReshootSourceInfo, SplatError> {
+    let project_id =
+        Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
+    PipelineRunner::new(paths_for_app(&app), |_| {})
+        .inspect_reshoot_source(project_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn probe_reshoot_input(
+    app: tauri::AppHandle,
+    project_id: String,
+    path: String,
+    input_type: ReshootInputType,
+) -> std::result::Result<ReshootInputInfo, SplatError> {
+    let project_id =
+        Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
+    PipelineRunner::new(paths_for_app(&app), |_| {})
+        .probe_reshoot_input(project_id, Path::new(&path), input_type)
+        .await
+}
+
+#[tauri::command]
+pub async fn start_incremental_reshoot_pipeline(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    request: IncrementalReshootRequest,
+) -> std::result::Result<PipelineResult, PipelineCommandError> {
+    let source_project_id = Uuid::parse_str(&request.source_project_id)
+        .map_err(|_| PipelineCommandError::from(SplatError::Process("原项目 ID 无效".into())))?;
+    let (_, source_metadata) = catalog::load_registered_project(source_project_id).await?;
+    let emitter = app.clone();
+    let telemetry_session = Arc::new(PipelineTelemetrySession::new(
+        telemetry.inner().clone(),
+        source_metadata.quality,
+        match request.input_type {
+            ReshootInputType::Video => TelemetryInputType::Video,
+            ReshootInputType::Images => TelemetryInputType::Images,
+        },
+    ));
+    let event_telemetry = telemetry_session.clone();
+    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
+        event_telemetry.observe(&event);
+        let _ = emitter.emit("pipeline-event", event);
+    }));
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() {
+            return Err(SplatError::Process("已有任务正在运行".into()).into());
+        }
+        *active = Some(runner.clone());
+    }
+    telemetry_session.generation_started();
+    let result = runner
+        .generate_incremental_reshoot(
+            source_project_id,
+            Path::new(&request.reshoot_path),
+            request.input_type,
+            Path::new(&request.projects_root),
+        )
+        .await;
+    match &result {
+        Ok(output) => telemetry_session.generation_completed(
+            output.duration_ms,
+            output.input_images,
+            output.source_duration_seconds,
+        ),
+        Err(error) => telemetry_session.generation_failed(error),
+    }
+    if let Err(error) = &result {
+        runner.emit_terminal(error);
+    }
+    *state.active.lock().await = None;
+    result.map_err(|error| PipelineCommandError::from_runner(error, &runner))
 }

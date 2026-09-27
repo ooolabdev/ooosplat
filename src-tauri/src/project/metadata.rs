@@ -199,6 +199,42 @@ pub struct ProjectMetadata {
     pub transform: GaussianTransform,
     #[serde(default)]
     pub editing: GaussianEditing,
+    /// 高清补拍溯源：仅当本项目由补拍派生时存在。源项目始终只读。
+    #[serde(default)]
+    pub reshoot: Option<ReshootProvenance>,
+}
+
+/// Where a derived reshoot project came from, and what was added to it.
+///
+/// The source project stays read-only: this records the paths the derivation
+/// read, so it is auditable, and it never implies the source was modified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshootProvenance {
+    pub source_project_id: Uuid,
+    pub source_project_path: PathBuf,
+    /// The source's `final.ply`, kept as a reference for the user.
+    pub source_final_ply: PathBuf,
+    /// The reshoot media the user supplied.
+    pub reshoot_source_path: PathBuf,
+    #[serde(default)]
+    pub camera_id: u32,
+    #[serde(default)]
+    pub camera_model: String,
+    #[serde(default)]
+    pub width: u64,
+    #[serde(default)]
+    pub height: u64,
+    #[serde(default)]
+    pub has_alpha: bool,
+    #[serde(default)]
+    pub mask_count: u64,
+    #[serde(default)]
+    pub source_image_count: u64,
+    #[serde(default)]
+    pub reshoot_frame_count: u64,
+    #[serde(default)]
+    pub registered_reshoot_count: u64,
 }
 
 pub const fn schema_version() -> u32 {
@@ -253,6 +289,28 @@ pub struct PipelineStateFile {
     pub matching_complete: bool,
     pub reconstruction_complete: bool,
     pub brush_complete: bool,
+    #[serde(default)]
+    pub reshoot: Option<ReshootState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReshootState {
+    pub source_snapshot_complete: bool,
+    pub supplemental_frames_complete: bool,
+    pub supplemental_features_complete: bool,
+    pub incremental_matching_complete: bool,
+    pub incremental_reconstruction_complete: bool,
+    #[serde(default)]
+    pub source_image_count: u64,
+    #[serde(default)]
+    pub reshoot_frame_count: u64,
+    #[serde(default)]
+    pub mask_count: u64,
+    #[serde(default)]
+    pub has_alpha: bool,
+    #[serde(default)]
+    pub registered_reshoot_count: u64,
 }
 
 impl PipelineStateFile {
@@ -272,6 +330,7 @@ impl PipelineStateFile {
             matching_complete: false,
             reconstruction_complete: false,
             brush_complete: false,
+            reshoot: None,
         }
     }
 }

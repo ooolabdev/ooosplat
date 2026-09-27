@@ -18,6 +18,21 @@ pub struct VideoInfo {
     pub has_alpha: bool,
 }
 
+pub fn prepared_video_dimensions(video: &VideoInfo) -> (u32, u32) {
+    let (width, height) = if video.rotation.rem_euclid(180) == 90 {
+        (video.height, video.width)
+    } else {
+        (video.width, video.height)
+    };
+    let scale = (1920.0 / width.max(1) as f64)
+        .min(1920.0 / height.max(1) as f64)
+        .min(1.0);
+    (
+        (width as f64 * scale).round().max(1.0) as u32,
+        (height as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ProbeDocument {
     #[serde(default)]
@@ -195,6 +210,26 @@ mod tests {
         assert_eq!(info.rotation, -90);
         assert_eq!(info.pixel_format, "yuv420p");
         assert!(!info.has_alpha);
+    }
+
+    #[test]
+    fn predicts_ffmpeg_output_dimensions_after_rotation_and_scaling() {
+        let mut info = VideoInfo {
+            duration: 1.0,
+            width: 3840,
+            height: 2160,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "prores".into(),
+            rotation: 0,
+            pixel_format: "yuva444p10le".into(),
+            has_alpha: true,
+        };
+        assert_eq!(prepared_video_dimensions(&info), (1920, 1080));
+        info.width = 1920;
+        info.height = 1080;
+        info.rotation = 90;
+        assert_eq!(prepared_video_dimensions(&info), (1080, 1920));
     }
 
     #[test]

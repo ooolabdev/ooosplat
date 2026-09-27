@@ -1,6 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::{Local, Utc};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -27,6 +31,14 @@ pub struct ProjectPaths {
     pub logs: PathBuf,
     pub state: PathBuf,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectImportProgress {
+    pub current: u64,
+    pub total: u64,
+}
+
+pub type ProjectImportObserver = Arc<dyn Fn(ProjectImportProgress) + Send + Sync + 'static>;
 
 impl ProjectPaths {
     pub fn existing(id: Uuid, project: PathBuf) -> Self {
@@ -95,8 +107,30 @@ impl ProjectManager {
         input: &Path,
         quality: Quality,
     ) -> Result<(ProjectPaths, ProjectMetadata)> {
-        let input_type = if input.is_dir() {
-            crate::video::analyze_image_sequence(input)?;
+        self.create_with_progress(input, quality, None, None).await
+    }
+
+    pub async fn create_with_progress(
+        &self,
+        input: &Path,
+        quality: Quality,
+        observer: Option<ProjectImportObserver>,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<(ProjectPaths, ProjectMetadata)> {
+        let image_scan = if input.is_dir() {
+            let source = input.to_path_buf();
+            let token = cancellation.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::video::scan_image_sequence(&source, token.as_ref())
+                })
+                .await
+                .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??,
+            )
+        } else {
+            None
+        };
+        let input_type = if image_scan.is_some() {
             ProjectInputType::Images
         } else {
             validate_video_path(input)?;
@@ -134,9 +168,36 @@ impl ProjectManager {
         let stored_source = if input_type == ProjectInputType::Images {
             let images_dir = source.join("images");
             tokio::fs::create_dir_all(&images_dir).await?;
-            for (index, path) in crate::video::list_images(input)?.iter().enumerate() {
-                let dest = images_dir.join(crate::video::normalized_image_name(index, path)?);
-                tokio::fs::copy(&path, &dest).await?;
+            let scan = image_scan
+                .as_ref()
+                .expect("image projects have a completed header scan");
+            let total = scan.images.len() as u64;
+            let mut last_percent = -1_i32;
+            if let Some(observer) = &observer {
+                observer(ProjectImportProgress { current: 0, total });
+            }
+            for (index, image) in scan.images.iter().enumerate() {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    let _ = tokio::fs::remove_dir_all(&project).await;
+                    return Err(SplatError::Cancelled);
+                }
+                let dest =
+                    images_dir.join(crate::video::normalized_image_name(index, &image.path)?);
+                if let Err(error) = tokio::fs::copy(&image.path, &dest).await {
+                    let _ = tokio::fs::remove_dir_all(&project).await;
+                    return Err(error.into());
+                }
+                let current = index as u64 + 1;
+                let percent = (current.saturating_mul(100) / total.max(1)) as i32;
+                if percent != last_percent || current == total {
+                    last_percent = percent;
+                    if let Some(observer) = &observer {
+                        observer(ProjectImportProgress { current, total });
+                    }
+                }
             }
             images_dir
         } else {
@@ -170,11 +231,14 @@ impl ProjectManager {
             model: "final.ply".into(),
             transform: Default::default(),
             editing: Default::default(),
+            reshoot: None,
         };
         let metadata_path = project.join("project.json");
         atomic_write_json(&metadata_path, &metadata).await?;
         let state = project.join("state.json");
-        atomic_write_json(&state, &PipelineStateFile::created_for(quality, input_type)).await?;
+        let mut pipeline_state = PipelineStateFile::created_for(quality, input_type);
+        pipeline_state.image_sequence = image_scan.map(|scan| scan.info);
+        atomic_write_json(&state, &pipeline_state).await?;
         if self.register_in_catalog {
             catalog::register_project(id, &project).await?;
         }
@@ -448,5 +512,78 @@ mod tests {
         let state: PipelineStateFile =
             serde_json::from_slice(&tokio::fs::read(paths.state).await.unwrap()).unwrap();
         assert_eq!(state.input_type, ProjectInputType::Images);
+        assert_eq!(state.image_sequence.unwrap().image_count, 2);
+    }
+
+    #[tokio::test]
+    async fn reports_image_import_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("images");
+        std::fs::create_dir(&input).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(input.join("image1.png"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(input.join("image2.jpg"))
+            .unwrap();
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = updates.clone();
+        let observer: ProjectImportObserver = Arc::new(move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+
+        ProjectManager::for_diagnostics(temporary.path().join("projects"))
+            .create_with_progress(&input, Quality::Balanced, Some(observer), None)
+            .await
+            .unwrap();
+
+        let updates = updates.lock().unwrap();
+        assert_eq!(
+            updates.first().copied(),
+            Some(ProjectImportProgress {
+                current: 0,
+                total: 2
+            })
+        );
+        assert_eq!(
+            updates.last().copied(),
+            Some(ProjectImportProgress {
+                current: 2,
+                total: 2
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn image_project_creation_honors_cancellation_without_registering_a_project() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("images");
+        std::fs::create_dir(&input).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(input.join("image1.png"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(input.join("image2.png"))
+            .unwrap();
+        let projects = temporary.path().join("projects");
+        let cancellation = CancellationToken::new();
+        let cancellation_from_observer = cancellation.clone();
+        let observer: ProjectImportObserver = Arc::new(move |progress| {
+            if progress.current == 1 {
+                cancellation_from_observer.cancel();
+            }
+        });
+
+        let result = ProjectManager::for_diagnostics(projects.clone())
+            .create_with_progress(
+                &input,
+                Quality::Balanced,
+                Some(observer),
+                Some(cancellation),
+            )
+            .await;
+
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert!(!projects.exists() || std::fs::read_dir(projects).unwrap().next().is_none());
     }
 }

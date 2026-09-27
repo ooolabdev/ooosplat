@@ -47,6 +47,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 视频使用均匀抽帧和顺序匹配；图片序列保留全部图片并使用共享相机、穷举匹配和现有增量 Mapper。
 - 自动检测透明 MOV 的 Alpha 通道，同步提取 RGBA PNG 画面与 COLMAP Mask；透明区域不会参与特征提取，同时保留给 Brush 训练使用。
 - 自动检测透明 PNG，保留 Alpha 供 Brush 使用，并生成 COLMAP Mask 排除完全透明区域。
+- 已完成项目支持“高清补拍”：使用同一设备、同一镜头和相同分辨率补充视频或图片后，OOOSplat 会复用原数据库、共享相机与稀疏模型，只处理新增画面的特征、匹配和注册，再使用全部已注册画面完整重训 Brush。透明 MOV/PNG 补拍素材会保留 RGBA 并自动生成 Mask；补拍会创建独立派生项目，不覆盖原项目。
 - Windows 安装包内置 CUDA 版 COLMAP；macOS Alpha 内置 arm64 CPU 版 COLMAP；Ubuntu 使用系统 CPU 版 COLMAP。三个平台均使用固定并校验的 FFmpeg/Brush 方案。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
@@ -150,6 +151,7 @@ sudo apt install ./OOOSplat-0.4.1-x64-linux.deb
 7. 在左侧查看实时阶段、指标和日志；完成后，在“02 历史任务”中查看项目并点击“预览”。
 8. 在“03 预览”的“调整”模式中修改模型，Transform 会自动保存；点击“保存”生成或更新 `edit.ply`。
 9. 切换到“动画”可查看竖屏构图并重新播放效果；点击“导出视频”会在项目目录生成 23 秒竖屏 MP4。
+10. 如需补充细节，在“02 历史任务”的已完成项目中点击“高清补拍”，使用原项目相同设备、镜头、方向、分辨率和缩放倍率拍摄，并确保补拍画面与原素材有足够重叠。
 
 使用提示：
 
