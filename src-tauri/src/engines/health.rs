@@ -86,6 +86,8 @@ pub struct ColmapAccelerationStatus {
     pub reason: String,
     pub device: Option<GpuDeviceInfo>,
     pub requirements: AccelerationRequirements,
+    #[serde(default)]
+    pub detected_nvidia_device_count: usize,
 }
 
 impl ColmapAccelerationStatus {
@@ -605,6 +607,7 @@ fn cpu_status(
         reason,
         device,
         requirements,
+        detected_nvidia_device_count: 0,
     }
 }
 
@@ -660,6 +663,7 @@ fn choose_acceleration(
     devices: Vec<GpuDeviceInfo>,
     requirements: AccelerationRequirements,
 ) -> ColmapAccelerationStatus {
+    let detected_nvidia_device_count = devices.len();
     let minimum_driver = parse_version(&requirements.minimum_driver_version)
         .expect("validated acceleration requirement");
     let minimum_compute = parse_version(&requirements.minimum_compute_capability)
@@ -688,6 +692,7 @@ fn choose_acceleration(
             ),
             device: Some(device),
             requirements,
+            detected_nvidia_device_count,
         };
     }
 
@@ -934,6 +939,7 @@ mod tests {
         assert_eq!(status.backend, ColmapBackend::Gpu);
         assert_eq!(status.reason_code, AccelerationReasonCode::GpuReady);
         assert_eq!(status.usable_gpu_total_memory_mb(), Some(8_192));
+        assert_eq!(status.detected_nvidia_device_count, 1);
     }
 
     #[test]
@@ -965,6 +971,7 @@ mod tests {
             ],
             requirements(),
         );
+        assert_eq!(status.detected_nvidia_device_count, 3);
         assert_eq!(status.device.unwrap().index, 0);
     }
 

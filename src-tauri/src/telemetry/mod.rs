@@ -155,6 +155,7 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::Json(_) => TelemetryErrorCode::Unknown,
         SplatError::Cancelled => TelemetryErrorCode::Unknown,
         SplatError::BrushOutOfMemory(_) => TelemetryErrorCode::BrushOutOfMemory,
+        SplatError::BrushDeviceLost(_) => TelemetryErrorCode::BrushDeviceLost,
         SplatError::Process(detail) => {
             let normalized = detail.to_ascii_lowercase();
             if normalized.contains("out of memory")
@@ -229,6 +230,21 @@ mod tests {
         assert_eq!(
             safe_error_code(&SplatError::Cancelled, None),
             TelemetryErrorCode::Unknown
+        );
+    }
+
+    #[test]
+    fn brush_device_loss_has_a_dedicated_privacy_safe_code() {
+        assert_eq!(
+            safe_error_code(
+                &SplatError::BrushDeviceLost("private driver detail".into()),
+                Some(TelemetryStage::TrainingSplats),
+            ),
+            TelemetryErrorCode::BrushDeviceLost
+        );
+        assert_eq!(
+            serde_json::to_value(TelemetryErrorCode::BrushDeviceLost).unwrap(),
+            "brush_device_lost"
         );
     }
 

@@ -113,8 +113,10 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .input-picker-menu small { color: var(--muted); font-size: 10px; }
 .field-note { margin: 8px 0 0; color: var(--faint); font-size: 11px; line-height: 1.6; }
 
-.quality-list { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+.quality-settings { background: var(--panel); border: 1px solid var(--line); }
+.quality-list { display: grid; grid-template-columns: repeat(3, 1fr); }
 .quality-option { min-width: 0; min-height: 92px; padding: 15px 12px; display: grid; grid-template-columns: 14px minmax(0,1fr); gap: 9px; color: var(--ink); text-align: left; background: transparent; border: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
+.quality-option:last-child { border-right: 0; }
 .quality-option.selected { background: #edf2ff; box-shadow: inset 0 -2px var(--blue); }
 .radio-mark { width: 13px; height: 13px; margin-top: 1px; display: grid; place-items: center; border: 1px solid #a8b1c0; border-radius: 50%; }
 .radio-mark span { width: 7px; height: 7px; border-radius: 50%; }
@@ -123,10 +125,10 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .quality-option > span:last-child { min-width: 0; display: grid; align-content: start; gap: 5px; }
 .quality-option strong { font-size: 13px; }
 .quality-option small { color: var(--muted); font-size: 11px; line-height: 1.5; }
-.planner-switch { width: 100%; margin-top: 10px; padding: 11px 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: var(--ink); text-align: left; background: var(--panel); border: 1px solid var(--line); cursor: pointer; }
+.planner-switch { width: 100%; margin: 0; padding: 15px 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: var(--ink); text-align: left; background: transparent; border: 0; cursor: pointer; }
 .planner-switch > span { display: grid; gap: 3px; }
-.planner-switch strong { font-size: 12px; }
-.planner-switch small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.planner-switch strong { font-size: 13px; }
+.planner-switch small { color: var(--muted); font-size: 11px; line-height: 1.5; }
 .planner-switch > i { position: relative; flex: 0 0 auto; width: 32px; height: 18px; border-radius: 10px; background: var(--line); transition: background .16s ease; }
 .planner-switch > i span { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: white; transition: transform .16s ease; }
 .planner-switch[aria-checked="true"] > i { background: var(--blue); }
@@ -582,7 +584,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 @media (max-width: 1050px) {
   .control-pane, .projects-pane { padding-left: 27px; padding-right: 27px; }
   .quality-list { grid-template-columns: 1fr; }
-  .quality-option { min-height: 55px; }
+  .quality-option { min-height: 55px; border-right: 0; }
 }
 @media (max-width: 700px) {
   .privacy-columns { grid-template-columns: 1fr; }

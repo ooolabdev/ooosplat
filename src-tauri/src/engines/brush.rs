@@ -4,10 +4,109 @@ use std::{
 };
 
 use crate::{
+    engines::ColmapAccelerationStatus,
     error::{Result, SplatError},
     presets::BrushTrainingPreset,
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
+
+const BRUSH_GPU_LOG_FILTER: &str = "cubecl_wgpu=info,burn_wgpu=info";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrushGpuLaunchPolicy {
+    expected_device_name: Option<String>,
+    force_first_discrete_gpu: bool,
+    disable_amd_switchable_graphics: bool,
+    selection_reason: &'static str,
+}
+
+pub struct BrushTrainingOptions<'a> {
+    pub preset: BrushTrainingPreset,
+    pub log_path: PathBuf,
+    pub gpu_launch_policy: &'a BrushGpuLaunchPolicy,
+}
+
+impl BrushGpuLaunchPolicy {
+    pub fn from_acceleration(acceleration: &ColmapAccelerationStatus) -> Self {
+        Self::resolve(cfg!(windows), acceleration)
+    }
+
+    fn resolve(is_windows: bool, acceleration: &ColmapAccelerationStatus) -> Self {
+        let selected = acceleration.device.as_ref();
+        let unambiguous_single_nvidia = is_windows
+            && acceleration.use_gpu()
+            && acceleration.detected_nvidia_device_count == 1
+            && selected.is_some_and(|device| device.index == 0);
+        let selection_reason = if unambiguous_single_nvidia {
+            "single_nvidia_discrete_gpu"
+        } else if !is_windows {
+            "non_windows_default"
+        } else if !acceleration.use_gpu() {
+            "no_compatible_nvidia_gpu"
+        } else {
+            "ambiguous_multi_gpu_topology"
+        };
+
+        Self {
+            expected_device_name: if unambiguous_single_nvidia {
+                selected.map(|device| device.name.clone())
+            } else {
+                None
+            },
+            force_first_discrete_gpu: unambiguous_single_nvidia,
+            disable_amd_switchable_graphics: unambiguous_single_nvidia,
+            selection_reason,
+        }
+    }
+
+    fn environment(&self) -> Vec<(OsString, OsString)> {
+        self.environment_with_rust_log(std::env::var_os("RUST_LOG"))
+    }
+
+    fn environment_with_rust_log(
+        &self,
+        existing_rust_log: Option<OsString>,
+    ) -> Vec<(OsString, OsString)> {
+        let mut environment = Vec::new();
+        if self.force_first_discrete_gpu {
+            environment.push((
+                OsString::from("CUBECL_WGPU_DEFAULT_DEVICE"),
+                OsString::from("DiscreteGpu(0)"),
+            ));
+        }
+        if self.disable_amd_switchable_graphics {
+            environment.push((
+                OsString::from("DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+                OsString::from("1"),
+            ));
+        }
+        let rust_log = match existing_rust_log {
+            Some(value) if !value.is_empty() => {
+                let mut combined = value;
+                combined.push(",");
+                combined.push(BRUSH_GPU_LOG_FILTER);
+                combined
+            }
+            _ => OsString::from(BRUSH_GPU_LOG_FILTER),
+        };
+        environment.push((OsString::from("RUST_LOG"), rust_log));
+        environment
+    }
+
+    pub fn log_summary(&self) -> String {
+        format!(
+            "backend=Vulkan selection={} expectedDevice={} cubeclDevice={} amdSwitchableLayerDisabled={}",
+            self.selection_reason,
+            self.expected_device_name.as_deref().unwrap_or("unverified"),
+            if self.force_first_discrete_gpu {
+                "DiscreteGpu(0)"
+            } else {
+                "automatic"
+            },
+            self.disable_amd_switchable_graphics
+        )
+    }
+}
 
 fn train_args(
     dataset: &Path,
@@ -62,8 +161,7 @@ pub async fn train(
     executable: &Path,
     dataset: &Path,
     output_directory: &Path,
-    preset: BrushTrainingPreset,
-    log_path: PathBuf,
+    options: BrushTrainingOptions<'_>,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<PathBuf> {
@@ -75,19 +173,26 @@ pub async fn train(
             tokio::fs::remove_file(partial).await?;
         }
     }
+    let environment = options.gpu_launch_policy.environment();
     let output = manager
-        .run(ProcessSpec {
-            executable: executable.to_path_buf(),
-            args: train_args(dataset, output_directory, preset),
-            working_directory: Some(output_directory.to_path_buf()),
-            log_path: Some(log_path),
-            observer,
-        })
+        .run_with_environment(
+            ProcessSpec {
+                executable: executable.to_path_buf(),
+                args: train_args(dataset, output_directory, options.preset),
+                working_directory: Some(output_directory.to_path_buf()),
+                log_path: Some(options.log_path),
+                observer,
+            },
+            &environment,
+        )
         .await?;
     if !output.success {
         let detail = output.failure_detail();
         if is_out_of_memory_detail(&detail) {
             return Err(SplatError::BrushOutOfMemory(detail));
+        }
+        if is_device_lost_detail(&detail) {
+            return Err(SplatError::BrushDeviceLost(detail));
         }
         return Err(SplatError::Process(format!(
             "Brush 退出码 {:?}{}",
@@ -131,15 +236,134 @@ fn is_out_of_memory_detail(detail: &str) -> bool {
     .any(|token| normalized.contains(token))
 }
 
+fn is_device_lost_detail(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    [
+        "devicelost",
+        "device lost",
+        "device_lost",
+        "parent device is lost",
+        "vk_error_device_lost",
+        "dxgi_error_device_removed",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presets::{resolve_brush_training_preset, Quality};
+    use crate::{
+        engines::{AccelerationReasonCode, AccelerationRequirements, ColmapBackend, GpuDeviceInfo},
+        presets::{resolve_brush_training_preset, Quality},
+    };
 
     fn args_as_strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn acceleration(
+        backend: ColmapBackend,
+        count: usize,
+        index: Option<u32>,
+    ) -> ColmapAccelerationStatus {
+        ColmapAccelerationStatus {
+            backend,
+            reason_code: if backend == ColmapBackend::Gpu {
+                AccelerationReasonCode::GpuReady
+            } else {
+                AccelerationReasonCode::NoNvidiaGpu
+            },
+            reason: String::new(),
+            device: index.map(|index| GpuDeviceInfo {
+                index,
+                name: "NVIDIA GeForce RTX 3060 Laptop GPU".into(),
+                driver_version: "560.81".into(),
+                compute_capability: "8.6".into(),
+                total_memory_mb: Some(6_144),
+            }),
+            requirements: AccelerationRequirements {
+                minimum_driver_version: "528.33".into(),
+                minimum_compute_capability: "5.0".into(),
+            },
+            detected_nvidia_device_count: count,
+        }
+    }
+
+    fn environment_value<'a>(
+        environment: &'a [(OsString, OsString)],
+        key: &str,
+    ) -> Option<&'a str> {
+        environment
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .and_then(|(_, value)| value.to_str())
+    }
+
+    #[test]
+    fn windows_single_nvidia_policy_forces_first_discrete_gpu_for_brush_only() {
+        let policy =
+            BrushGpuLaunchPolicy::resolve(true, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+        let environment = policy.environment_with_rust_log(Some("app=debug".into()));
+
+        assert_eq!(
+            environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
+            Some("DiscreteGpu(0)")
+        );
+        assert_eq!(
+            environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+            Some("1")
+        );
+        assert_eq!(
+            environment_value(&environment, "RUST_LOG"),
+            Some("app=debug,cubecl_wgpu=info,burn_wgpu=info")
+        );
+        assert!(!environment.iter().any(|(key, _)| key == "WGPU_BACKEND"));
+        assert!(policy.log_summary().contains("backend=Vulkan"));
+        assert!(policy
+            .log_summary()
+            .contains("expectedDevice=NVIDIA GeForce RTX 3060 Laptop GPU"));
+    }
+
+    #[test]
+    fn ambiguous_or_cpu_topologies_keep_automatic_device_selection() {
+        for status in [
+            acceleration(ColmapBackend::Gpu, 2, Some(0)),
+            acceleration(ColmapBackend::Gpu, 1, Some(1)),
+            acceleration(ColmapBackend::Cpu, 0, None),
+        ] {
+            let policy = BrushGpuLaunchPolicy::resolve(true, &status);
+            let environment = policy.environment_with_rust_log(None);
+            assert_eq!(
+                environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
+                None
+            );
+            assert_eq!(
+                environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+                None
+            );
+            assert_eq!(
+                environment_value(&environment, "RUST_LOG"),
+                Some(BRUSH_GPU_LOG_FILTER)
+            );
+        }
+    }
+
+    #[test]
+    fn non_windows_policy_never_forces_windows_gpu_workarounds() {
+        let policy =
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Gpu, 1, Some(0)));
+        let environment = policy.environment_with_rust_log(None);
+        assert_eq!(
+            environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
+            None
+        );
+        assert_eq!(
+            environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+            None
+        );
     }
 
     #[test]
@@ -211,11 +435,18 @@ mod tests {
     }
 
     #[test]
-    fn oom_classifier_is_specific_and_does_not_retry_generic_device_loss() {
+    fn gpu_failure_classifiers_keep_oom_and_device_loss_separate() {
         assert!(is_out_of_memory_detail("OutOfMemory while allocating"));
         assert!(is_out_of_memory_detail("BufferTooBig(2290420416)"));
         assert!(is_out_of_memory_detail("GPU allocation failed"));
         assert!(!is_out_of_memory_detail("DeviceLost: driver reset"));
+        assert!(is_device_lost_detail("DeviceLost: driver reset"));
+        assert!(is_device_lost_detail("Parent device is lost"));
+        assert!(is_device_lost_detail("VK_ERROR_DEVICE_LOST"));
+        assert!(!is_device_lost_detail("process exited with code 101"));
+        assert!(!is_device_lost_detail(
+            "process exited with code -1073740791"
+        ));
         assert!(!is_out_of_memory_detail("process exited with code 1"));
     }
 }

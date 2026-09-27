@@ -87,7 +87,7 @@ describe("App live log", () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null,
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
@@ -134,6 +134,18 @@ describe("App live log", () => {
     expect(labels).toEqual(["当前阶段", "总耗时"]);
   });
 
+  it("integrates automatic optimization into the quality card with matching typography copy", () => {
+    const settings = container.querySelector(".quality-settings")!;
+    const qualityList = settings.querySelector(".quality-list");
+    const plannerSwitch = settings.querySelector<HTMLButtonElement>(".planner-switch");
+
+    expect(qualityList).not.toBeNull();
+    expect(plannerSwitch?.getAttribute("aria-checked")).toBe("true");
+    expect(plannerSwitch?.disabled).toBe(true);
+    expect(plannerSwitch?.textContent).toContain("自动优化（实验性）");
+    expect(plannerSwitch?.textContent).toContain("开启后，将自动优化重建与训练参数，通常可缩短生成时间，并提升高斯泼溅效果");
+  });
+
   it("keeps the outer task pane fixed while following fewer than 500 log lines", async () => {
     const viewport = mockLogViewport();
     const controlPane = container.querySelector<HTMLElement>(".control-pane")!;
@@ -178,23 +190,82 @@ describe("App live log", () => {
     expect(viewport.getScrollTop()).toBe(1_500);
   });
 
-  it("shows the last registered count during mapper refinement", async () => {
+  it("shows plain-language progress with counts for the four processing stages", async () => {
+    const cases = [
+      ["extractingFeatures", "正在提取图像特征（8/20）"],
+      ["matching", "正在匹配图像（9/20）"],
+      ["reconstructing", "正在重建相机（10/20）"],
+      ["trainingSplats", "正在训练 Splat（11/20）"],
+    ] as const;
+
+    for (const [index, [stage, expected]] of cases.entries()) {
+      await act(async () => {
+        useAppStore.getState().receiveEvent({
+          ...event(index + 1),
+          stage,
+          message: `technical detail for ${stage}`,
+          current: index + 8,
+          total: 20,
+        });
+      });
+      await flush();
+      expect(container.querySelector(".current-message")?.textContent).toBe(expected);
+    }
+  });
+
+  it("keeps the latest count when a later technical log has no count", async () => {
     await act(async () => {
       useAppStore.getState().receiveEvent({
-        ...event(1),
-        stage: "reconstructing",
-        engine: "colmap",
-        message: "Retriangulation and Global bundle adjustment",
-        current: 86,
-        total: 100,
+        ...event(1), stage: "matching", message: "Matching pair batch", current: 12, total: 40,
+      });
+      useAppStore.getState().receiveEvent({
+        ...event(2), stage: "matching", kind: "log", message: "Technical matcher detail", current: null, total: null,
       });
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("Retriangulation and Global bundle adjustment · 已注册 86/100");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在匹配图像（12/40）");
+    expect(container.querySelector(".live-log")?.textContent).toContain("Technical matcher detail");
+  });
+
+  it("omits the count until progress data is available", async () => {
+    await act(async () => {
+      useAppStore.getState().receiveEvent({
+        ...event(1), stage: "extractingFeatures", message: "COLMAP startup", current: null, total: null,
+      });
+    });
+    await flush();
+
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在提取图像特征…");
+    expect(container.querySelector(".live-log")?.textContent).toContain("COLMAP startup");
+  });
+
+  it("derives the Splat training step from stage progress", async () => {
+    await act(async () => {
+      useAppStore.getState().receiveEvent({
+        ...event(1), stage: "trainingSplats", kind: "heartbeat", message: "Brush estimate", current: null, total: 30_000, stageProgress: 50,
+      });
+    });
+    await flush();
+
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在训练 Splat（15,000/30,000）");
 
     await act(async () => { container.querySelector<HTMLButtonElement>(".language-action")!.click(); });
-    expect(container.querySelector(".current-message")?.textContent).toBe("Retriangulation and Global bundle adjustment · Registered 86/100");
+    expect(container.querySelector(".current-message")?.textContent).toBe("Training Splats (15,000/30,000)");
+  });
+
+  it("keeps terminal messages instead of presenting them as active work", async () => {
+    await act(async () => {
+      useAppStore.getState().receiveEvent({
+        ...event(1), stage: "matching", message: "Technical matcher detail", current: 4, total: 20,
+      });
+      useAppStore.getState().receiveEvent({
+        ...event(2), stage: "cancelled", message: "任务已取消", current: null, total: null,
+      });
+    });
+    await flush();
+
+    expect(container.querySelector(".current-message")?.textContent).toBe("任务已取消");
   });
 
   it("keeps the real percentage and marks the failing stage", async () => {

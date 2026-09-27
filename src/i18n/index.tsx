@@ -4,9 +4,8 @@ export type Locale = "zh-CN" | "en";
 export type TranslationParams = Record<string, string | number>;
 
 const zhCN = {
-  "planner.label": "自动重建 Planner",
-  "planner.enabledHint": "已启用 Quality v2 与低注册率桥接补帧",
-  "planner.disabledHint": "已关闭，将使用旧版质量与重建流程",
+  "planner.label": "自动优化（实验性）",
+  "planner.hint": "开启后，将自动优化重建与训练参数，通常可缩短生成时间，并提升高斯泼溅效果",
   "common.close": "关闭",
   "common.cancel": "取消",
   "common.retry": "重试",
@@ -97,6 +96,11 @@ const zhCN = {
   "progress.cancel": "取消任务并终止所有进程",
   "progress.cancelError": "无法终止任务：{detail}",
   "progress.privacyError": "无法保存隐私设置：{detail}",
+  "progress.activeFeatures": "正在提取图像特征",
+  "progress.activeMatching": "正在匹配图像",
+  "progress.activeReconstruction": "正在重建相机",
+  "progress.activeTraining": "正在训练 Splat",
+  "progress.activeCount": "{label}（{current}/{total}）",
   "stage.material": "素材分析",
   "stage.frames": "画面准备",
   "stage.features": "特征提取",
@@ -220,8 +224,10 @@ const zhCN = {
   "failure.mapperStorage": "还原拍摄空间时无法正常读取项目文件。文件可能被其他程序占用，或项目所在磁盘暂时不可用。",
   "failure.brushTitle": "显卡未能完成模型生成",
   "failure.brushDatasetTitle": "模型生成所需图片读取不完整",
+  "failure.brushDeviceLostTitle": "Splat 训练期间显卡连接中断",
   "failure.brushGpu": "最常见的原因是显卡驱动过旧、显卡当前负担过重，或显卡可用空间不足。素材和已经完成的步骤仍保留在项目中。",
   "failure.brushDataset": "生成模型时发现项目图片读取不完整。文件可能未写完、已损坏，或项目所在磁盘连接不稳定。",
+  "failure.brushDeviceLost": "Windows 或显卡驱动在 Splat 训练期间重置了显卡连接。已有素材和已经完成的重建步骤仍保留在项目中。",
   "failure.solutions": "可以这样处理",
   "failure.mapperTip1": "重新拍摄时缓慢、连续地移动，避免突然转向。",
   "failure.mapperTip2": "让相邻画面保留更多相同区域，并尽量保持光线稳定。",
@@ -233,6 +239,9 @@ const zhCN = {
   "failure.brushTip3": "如果仍然失败，可改用快速档位或更短、分辨率更低的素材。",
   "failure.datasetTip1": "确认项目磁盘连接正常，并检查剩余空间。",
   "failure.datasetTip2": "不要移动或修改项目文件，随后点击重试。",
+  "failure.deviceLostTip1": "接通电源，并关闭游戏、渲染和其他占用显卡的程序。",
+  "failure.deviceLostTip2": "在 Windows 图形设置中将 brush_app.exe 设为高性能应用。",
+  "failure.deviceLostTip3": "更新显卡驱动并重启电脑，然后继续任务。",
   "failure.retry": "重试",
   "failure.openLogs": "打开日志",
   "failure.details": "查看原始错误",
@@ -444,7 +453,7 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
-  "planner.label": "Auto Reconstruction Planner", "planner.enabledHint": "Quality v2 and low-registration Bridge Backfill are enabled", "planner.disabledHint": "Disabled; the legacy quality and reconstruction pipeline will be used",
+  "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat automatically tunes reconstruction and training parameters, usually reducing generation time and improving Gaussian splat quality.",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
   "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
   "task.create": "01 Create New Task", "task.running": "Running", "task.idle": "Standby", "task.console": "Generation console",
@@ -455,7 +464,7 @@ const en: Record<TranslationKey, string> = {
   "metrics.imageCount": "Image count", "metrics.duration": "Media duration", "metrics.resolution": "Resolution", "metrics.processingImages": "Images processed", "metrics.estimatedFrames": "Estimated frames", "metrics.keepAll": "Keep all", "metrics.approx": "About {value}", "metrics.estimate": "Estimated duration", "metrics.analyzing": "Analyzing",
   "alpha.imagesTitle": "Alpha channel detected", "alpha.videoTitle": "Alpha channel detected", "alpha.imagesHint": "Transparency will be checked during generation and COLMAP masks created only when needed", "alpha.videoHint": "Transparent frames and COLMAP masks will be extracted automatically · {format}",
   "sequence.title": "Large image sequence", "sequence.hint": "More than 500 images can require much more time and disk space for exhaustive matching. OOOSplat will ask again before generation starts.",
-  "generate.analyzing": "Analyzing media", "generate.start": "Start Generation", "progress.title": "Live progress", "progress.preparing": "Preparing task", "progress.stage": "Current stage", "progress.progress": "Progress", "progress.elapsed": "Total elapsed", "progress.registered": "Registered {current}/{total}", "progress.estimated": "Estimated {value}%", "progress.continuing": "Running", "progress.running": "Running", "progress.log": "Task log", "progress.logCount": "Latest {count} / 500 entries", "progress.terminating": "Stopping task", "progress.cancel": "Cancel task and stop all processes", "progress.cancelError": "Could not stop the task: {detail}", "progress.privacyError": "Could not save privacy settings: {detail}",
+  "generate.analyzing": "Analyzing media", "generate.start": "Start Generation", "progress.title": "Live progress", "progress.preparing": "Preparing task", "progress.stage": "Current stage", "progress.progress": "Progress", "progress.elapsed": "Total elapsed", "progress.registered": "Registered {current}/{total}", "progress.estimated": "Estimated {value}%", "progress.continuing": "Running", "progress.running": "Running", "progress.log": "Task log", "progress.logCount": "Latest {count} / 500 entries", "progress.terminating": "Stopping task", "progress.cancel": "Cancel task and stop all processes", "progress.cancelError": "Could not stop the task: {detail}", "progress.privacyError": "Could not save privacy settings: {detail}", "progress.activeFeatures": "Extracting image features", "progress.activeMatching": "Matching images", "progress.activeReconstruction": "Reconstructing cameras", "progress.activeTraining": "Training Splats", "progress.activeCount": "{label} ({current}/{total})",
   "stage.material": "Media analysis", "stage.frames": "Frame preparation", "stage.features": "Feature extraction", "stage.matching": "Image matching", "stage.reconstruction": "Camera reconstruction", "stage.training": "Splat training", "stage.export": "Result publishing", "stage.completed": "Completed", "stage.failed": "Task failed", "stage.cancelled": "Cancelled", "stage.preparing": "Preparing",
   "history.title": "02 Task History", "history.aria": "Project results", "history.refresh": "Refresh", "history.completed": "Completed", "history.unfinished": "Unfinished", "history.projects": "{count} projects", "history.emptyTitle": "No projects yet", "history.emptyHint": "Choose a video or image sequence and a project folder to start. Results will appear here automatically.",
   "project.date": "Created", "project.elapsed": "Elapsed", "project.quality": "Preset", "project.opening": "Opening", "project.preview": "Preview", "project.resume": "Resume task", "project.reveal": "Show in file manager", "project.delete": "Delete", "project.reshoot": "High-res reshoot",
@@ -472,8 +481,10 @@ const en: Record<TranslationKey, string> = {
   "failure.mapperStorage": "The app could not read the project files while rebuilding the captured space. Another app may be using them, or the project drive may be temporarily unavailable.",
   "failure.brushTitle": "The graphics card could not finish building the model",
   "failure.brushDatasetTitle": "Some images needed to build the model could not be read",
+  "failure.brushDeviceLostTitle": "The GPU disconnected during Splat training",
   "failure.brushGpu": "The most common causes are an outdated graphics driver, heavy graphics usage by another app, or too little free graphics memory. Your media and completed steps are still saved in the project.",
   "failure.brushDataset": "Some project images could not be read completely while building the model. A file may be incomplete or damaged, or the project drive may be unstable.",
+  "failure.brushDeviceLost": "Windows or the graphics driver reset the GPU connection during Splat training. Your media and completed reconstruction steps are still saved in the project.",
   "failure.solutions": "What you can try",
   "failure.mapperTip1": "Capture again while moving slowly and continuously, without sudden turns.",
   "failure.mapperTip2": "Keep more of the same area visible between neighboring views and keep the lighting steady.",
@@ -485,6 +496,9 @@ const en: Record<TranslationKey, string> = {
   "failure.brushTip3": "If it still fails, use the Fast preset or shorter, lower-resolution media.",
   "failure.datasetTip1": "Make sure the project drive is connected and has enough free space.",
   "failure.datasetTip2": "Do not move or change project files, then retry.",
+  "failure.deviceLostTip1": "Connect the computer to power and close games, rendering tools, and other GPU-heavy apps.",
+  "failure.deviceLostTip2": "Set brush_app.exe to High performance in Windows Graphics settings.",
+  "failure.deviceLostTip3": "Update the graphics driver, restart the computer, and resume the task.",
   "failure.retry": "Retry",
   "failure.openLogs": "Open logs",
   "failure.details": "Show original error",
@@ -666,6 +680,7 @@ export function localizePipelineMessage(locale: Locale, message: string): string
   const exact = exactPipelineEnglish[message];
   if (exact) return exact;
   const patterns: Array<[RegExp, (...values: string[]) => string]> = [
+    [/^Splat 训练期间显卡设备连接中断。请接通电源、关闭占用显卡的软件，并在 Windows 图形设置中将 brush_app\.exe 设为高性能后重试。(?:\n[\s\S]*)?$/, () => "The GPU device disconnected during Splat training. Connect the computer to power, close other GPU-heavy apps, set brush_app.exe to High performance in Windows Graphics settings, and try again."],
     [/^正在使用 (CPU|GPU) 提取补拍画面的信息$/, (backend) => `Extracting reshoot image features with ${backend}`],
     [/^正在准备补拍画面 · ([\d,]+)\/([\d,]+)$/, (current, total) => `Preparing reshoot frames · ${current}/${total}`],
     [/^补拍画面准备完成 · ([\d,]+) 张$/, (count) => `Reshoot frame preparation completed · ${count} images`],

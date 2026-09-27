@@ -33,6 +33,16 @@ describe("pipeline command errors", () => {
     });
   });
 
+  it("preserves the dedicated Brush device-lost guidance kind", () => {
+    expect(pipelineCommandError({
+      code: "pipeline_failed",
+      message: "VK_ERROR_DEVICE_LOST",
+      failedStage: "trainingSplats",
+      engine: "brush",
+      failureKind: "brush_device_lost",
+    })?.failureKind).toBe("brush_device_lost");
+  });
+
   it("drops unknown engines and failure kinds", () => {
     expect(pipelineCommandError({
       code: "pipeline_failed",

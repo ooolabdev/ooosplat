@@ -1474,6 +1474,7 @@ impl PipelineRunner {
                     paths,
                     &mut state,
                     metadata.quality,
+                    acceleration,
                     &dataset,
                     report.points_3d,
                     resolved_brush,
@@ -1903,6 +1904,7 @@ impl PipelineRunner {
                     paths,
                     &mut state,
                     quality,
+                    acceleration,
                     &dataset,
                     report.points_3d,
                     resolved_brush,
@@ -1980,12 +1982,26 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         state: &mut PipelineStateFile,
         quality: Quality,
+        acceleration: &crate::engines::ColmapAccelerationStatus,
         dataset: &Path,
         initial_sfm_points: u64,
         resolved: ResolvedBrushTrainingPreset,
         estimated_duration_ms: u64,
     ) -> Result<PathBuf> {
         self.log_brush_profile("BrushProfile", &resolved, EventLevel::Info);
+        let gpu_launch_policy = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
+        self.events.send(
+            PipelineStage::TrainingSplats,
+            Some(PipelineEngine::Brush),
+            EventKind::Log,
+            EventLevel::Info,
+            None,
+            true,
+            format!("[BrushGpu] {}", gpu_launch_policy.log_summary()),
+            None,
+            None,
+            None,
+        );
         let first_log = if state.brush_training.oom_retry_used {
             paths.logs.join("brush-retry.log")
         } else {
@@ -1995,8 +2011,11 @@ impl PipelineRunner {
             &self.engines.brush,
             dataset,
             &paths.brush,
-            resolved.preset,
-            first_log,
+            brush::BrushTrainingOptions {
+                preset: resolved.preset,
+                log_path: first_log,
+                gpu_launch_policy: &gpu_launch_policy,
+            },
             &self.process_manager,
             Some(self.process_observer(
                 PipelineStage::TrainingSplats,
@@ -2054,8 +2073,11 @@ impl PipelineRunner {
                     &self.engines.brush,
                     dataset,
                     &paths.brush,
-                    downgraded.preset,
-                    paths.logs.join("brush-retry.log"),
+                    brush::BrushTrainingOptions {
+                        preset: downgraded.preset,
+                        log_path: paths.logs.join("brush-retry.log"),
+                        gpu_launch_policy: &gpu_launch_policy,
+                    },
                     &self.process_manager,
                     Some(self.process_observer(
                         PipelineStage::TrainingSplats,

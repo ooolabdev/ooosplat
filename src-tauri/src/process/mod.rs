@@ -233,6 +233,17 @@ impl ProcessManager {
     }
 
     pub async fn run(&self, spec: ProcessSpec) -> Result<ProcessOutput> {
+        self.run_with_environment(spec, &[]).await
+    }
+
+    /// Runs a child with overrides that apply only to that process. The parent
+    /// environment is never mutated, which keeps engine-specific GPU settings
+    /// from leaking into OOOSplat or other bundled tools.
+    pub async fn run_with_environment(
+        &self,
+        spec: ProcessSpec,
+        environment: &[(OsString, OsString)],
+    ) -> Result<ProcessOutput> {
         if !spec.executable.is_file() {
             return Err(SplatError::EngineMissing(
                 spec.executable.display().to_string(),
@@ -247,6 +258,7 @@ impl ProcessManager {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.args)
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -468,6 +480,38 @@ mod tests {
         assert!(detail.ends_with("early eof"));
         assert_eq!(detail.chars().count(), 4_096);
         assert!(!detail.contains("less useful stdout"));
+    }
+
+    #[tokio::test]
+    async fn child_environment_overrides_do_not_mutate_the_parent() {
+        const KEY: &str = "OOOSPLAT_PROCESS_ENV_ISOLATION_TEST";
+        let parent_value = std::env::var_os(KEY);
+        let environment = vec![(OsString::from(KEY), OsString::from("child-only"))];
+
+        #[cfg(windows)]
+        let spec = ProcessSpec {
+            executable: system_executable("cmd.exe"),
+            args: vec!["/C".into(), format!("echo %{KEY}%").into()],
+            working_directory: None,
+            log_path: None,
+            observer: None,
+        };
+        #[cfg(unix)]
+        let spec = ProcessSpec {
+            executable: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), format!("printf '%s' \"${KEY}\"").into()],
+            working_directory: None,
+            log_path: None,
+            observer: None,
+        };
+
+        let output = ProcessManager::new()
+            .run_with_environment(spec, &environment)
+            .await
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "child-only");
+        assert_eq!(std::env::var_os(KEY), parent_value);
     }
 
     #[cfg(windows)]

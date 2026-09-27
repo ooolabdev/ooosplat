@@ -16,6 +16,8 @@ pub enum SplatError {
     Process(String),
     #[error("Brush 显存不足：{0}")]
     BrushOutOfMemory(String),
+    #[error("Splat 训练期间显卡设备连接中断。请接通电源、关闭占用显卡的软件，并在 Windows 图形设置中将 brush_app.exe 设为高性能后重试。\n{0}")]
+    BrushDeviceLost(String),
     #[error("当前引擎版本不支持安全接入：{0}")]
     UnsupportedEngine(String),
     #[error("文件读写失败：{0}")]

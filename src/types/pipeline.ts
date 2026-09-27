@@ -17,6 +17,7 @@ export interface ColmapAccelerationStatus {
   reason: string;
   device: GpuDeviceInfo | null;
   requirements: AccelerationRequirements;
+  detectedNvidiaDeviceCount?: number;
 }
 export interface EngineStatus { kind: EngineKind; path: string; exists: boolean; canStart: boolean; version: string | null; cpuOnly: boolean | null; acceleration: ColmapAccelerationStatus | null; colmapCliFamily?: "legacy39" | "modern4"; detail: string; }
 export interface VideoInfo {

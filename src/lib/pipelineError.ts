@@ -1,5 +1,5 @@
 export type PipelineErrorCode = "cancelled" | "pipeline_failed";
-export type PipelineFailureKind = "mapper_source" | "mapper_storage" | "brush_gpu" | "brush_dataset";
+export type PipelineFailureKind = "mapper_source" | "mapper_storage" | "brush_gpu" | "brush_device_lost" | "brush_dataset";
 
 export interface PipelineCommandError {
   code: PipelineErrorCode;
@@ -12,7 +12,7 @@ export interface PipelineCommandError {
   logsDirectory?: string;
 }
 
-const failureKinds = new Set<PipelineFailureKind>(["mapper_source", "mapper_storage", "brush_gpu", "brush_dataset"]);
+const failureKinds = new Set<PipelineFailureKind>(["mapper_source", "mapper_storage", "brush_gpu", "brush_device_lost", "brush_dataset"]);
 
 export function pipelineCommandError(error: unknown): PipelineCommandError | null {
   if (typeof error !== "object" || error == null) return null;

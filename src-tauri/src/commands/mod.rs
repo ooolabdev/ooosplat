@@ -150,6 +150,17 @@ fn classify_pipeline_failure(
             )
         }
         Some(PipelineStage::TrainingSplats) => {
+            let device_lost = [
+                "devicelost",
+                "device lost",
+                "device_lost",
+                "parent device is lost",
+                "vk_error_device_lost",
+                "dxgi_error_device_removed",
+                "显卡设备连接中断",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
             let dataset_error = [
                 "early eof",
                 "failed to load dataset",
@@ -163,7 +174,9 @@ fn classify_pipeline_failure(
             .any(|needle| lower.contains(needle));
             (
                 Some(PipelineEngine::Brush),
-                Some(if dataset_error {
+                Some(if device_lost {
+                    "brush_device_lost"
+                } else if dataset_error {
                     "brush_dataset"
                 } else {
                     "brush_gpu"
@@ -1346,7 +1359,7 @@ mod tests {
                 Some(PipelineStage::TrainingSplats),
                 "Device lost while allocating a buffer",
             ),
-            (Some(PipelineEngine::Brush), Some("brush_gpu")),
+            (Some(PipelineEngine::Brush), Some("brush_device_lost")),
         );
     }
 

@@ -97,6 +97,7 @@ pub enum TelemetryErrorCode {
     LowRegisteredImages,
     BrushFailed,
     BrushOutOfMemory,
+    BrushDeviceLost,
     DiskSpaceLow,
     IoFailed,
     Unknown,

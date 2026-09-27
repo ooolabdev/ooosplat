@@ -60,6 +60,14 @@ describe("interface language", () => {
     expect(localizePipelineMessage("en", "图片序列 30 张 · 1920×1080 · 检测到 Alpha 通道")).toBe("Image sequence 30 images · 1920×1080 · alpha channel detected");
   });
 
+  it("localizes Brush device loss without exposing raw driver details", () => {
+    const message = "Splat 训练期间显卡设备连接中断。请接通电源、关闭占用显卡的软件，并在 Windows 图形设置中将 brush_app.exe 设为高性能后重试。\nParent device is lost";
+    expect(localizePipelineMessage("en", message)).toBe(
+      "The GPU device disconnected during Splat training. Connect the computer to power, close other GPU-heavy apps, set brush_app.exe to High performance in Windows Graphics settings, and try again.",
+    );
+    expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+  });
+
   it("switches immediately, localizes formatting, and persists the explicit choice", async () => {
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     await act(async () => root.render(<LanguageProvider><Harness /></LanguageProvider>));

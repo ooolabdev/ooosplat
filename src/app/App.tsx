@@ -19,15 +19,30 @@ import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type 
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, ProjectStatus, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo } from "../types/pipeline";
+import type { EngineStatus, InputType, PipelineEvent, ProjectStatus, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
 const CANCELLATION_OVERLAY_DELAY_MS = 300;
 const PREVIEW_CLOSE_TIMEOUT_MS = 8_000;
 const NATIVE_ACTION_TIMEOUT_MS = 8_000;
-const MAPPER_REFINEMENT_PATTERN = /retriangulation|global bundle adjustment/i;
+const friendlyProgressKeyByStage: Record<string, TranslationKey> = {
+  extractingFeatures: "progress.activeFeatures",
+  matching: "progress.activeMatching",
+  reconstructing: "progress.activeReconstruction",
+  trainingSplats: "progress.activeTraining",
+};
 
+const countFromProgressEvent = (event: PipelineEvent, stage: string): { current: number; total: number } | null => {
+  if (event.stage !== stage || event.total == null || event.total <= 0) return null;
+  const directCurrent = event.current;
+  const estimatedTrainingCurrent = stage === "trainingSplats" && event.stageProgress != null
+    ? Math.round(event.total * event.stageProgress / 100)
+    : null;
+  const current = directCurrent ?? estimatedTrainingCurrent;
+  if (current == null || !Number.isFinite(current)) return null;
+  return { current: Math.max(0, Math.min(event.total, current)), total: event.total };
+};
 
 type FailureDialogState = {
   kind: PipelineFailureKind;
@@ -51,9 +66,11 @@ const inferFailureDialog = (error: unknown, fallbackStage?: string, fallbackProj
   let kind = structured?.failureKind;
   if (!kind && stage === "reconstructing") kind = "mapper_source";
   if (!kind && stage === "trainingSplats") {
-    kind = /early eof|failed to load dataset|i\/o error|io error|no such file|access denied|permission denied/i.test(rawMessage)
-      ? "brush_dataset"
-      : "brush_gpu";
+    kind = /devicelost|device lost|device_lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡设备连接中断/i.test(rawMessage)
+      ? "brush_device_lost"
+      : /early eof|failed to load dataset|i\/o error|io error|no such file|access denied|permission denied/i.test(rawMessage)
+        ? "brush_dataset"
+        : "brush_gpu";
   }
   if (!kind) return null;
   return { kind, projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage };
@@ -66,16 +83,19 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
   onRetry: () => void;
   onOpenLogs: () => void;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage";
   const dataset = failure.kind === "brush_dataset";
-  const title = mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : t("failure.brushTitle");
+  const deviceLost = failure.kind === "brush_device_lost";
+  const title = mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
   const description = failure.kind === "mapper_source"
     ? t("failure.mapperSource")
     : failure.kind === "mapper_storage"
       ? t("failure.mapperStorage")
       : dataset
         ? t("failure.brushDataset")
+        : deviceLost
+          ? t("failure.brushDeviceLost")
         : t("failure.brushGpu");
   const tips: TranslationKey[] = failure.kind === "mapper_source"
     ? ["failure.mapperTip1", "failure.mapperTip2", "failure.mapperTip3"]
@@ -83,6 +103,8 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
       ? ["failure.storageTip1", "failure.storageTip2"]
       : dataset
         ? ["failure.datasetTip1", "failure.datasetTip2"]
+        : deviceLost
+          ? ["failure.deviceLostTip1", "failure.deviceLostTip2", "failure.deviceLostTip3"]
         : ["failure.brushTip1", "failure.brushTip2", "failure.brushTip3"];
 
   useEffect(() => {
@@ -103,7 +125,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
       <p>{description}</p>
       <strong>{t("failure.solutions")}</strong>
       <ul>{tips.map((key) => <li key={key}>{t(key)}</li>)}</ul>
-      {failure.rawMessage && <details><summary>{t("failure.details")}</summary><pre>{failure.rawMessage}</pre></details>}
+      {failure.rawMessage && <details><summary>{t("failure.details")}</summary><pre>{deviceLost ? localizePipelineMessage(locale, failure.rawMessage) : failure.rawMessage}</pre></details>}
       <div className="failure-guidance-actions">
         <button type="button" className="secondary" disabled={action !== null || !failure.projectId} onClick={onOpenLogs}>{action === "logs" ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{t("failure.openLogs")}</button>
         <button type="button" className="primary" disabled={action !== null || !failure.projectId} onClick={onRetry}>{action === "retry" ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}{t("failure.retry")}</button>
@@ -262,15 +284,23 @@ export function App() {
     : store.progressMessage
       ? localizePipelineMessage(locale, store.progressMessage)
       : t("progress.preparing");
-  const mapperPhaseKeepsRegistrationCount = store.latestEvent?.stage === "reconstructing"
-    && store.latestEvent.current != null
-    && store.latestEvent.total != null
-    && MAPPER_REFINEMENT_PATTERN.test(store.latestEvent.message);
-  const currentMessage = mapperPhaseKeepsRegistrationCount
-    ? `${latestMessage} · ${t("progress.registered", {
-      current: formatNumber(store.latestEvent!.current!),
-      total: formatNumber(store.latestEvent!.total!),
-    })}`
+  const latestEventIsTerminal = store.latestEvent != null && ["failed", "cancelled"].includes(store.latestEvent.stage);
+  const friendlyProgressKey = store.phase === "running" && !latestEventIsTerminal && progressEvent
+    ? friendlyProgressKeyByStage[progressEvent.stage]
+    : undefined;
+  const friendlyProgressCount = friendlyProgressKey && progressEvent
+    ? [progressEvent, ...store.events.slice().reverse()]
+      .map((event) => countFromProgressEvent(event, progressEvent.stage))
+      .find((count) => count != null) ?? null
+    : null;
+  const currentMessage = friendlyProgressKey
+    ? friendlyProgressCount
+      ? t("progress.activeCount", {
+        label: t(friendlyProgressKey),
+        current: formatNumber(friendlyProgressCount.current),
+        total: formatNumber(friendlyProgressCount.total),
+      })
+      : `${t(friendlyProgressKey)}…`
     : latestMessage;
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const currentStageLabel = useCallback((stage: string | undefined, index: number) => {
@@ -898,15 +928,17 @@ export function App() {
 
         <div className="form-section">
           <label className="field-label">{t("quality.label")}</label>
-          <div className="quality-list" role="radiogroup">
-            {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
-              <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
-            </button>)}
+          <div className="quality-settings">
+            <div className="quality-list" role="radiogroup">
+              {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
+                <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
+              </button>)}
+            </div>
+            <button className="planner-switch" type="button" role="switch" aria-checked={store.plannerEnabled} disabled={isRunning} onClick={() => void changePlannerEnabled()}>
+              <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
+              <i aria-hidden="true"><span /></i>
+            </button>
           </div>
-          <button className="planner-switch" type="button" role="switch" aria-checked={store.plannerEnabled} disabled={isRunning} onClick={() => void changePlannerEnabled()}>
-            <span><strong>{t("planner.label")}</strong><small>{store.plannerEnabled ? t("planner.enabledHint") : t("planner.disabledHint")}</small></span>
-            <i aria-hidden="true"><span /></i>
-          </button>
         </div>
 
         <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">
