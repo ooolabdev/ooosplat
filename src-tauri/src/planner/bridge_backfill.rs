@@ -67,6 +67,8 @@ pub struct BridgeBackfillCheckpoint {
     pub final_registered_images: Option<u64>,
     #[serde(default)]
     pub final_points_3d: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

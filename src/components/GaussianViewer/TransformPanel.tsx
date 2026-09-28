@@ -11,7 +11,7 @@ type DragState = {
 };
 
 const TRANSFORM_SCALE_MIN = 0.001;
-const TRANSFORM_SCALE_MAX = 1000;
+const TRANSFORM_SCALE_MAX = 10000;
 const clampValue = (value: number, minimum?: number, maximum?: number) => Math.min(maximum ?? Number.POSITIVE_INFINITY, Math.max(minimum ?? Number.NEGATIVE_INFINITY, value));
 const formatValue = (value: number) => {
   const absolute = Math.abs(value);

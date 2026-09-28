@@ -63,6 +63,34 @@ describe("TransformPanel", () => {
     expect(uniform?.closest(".transform-field")?.classList.contains("long-label")).toBe(true);
   });
 
+  it("allows a uniform scale of 10000 and rejects values above it", async () => {
+    window.localStorage.setItem("ooo-splat-language", "en");
+    function Harness() {
+      const [transform, setTransform] = useState<GaussianTransform>({ position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 });
+      return <LanguageProvider><TransformPanel transform={transform} onBegin={() => {}} onChange={setTransform} onCommit={() => {}} /></LanguageProvider>;
+    }
+    await act(async () => root.render(<Harness />));
+
+    const input = container.querySelector<HTMLInputElement>(".transform-panel section:last-of-type input")!;
+    await act(async () => { input.focus(); });
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "10000");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { input.blur(); });
+    expect(input.value).toBe("10000");
+    expect(input.getAttribute("aria-invalid")).toBe("false");
+
+    await act(async () => { input.focus(); });
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "10001");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { input.blur(); });
+    expect(input.value).toBe("10000");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+  });
+
   it("scrubs crop extents above 1000 without snapping to the transform scale limit", async () => {
     function Harness() {
       const [crop, setCrop] = useState<GaussianCrop>({ kind: "sphere", center: [0, 0, 0], radius: 1500 });

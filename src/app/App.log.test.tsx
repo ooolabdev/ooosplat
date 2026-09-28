@@ -143,7 +143,7 @@ describe("App live log", () => {
     expect(plannerSwitch?.getAttribute("aria-checked")).toBe("true");
     expect(plannerSwitch?.disabled).toBe(true);
     expect(plannerSwitch?.textContent).toContain("自动优化（实验性）");
-    expect(plannerSwitch?.textContent).toContain("开启后，将自动优化重建与训练参数，通常可缩短生成时间，并提升高斯泼溅效果");
+    expect(plannerSwitch?.textContent).toContain("开启后，将优化重建与训练参数并自动补救，通常可缩短视频素材的生成时长，提升图片素材的细节表现");
   });
 
   it("keeps the outer task pane fixed while following fewer than 500 log lines", async () => {
@@ -192,10 +192,10 @@ describe("App live log", () => {
 
   it("shows plain-language progress with counts for the four processing stages", async () => {
     const cases = [
-      ["extractingFeatures", "正在提取图像特征（8/20）"],
-      ["matching", "正在匹配图像（9/20）"],
-      ["reconstructing", "正在重建相机（10/20）"],
-      ["trainingSplats", "正在训练 Splat（11/20）"],
+      ["extractingFeatures", "正在分析画面（8/20）"],
+      ["matching", "正在寻找画面之间的联系（9/20）"],
+      ["reconstructing", "正在还原拍摄场景（10/20）"],
+      ["trainingSplats", "正在生成三维模型（11/20）"],
     ] as const;
 
     for (const [index, [stage, expected]] of cases.entries()) {
@@ -224,7 +224,7 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在匹配图像（12/40）");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在寻找画面之间的联系（12/40）");
     expect(container.querySelector(".live-log")?.textContent).toContain("Technical matcher detail");
   });
 
@@ -236,7 +236,7 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在提取图像特征…");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在分析画面…");
     expect(container.querySelector(".live-log")?.textContent).toContain("COLMAP startup");
   });
 
@@ -248,10 +248,10 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在训练 Splat（15,000/30,000）");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成三维模型（15,000/30,000）");
 
     await act(async () => { container.querySelector<HTMLButtonElement>(".language-action")!.click(); });
-    expect(container.querySelector(".current-message")?.textContent).toBe("Training Splats (15,000/30,000)");
+    expect(container.querySelector(".current-message")?.textContent).toBe("Creating the 3D model (15,000/30,000)");
   });
 
   it("keeps terminal messages instead of presenting them as active work", async () => {

@@ -17,6 +17,7 @@ use crate::{
     },
     error::{Result, SplatError},
     pipeline::{
+        effectiveness::PlannerEffectivenessTracker,
         estimate::{
             estimate_runtime_for_images_with_brush, estimate_runtime_with_brush, RuntimeEstimate,
         },
@@ -43,7 +44,8 @@ use crate::{
         splat_transform::{export_transformed_ply_with_edits, GaussianExportEdits},
     },
     telemetry::{
-        PipelineTelemetrySession, TelemetryInputType, TelemetryPreferences, TelemetryService,
+        PipelineTelemetrySession, TelemetryInputType, TelemetryPreferences, TelemetryRunKind,
+        TelemetryService,
     },
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
@@ -569,7 +571,9 @@ pub async fn start_pipeline(
     planner_enabled: Option<bool>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
     let emitter = app.clone();
-    let telemetry_session = Arc::new(PipelineTelemetrySession::new(
+    let planner_enabled = planner_enabled.unwrap_or(true);
+    let effectiveness = PlannerEffectivenessTracker::default();
+    let telemetry_session = Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
         telemetry.inner().clone(),
         quality,
         if Path::new(&path).is_dir() {
@@ -577,16 +581,18 @@ pub async fn start_pipeline(
         } else {
             TelemetryInputType::Video
         },
+        TelemetryRunKind::New,
+        planner_enabled,
+        effectiveness.clone(),
     ));
     let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(PipelineRunner::new_with_planner(
-        paths_for_app(&app),
-        planner_enabled.unwrap_or(true),
-        move |event| {
+    let runner = Arc::new(
+        PipelineRunner::new_with_planner(paths_for_app(&app), planner_enabled, move |event| {
             event_telemetry.observe(&event);
             let _ = emitter.emit("pipeline-event", event);
-        },
-    ));
+        })
+        .with_effectiveness_tracker(effectiveness),
+    );
     {
         let mut active = state.active.lock().await;
         if active.is_some() {
@@ -621,21 +627,37 @@ pub async fn resume_pipeline(
     project_id: String,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
     let project_id = parse_project_id(&project_id)?;
-    let (_, metadata) = catalog::load_registered_project(project_id).await?;
+    let (project_root, metadata) = catalog::load_registered_project(project_id).await?;
+    let state_bytes = tokio::fs::read(project_root.join("state.json"))
+        .await
+        .map_err(SplatError::from)?;
+    let pipeline_state: PipelineStateFile =
+        serde_json::from_slice(&state_bytes).map_err(SplatError::from)?;
     let emitter = app.clone();
-    let telemetry_session = Arc::new(PipelineTelemetrySession::new(
+    let effectiveness = PlannerEffectivenessTracker::default();
+    let telemetry_session = Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
         telemetry.inner().clone(),
         metadata.quality,
         match metadata.input_type {
             ProjectInputType::Video => TelemetryInputType::Video,
             ProjectInputType::Images => TelemetryInputType::Images,
         },
+        TelemetryRunKind::Resume,
+        pipeline_state.planner_enabled,
+        effectiveness.clone(),
     ));
     let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
-        event_telemetry.observe(&event);
-        let _ = emitter.emit("pipeline-event", event);
-    }));
+    let runner = Arc::new(
+        PipelineRunner::new_with_planner(
+            paths_for_app(&app),
+            pipeline_state.planner_enabled,
+            move |event| {
+                event_telemetry.observe(&event);
+                let _ = emitter.emit("pipeline-event", event);
+            },
+        )
+        .with_effectiveness_tracker(effectiveness),
+    );
     {
         let mut active = state.active.lock().await;
         if active.is_some() {

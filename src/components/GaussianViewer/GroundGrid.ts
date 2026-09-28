@@ -1,4 +1,17 @@
-import { BoundingBox, Color, LAYERID_WORLD, Vec3, type Application } from "playcanvas";
+import {
+  BLEND_NONE,
+  BoundingBox,
+  Color,
+  GraphNode,
+  LAYERID_WORLD,
+  Mesh,
+  MeshInstance,
+  PRIMITIVE_LINES,
+  StandardMaterial,
+  Vec3,
+  type Application,
+  type Layer,
+} from "playcanvas";
 
 export interface GroundGridGeometry {
   positions: Vec3[];
@@ -52,32 +65,60 @@ export function buildGroundGrid(modelBounds: BoundingBox): GroundGridGeometry {
 
 export class GroundGrid {
   private destroyed = false;
-  private visible = true;
-  private readonly stopDrawing: () => void;
+  private readonly worldLayer: Layer;
+  private readonly meshInstance: MeshInstance;
+  private readonly material: StandardMaterial;
+  private readonly node: GraphNode;
   readonly bounds: BoundingBox;
 
   constructor(app: Application, bounds: BoundingBox) {
     const geometry = buildGroundGrid(bounds);
     this.bounds = geometry.bounds.clone();
-    const worldLayer = app.scene.layers.getLayerById(LAYERID_WORLD) ?? undefined;
-    const draw = () => {
-      if (this.visible) app.drawLines(geometry.positions, geometry.colors, true, worldLayer);
-    };
-    const updateHandle = app.on("update", draw);
-    this.stopDrawing = () => updateHandle.off();
+    const worldLayer = app.scene.layers.getLayerById(LAYERID_WORLD);
+    if (!worldLayer) throw new Error("PlayCanvas World layer is unavailable");
+    this.worldLayer = worldLayer;
+
+    const mesh = new Mesh(app.graphicsDevice);
+    mesh.setPositions(geometry.positions.flatMap(({ x, y, z }) => [x, y, z]));
+    mesh.setColors(geometry.colors.flatMap(({ r, g, b, a }) => [r, g, b, a]));
+    mesh.update(PRIMITIVE_LINES);
+
+    const material = new StandardMaterial();
+    material.name = "OOOSplat Ground Grid";
+    material.useLighting = false;
+    material.useTonemap = false;
+    material.useFog = false;
+    material.diffuse.set(0, 0, 0);
+    material.emissive.set(1, 1, 1);
+    material.emissiveVertexColor = true;
+    material.blendType = BLEND_NONE;
+    material.depthTest = true;
+    material.depthWrite = true;
+    material.update();
+    this.material = material;
+
+    const node = new GraphNode("OOOSplat Ground Grid");
+    this.node = node;
+    const meshInstance = new MeshInstance(mesh, material, node);
+    meshInstance.castShadow = false;
+    this.meshInstance = meshInstance;
+    worldLayer.addMeshInstances([meshInstance], true);
   }
 
   setVisible(visible: boolean) {
-    this.visible = visible;
+    this.meshInstance.visible = visible;
   }
 
   get isVisible() {
-    return this.visible;
+    return this.meshInstance.visible;
   }
 
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.stopDrawing();
+    this.worldLayer.removeMeshInstances([this.meshInstance], true);
+    this.meshInstance.destroy();
+    this.material.destroy();
+    this.node.destroy();
   }
 }

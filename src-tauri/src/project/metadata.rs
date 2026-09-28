@@ -52,9 +52,9 @@ impl GaussianTransform {
                 "Transform 包含无效数值".into(),
             ));
         }
-        if !(0.001..=1000.0).contains(&self.scale) {
+        if !(0.001..=10_000.0).contains(&self.scale) {
             return Err(crate::error::SplatError::Process(
-                "Uniform Scale 必须位于 0.001–1000 之间".into(),
+                "Uniform Scale 必须位于 0.001–10000 之间".into(),
             ));
         }
         Ok(self)
@@ -267,11 +267,15 @@ pub struct FrameState {
     pub candidate_frames: Vec<PlannedFrame>,
     #[serde(default)]
     pub rescue_max_frames: u64,
+    #[serde(default)]
+    pub minimum_frame_override_applied: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrushTrainingCheckpoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<ResolvedBrushTrainingPreset>,
     #[serde(default)]
@@ -292,6 +296,7 @@ impl From<&FramePlan> for FrameState {
             selected_frames: plan.selected_frames.clone(),
             candidate_frames: plan.candidate_frames.clone(),
             rescue_max_frames: plan.rescue_max_frames,
+            minimum_frame_override_applied: plan.minimum_frame_override_applied,
         }
     }
 }
@@ -414,13 +419,15 @@ mod tests {
     #[test]
     fn brush_training_checkpoint_round_trips_resolved_retry_state() {
         let mut state = PipelineStateFile::created(Quality::High);
-        state.brush_training.resolved = Some(crate::presets::resolve_brush_training_preset(
+        let initial = crate::presets::resolve_brush_training_preset(
             Quality::High,
             true,
             Some(12_288),
             7_680,
             350_000,
-        ));
+        );
+        state.brush_training.initial_resolved = Some(initial);
+        state.brush_training.resolved = initial.downgrade_after_oom(350_000);
         state.brush_training.oom_retry_used = true;
 
         let json = serde_json::to_string(&state).unwrap();
@@ -446,6 +453,18 @@ mod tests {
 
     #[test]
     fn rejects_invalid_transform_values() {
+        assert!(GaussianTransform {
+            scale: 10_000.0,
+            ..GaussianTransform::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(GaussianTransform {
+            scale: 10_000.1,
+            ..GaussianTransform::default()
+        }
+        .validate()
+        .is_err());
         assert!(GaussianTransform {
             scale: 0.0,
             ..GaussianTransform::default()

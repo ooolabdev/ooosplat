@@ -1,23 +1,42 @@
 mod event;
 mod service;
 
-use std::{sync::Mutex, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::Instant,
+};
 
 use crate::{
     error::SplatError,
-    pipeline::{EventKind, PipelineEvent, PipelineStage},
+    pipeline::{
+        effectiveness::{
+            PlannerEffectivenessTracker, PLANNER_EFFECTIVENESS_SCHEMA_VERSION, PLANNER_VERSION_V1,
+        },
+        EventKind, PipelineEvent, PipelineStage,
+    },
     presets::Quality,
 };
 
 pub use event::{
     DurationBucket, FrameCountBucket, TelemetryErrorCode, TelemetryEvent, TelemetryInputType,
-    TelemetryQuality, TelemetryStage,
+    TelemetryPlannerOutcome, TelemetryQuality, TelemetryRunKind, TelemetryStage,
 };
 pub use service::{TelemetryDeliveryStatus, TelemetryPreferences, TelemetryService};
 
 #[derive(Debug)]
 struct StageTiming {
-    active: Option<(PipelineStage, Instant)>,
+    active: Option<(PipelineStage, Instant, bool)>,
+}
+
+struct PlannerTelemetryRun {
+    run_id: uuid::Uuid,
+    run_kind: TelemetryRunKind,
+    planner_enabled: bool,
+    tracker: PlannerEffectivenessTracker,
+    emitted: AtomicBool,
 }
 
 /// Side-channel observer for one generation run. It consumes the existing public stage events
@@ -28,6 +47,7 @@ pub struct PipelineTelemetrySession {
     input_type: TelemetryInputType,
     started: Instant,
     timing: Mutex<StageTiming>,
+    planner_run: Option<PlannerTelemetryRun>,
 }
 
 impl PipelineTelemetrySession {
@@ -42,6 +62,31 @@ impl PipelineTelemetrySession {
             input_type,
             started: Instant::now(),
             timing: Mutex::new(StageTiming { active: None }),
+            planner_run: None,
+        }
+    }
+
+    pub fn new_with_planner_evaluation(
+        service: TelemetryService,
+        quality: Quality,
+        input_type: TelemetryInputType,
+        run_kind: TelemetryRunKind,
+        planner_enabled: bool,
+        tracker: PlannerEffectivenessTracker,
+    ) -> Self {
+        Self {
+            service,
+            quality: quality.into(),
+            input_type,
+            started: Instant::now(),
+            timing: Mutex::new(StageTiming { active: None }),
+            planner_run: Some(PlannerTelemetryRun {
+                run_id: uuid::Uuid::new_v4(),
+                run_kind,
+                planner_enabled,
+                tracker,
+                emitted: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -68,25 +113,28 @@ impl PipelineTelemetrySession {
         if timing
             .active
             .as_ref()
-            .is_some_and(|(active, _)| *active != event.stage)
+            .is_some_and(|(active, _, _)| *active != event.stage)
         {
-            if let Some((completed, started)) = timing.active.take() {
+            if let Some((completed, started, record_effectiveness)) = timing.active.take() {
                 if let Some(completed) = TelemetryStage::from_pipeline(completed) {
-                    self.emit_stage_completed(completed, started.elapsed());
+                    self.emit_stage_completed(completed, started.elapsed(), record_effectiveness);
                 }
             }
         }
         if timing.active.is_none() {
-            timing.active = Some((event.stage, now));
+            let record_effectiveness = !event
+                .stage_progress
+                .is_some_and(|progress| progress >= 99.999);
+            timing.active = Some((event.stage, now, record_effectiveness));
         }
 
         if event
             .stage_progress
             .is_some_and(|progress| progress >= 99.999)
         {
-            if let Some((completed, started)) = timing.active.take() {
+            if let Some((completed, started, record_effectiveness)) = timing.active.take() {
                 if completed == event.stage {
-                    self.emit_stage_completed(stage, started.elapsed());
+                    self.emit_stage_completed(stage, started.elapsed(), record_effectiveness);
                 }
             }
         }
@@ -98,12 +146,14 @@ impl PipelineTelemetrySession {
         frame_count: u64,
         source_duration_seconds: Option<f64>,
     ) {
+        self.flush_active_stage();
         self.service.track(TelemetryEvent::GenerationCompleted {
             quality_preset: self.quality,
             total_duration_ms,
             frame_count_bucket: FrameCountBucket::from_count(frame_count),
             duration_bucket: source_duration_seconds.map(DurationBucket::from_seconds),
         });
+        self.emit_planner_evaluation(TelemetryPlannerOutcome::Completed, None, None);
     }
 
     pub fn generation_failed(&self, error: &SplatError) {
@@ -111,10 +161,11 @@ impl PipelineTelemetrySession {
             return;
         }
         let stage = self.current_stage();
-        self.service.track(TelemetryEvent::GenerationFailed {
-            stage,
-            error_code: safe_error_code(error, stage),
-        });
+        self.flush_active_stage();
+        let error_code = safe_error_code(error, stage);
+        self.service
+            .track(TelemetryEvent::GenerationFailed { stage, error_code });
+        self.emit_planner_evaluation(TelemetryPlannerOutcome::Failed, stage, Some(error_code));
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -126,14 +177,87 @@ impl PipelineTelemetrySession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active
-            .and_then(|(stage, _)| TelemetryStage::from_pipeline(stage))
+            .and_then(|(stage, _, _)| TelemetryStage::from_pipeline(stage))
     }
 
-    fn emit_stage_completed(&self, stage: TelemetryStage, duration: std::time::Duration) {
+    fn emit_stage_completed(
+        &self,
+        stage: TelemetryStage,
+        duration: std::time::Duration,
+        record_effectiveness: bool,
+    ) {
+        if record_effectiveness {
+            if let Some(run) = &self.planner_run {
+                if let Some(pipeline_stage) = pipeline_stage_from_telemetry(stage) {
+                    run.tracker
+                        .record_stage_duration(pipeline_stage, duration.as_millis() as u64);
+                }
+            }
+        }
         self.service.track(TelemetryEvent::PipelineStageCompleted {
             stage,
             duration_ms: duration.as_millis() as u64,
         });
+    }
+
+    fn flush_active_stage(&self) {
+        let active = self
+            .timing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .take();
+        if let Some((stage, started, record_effectiveness)) = active {
+            if let Some(stage) = TelemetryStage::from_pipeline(stage) {
+                self.emit_stage_completed(stage, started.elapsed(), record_effectiveness);
+            }
+        }
+    }
+
+    fn emit_planner_evaluation(
+        &self,
+        outcome: TelemetryPlannerOutcome,
+        failure_stage: Option<TelemetryStage>,
+        error_code: Option<TelemetryErrorCode>,
+    ) {
+        let Some(run) = &self.planner_run else {
+            return;
+        };
+        if run
+            .emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.service.track(TelemetryEvent::PlannerEvaluation {
+            planner_schema_version: PLANNER_EFFECTIVENESS_SCHEMA_VERSION,
+            run_id: run.run_id,
+            run_kind: run.run_kind,
+            outcome,
+            planner_enabled: run.planner_enabled,
+            planner_version: run.planner_enabled.then_some(PLANNER_VERSION_V1),
+            quality_preset: self.quality,
+            input_type: self.input_type,
+            total_duration_ms: self.elapsed_ms(),
+            failure_stage,
+            error_code,
+            snapshot: Box::new(run.tracker.snapshot()),
+        });
+    }
+}
+
+fn pipeline_stage_from_telemetry(stage: TelemetryStage) -> Option<PipelineStage> {
+    match stage {
+        TelemetryStage::ProbingVideo => Some(PipelineStage::ProbingVideo),
+        TelemetryStage::ExtractingFrames => Some(PipelineStage::ExtractingFrames),
+        TelemetryStage::ExtractingFeatures => Some(PipelineStage::ExtractingFeatures),
+        TelemetryStage::Matching => Some(PipelineStage::Matching),
+        TelemetryStage::Reconstructing => Some(PipelineStage::Reconstructing),
+        TelemetryStage::ValidatingReconstruction => Some(PipelineStage::ValidatingReconstruction),
+        TelemetryStage::TrainingSplats => Some(PipelineStage::TrainingSplats),
+        TelemetryStage::Exporting => Some(PipelineStage::Exporting),
+        TelemetryStage::Unknown => None,
     }
 }
 
@@ -280,5 +404,67 @@ mod tests {
         assert_eq!(stage["properties"]["stage"], "extracting_frames");
         assert!(stage.get("message").is_none());
         assert!(stage.get("path").is_none());
+    }
+
+    #[tokio::test]
+    async fn planner_evaluation_is_terminal_idempotent_and_cancellation_is_excluded() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, events) =
+            TelemetryService::recording(directory.path().join("telemetry.json"));
+        service.enable_for_test().await;
+        let session = PipelineTelemetrySession::new_with_planner_evaluation(
+            service,
+            Quality::High,
+            TelemetryInputType::Images,
+            TelemetryRunKind::Resume,
+            true,
+            PlannerEffectivenessTracker::default(),
+        );
+        session.generation_failed(&SplatError::Cancelled);
+        session.generation_completed(100, 30, None);
+        session.generation_completed(100, 30, None);
+
+        for _ in 0..50 {
+            if events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|value| value["event"] == "planner_evaluation")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let recorded = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let evaluations = recorded
+            .iter()
+            .filter(|value| value["event"] == "planner_evaluation")
+            .collect::<Vec<_>>();
+        assert_eq!(evaluations.len(), 1);
+        assert_eq!(evaluations[0]["properties"]["runKind"], "resume");
+        assert_eq!(evaluations[0]["properties"]["outcome"], "completed");
+    }
+
+    #[test]
+    fn resume_checkpoint_events_do_not_invent_stage_duration() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(directory.path().join("telemetry.json"));
+        let tracker = PlannerEffectivenessTracker::default();
+        let session = PipelineTelemetrySession::new_with_planner_evaluation(
+            service,
+            Quality::Balanced,
+            TelemetryInputType::Video,
+            TelemetryRunKind::Resume,
+            true,
+            tracker.clone(),
+        );
+        session.observe(&stage_event(PipelineStage::ExtractingFeatures, 100.0));
+
+        assert_eq!(
+            tracker.snapshot().stage_durations.extracting_features_ms,
+            None
+        );
     }
 }

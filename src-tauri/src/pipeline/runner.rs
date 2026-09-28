@@ -24,6 +24,11 @@ use crate::{
     },
     error::{Result, SplatError},
     pipeline::{
+        effectiveness::{
+            PlannerBridgeMetrics, PlannerBridgeStatus, PlannerEffectivenessTracker,
+            PlannerFinalResultMetrics, PlannerFramePlanMetrics, PlannerGpuVendor,
+            PlannerInitialReconstructionMetrics,
+        },
         estimate::{
             estimate_calibrated_brush_stage_ms, estimate_calibrated_brush_stage_ms_for_images,
             estimate_runtime, estimate_runtime_for_images, RuntimeEstimate,
@@ -288,6 +293,7 @@ pub struct PipelineRunner {
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     planner_enabled: bool,
+    effectiveness: Option<PlannerEffectivenessTracker>,
 }
 
 impl PipelineRunner {
@@ -313,7 +319,13 @@ impl PipelineRunner {
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
             planner_enabled,
+            effectiveness: None,
         }
+    }
+
+    pub fn with_effectiveness_tracker(mut self, tracker: PlannerEffectivenessTracker) -> Self {
+        self.effectiveness = Some(tracker);
+        self
     }
 
     pub fn cancel(&self) {
@@ -1611,6 +1623,58 @@ impl PipelineRunner {
                 prepared
             };
         let source_duration_seconds = prepared.video.as_ref().map(|video| video.duration);
+        if let Some(tracker) = &self.effectiveness {
+            let (source_width, source_height, source_item_count) =
+                match (prepared.video.as_ref(), prepared.image_sequence.as_ref()) {
+                    (Some(video), _) => (
+                        u64::from(video.width),
+                        u64::from(video.height),
+                        video.total_frames,
+                    ),
+                    (_, Some(images)) => (
+                        u64::from(images.width),
+                        u64::from(images.height),
+                        images.image_count,
+                    ),
+                    _ => (0, 0, prepared.extracted_frames),
+                };
+            let preset = quality.preset();
+            let is_planned_video = state.planner_enabled && prepared.video.is_some();
+            let initial_selected_count = state
+                .frames
+                .as_ref()
+                .map(|frames| frames.initial_extracted_frames)
+                .filter(|count| *count > 0)
+                .unwrap_or(prepared.extracted_frames);
+            let candidate_count = if is_planned_video {
+                prepared.plan.candidate_frames.len() as u64
+            } else {
+                initial_selected_count
+            };
+            tracker.record_frame_plan(PlannerFramePlanMetrics {
+                source_width,
+                source_height,
+                source_item_count,
+                configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
+                configured_candidate_fps: is_planned_video
+                    .then_some(preset.rescue_max_fps)
+                    .flatten(),
+                effective_target_fps: prepared
+                    .video
+                    .as_ref()
+                    .map(|video| initial_selected_count as f64 / video.duration.max(0.001)),
+                effective_candidate_fps: prepared
+                    .video
+                    .as_ref()
+                    .map(|video| candidate_count as f64 / video.duration.max(0.001)),
+                initial_selected_count,
+                candidate_count,
+                minimum_frame_override_applied: is_planned_video
+                    && prepared.plan.minimum_frame_override_applied,
+                minimum_frame_target_unreachable: is_planned_video
+                    && source_item_count < crate::video::MINIMUM_SELECTED_FRAMES,
+            });
+        }
 
         let database = paths.colmap.join("database.db");
         let sparse = paths.colmap.join("sparse");
@@ -1746,12 +1810,12 @@ impl PipelineRunner {
             );
         }
 
+        let allow_two_view_tracks = state.planner_enabled && preset.sfm_allow_two_view_tracks;
         if state.reconstruction_complete {
             self.events
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
         } else {
             reset_directory(&sparse).await?;
-            let allow_two_view_tracks = state.planner_enabled && preset.sfm_allow_two_view_tracks;
             self.events.stage(
                 PipelineStage::Reconstructing,
                 0.0,
@@ -1797,6 +1861,23 @@ impl PipelineRunner {
             .unwrap_or(prepared.extracted_frames);
         let (initial_model, initial_report) =
             best_sparse_model_with_input_count(&sparse, initial_input_images).await?;
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_gpu_vendor(if acceleration.detected_nvidia_device_count > 0 {
+                PlannerGpuVendor::Nvidia
+            } else if cfg!(target_os = "macos") {
+                PlannerGpuVendor::Apple
+            } else {
+                PlannerGpuVendor::Unknown
+            });
+            tracker.record_initial_reconstruction(PlannerInitialReconstructionMetrics {
+                input_images: initial_report.input_images,
+                registered_images: initial_report.registered_images,
+                points_3d: initial_report.points_3d,
+                backend: acceleration.backend,
+                allow_two_view_tracks,
+            });
+        }
+        let initial_report_for_metrics = initial_report.clone();
         let (model, report) = self
             .maybe_run_bridge_backfill(
                 project_manager,
@@ -1813,6 +1894,42 @@ impl PipelineRunner {
                 initial_report,
             )
             .await?;
+        if let Some(tracker) = &self.effectiveness {
+            let bridge_applicable =
+                state.planner_enabled && prepared.input_type == ProjectInputType::Video;
+            let plan = state.bridge_backfill.plan.as_ref();
+            tracker.record_bridge(PlannerBridgeMetrics {
+                status: if bridge_applicable {
+                    PlannerBridgeStatus::from(state.bridge_backfill.status)
+                } else {
+                    PlannerBridgeStatus::NotApplicable
+                },
+                trigger_ratio: BRIDGE_TRIGGER_RATIO,
+                available_budget: plan.map(|value| value.available_budget).unwrap_or(0),
+                requested_frames: plan
+                    .map(|value| value.selected_frame_indices.len() as u64)
+                    .unwrap_or(0),
+                added_frames: if matches!(
+                    state.bridge_backfill.status,
+                    BridgeBackfillStatus::Completed | BridgeBackfillStatus::FailedRolledBack
+                ) {
+                    plan.map(|value| value.selected_frame_indices.len() as u64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                internal_bridge_count: plan.map(|value| value.internal_bridge_count).unwrap_or(0),
+                edge_extension_count: plan.map(|value| value.edge_extension_count).unwrap_or(0),
+                duration_ms: state.bridge_backfill.duration_ms,
+                initial_input_images: initial_report_for_metrics.input_images,
+                initial_registered_images: initial_report_for_metrics.registered_images,
+                initial_points_3d: initial_report_for_metrics.points_3d,
+                final_input_images: report.input_images,
+                final_registered_images: report.registered_images,
+                final_points_3d: report.points_3d,
+                adopted: state.bridge_backfill.status == BridgeBackfillStatus::Completed,
+            });
+        }
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
@@ -1829,6 +1946,18 @@ impl PipelineRunner {
         );
 
         let candidate = if state.brush_complete {
+            if let Some(tracker) = &self.effectiveness {
+                if let Some(initial) = state
+                    .brush_training
+                    .initial_resolved
+                    .or(state.brush_training.resolved)
+                {
+                    tracker.record_brush(initial, false);
+                }
+                if let Some(resolved) = state.brush_training.resolved {
+                    tracker.record_brush(resolved, state.brush_training.oom_retry_used);
+                }
+            }
             self.events.stage(
                 PipelineStage::TrainingSplats,
                 1.0,
@@ -1860,7 +1989,17 @@ impl PipelineRunner {
                     report.points_3d,
                 )
             });
+            state
+                .brush_training
+                .initial_resolved
+                .get_or_insert(resolved_brush);
             state.brush_training.resolved = Some(resolved_brush);
+            if let Some(tracker) = &self.effectiveness {
+                if let Some(initial) = state.brush_training.initial_resolved {
+                    tracker.record_brush(initial, false);
+                }
+                tracker.record_brush(resolved_brush, state.brush_training.oom_retry_used);
+            }
             project_manager.write_state(&paths.state, &state).await?;
             let runtime_samples = catalog::runtime_samples().await;
             let estimated_brush_duration_ms = match (&prepared.video, &prepared.image_sequence) {
@@ -1949,6 +2088,16 @@ impl PipelineRunner {
         project_manager
             .write_metadata(&paths.metadata, metadata)
             .await?;
+
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_final_result(PlannerFinalResultMetrics {
+                input_images: report.input_images,
+                registered_images: report.registered_images,
+                points_3d: report.points_3d,
+                splat_count: ply.splat_count,
+                ply_size_bytes: ply.file_size,
+            });
+        }
 
         self.events.stage(
             PipelineStage::Exporting,
@@ -2046,6 +2195,9 @@ impl PipelineRunner {
                 };
                 state.brush_training.oom_retry_used = true;
                 state.brush_training.resolved = Some(downgraded);
+                if let Some(tracker) = &self.effectiveness {
+                    tracker.record_brush(downgraded, true);
+                }
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::TrainingSplats,
@@ -2356,6 +2508,7 @@ impl PipelineRunner {
                 state.bridge_backfill.selected_model = Some(relative_model_path(paths, &model));
                 state.bridge_backfill.final_registered_images = Some(report.registered_images);
                 state.bridge_backfill.final_points_3d = Some(report.points_3d);
+                state.bridge_backfill.duration_ms = Some(bridge_duration_ms);
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
@@ -2408,6 +2561,7 @@ impl PipelineRunner {
                 update_frame_checkpoint(state, prepared);
                 state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
                 state.bridge_backfill.selected_model = state.bridge_backfill.initial_model.clone();
+                state.bridge_backfill.duration_ms = Some(bridge_duration_ms);
                 project_manager.write_state(&paths.state, state).await?;
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
@@ -3197,7 +3351,7 @@ async fn prepared_frames_from_checkpoint(
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
         rescue_max_frames: frames.rescue_max_frames,
-        ..FramePlan::default()
+        minimum_frame_override_applied: frames.minimum_frame_override_applied,
     };
     match state.input_type {
         ProjectInputType::Video => {
@@ -3406,6 +3560,7 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.selected_frames = prepared.plan.selected_frames.clone();
         frames.candidate_frames = prepared.plan.candidate_frames.clone();
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
+        frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
     }
 }
