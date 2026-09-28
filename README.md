@@ -364,6 +364,30 @@ Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLM
 
 无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
 
+### 不同显卡组合会如何处理？
+
+COLMAP 和 Brush 是两个独立阶段：COLMAP 只有兼容的 NVIDIA CUDA 环境才能使用 GPU；Brush 在 Windows 和 Linux 上使用 Vulkan，在 Apple Silicon macOS 上使用 Metal。常见组合按以下方式处理；表中未另行标注平台的组合均指 Windows：
+
+| 平台与显卡组合 | COLMAP | Brush 训练 | 自动优化的精细档显存配置 |
+|---|---|---|---|
+| Windows：单张 NVIDIA 独显 | 满足驱动和 Compute Capability 要求时使用 CUDA | 明确选择第一张独立 GPU，通过 Vulkan 运行 | 使用该 NVIDIA 显卡的总显存选择 Low、Standard 或 Large |
+| Intel 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，避免误用 Intel 核显 | 使用 NVIDIA 总显存分档 |
+| AMD 核显 + 单张 NVIDIA 独显 | 使用符合要求的 NVIDIA CUDA | 明确选择第一张独立 GPU，并仅为 Brush 子进程规避 AMD Switchable Graphics 隐式层 | 使用 NVIDIA 总显存分档 |
+| 仅 AMD，或 Intel 核显 + AMD 独显 | 自动回退 CPU | 由 Vulkan 自动选择 AMD GPU；不会禁用 AMD 图形层 | 当前使用保守的 Low 配置 |
+| 仅 Intel 核显或 Intel 独显 | 自动回退 CPU | 由 Vulkan 自动选择 Intel GPU | 当前使用保守的 Low 配置 |
+| 多张 NVIDIA 显卡 | 选择 Compute Capability 最高的兼容显卡；相同时选择 NVIDIA 索引较小者 | 因 Vulkan 与 CUDA 的设备索引不能可靠对应，不强制 Brush 的设备索引，由 Vulkan 自动选择 | 使用 COLMAP 选中显卡的总显存分档 |
+| AMD 独显 + NVIDIA 独显 | COLMAP 使用符合要求的 NVIDIA | 当前会进入单 NVIDIA 优先策略，但跨品牌独显的 Vulkan 排序无法完全保证；建议同时在 Windows 图形设置中把 `brush_app.exe` 设为“高性能”并检查任务日志中的实际适配器 | 使用 NVIDIA 总显存分档 |
+| NVIDIA 驱动过旧、型号不兼容或检测失败 | 自动回退 CPU | Brush 仍会尝试通过 Vulkan 自动选择可用 GPU，但不会强制 NVIDIA | 当前使用保守的 Low 配置 |
+| 没有可用 GPU 图形后端 | COLMAP 使用 CPU | Brush 可能无法启动；CPU-only 软件图形后端尚未完成端到端验证 | 不适用 |
+| macOS：Apple Silicon M 系列（含 Pro、Max、Ultra） | 当前使用 CPU，不启用 CUDA | 自动使用 M 系列芯片的 Metal GPU 和统一内存 | 当前不会按统一内存容量提升显存档，使用保守的 Low 配置 |
+| Ubuntu Alpha：NVIDIA、AMD 或 Intel GPU | 当前使用 CPU | 通过 Vulkan 自动选择可用 GPU | 当前使用保守的 Low 配置 |
+
+上述强制选卡和 AMD 隐式层规避只通过环境变量传给单次 `brush_app.exe` 子进程，不会修改系统环境、驱动设置或其他应用，也不会将 Brush 切换到 D3D12。AMD-only 设备不会应用 AMD 隐式层规避。
+
+如果 Brush 日志显示 `Device Lost`，OOOSplat 会将其与显存不足区分并给出提示，但不会自动降低质量重试。建议接通电源、关闭其他 GPU 高负载程序，并在 Windows“设置 → 系统 → 显示 → 图形”中将 `brush_app.exe` 设为“高性能”。精细档只有在明确识别为显存不足时才会降低一级配置，并且最多重试一次。
+
+M 系列芯片的 CPU 与 GPU 共享统一内存，但当前 Planner 不会把统一内存等同于独立显存。因此，即使是内存较大的 M 系列 Pro、Max 或 Ultra，精细档目前仍采用 Low 配置；这属于保守兼容策略，不代表 Metal 训练只能使用少量统一内存。
+
 ### 为什么会出现注册率较低的警告？
 
 注册率较低通常表示可用于重建的连续视角不足。任务仍会继续进入 Brush，但结果质量可能受影响。建议使用曝光稳定、画面清晰、运动连续、视角重叠充分的环绕拍摄视频，避免快速转动、强反光、大面积纯色和运动物体。

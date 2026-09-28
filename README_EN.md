@@ -364,6 +364,30 @@ On Linux, `OOOSPLAT_FFMPEG`, `OOOSPLAT_FFPROBE`, `OOOSPLAT_COLMAP`, and `OOOSPLA
 
 OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush is independent of COLMAP and selects an available graphics backend at runtime.
 
+### How does OOOSplat handle different GPU combinations?
+
+COLMAP and Brush are separate stages. COLMAP requires a compatible NVIDIA CUDA environment for GPU acceleration. Brush uses Vulkan on Windows and Linux and Metal on Apple Silicon macOS. Common configurations are handled as follows; rows without an explicit platform refer to Windows:
+
+| Platform and GPU configuration | COLMAP | Brush training | Detailed Auto Optimize VRAM profile |
+|---|---|---|---|
+| Windows: one NVIDIA discrete GPU | Uses CUDA when the driver and Compute Capability requirements are met | Explicitly selects the first discrete GPU and runs through Vulkan | Uses that NVIDIA GPU's total VRAM to select Low, Standard, or Large |
+| Intel integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU instead of the Intel integrated GPU | Uses NVIDIA total VRAM |
+| AMD integrated GPU + one NVIDIA discrete GPU | Uses the compatible NVIDIA GPU through CUDA | Explicitly selects the first discrete GPU and bypasses the AMD Switchable Graphics implicit layer for the Brush child process only | Uses NVIDIA total VRAM |
+| AMD only, or Intel integrated GPU + AMD discrete GPU | Falls back to CPU | Vulkan automatically selects an AMD GPU; the AMD graphics layer is not disabled | Currently uses the conservative Low profile |
+| Intel integrated or discrete GPU only | Falls back to CPU | Vulkan automatically selects an Intel GPU | Currently uses the conservative Low profile |
+| Multiple NVIDIA GPUs | Selects the compatible GPU with the highest Compute Capability, then the lower NVIDIA index on a tie | Does not force a Brush device index because Vulkan and CUDA indices cannot be mapped reliably; Vulkan selects automatically | Uses the total VRAM of the GPU selected for COLMAP |
+| AMD discrete GPU + NVIDIA discrete GPU | Uses a compatible NVIDIA GPU for COLMAP | Currently enters the single-NVIDIA preference path, but cross-vendor Vulkan ordering cannot be guaranteed; also set `brush_app.exe` to High performance in Windows Graphics settings and verify the actual adapter in the task log | Uses NVIDIA total VRAM |
+| Old NVIDIA driver, unsupported NVIDIA model, or failed detection | Falls back to CPU | Brush still attempts to select an available GPU through Vulkan but does not force NVIDIA | Currently uses the conservative Low profile |
+| No usable GPU graphics backend | Uses CPU for COLMAP | Brush may not start; CPU-only software graphics has not been validated end to end | Not applicable |
+| macOS: Apple Silicon M series, including Pro, Max, and Ultra | Currently uses the CPU; CUDA is not enabled | Automatically uses the M-series Metal GPU and unified memory | Currently stays on the conservative Low profile instead of scaling from unified-memory capacity |
+| Ubuntu Alpha: NVIDIA, AMD, or Intel GPU | Currently uses the CPU | Vulkan automatically selects an available GPU | Currently uses the conservative Low profile |
+
+Forced adapter selection and the AMD implicit-layer workaround are passed only to the individual `brush_app.exe` child process. OOOSplat does not modify the system environment, driver configuration, or other applications, and it does not switch Brush to D3D12. AMD-only systems do not receive the AMD implicit-layer workaround.
+
+If the Brush log reports `Device Lost`, OOOSplat distinguishes it from an out-of-memory failure and shows guidance, but it does not automatically lower quality and retry. Connect the computer to power, close other GPU-heavy applications, and set `brush_app.exe` to High performance under Windows Settings → System → Display → Graphics. Detailed quality lowers its profile and retries at most once only after an explicit out-of-memory failure.
+
+M-series CPUs and GPUs share unified memory, but the current Planner does not treat unified memory as dedicated VRAM. Consequently, even an M-series Pro, Max, or Ultra with substantial memory currently uses the Detailed Low profile. This is a conservative compatibility policy; it does not mean Metal training can access only a small portion of unified memory.
+
 ### Why does OOOSplat warn about a low registration rate?
 
 A low registration rate usually means COLMAP could not find enough continuous, overlapping viewpoints. The task still continues to Brush, but result quality may be affected. Use an orbit video with stable exposure, clear frames, continuous movement, and sufficient viewpoint overlap. Avoid fast rotation, strong reflections, large plain-color areas, and moving subjects.
