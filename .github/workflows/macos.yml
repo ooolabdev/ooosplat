@@ -92,6 +92,7 @@ jobs:
             test -x "$app/Contents/Resources/engines/macos/arm64/bin/$engine"
             file "$app/Contents/Resources/engines/macos/arm64/bin/$engine" | grep -q arm64
           done
+          test -z "$(find "$app/Contents/Resources" -type f -name 'vocab_tree_faiss_flickr100K_words256K.bin' -print -quit)"
           hdiutil verify "$dmg"
 
       - name: Package downloadable files

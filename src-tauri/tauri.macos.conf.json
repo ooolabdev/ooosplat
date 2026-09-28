@@ -4,7 +4,12 @@
     "targets": ["app", "dmg"],
     "resources": {
       "../engines/manifest.macos.json": "engines/manifest.macos.json",
-      "../engines/macos/arm64/": "engines/macos/arm64/"
+      "../engines/macos/arm64/bin/": "engines/macos/arm64/bin/",
+      "../engines/macos/arm64/lib/": "engines/macos/arm64/lib/",
+      "../engines/macos/arm64/licenses/": "engines/macos/arm64/licenses/",
+      "../engines/macos/arm64/SHA256SUMS": "engines/macos/arm64/SHA256SUMS",
+      "../engines/macos/arm64/BUILD-INFO.json": "engines/macos/arm64/BUILD-INFO.json",
+      "../engines/macos/arm64/BUNDLED-COMPONENTS.json": "engines/macos/arm64/BUNDLED-COMPONENTS.json"
     },
     "macOS": {
       "frameworks": [],

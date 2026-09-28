@@ -5,7 +5,8 @@
     "resources": {
       "../engines/manifest.json": "engines/manifest.json",
       "../engines/ffmpeg/": "engines/ffmpeg/",
-      "../engines/colmap/": "engines/colmap/",
+      "../engines/colmap/bin/": "engines/colmap/bin/",
+      "../engines/colmap/plugins/": "engines/colmap/plugins/",
       "../engines/brush/": "engines/brush/"
     }
   }

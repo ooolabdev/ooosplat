@@ -92,14 +92,19 @@ for (const resource of [
 }
 
 const tauriWindows = JSON.parse(readText("src-tauri/tauri.windows.conf.json"));
-assert(
-  Object.hasOwn(tauriWindows.bundle?.resources ?? {}, "../engines/manifest.json"),
-  "Windows Tauri resources are missing the Windows engine manifest.",
-);
+for (const resource of [
+  "../engines/manifest.json",
+  "../engines/ffmpeg/",
+  "../engines/colmap/bin/",
+  "../engines/colmap/plugins/",
+  "../engines/brush/",
+]) {
+  assert(Object.hasOwn(tauriWindows.bundle?.resources ?? {}, resource), `Windows Tauri resources are missing ${resource}.`);
+}
 const tauriLinux = JSON.parse(readText("src-tauri/tauri.linux.conf.json"));
 assert(tauriLinux.bundle?.active === true, "Linux Tauri bundling must be enabled.");
 assert(tauriLinux.bundle?.targets?.includes("deb"), "Linux Tauri targets must include deb.");
-for (const resource of ["../engines/manifest.linux.json", "../engines/linux/brush/"]) {
+for (const resource of ["../engines/manifest.linux.json", "../engines/linux/brush/brush_app"]) {
   assert(Object.hasOwn(tauriLinux.bundle?.resources ?? {}, resource), `Linux Tauri resources are missing ${resource}.`);
 }
 for (const dependency of ["ffmpeg", "colmap"]) {
@@ -107,7 +112,15 @@ for (const dependency of ["ffmpeg", "colmap"]) {
 }
 const tauriMacos = JSON.parse(readText("src-tauri/tauri.macos.conf.json"));
 assert(tauriMacos.bundle?.macOS?.minimumSystemVersion === "15.0", "macOS bundle must target macOS 15.0.");
-for (const resource of ["../engines/manifest.macos.json", "../engines/macos/arm64/"]) {
+for (const resource of [
+  "../engines/manifest.macos.json",
+  "../engines/macos/arm64/bin/",
+  "../engines/macos/arm64/lib/",
+  "../engines/macos/arm64/licenses/",
+  "../engines/macos/arm64/SHA256SUMS",
+  "../engines/macos/arm64/BUILD-INFO.json",
+  "../engines/macos/arm64/BUNDLED-COMPONENTS.json",
+]) {
   assert(Object.hasOwn(tauriMacos.bundle?.resources ?? {}, resource), `macOS Tauri resources are missing ${resource}.`);
 }
 
