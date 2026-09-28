@@ -19,18 +19,41 @@ pub struct VideoInfo {
 }
 
 pub fn prepared_video_dimensions(video: &VideoInfo) -> (u32, u32) {
+    scaled_video_dimensions(video, 1920)
+}
+
+pub fn scaled_video_dimensions(video: &VideoInfo, max_long_edge: u32) -> (u32, u32) {
     let (width, height) = if video.rotation.rem_euclid(180) == 90 {
         (video.height, video.width)
     } else {
         (video.width, video.height)
     };
-    let scale = (1920.0 / width.max(1) as f64)
-        .min(1920.0 / height.max(1) as f64)
+    let max_long_edge = max_long_edge.max(1) as f64;
+    let scale = (max_long_edge / width.max(1) as f64)
+        .min(max_long_edge / height.max(1) as f64)
         .min(1.0);
     (
         (width as f64 * scale).round().max(1.0) as u32,
         (height as f64 * scale).round().max(1.0) as u32,
     )
+}
+
+pub fn video_can_scale_to(video: &VideoInfo, target_width: u32, target_height: u32) -> bool {
+    let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
+        (video.height, video.width)
+    } else {
+        (video.width, video.height)
+    };
+    if target_width == 0
+        || target_height == 0
+        || source_width < target_width
+        || source_height < target_height
+    {
+        return false;
+    }
+    let source_ratio = source_width as f64 / source_height.max(1) as f64;
+    let target_ratio = target_width as f64 / target_height as f64;
+    ((source_ratio - target_ratio) / target_ratio.max(f64::EPSILON)).abs() <= 0.001
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +253,43 @@ mod tests {
         info.height = 1080;
         info.rotation = 90;
         assert_eq!(prepared_video_dimensions(&info), (1080, 1920));
+    }
+
+    #[test]
+    fn custom_video_limit_preserves_aspect_ratio_without_upscaling() {
+        let mut info = VideoInfo {
+            duration: 1.0,
+            width: 3840,
+            height: 2160,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        assert_eq!(scaled_video_dimensions(&info, 1600), (1600, 900));
+        info.width = 1280;
+        info.height = 720;
+        assert_eq!(scaled_video_dimensions(&info, 1600), (1280, 720));
+    }
+
+    #[test]
+    fn reshoot_scaling_rejects_upscale_and_aspect_change() {
+        let info = VideoInfo {
+            duration: 1.0,
+            width: 3840,
+            height: 2160,
+            fps: 30.0,
+            total_frames: 30,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        assert!(video_can_scale_to(&info, 1600, 900));
+        assert!(!video_can_scale_to(&info, 1600, 1000));
+        assert!(!video_can_scale_to(&info, 7680, 4320));
     }
 
     #[test]

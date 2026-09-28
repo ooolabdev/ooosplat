@@ -143,7 +143,7 @@ describe("App live log", () => {
     expect(plannerSwitch?.getAttribute("aria-checked")).toBe("true");
     expect(plannerSwitch?.disabled).toBe(true);
     expect(plannerSwitch?.textContent).toContain("自动优化（实验性）");
-    expect(plannerSwitch?.textContent).toContain("开启后，将优化重建与训练参数并自动补救，通常可缩短视频素材的生成时长，提升图片素材的细节表现");
+    expect(plannerSwitch?.textContent).toContain("开启后，将优化重建与训练参数并自动补救，通常可缩短生成时长，提升（尤其是图片素材）细节表现");
   });
 
   it("keeps the outer task pane fixed while following fewer than 500 log lines", async () => {
@@ -194,8 +194,8 @@ describe("App live log", () => {
     const cases = [
       ["extractingFeatures", "正在分析画面（8/20）"],
       ["matching", "正在寻找画面之间的联系（9/20）"],
-      ["reconstructing", "正在还原拍摄场景（10/20）"],
-      ["trainingSplats", "正在生成三维模型（11/20）"],
+      ["reconstructing", "正在还原拍摄场景（10/20）。此步骤可能耗时较长，请耐心等待"],
+      ["trainingSplats", "正在生成高斯泼溅（11/20）。此步骤可能耗时较长，请耐心等待"],
     ] as const;
 
     for (const [index, [stage, expected]] of cases.entries()) {
@@ -248,10 +248,10 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成三维模型（15,000/30,000）");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅（15,000/30,000）。此步骤可能耗时较长，请耐心等待");
 
     await act(async () => { container.querySelector<HTMLButtonElement>(".language-action")!.click(); });
-    expect(container.querySelector(".current-message")?.textContent).toBe("Creating the 3D model (15,000/30,000)");
+    expect(container.querySelector(".current-message")?.textContent).toBe("Generating Gaussian splats (15,000/30,000). This step may take a while. Please wait.");
   });
 
   it("keeps terminal messages instead of presenting them as active work", async () => {

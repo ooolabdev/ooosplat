@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Current version: **0.4.1**. This release focuses on multiple input types, recoverable generation pipelines, clearer progress feedback, and non-destructive Gaussian editing.
+Current version: **0.5.0**. This release adds Quality v2 automatic parameter planning, video bridge-frame recovery, VRAM-aware training, same-camera incremental high-resolution reshoots, and further Windows Brush and preview stability improvements.
 
 ## Product Principles
 
@@ -16,7 +16,7 @@ Current version: **0.4.1**. This release focuses on multiple input types, recove
 
 - **P0 · Near-term focus**: Stability, speed, generation quality, and error handling.
 - **P1 · High priority**: Evaluation infrastructure, data insights, capture guidance, and product experience.
-- **P2 · Capability expansion**: New output formats, project import, additional capture, and AI integrations.
+- **P2 · Capability expansion**: New output formats, project import, and AI integrations.
 - **P3 · Longer-term exploration**: Adoption and additional capture or usage scenarios.
 
 ## Planned Work
@@ -35,7 +35,6 @@ Current version: **0.4.1**. This release focuses on multiple input types, recove
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
 | P2 | MCP tool support | Provide safe MCP tools for AI Agents to analyze media, start generation, query status, resume tasks, and retrieve results. | To be created |
 | P2 | Create projects and import PLY from “02 History” | Import an existing PLY directly as an OOOSplat project for preview and editing without running the generation pipeline. | To be created |
-| P2 | Additional capture support | Add video or image media to an existing project to reconstruct missing regions while reusing valid results. | To be created |
 | P3 | Panoramic video support | Explore a workflow for using panoramic video as input and producing usable Gaussian Splatting results. | To be created |
 
 ## Completed
@@ -53,6 +52,11 @@ Current version: **0.4.1**. This release focuses on multiple input types, recove
 | Completed · 0.4.0 | Image-sequence input | Unifies video and image input. Image sequences use a shared camera, exhaustive matching, and the incremental Mapper, with automatic masks for transparent PNG files. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) |
 | Completed · 0.4.0 | Gaussian editing | Supports rectangle, sphere, and box selection, non-destructive deletion, crop freezing, undo/redo, and saving to `edit.ply`, with a foundation compatible with future AI Agent workflows. | Implemented in 0.4.0; issue to be created |
 | Completed · 0.4.0 | English UI and Chinese/English switching | Switches instantly between Simplified Chinese and English, chooses the first-run default from the system language, and persists explicit choices across restarts; task, settings, preview, status, and interaction guidance are covered. | Implemented in 0.4.0; issue to be created |
+| Completed · 0.5.0 | Quality v2 automatic parameters and video bridge-frame recovery | Enables optional experimental Auto Optimize by default, planning video sampling and COLMAP limits by preset. When initial reconstruction coverage is low, it adds bridge frames within budget and safely returns to the original model if recovery fails. | Implemented in 0.5.0 |
+| Completed · 0.5.0 | VRAM-aware Brush training and OOM downgrade | Detailed quality selects resolution, densification, and Splat limits from VRAM, with at most one lower-profile retry after an explicit out-of-memory failure. | Implemented in 0.5.0 |
+| Completed · 0.5.0 | Same-camera incremental high-resolution reshoots | Completed projects can add video or images captured with the same device, lens, and resolution. OOOSplat reuses the source database, shared camera, and sparse model, processes only new views, fully retrains Brush, and supports transparent MOV/PNG media. | [PR #49](https://github.com/ooolabdev/ooosplat/pull/49) |
+| Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
+| Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
 
 ## Tracking and Contributions
 

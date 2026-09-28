@@ -5,7 +5,7 @@ export type TranslationParams = Record<string, string | number>;
 
 const zhCN = {
   "planner.label": "自动优化（实验性）",
-  "planner.hint": "开启后，将优化重建与训练参数并自动补救，通常可缩短视频素材的生成时长，提升图片素材的细节表现",
+  "planner.hint": "开启后，将优化重建与训练参数并自动补救，通常可缩短生成时长，提升（尤其是图片素材）细节表现",
   "common.close": "关闭",
   "common.cancel": "取消",
   "common.retry": "重试",
@@ -99,8 +99,9 @@ const zhCN = {
   "progress.activeFeatures": "正在分析画面",
   "progress.activeMatching": "正在寻找画面之间的联系",
   "progress.activeReconstruction": "正在还原拍摄场景",
-  "progress.activeTraining": "正在生成三维模型",
+  "progress.activeTraining": "正在生成高斯泼溅",
   "progress.activeCount": "{label}（{current}/{total}）",
+  "progress.activeLongWait": "{label}。此步骤可能耗时较长，请耐心等待",
   "stage.material": "素材分析",
   "stage.frames": "画面准备",
   "stage.features": "特征提取",
@@ -453,7 +454,7 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
-  "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat optimizes reconstruction and training parameters and automatically applies recovery, usually reducing generation time for videos and improving detail in image inputs",
+  "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat optimizes reconstruction and training parameters and automatically applies recovery, usually reducing generation time and improving detail, especially for image inputs",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
   "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
   "task.create": "01 Create New Task", "task.running": "Running", "task.idle": "Standby", "task.console": "Generation console",
@@ -464,7 +465,7 @@ const en: Record<TranslationKey, string> = {
   "metrics.imageCount": "Image count", "metrics.duration": "Media duration", "metrics.resolution": "Resolution", "metrics.processingImages": "Images processed", "metrics.estimatedFrames": "Estimated frames", "metrics.keepAll": "Keep all", "metrics.approx": "About {value}", "metrics.estimate": "Estimated duration", "metrics.analyzing": "Analyzing",
   "alpha.imagesTitle": "Alpha channel detected", "alpha.videoTitle": "Alpha channel detected", "alpha.imagesHint": "Transparency will be checked during generation and COLMAP masks created only when needed", "alpha.videoHint": "Transparent frames and COLMAP masks will be extracted automatically · {format}",
   "sequence.title": "Large image sequence", "sequence.hint": "More than 500 images can require much more time and disk space for exhaustive matching. OOOSplat will ask again before generation starts.",
-  "generate.analyzing": "Analyzing media", "generate.start": "Start Generation", "progress.title": "Live progress", "progress.preparing": "Preparing task", "progress.stage": "Current stage", "progress.progress": "Progress", "progress.elapsed": "Total elapsed", "progress.registered": "Registered {current}/{total}", "progress.estimated": "Estimated {value}%", "progress.continuing": "Running", "progress.running": "Running", "progress.log": "Task log", "progress.logCount": "Latest {count} / 500 entries", "progress.terminating": "Stopping task", "progress.cancel": "Cancel task and stop all processes", "progress.cancelError": "Could not stop the task: {detail}", "progress.privacyError": "Could not save privacy settings: {detail}", "progress.activeFeatures": "Analyzing images", "progress.activeMatching": "Finding connections between images", "progress.activeReconstruction": "Rebuilding the captured scene", "progress.activeTraining": "Creating the 3D model", "progress.activeCount": "{label} ({current}/{total})",
+  "generate.analyzing": "Analyzing media", "generate.start": "Start Generation", "progress.title": "Live progress", "progress.preparing": "Preparing task", "progress.stage": "Current stage", "progress.progress": "Progress", "progress.elapsed": "Total elapsed", "progress.registered": "Registered {current}/{total}", "progress.estimated": "Estimated {value}%", "progress.continuing": "Running", "progress.running": "Running", "progress.log": "Task log", "progress.logCount": "Latest {count} / 500 entries", "progress.terminating": "Stopping task", "progress.cancel": "Cancel task and stop all processes", "progress.cancelError": "Could not stop the task: {detail}", "progress.privacyError": "Could not save privacy settings: {detail}", "progress.activeFeatures": "Analyzing images", "progress.activeMatching": "Finding connections between images", "progress.activeReconstruction": "Rebuilding the captured scene", "progress.activeTraining": "Generating Gaussian splats", "progress.activeCount": "{label} ({current}/{total})", "progress.activeLongWait": "{label}. This step may take a while. Please wait.",
   "stage.material": "Media analysis", "stage.frames": "Frame preparation", "stage.features": "Feature extraction", "stage.matching": "Image matching", "stage.reconstruction": "Camera reconstruction", "stage.training": "Splat training", "stage.export": "Result publishing", "stage.completed": "Completed", "stage.failed": "Task failed", "stage.cancelled": "Cancelled", "stage.preparing": "Preparing",
   "history.title": "02 Task History", "history.aria": "Project results", "history.refresh": "Refresh", "history.completed": "Completed", "history.unfinished": "Unfinished", "history.projects": "{count} projects", "history.emptyTitle": "No projects yet", "history.emptyHint": "Choose a video or image sequence and a project folder to start. Results will appear here automatically.",
   "project.date": "Created", "project.elapsed": "Elapsed", "project.quality": "Preset", "project.opening": "Opening", "project.preview": "Preview", "project.resume": "Resume task", "project.reveal": "Show in file manager", "project.delete": "Delete", "project.reshoot": "Reshoot",

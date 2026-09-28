@@ -192,7 +192,7 @@ describe("App preview workspace", () => {
 
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
-    expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.4.1");
+    expect(container.querySelector(".version-tag")?.textContent).toBe("LOCAL / 0.5.0");
     const startButton = container.querySelector(".primary-action");
     expect(startButton?.textContent?.trim()).toBe("开始生成");
     expect(startButton?.querySelectorAll("svg")).toHaveLength(1);

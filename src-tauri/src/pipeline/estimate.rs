@@ -16,6 +16,8 @@ pub struct RuntimeSample {
     pub quality: Quality,
     pub input_kind: RuntimeInputKind,
     pub source_long_edge: u32,
+    pub working_long_edge: Option<u32>,
+    pub resolution_policy_version: Option<u32>,
     pub extracted_frames: u64,
     pub duration_ms: u64,
     pub brush: Option<ResolvedBrushTrainingPreset>,
@@ -56,14 +58,35 @@ pub fn estimate_runtime_with_brush(
     samples: &[RuntimeSample],
     brush: Option<&ResolvedBrushTrainingPreset>,
 ) -> RuntimeEstimate {
+    estimate_runtime_with_brush_and_resolution(
+        video,
+        plan,
+        quality,
+        samples,
+        brush,
+        None,
+        video.width.max(video.height),
+    )
+}
+
+pub fn estimate_runtime_with_brush_and_resolution(
+    video: &VideoInfo,
+    plan: &FramePlan,
+    quality: Quality,
+    samples: &[RuntimeSample],
+    brush: Option<&ResolvedBrushTrainingPreset>,
+    resolution_policy_version: Option<u32>,
+    working_long_edge: u32,
+) -> RuntimeEstimate {
     estimate_runtime_for_input(
         video.total_frames,
         plan,
         quality,
         samples,
         RuntimeInputKind::Video,
-        video.width.max(video.height),
+        working_long_edge,
         brush,
+        resolution_policy_version,
     )
 }
 
@@ -92,14 +115,38 @@ pub fn estimate_runtime_for_images_with_brush(
     samples: &[RuntimeSample],
     brush: Option<&ResolvedBrushTrainingPreset>,
 ) -> RuntimeEstimate {
+    estimate_runtime_for_images_with_brush_and_resolution(
+        image_count,
+        source_long_edge,
+        plan,
+        quality,
+        samples,
+        brush,
+        None,
+        source_long_edge,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_runtime_for_images_with_brush_and_resolution(
+    image_count: u64,
+    _source_long_edge: u32,
+    plan: &FramePlan,
+    quality: Quality,
+    samples: &[RuntimeSample],
+    brush: Option<&ResolvedBrushTrainingPreset>,
+    resolution_policy_version: Option<u32>,
+    working_long_edge: u32,
+) -> RuntimeEstimate {
     let mut estimate = estimate_runtime_for_input(
         image_count,
         plan,
         quality,
         samples,
         RuntimeInputKind::Images,
-        source_long_edge,
+        working_long_edge,
         brush,
+        resolution_policy_version,
     );
     estimate.basis = if estimate.sample_count == 0 {
         format!("根据 {image_count} 张输入图片和质量档位估算；完成任务后会自动校准")
@@ -112,6 +159,7 @@ pub fn estimate_runtime_for_images_with_brush(
     estimate
 }
 
+#[allow(clippy::too_many_arguments)]
 fn estimate_runtime_for_input(
     source_count: u64,
     plan: &FramePlan,
@@ -120,6 +168,7 @@ fn estimate_runtime_for_input(
     input_kind: RuntimeInputKind,
     source_long_edge: u32,
     brush: Option<&ResolvedBrushTrainingPreset>,
+    resolution_policy_version: Option<u32>,
 ) -> RuntimeEstimate {
     let base = base_estimate_ms_with_brush(
         plan.estimated_frames,
@@ -155,11 +204,21 @@ fn estimate_runtime_for_input(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let same_profile_and_policy = same_profile
+        .iter()
+        .copied()
+        .filter(|sample| sample.resolution_policy_version == resolution_policy_version)
+        .collect::<Vec<_>>();
     let profile_calibration_required =
         brush.is_some_and(|current| current.profile != BrushTrainingProfile::Legacy);
-    let exact_profile_calibration = !profile_calibration_required || !same_profile.is_empty();
+    let exact_profile_calibration =
+        !profile_calibration_required || !same_profile_and_policy.is_empty();
     let same_quality = if profile_calibration_required {
-        same_profile
+        if same_profile_and_policy.is_empty() {
+            same_profile
+        } else {
+            same_profile_and_policy
+        }
     } else if same_profile.is_empty() {
         same_quality
     } else {
@@ -188,7 +247,7 @@ fn estimate_runtime_for_input(
                 sample.extracted_frames,
                 sample.quality,
                 sample.input_kind,
-                sample.source_long_edge,
+                sample.working_long_edge.unwrap_or(sample.source_long_edge),
                 sample.brush.as_ref(),
             );
             (sample.duration_ms as f64 / expected.max(1) as f64).clamp(0.15, 5.0)
@@ -319,8 +378,10 @@ pub(crate) fn estimate_calibrated_brush_stage_ms(
     quality: Quality,
     samples: &[RuntimeSample],
     brush: Option<&ResolvedBrushTrainingPreset>,
+    resolution_policy_version: Option<u32>,
+    working_long_edge: u32,
 ) -> u64 {
-    let source_long_edge = video.width.max(video.height);
+    let source_long_edge = working_long_edge.max(1);
     let base_total_ms = base_estimate_ms_with_brush(
         plan.estimated_frames,
         quality,
@@ -329,8 +390,16 @@ pub(crate) fn estimate_calibrated_brush_stage_ms(
         brush,
     )
     .max(1);
-    let calibrated_total_ms =
-        estimate_runtime_with_brush(video, plan, quality, samples, brush).estimated_ms;
+    let calibrated_total_ms = estimate_runtime_with_brush_and_resolution(
+        video,
+        plan,
+        quality,
+        samples,
+        brush,
+        resolution_policy_version,
+        working_long_edge,
+    )
+    .estimated_ms;
     let calibration = calibrated_total_ms as f64 / base_total_ms as f64;
     let brush_ms = brush
         .map(|resolved| estimate_brush_stage_ms_for_resolved(resolved, source_long_edge))
@@ -338,6 +407,7 @@ pub(crate) fn estimate_calibrated_brush_stage_ms(
     (brush_ms as f64 * calibration).round().max(1_000.0) as u64
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate_calibrated_brush_stage_ms_for_images(
     image_count: u64,
     source_long_edge: u32,
@@ -345,27 +415,31 @@ pub(crate) fn estimate_calibrated_brush_stage_ms_for_images(
     quality: Quality,
     samples: &[RuntimeSample],
     brush: Option<&ResolvedBrushTrainingPreset>,
+    resolution_policy_version: Option<u32>,
+    working_long_edge: u32,
 ) -> u64 {
     let base_total_ms = base_estimate_ms_with_brush(
         plan.estimated_frames,
         quality,
         RuntimeInputKind::Images,
-        source_long_edge,
+        working_long_edge,
         brush,
     )
     .max(1);
-    let calibrated_total_ms = estimate_runtime_for_images_with_brush(
+    let calibrated_total_ms = estimate_runtime_for_images_with_brush_and_resolution(
         image_count,
         source_long_edge,
         plan,
         quality,
         samples,
         brush,
+        resolution_policy_version,
+        working_long_edge,
     )
     .estimated_ms;
     let calibration = calibrated_total_ms as f64 / base_total_ms as f64;
     let brush_ms = brush
-        .map(|resolved| estimate_brush_stage_ms_for_resolved(resolved, source_long_edge))
+        .map(|resolved| estimate_brush_stage_ms_for_resolved(resolved, working_long_edge))
         .unwrap_or_else(|| estimate_brush_stage_ms(quality));
     (brush_ms as f64 * calibration).round().max(1_000.0) as u64
 }
@@ -442,13 +516,22 @@ mod tests {
             quality: Quality::Balanced,
             input_kind: RuntimeInputKind::Video,
             source_long_edge: 3_840,
+            working_long_edge: None,
+            resolution_policy_version: None,
             extracted_frames: plan.estimated_frames,
             duration_ms: base_total * 2,
             brush: None,
         };
 
-        let calibrated =
-            estimate_calibrated_brush_stage_ms(&video, &plan, Quality::Balanced, &[sample], None);
+        let calibrated = estimate_calibrated_brush_stage_ms(
+            &video,
+            &plan,
+            Quality::Balanced,
+            &[sample],
+            None,
+            None,
+            3_840,
+        );
         assert_eq!(calibrated, estimate_brush_stage_ms(Quality::Balanced) * 2);
     }
 
@@ -465,6 +548,8 @@ mod tests {
             quality: Quality::Fast,
             input_kind: RuntimeInputKind::Video,
             source_long_edge: 3_840,
+            working_long_edge: None,
+            resolution_policy_version: None,
             extracted_frames: 226,
             duration_ms: 858_613,
             brush: None,
@@ -495,6 +580,8 @@ mod tests {
                 quality: Quality::Balanced,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 533,
                 duration_ms: 3_954_000,
                 brush: None,
@@ -503,6 +590,8 @@ mod tests {
                 quality: Quality::Fast,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 320,
                 duration_ms: 374_000,
                 brush: None,
@@ -511,6 +600,8 @@ mod tests {
                 quality: Quality::High,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 416,
                 duration_ms: 10_464_000,
                 brush: None,
@@ -536,6 +627,8 @@ mod tests {
                 quality: Quality::Fast,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 320,
                 duration_ms: 840_000,
                 brush: None,
@@ -544,6 +637,8 @@ mod tests {
                 quality: Quality::Fast,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 320,
                 duration_ms: 960_000,
                 brush: None,
@@ -552,6 +647,8 @@ mod tests {
                 quality: Quality::Fast,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 506,
                 duration_ms: 374_000,
                 brush: None,
@@ -584,6 +681,8 @@ mod tests {
                 quality: Quality::High,
                 input_kind: RuntimeInputKind::Video,
                 source_long_edge: 3_840,
+                working_long_edge: None,
+                resolution_policy_version: None,
                 extracted_frames: 150,
                 duration_ms: 1_000_000,
                 brush: None,
@@ -598,6 +697,52 @@ mod tests {
             Some(&current),
         );
         assert_eq!(estimate.confidence, EstimateConfidence::Low);
+    }
+
+    #[test]
+    fn same_profile_from_an_old_resolution_policy_is_only_a_fallback() {
+        let video = video();
+        let plan = FramePlan {
+            estimated_frames: 251,
+            ..FramePlan::default()
+        };
+        let resolution = crate::presets::resolve_planner_resolution_plan(
+            Quality::Fast,
+            Some(8_192),
+            3_840,
+            2_160,
+            true,
+        );
+        let brush = crate::presets::resolve_brush_training_preset_for_plan(
+            Quality::Fast,
+            Some(8_192),
+            3_840,
+            0,
+            &resolution,
+        );
+        let samples = (0..6)
+            .map(|_| RuntimeSample {
+                quality: Quality::Fast,
+                input_kind: RuntimeInputKind::Video,
+                source_long_edge: 3_840,
+                working_long_edge: Some(1_600),
+                resolution_policy_version: None,
+                extracted_frames: 251,
+                duration_ms: 350_000,
+                brush: Some(brush),
+            })
+            .collect::<Vec<_>>();
+        let estimate = estimate_runtime_with_brush_and_resolution(
+            &video,
+            &plan,
+            Quality::Fast,
+            &samples,
+            Some(&brush),
+            Some(resolution.policy_version),
+            resolution.working_long_edge(),
+        );
+        assert_eq!(estimate.confidence, EstimateConfidence::Low);
+        assert_eq!(estimate.sample_count, 6);
     }
 
     #[test]
@@ -623,6 +768,37 @@ mod tests {
                 Some(&brush),
             );
             assert!(estimated.abs_diff(measured_ms) <= 1_000);
+        }
+    }
+
+    #[test]
+    fn staged_fast_and_balanced_brush_limits_raise_the_new_policy_estimate() {
+        for (quality, frames, expected_ms) in [
+            (Quality::Fast, 251, 348_346_u64),
+            (Quality::Balanced, 285, 1_401_275_u64),
+        ] {
+            let resolution = crate::presets::resolve_planner_resolution_plan(
+                quality,
+                Some(8_192),
+                3_840,
+                2_160,
+                true,
+            );
+            let brush = crate::presets::resolve_brush_training_preset_for_plan(
+                quality,
+                Some(8_192),
+                3_840,
+                0,
+                &resolution,
+            );
+            let estimated = base_estimate_ms_with_brush(
+                frames,
+                quality,
+                RuntimeInputKind::Video,
+                resolution.working_long_edge(),
+                Some(&brush),
+            );
+            assert!(estimated.abs_diff(expected_ms) <= 1_000);
         }
     }
 
@@ -659,6 +835,8 @@ mod tests {
             quality: Quality::High,
             input_kind: RuntimeInputKind::Video,
             source_long_edge: 1_920,
+            working_long_edge: None,
+            resolution_policy_version: None,
             extracted_frames: 674,
             duration_ms: 1_813_324,
             brush: Some(brush),

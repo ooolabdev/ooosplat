@@ -128,6 +128,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 &plan,
                 video.has_alpha,
                 None,
+                None,
                 &ProcessManager::new(),
                 None,
             )

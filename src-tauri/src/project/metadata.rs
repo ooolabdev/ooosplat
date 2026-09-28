@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     pipeline::PipelineStage,
     planner::BridgeBackfillCheckpoint,
-    presets::{Quality, ResolvedBrushTrainingPreset},
+    presets::{PlannerResolutionPlan, Quality, ResolvedBrushTrainingPreset},
     video::{FramePlan, ImageSequenceInfo, PlannedFrame, VideoInfo},
 };
 
@@ -316,6 +316,13 @@ pub struct PipelineStateFile {
     /// legacy pipeline rather than silently changing their reconstruction.
     #[serde(default)]
     pub planner_enabled: bool,
+    /// Present only on projects created after the staged-resolution policy was
+    /// introduced. Its absence deliberately keeps older checkpoints on their
+    /// original resolution behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_plan: Option<PlannerResolutionPlan>,
     #[serde(default)]
     pub bridge_backfill: BridgeBackfillCheckpoint,
     #[serde(default)]
@@ -362,6 +369,8 @@ impl PipelineStateFile {
             image_sequence: None,
             frames: None,
             planner_enabled: true,
+            resolution_policy_version: None,
+            resolution_plan: None,
             bridge_backfill: BridgeBackfillCheckpoint::default(),
             brush_training: BrushTrainingCheckpoint::default(),
             features_complete: false,
@@ -408,6 +417,8 @@ mod tests {
         assert_eq!(frames.mask_count, None);
         assert!(!frames.has_alpha);
         assert!(!state.planner_enabled);
+        assert!(state.resolution_policy_version.is_none());
+        assert!(state.resolution_plan.is_none());
         assert_eq!(
             state.bridge_backfill.status,
             crate::planner::BridgeBackfillStatus::NotEvaluated
@@ -434,6 +445,23 @@ mod tests {
         let restored: PipelineStateFile = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.brush_training, state.brush_training);
+    }
+
+    #[test]
+    fn staged_resolution_plan_round_trips_without_affecting_old_states() {
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.resolution_policy_version = Some(crate::presets::PLANNER_RESOLUTION_POLICY_VERSION);
+        state.resolution_plan = Some(crate::presets::resolve_planner_resolution_plan(
+            Quality::High,
+            Some(8_192),
+            2_560,
+            3_840,
+            false,
+        ));
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: PipelineStateFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.resolution_policy_version, Some(1));
+        assert_eq!(restored.resolution_plan.unwrap().working_long_edge(), 3_840);
     }
 
     #[test]

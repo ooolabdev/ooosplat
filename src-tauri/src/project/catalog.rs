@@ -72,6 +72,13 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
                         })
                 })
                 .unwrap_or(1),
+            working_long_edge: state
+                .as_ref()
+                .and_then(|state| state.resolution_plan)
+                .map(|plan| plan.working_long_edge()),
+            resolution_policy_version: state
+                .as_ref()
+                .and_then(|state| state.resolution_policy_version),
             extracted_frames,
             duration_ms,
             brush,

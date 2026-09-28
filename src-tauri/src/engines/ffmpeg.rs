@@ -34,6 +34,8 @@ pub struct FrameExtractionResult {
     pub image_format: FrameImageFormat,
     pub mask_count: u64,
     pub has_alpha: bool,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -44,6 +46,7 @@ pub async fn extract_uniform_frames(
     mask_directory: &Path,
     plan: &FramePlan,
     has_alpha: bool,
+    target_dimensions: Option<(u32, u32)>,
     log_path: Option<PathBuf>,
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -63,6 +66,7 @@ pub async fn extract_uniform_frames(
         mask_directory,
         plan.sampling_fps,
         has_alpha,
+        target_dimensions,
     );
     let output = process_manager
         .run(ProcessSpec {
@@ -99,6 +103,7 @@ pub async fn extract_selected_frames(
     mask_directory: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
+    target_dimensions: Option<(u32, u32)>,
     log_path: Option<PathBuf>,
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -121,11 +126,7 @@ pub async fn extract_selected_frames(
         .unwrap_or(output_directory)
         .join(format!("frame-selection-{}.ffscript", uuid::Uuid::new_v4()));
     let expression = selection_expression(selected_frames);
-    let script = if has_alpha {
-        format!("[0:v]select='{expression}',format=rgba,split=2[rgba][masksrc];[masksrc]alphaextract[mask]")
-    } else {
-        format!("select='{expression}'")
-    };
+    let script = selected_filter_script(&expression, has_alpha, target_dimensions);
     tokio::fs::write(&script_path, script).await?;
     let args = selected_frame_extraction_args(
         input,
@@ -171,6 +172,7 @@ pub async fn extract_additional_frames(
     mask_directory: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
+    target_dimensions: Option<(u32, u32)>,
     log_path: Option<PathBuf>,
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -187,6 +189,7 @@ pub async fn extract_additional_frames(
         &temporary_masks,
         selected_frames,
         has_alpha,
+        target_dimensions,
         log_path,
         process_manager,
         observer,
@@ -321,6 +324,21 @@ fn selection_expression(selected_frames: &[PlannedFrame]) -> String {
     balanced_selection_expression(&indices)
 }
 
+fn selected_filter_script(
+    expression: &str,
+    has_alpha: bool,
+    target_dimensions: Option<(u32, u32)>,
+) -> String {
+    let scale = target_dimensions
+        .map(|(width, height)| format!(",scale={width}:{height}:flags=lanczos"))
+        .unwrap_or_default();
+    if has_alpha {
+        format!("[0:v]select='{expression}'{scale},format=rgba,split=2[rgba][masksrc];[masksrc]alphaextract[mask]")
+    } else {
+        format!("select='{expression}'{scale}")
+    }
+}
+
 fn balanced_selection_expression(indices: &[u64]) -> String {
     if indices.is_empty() {
         return "0".into();
@@ -400,6 +418,7 @@ fn frame_extraction_args(
     mask_directory: &Path,
     sampling_fps: f64,
     has_alpha: bool,
+    target_dimensions: Option<(u32, u32)>,
 ) -> Vec<OsString> {
     let mut args = vec![
         "-hide_banner".into(),
@@ -409,7 +428,10 @@ fn frame_extraction_args(
         "-i".into(),
         input.as_os_str().to_owned(),
     ];
-    let scale = "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease";
+    let scale = target_dimensions.map_or_else(
+        || "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease".into(),
+        |(width, height)| format!("scale={width}:{height}:flags=lanczos"),
+    );
     if has_alpha {
         let filter = format!(
             "[0:v]fps={sampling_fps:.8},{scale},format=rgba,split=2[rgba][masksrc];[masksrc]alphaextract[mask]"
@@ -499,6 +521,35 @@ pub(crate) async fn validate_extraction(
         0
     };
 
+    let first_frame = frame_names
+        .iter()
+        .next()
+        .ok_or_else(|| SplatError::Process("FFmpeg did not output any frames".into()))?;
+    let first_path = frames.join(first_frame);
+    let first_mask_path = has_alpha.then(|| masks.join(format!("{first_frame}.png")));
+    let (width, height) = tokio::task::spawn_blocking(move || {
+        use image::ImageDecoder;
+        let decoder = image::ImageReader::open(first_path)?
+            .with_guessed_format()?
+            .into_decoder()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let dimensions = decoder.dimensions();
+        if let Some(mask_path) = first_mask_path {
+            let mask_decoder = image::ImageReader::open(mask_path)?
+                .with_guessed_format()?
+                .into_decoder()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if mask_decoder.dimensions() != dimensions {
+                return Err(std::io::Error::other(
+                    "Alpha mask dimensions do not match the extracted frame",
+                ));
+            }
+        }
+        Ok::<_, std::io::Error>(dimensions)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("Frame dimension task failed: {error}")))??;
+
     Ok(FrameExtractionResult {
         frame_count: frame_names.len() as u64,
         image_format: if has_alpha {
@@ -508,6 +559,8 @@ pub(crate) async fn validate_extraction(
         },
         mask_count,
         has_alpha,
+        width,
+        height,
     })
 }
 
@@ -553,6 +606,7 @@ mod tests {
             Path::new("masks"),
             15.0,
             false,
+            None,
         ));
         assert!(args.iter().any(|value| value.ends_with("frame_%06d.jpg")));
         assert!(!args.iter().any(|value| value == "-filter_complex"));
@@ -567,6 +621,7 @@ mod tests {
             Path::new("masks"),
             15.0,
             true,
+            None,
         ));
         assert!(args.iter().any(|value| value == "-filter_complex"));
         assert!(args.iter().any(|value| value.contains("alphaextract")));
@@ -589,6 +644,31 @@ mod tests {
         assert!(!expression.contains("+eq(n"));
     }
 
+    #[test]
+    fn explicit_uniform_target_is_used_only_when_requested() {
+        let args = args_as_strings(frame_extraction_args(
+            Path::new("input.mov"),
+            Path::new("frames"),
+            Path::new("masks"),
+            8.0,
+            false,
+            Some((1600, 900)),
+        ));
+        assert!(args
+            .iter()
+            .any(|value| value.contains("scale=1600:900:flags=lanczos")));
+        assert!(!args.iter().any(|value| value.contains("min(1920,iw)")));
+    }
+
+    #[test]
+    fn exact_selection_scales_rgb_and_alpha_before_mask_split() {
+        let opaque = selected_filter_script("eq(n\\,0)", false, Some((1600, 900)));
+        assert!(opaque.contains("scale=1600:900:flags=lanczos"));
+        let alpha = selected_filter_script("eq(n\\,0)", true, Some((1920, 1080)));
+        assert!(alpha.contains("scale=1920:1080:flags=lanczos,format=rgba,split=2"));
+        assert!(alpha.contains("alphaextract[mask]"));
+    }
+
     #[tokio::test]
     async fn validates_matching_alpha_frame_and_mask_names() {
         let temporary = tempfile::tempdir().unwrap();
@@ -596,11 +676,11 @@ mod tests {
         let masks = temporary.path().join("masks");
         tokio::fs::create_dir_all(&frames).await.unwrap();
         tokio::fs::create_dir_all(&masks).await.unwrap();
-        tokio::fs::write(frames.join("frame_000001.png"), b"png")
-            .await
+        image::RgbaImage::new(2, 2)
+            .save(frames.join("frame_000001.png"))
             .unwrap();
-        tokio::fs::write(masks.join("frame_000001.png.png"), b"mask")
-            .await
+        image::GrayImage::new(2, 2)
+            .save(masks.join("frame_000001.png.png"))
             .unwrap();
         let result = validate_extraction(&frames, &masks, true).await.unwrap();
         assert_eq!(result.frame_count, 1);
@@ -615,8 +695,8 @@ mod tests {
         let masks = temporary.path().join("masks");
         tokio::fs::create_dir_all(&frames).await.unwrap();
         tokio::fs::create_dir_all(&masks).await.unwrap();
-        tokio::fs::write(frames.join("frame_000001.png"), b"png")
-            .await
+        image::RgbaImage::new(2, 2)
+            .save(frames.join("frame_000001.png"))
             .unwrap();
         let error = validate_extraction(&frames, &masks, true)
             .await

@@ -293,7 +293,7 @@ export function App() {
       .map((event) => countFromProgressEvent(event, progressEvent.stage))
       .find((count) => count != null) ?? null
     : null;
-  const currentMessage = friendlyProgressKey
+  const friendlyProgressMessage = friendlyProgressKey
     ? friendlyProgressCount
       ? t("progress.activeCount", {
         label: t(friendlyProgressKey),
@@ -301,6 +301,11 @@ export function App() {
         total: formatNumber(friendlyProgressCount.total),
       })
       : `${t(friendlyProgressKey)}…`
+    : null;
+  const currentMessage = friendlyProgressMessage
+    ? ["reconstructing", "trainingSplats"].includes(progressEvent?.stage ?? "")
+      ? t("progress.activeLongWait", { label: friendlyProgressMessage })
+      : friendlyProgressMessage
     : latestMessage;
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const currentStageLabel = useCallback((stage: string | undefined, index: number) => {

@@ -19,7 +19,8 @@ use crate::{
     pipeline::{
         effectiveness::PlannerEffectivenessTracker,
         estimate::{
-            estimate_runtime_for_images_with_brush, estimate_runtime_with_brush, RuntimeEstimate,
+            estimate_runtime_for_images_with_brush_and_resolution,
+            estimate_runtime_with_brush_and_resolution, RuntimeEstimate,
         },
         runner::{
             PipelineFailureContext, PipelineResult, PipelineRunner, ReshootInputInfo,
@@ -27,7 +28,10 @@ use crate::{
         },
         PipelineEngine, PipelineStage,
     },
-    presets::{resolve_brush_training_preset, Quality},
+    presets::{
+        resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
+        resolve_planner_resolution_plan, Quality,
+    },
     process::ProcessManager,
     project::{
         catalog::{self, AppSettings, ProjectOverview},
@@ -344,20 +348,46 @@ pub async fn probe_and_plan(
         .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let plan = create_image_plan(&image_sequence, &quality.preset());
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
-        let brush = resolve_brush_training_preset(
-            quality,
-            planner_enabled,
-            acceleration.usable_gpu_total_memory_mb(),
-            image_sequence.width.max(image_sequence.height),
-            0,
+        let resolution = planner_enabled.then(|| {
+            resolve_planner_resolution_plan(
+                quality,
+                acceleration.usable_gpu_total_memory_mb(),
+                image_sequence.width,
+                image_sequence.height,
+                false,
+            )
+        });
+        let brush = resolution.map_or_else(
+            || {
+                resolve_brush_training_preset(
+                    quality,
+                    false,
+                    acceleration.usable_gpu_total_memory_mb(),
+                    image_sequence.width.max(image_sequence.height),
+                    0,
+                )
+            },
+            |resolution| {
+                resolve_brush_training_preset_for_plan(
+                    quality,
+                    acceleration.usable_gpu_total_memory_mb(),
+                    image_sequence.width.max(image_sequence.height),
+                    0,
+                    &resolution,
+                )
+            },
         );
-        let estimate = estimate_runtime_for_images_with_brush(
+        let estimate = estimate_runtime_for_images_with_brush_and_resolution(
             image_sequence.image_count,
             image_sequence.width.max(image_sequence.height),
             &plan,
             quality,
             &samples,
             Some(&brush),
+            resolution.map(|plan| plan.policy_version),
+            resolution
+                .map(|plan| plan.working_long_edge())
+                .unwrap_or_else(|| image_sequence.width.max(image_sequence.height)),
         );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Images,
@@ -375,14 +405,51 @@ pub async fn probe_and_plan(
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
         let acceleration = detect_colmap_acceleration(&engine_paths).await;
-        let brush = resolve_brush_training_preset(
-            quality,
-            planner_enabled,
-            acceleration.usable_gpu_total_memory_mb(),
-            video.width.max(video.height),
-            0,
+        let (source_width, source_height) = if video.rotation.rem_euclid(180) == 90 {
+            (video.height, video.width)
+        } else {
+            (video.width, video.height)
+        };
+        let resolution = planner_enabled.then(|| {
+            resolve_planner_resolution_plan(
+                quality,
+                acceleration.usable_gpu_total_memory_mb(),
+                source_width,
+                source_height,
+                true,
+            )
+        });
+        let brush = resolution.map_or_else(
+            || {
+                resolve_brush_training_preset(
+                    quality,
+                    false,
+                    acceleration.usable_gpu_total_memory_mb(),
+                    source_width.max(source_height),
+                    0,
+                )
+            },
+            |resolution| {
+                resolve_brush_training_preset_for_plan(
+                    quality,
+                    acceleration.usable_gpu_total_memory_mb(),
+                    source_width.max(source_height),
+                    0,
+                    &resolution,
+                )
+            },
         );
-        let estimate = estimate_runtime_with_brush(&video, &plan, quality, &samples, Some(&brush));
+        let estimate = estimate_runtime_with_brush_and_resolution(
+            &video,
+            &plan,
+            quality,
+            &samples,
+            Some(&brush),
+            resolution.map(|plan| plan.policy_version),
+            resolution
+                .map(|plan| plan.working_long_edge())
+                .unwrap_or_else(|| source_width.max(source_height)),
+        );
         Ok(ProbeAndPlan {
             input_type: ProjectInputType::Video,
             video: Some(video),
@@ -412,6 +479,35 @@ fn resume_checkpoint_fraction(state: &PipelineStateFile) -> (f64, &'static str) 
     } else {
         (0.0, "画面提取")
     }
+}
+
+fn resolve_checkpoint_brush(
+    state: &PipelineStateFile,
+    quality: Quality,
+    detected_total_memory_mb: Option<u64>,
+    source_long_edge: u32,
+    initial_sfm_points: u64,
+) -> crate::presets::ResolvedBrushTrainingPreset {
+    state.resolution_plan.map_or_else(
+        || {
+            resolve_brush_training_preset(
+                quality,
+                state.planner_enabled,
+                detected_total_memory_mb,
+                source_long_edge,
+                initial_sfm_points,
+            )
+        },
+        |resolution| {
+            resolve_brush_training_preset_for_plan(
+                quality,
+                detected_total_memory_mb,
+                source_long_edge,
+                initial_sfm_points,
+                &resolution,
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -455,9 +551,9 @@ pub async fn estimate_project_runtime(
                 UniformRatioFrameSelection.create_plan(&video, &metadata.quality.preset())
             });
             let brush = state.brush_training.resolved.unwrap_or_else(|| {
-                resolve_brush_training_preset(
+                resolve_checkpoint_brush(
+                    &state,
                     metadata.quality,
-                    state.planner_enabled,
                     detected_total_memory_mb,
                     video.width.max(video.height),
                     metadata
@@ -467,7 +563,18 @@ pub async fn estimate_project_runtime(
                         .unwrap_or(0),
                 )
             });
-            estimate_runtime_with_brush(&video, &plan, metadata.quality, &samples, Some(&brush))
+            estimate_runtime_with_brush_and_resolution(
+                &video,
+                &plan,
+                metadata.quality,
+                &samples,
+                Some(&brush),
+                state.resolution_policy_version,
+                state
+                    .resolution_plan
+                    .map(|resolution| resolution.working_long_edge())
+                    .unwrap_or_else(|| video.width.max(video.height)),
+            )
         }
         ProjectInputType::Images => {
             let image_sequence = match state.image_sequence.clone() {
@@ -482,9 +589,9 @@ pub async fn estimate_project_runtime(
             let plan = saved_plan
                 .unwrap_or_else(|| create_image_plan(&image_sequence, &metadata.quality.preset()));
             let brush = state.brush_training.resolved.unwrap_or_else(|| {
-                resolve_brush_training_preset(
+                resolve_checkpoint_brush(
+                    &state,
                     metadata.quality,
-                    state.planner_enabled,
                     detected_total_memory_mb,
                     image_sequence.width.max(image_sequence.height),
                     metadata
@@ -494,13 +601,18 @@ pub async fn estimate_project_runtime(
                         .unwrap_or(0),
                 )
             });
-            estimate_runtime_for_images_with_brush(
+            estimate_runtime_for_images_with_brush_and_resolution(
                 image_sequence.image_count,
                 image_sequence.width.max(image_sequence.height),
                 &plan,
                 metadata.quality,
                 &samples,
                 Some(&brush),
+                state.resolution_policy_version,
+                state
+                    .resolution_plan
+                    .map(|resolution| resolution.working_long_edge())
+                    .unwrap_or_else(|| image_sequence.width.max(image_sequence.height)),
             )
         }
     };

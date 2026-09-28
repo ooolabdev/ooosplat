@@ -7,18 +7,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.4.1"><strong>⬇️ 下载 OOOSplat 0.4.1（Windows / macOS / Ubuntu）</strong></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.5.0"><strong>⬇️ 下载 OOOSplat 0.5.0（Windows / macOS / Ubuntu）</strong></a>
 </p>
 
 OOOSplat 是一款将普通环绕拍摄视频或图片序列一键转换为 3D Gaussian Splatting 的本地桌面应用。选择素材、项目目录和质量档位后，应用会自动完成画面准备、相机重建、训练与 PLY 发布，并可直接预览、调整和导出结果。
 
 Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端，不需要远程服务或 localhost API。
 
-当前版本：**0.4.1**
+当前版本：**0.5.0**
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.4.1 支持图片序列输入、透明 MOV/PNG 自动 Mask、阶段级断点续跑，以及矩形、球形和盒形 Gaussian 编辑；原始 `final.ply` 始终保留。
+> 0.5.0 新增默认开启、可关闭的实验性自动优化，可按素材、档位和显存规划重建与训练参数，并在视频重建覆盖不足时尝试桥接补帧；同时加入同相机增量高清补拍、Windows Brush 显卡稳定性与预览体验改进。
 
 ## 核心优势
 
@@ -44,12 +44,14 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ## 主要功能
 
 - 从 MP4、MOV 视频，或包含 JPG、JPEG、PNG 的图片序列文件夹创建 Gaussian Splatting 项目。
-- 视频使用均匀抽帧和顺序匹配；图片序列保留全部图片并使用共享相机、穷举匹配和现有增量 Mapper。
+- 默认开启“自动优化（实验性）”：视频根据档位采用 6 / 8 / 12 FPS 初始采样，并在画面准备、COLMAP 和 Brush 阶段使用对应的分辨率策略；初始重建覆盖不足时，会在剩余预算内尝试补充桥接画面。关闭后继续使用旧版固定比例抽帧和分辨率策略。
+- 图片序列保留全部图片并使用共享相机、穷举匹配和现有增量 Mapper；视频使用顺序匹配，桥接补帧不适用于图片序列。
 - 自动检测透明 MOV 的 Alpha 通道，同步提取 RGBA PNG 画面与 COLMAP Mask；透明区域不会参与特征提取，同时保留给 Brush 训练使用。
 - 自动检测透明 PNG，保留 Alpha 供 Brush 使用，并生成 COLMAP Mask 排除完全透明区域。
 - 已完成项目支持“高清补拍”：使用同一设备、同一镜头和相同分辨率补充视频或图片后，OOOSplat 会复用原数据库、共享相机与稀疏模型，只处理新增画面的特征、匹配和注册，再使用全部已注册画面完整重训 Brush。透明 MOV/PNG 补拍素材会保留 RGBA 并自动生成 Mask；补拍会创建独立派生项目，不覆盖原项目。
 - Windows 安装包内置 CUDA 版 COLMAP；macOS Alpha 内置 arm64 CPU 版 COLMAP；Ubuntu 使用系统 CPU 版 COLMAP。三个平台均使用固定并校验的 FFmpeg/Brush 方案。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
+- 精细档会依据检测到的显存选择 Brush 训练分辨率和 Splat 上限；若明确检测到显存不足，会安全降低一次训练配置后重试。Windows 单 NVIDIA 独显环境还会优先稳定选择该独显，并为显卡设备中断提供明确提示。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
 - 原始进程输出完整写入项目的 `logs` 目录。
 - 支持取消任务，并通过 Windows Job Object 或 Unix process group 终止整个子进程树。
@@ -59,6 +61,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 根据素材规模、质量档位和本机历史任务估算生成时长；Brush 训练阶段持续更新进度。
 - 在“03 预览”中直接加载历史项目的 `.ply`，支持 Orbit、Pan 和 Zoom；“调整 / 动画”双模式切换不会重新加载模型或重置相机。
 - 调整模式支持整个 Gaussian 模型的位置、旋转、等比缩放，以及撤销 / 重做。
+- 预览地面网格使用持久渲染资源，减少长时间预览中的重复绘制开销；模型 Transform 缩放范围扩展至 `0.001–10000`。
 - 提供矩形、球形和盒形 Gaussian 选择工具：矩形可穿透框选并非破坏式删除点，球形和盒形区域则实时保留区域内的 Gaussian。
 - 裁切区域和删除记录会自动保存；点击“保存”时将编辑结果写入唯一的 `edit.ply`，后续保存会安全替换该文件，始终不覆盖原始 `final.ply`。
 - 动画模式依次播放 5 秒显现、8 秒冲击波和持续相机环绕，并可导出带 OOOSplat 水印的 1080×1920、30 fps、23 秒 H.264 MP4。
@@ -79,11 +82,11 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 ```text
 输入视频或图片序列
   │
-  ├─ 视频：FFprobe 分析，FFmpeg 按质量档位均匀抽帧；透明视频同步生成 RGBA 画面与 Mask
+  ├─ 视频：FFprobe 分析，FFmpeg 按档位目标 FPS 和工作分辨率抽帧；透明视频同步生成 RGBA 画面与 Mask
   ├─ 图片：按文件名排序并保留全部图片；透明 PNG 自动生成 Mask
   ├─ COLMAP：自动选择 CPU 或 CUDA GPU 提取特征；视频顺序匹配，图片穷举匹配
-  ├─ COLMAP：增量重建并验证注册率和三维点
-  ├─ Brush：使用可用 GPU 训练 Gaussian Splats
+  ├─ COLMAP：增量重建并验证注册率和三维点；自动优化开启时可按需尝试桥接补帧
+  ├─ Brush：使用可用 GPU 训练 Gaussian Splats；精细档按显存选择训练配置
   └─ 校验 PLY 后原子发布为 final.ply
 ```
 
@@ -132,17 +135,17 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU；Brush 会在运行时选择可用的图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
-从 GitHub Actions 下载 `OOOSplat-0.4.1-x64-linux` Artifact 后，可执行：
+从 GitHub Actions 下载 `OOOSplat-0.5.0-x64-linux` Artifact 后，可执行：
 
 ```bash
-sudo apt install ./OOOSplat-0.4.1-x64-linux.deb
+sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
 ```
 
 `.deb` 会通过 Ubuntu 包管理器安装 FFmpeg、FFprobe 和 CPU 版 COLMAP；固定版本 Brush 已包含在安装包中。
 
 ## 安装与使用
 
-1. Windows 运行 `OOOSplat-0.4.1-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.4.1-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.4.1-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.5.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.5.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.5.0-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在“01 创建新任务”的输入类型下拉栏选择“视频”或“图片”，再点击输入框选择视频文件或图片序列文件夹。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -162,13 +165,17 @@ sudo apt install ./OOOSplat-0.4.1-x64-linux.deb
 
 ## 质量档位
 
-| 档位 | 保留画面 | FFmpeg 抽帧率 | Brush iterations | 最大训练分辨率 |
-| --- | ---: | ---: | ---: | ---: |
-| 快速 | 30% | 源视频 FPS × 0.30 | 8,000 | 1,200 |
-| 均衡 | 50% | 源视频 FPS × 0.50 | 15,000 | 1,600 |
-| 精细 | 100% | 源视频 FPS × 1.00 | 30,000 | 2,000 |
+“自动优化（实验性）”默认开启。视频会在抽帧时一次性缩放到对应工作分辨率，并保持原始宽高比且不会放大低分辨率素材；实际采样不会超过源视频 FPS 或总帧数。图片序列始终保留全部有效图片和原始输入分辨率，但 COLMAP 与 Brush 仍使用对应档位的处理上限。
 
-抽帧由 FFmpeg 完成，COLMAP 不负责减少帧数。程序不设置最大抽帧数量，也没有额外的 Splat 数量上限；最终 Splat 数量由素材、重建结果和 Brush 训练过程决定。
+| 档位 | 视频初始 / 桥接上限 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
+| --- | ---: | ---: | ---: | --- |
+| 快速 | 6 / 9 FPS | 最大 1,600 | 1,200 / 4,096 | 8,000 iterations，最大分辨率 1,600 |
+| 均衡 | 8 / 12 FPS | 最大 1,920 | 1,600 / 8,192 | 15,000 iterations，最大分辨率 1,920 |
+| 精细 | 12 / 15 FPS | 依据显存为最大 3,200、3,840 或原生分辨率 | 3,200 / 16,384 | 30,000 iterations，依据显存选择最大分辨率和 Splat 上限 |
+
+精细档的初始配置按可用显存划分：显存低于 8 GB 或无法读取时，视频和 Brush 最大长边为 3,200；8 GB（含）至 12 GB 之间为 3,840；12 GB（含）以上保留视频原生长边，并让 Brush 使用原生长边。三个精细配置的 COLMAP 图像长边均限制为 3,200。桥接补帧仅在视频初始重建覆盖不足且仍有候选画面时尝试；失败会安全回退到初始重建，不适用于图片序列。精细档在明确检测到显存不足时最多自动降低一次训练配置并重试。
+
+关闭自动优化后，快速、均衡、精细档分别恢复为保留源视频 30%、50%、100% 画面的旧版策略；视频画面长边沿用旧版最大 1,920，Brush 最大训练分辨率分别为 1,200、1,600、2,000，且不额外设置 Splat 数量上限。
 
 ## 项目与文件位置
 
@@ -212,11 +219,12 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 字段 | 说明 |
 | --- | --- |
 | 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
-| 应用版本、操作系统、CPU 架构 | 例如 `0.4.1` / `windows` / `x86_64` |
-| 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.5.0` / `windows` / `x86_64` |
+| 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
 | 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
 | 阶段耗时与总耗时 | 毫秒 |
 | 帧数与视频时长 | 分桶值，不是原始数量 |
+| 自动优化效果指标 | 匿名的素材尺寸与数量、规划结果、注册结果、桥接补帧、Brush 配置、Splat 数量和阶段耗时，用于比较自动优化效果 |
 | 失败阶段与错误码 | 枚举值，例如 `colmap_mapper_failed`；不含原始错误文本 |
 
 不会发送的内容：视频、图片、PLY 等任何素材；文件名、路径和项目名称；日志与命令输出；用户名或任何个人信息。
@@ -317,7 +325,7 @@ npm run package:windows
 NSIS 安装包输出到：
 
 ```text
-dist-artifacts\OOOSplat-0.4.1-x64-windows.exe
+dist-artifacts\OOOSplat-0.5.0-x64-windows.exe
 ```
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。
@@ -366,7 +374,7 @@ Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLM
 
 ### 可以直接在应用中查看 final.ply 吗？
 
-可以。在“02 历史任务”中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式用于编辑整个模型的位置、旋转和等比缩放；“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕以及带水印的竖屏 MP4 导出。当前不支持单个 Gaussian 选择、删除、裁剪或清理；`.sog` 和 `.spz` 也尚未开放。
+可以。在“02 历史任务”中选择已完成项目并点击“预览”，即可在独立预览工作区浏览 `.ply`。“调整”模式支持整体 Transform，以及矩形、球形和盒形 Gaussian 选择；可以非破坏式删除、裁切、撤销和重做。编辑状态会保存在项目中，点击“保存”生成或更新唯一的 `edit.ply`，原始 `final.ply` 始终不变。“动画”模式提供 5 秒显现、8 秒冲击波、持续环绕以及带水印的竖屏 MP4 导出；`.sog` 和 `.spz` 尚未开放。
 
 ## 技术栈
 

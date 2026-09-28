@@ -40,7 +40,11 @@ use crate::{
         plan_bridge_backfill, read_registered_source_indices, write_bridge_pair_list,
         BridgeBackfillStatus, BRIDGE_TRIGGER_RATIO,
     },
-    presets::{resolve_brush_training_preset, Quality, ResolvedBrushTrainingPreset},
+    presets::{
+        resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
+        resolve_planner_resolution_plan, Quality, ResolvedBrushTrainingPreset,
+        PLANNER_RESOLUTION_POLICY_VERSION,
+    },
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
         catalog, manager::atomic_replace_file, FrameState, PipelineStateFile,
@@ -53,11 +57,11 @@ use crate::{
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
     video::{
-        prepare_scanned_image_sequence, prepared_video_dimensions, scan_image_sequence,
-        validate_prepared_image_sequence, validate_reshoot_image_sequence, FramePlan,
-        FrameSelectionStrategy, ImagePreparationObserver, ImagePreparationPhase, ImageSequenceInfo,
-        ImageSequenceNaming, PlannedFrame, QualityV2FrameSelection, UniformRatioFrameSelection,
-        VideoInfo,
+        prepare_scanned_image_sequence, scaled_video_dimensions, scan_image_sequence,
+        validate_prepared_image_sequence, validate_reshoot_image_sequence, video_can_scale_to,
+        FramePlan, FrameSelectionStrategy, ImagePreparationObserver, ImagePreparationPhase,
+        ImageSequenceInfo, ImageSequenceNaming, PlannedFrame, QualityV2FrameSelection,
+        UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -70,6 +74,8 @@ pub struct PreparedFrames {
     pub image_format: String,
     pub mask_count: u64,
     pub has_alpha: bool,
+    pub working_width: u32,
+    pub working_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -388,6 +394,7 @@ impl PipelineRunner {
             .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_frames(
         &self,
         input: &Path,
@@ -396,16 +403,23 @@ impl PipelineRunner {
         masks: &Path,
         logs: Option<&Path>,
         planner_enabled: bool,
+        probed_video: Option<VideoInfo>,
+        target_dimensions: Option<(u32, u32)>,
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
-        let video = probe_video(
-            &self.engines.ffprobe,
-            input,
-            logs.map(|path| path.join("ffprobe.log")),
-            &self.process_manager,
-        )
-        .await?;
+        let video = match probed_video {
+            Some(video) => video,
+            None => {
+                probe_video(
+                    &self.engines.ffprobe,
+                    input,
+                    logs.map(|path| path.join("ffprobe.log")),
+                    &self.process_manager,
+                )
+                .await?
+            }
+        };
         let probe_message = if video.has_alpha {
             format!(
                 "视频 {:.1} 秒 · {:.2} FPS · {}×{} · 检测到 Alpha 通道（{}）",
@@ -462,6 +476,7 @@ impl PipelineRunner {
                 masks,
                 &plan.selected_frames,
                 video.has_alpha,
+                target_dimensions,
                 logs.map(|path| path.join("ffmpeg.log")),
                 &self.process_manager,
                 Some(observer),
@@ -475,12 +490,21 @@ impl PipelineRunner {
                 masks,
                 &plan,
                 video.has_alpha,
+                target_dimensions,
                 logs.map(|path| path.join("ffmpeg.log")),
                 &self.process_manager,
                 Some(observer),
             )
             .await?
         };
+        if let Some(expected) = target_dimensions {
+            if (extraction.width, extraction.height) != expected {
+                return Err(SplatError::Process(format!(
+                    "FFmpeg produced {}x{} frames; expected {}x{}",
+                    extraction.width, extraction.height, expected.0, expected.1
+                )));
+            }
+        }
         self.events.stage(
             PipelineStage::ExtractingFrames,
             1.0,
@@ -502,6 +526,8 @@ impl PipelineRunner {
             image_format: extraction.image_format.as_str().into(),
             mask_count: extraction.mask_count,
             has_alpha: extraction.has_alpha,
+            working_width: extraction.width,
+            working_height: extraction.height,
         })
     }
 
@@ -614,6 +640,8 @@ impl PipelineRunner {
                 format!("已准备 {} 张图片", prepared.image_count)
             },
         );
+        let working_width = image_sequence.width;
+        let working_height = image_sequence.height;
         Ok(PreparedFrames {
             input_type: ProjectInputType::Images,
             video: None,
@@ -623,6 +651,8 @@ impl PipelineRunner {
             image_format: "images".into(),
             mask_count: prepared.mask_count,
             has_alpha: prepared.has_alpha,
+            working_width,
+            working_height,
         })
     }
 
@@ -698,6 +728,9 @@ impl PipelineRunner {
         };
         let mut state = project_manager.read_state(&paths.state).await?;
         state.planner_enabled = self.planner_enabled;
+        state.resolution_policy_version = self
+            .planner_enabled
+            .then_some(PLANNER_RESOLUTION_POLICY_VERSION);
         project_manager.write_state(&paths.state, &state).await?;
         self.execute_project(project_manager, paths, &mut metadata, state, &acceleration)
             .await
@@ -826,7 +859,14 @@ impl PipelineRunner {
                             .await?;
                     let plan =
                         UniformRatioFrameSelection.create_plan(&video, &source.quality.preset());
-                    let dimensions = prepared_video_dimensions(&video);
+                    let target_width = u32::try_from(source.width).unwrap_or(u32::MAX);
+                    let target_height = u32::try_from(source.height).unwrap_or(u32::MAX);
+                    let can_scale = video_can_scale_to(&video, target_width, target_height);
+                    let dimensions = if can_scale {
+                        (target_width, target_height)
+                    } else {
+                        scaled_video_dimensions(&video, target_width.max(target_height))
+                    };
                     let estimate = estimate_runtime(
                         &video,
                         &FramePlan {
@@ -1242,6 +1282,25 @@ impl PipelineRunner {
                     let temporary_masks = paths.work.join("reshoot-extract-masks");
                     reset_directory(&temporary).await?;
                     reset_directory(&temporary_masks).await?;
+                    let supplemental_video = probe_video(
+                        &self.engines.ffprobe,
+                        &metadata.source_path,
+                        Some(paths.logs.join("ffprobe.log")),
+                        &self.process_manager,
+                    )
+                    .await?;
+                    let target_width = u32::try_from(provenance.width).map_err(|_| {
+                        SplatError::Process("Reshoot target width exceeds supported range".into())
+                    })?;
+                    let target_height = u32::try_from(provenance.height).map_err(|_| {
+                        SplatError::Process("Reshoot target height exceeds supported range".into())
+                    })?;
+                    if !video_can_scale_to(&supplemental_video, target_width, target_height) {
+                        return Err(SplatError::Process(format!(
+                            "Reshoot video cannot be scaled to the source camera resolution {}x{} without upscaling or changing aspect ratio",
+                            target_width, target_height
+                        )));
+                    }
                     let extracted = self
                         .prepare_frames(
                             &metadata.source_path,
@@ -1250,6 +1309,8 @@ impl PipelineRunner {
                             &temporary_masks,
                             Some(&paths.logs),
                             state.planner_enabled,
+                            Some(supplemental_video),
+                            Some((target_width, target_height)),
                         )
                         .await?;
                     move_extracted_reshoot(
@@ -1568,6 +1629,36 @@ impl PipelineRunner {
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
+        let uses_current_resolution_policy = state.planner_enabled
+            && state.resolution_policy_version == Some(PLANNER_RESOLUTION_POLICY_VERSION);
+        let mut preprobed_video = None;
+        if uses_current_resolution_policy
+            && state.resolution_plan.is_none()
+            && metadata.input_type == ProjectInputType::Video
+        {
+            let video = probe_video(
+                &self.engines.ffprobe,
+                &metadata.source_path,
+                Some(paths.logs.join("ffprobe.log")),
+                &self.process_manager,
+            )
+            .await?;
+            let (source_width, source_height) = oriented_video_dimensions(&video);
+            let resolution = resolve_planner_resolution_plan(
+                quality,
+                acceleration.usable_gpu_total_memory_mb(),
+                source_width,
+                source_height,
+                true,
+            );
+            state.video = Some(video.clone());
+            state.resolution_plan = Some(resolution);
+            project_manager.write_state(&paths.state, &state).await?;
+            preprobed_video = Some(video);
+        }
+        let target_dimensions = state
+            .resolution_plan
+            .map(|plan| (plan.working_width, plan.working_height));
         let mut prepared =
             if let Some(prepared) = prepared_frames_from_checkpoint(paths, &state).await? {
                 self.events.stage(
@@ -1590,6 +1681,8 @@ impl PipelineRunner {
                             &paths.masks,
                             Some(&paths.logs),
                             state.planner_enabled,
+                            preprobed_video.or_else(|| state.video.clone()),
+                            target_dimensions,
                         )
                         .await?
                     }
@@ -1607,6 +1700,15 @@ impl PipelineRunner {
                 state.input_type = prepared.input_type;
                 state.video = prepared.video.clone();
                 state.image_sequence = prepared.image_sequence.clone();
+                if uses_current_resolution_policy && state.resolution_plan.is_none() {
+                    state.resolution_plan = Some(resolve_planner_resolution_plan(
+                        quality,
+                        acceleration.usable_gpu_total_memory_mb(),
+                        prepared.working_width,
+                        prepared.working_height,
+                        false,
+                    ));
+                }
                 let mut frames = FrameState::from(&prepared.plan);
                 frames.extracted_frames = Some(prepared.extracted_frames);
                 frames.initial_extracted_frames = prepared.extracted_frames;
@@ -1680,6 +1782,44 @@ impl PipelineRunner {
         let sparse = paths.colmap.join("sparse");
         let colmap_log = paths.logs.join("colmap.log");
         let preset = quality.preset();
+        let sfm_max_image_size = state
+            .resolution_plan
+            .map(|plan| plan.sfm_max_image_size)
+            .unwrap_or(preset.sfm_max_image_size);
+        if let Some(resolution) = state.resolution_plan {
+            self.events.send(
+                PipelineStage::ExtractingFeatures,
+                Some(PipelineEngine::System),
+                EventKind::Log,
+                EventLevel::Info,
+                None,
+                true,
+                format!(
+                    "[ResolutionPlan] version={} source={}x{} working={}x{} sfmMax={} brushMax={} profile={}",
+                    resolution.policy_version,
+                    prepared
+                        .video
+                        .as_ref()
+                        .map(|video| oriented_video_dimensions(video).0)
+                        .or_else(|| prepared.image_sequence.as_ref().map(|images| images.width))
+                        .unwrap_or(prepared.working_width),
+                    prepared
+                        .video
+                        .as_ref()
+                        .map(|video| oriented_video_dimensions(video).1)
+                        .or_else(|| prepared.image_sequence.as_ref().map(|images| images.height))
+                        .unwrap_or(prepared.working_height),
+                    prepared.working_width,
+                    prepared.working_height,
+                    resolution.sfm_max_image_size,
+                    resolution.brush_initial_max_resolution,
+                    resolution.brush_initial_profile.label(),
+                ),
+                None,
+                None,
+                None,
+            );
+        }
         // COLMAP's bundled bitmap loader cannot reliably open non-ASCII absolute
         // paths on Windows. The process working directory is work/colmap, so this
         // ASCII-only relative path preserves Unicode/UNC project roots without
@@ -1715,7 +1855,7 @@ impl PipelineRunner {
                     colmap_images,
                     colmap_masks,
                     None,
-                    preset.sfm_max_image_size,
+                    sfm_max_image_size,
                     preset.sfm_max_features,
                     colmap_log.clone(),
                     &self.process_manager,
@@ -1981,12 +2121,25 @@ impl PipelineRunner {
                 .unwrap_or(1);
             let detected_total_memory_mb = acceleration.usable_gpu_total_memory_mb();
             let resolved_brush = state.brush_training.resolved.unwrap_or_else(|| {
-                resolve_brush_training_preset(
-                    quality,
-                    state.planner_enabled,
-                    detected_total_memory_mb,
-                    source_long_edge,
-                    report.points_3d,
+                state.resolution_plan.map_or_else(
+                    || {
+                        resolve_brush_training_preset(
+                            quality,
+                            state.planner_enabled,
+                            detected_total_memory_mb,
+                            source_long_edge,
+                            report.points_3d,
+                        )
+                    },
+                    |resolution| {
+                        resolve_brush_training_preset_for_plan(
+                            quality,
+                            detected_total_memory_mb,
+                            source_long_edge,
+                            report.points_3d,
+                            &resolution,
+                        )
+                    },
                 )
             });
             state
@@ -2009,6 +2162,8 @@ impl PipelineRunner {
                     quality,
                     &runtime_samples,
                     Some(&resolved_brush),
+                    state.resolution_policy_version,
+                    prepared.working_width.max(prepared.working_height),
                 ),
                 (_, Some(images)) => estimate_calibrated_brush_stage_ms_for_images(
                     images.image_count,
@@ -2017,6 +2172,8 @@ impl PipelineRunner {
                     quality,
                     &runtime_samples,
                     Some(&resolved_brush),
+                    state.resolution_policy_version,
+                    prepared.working_width.max(prepared.working_height),
                 ),
                 _ => return Err(SplatError::Process("项目输入信息不完整".into())),
             };
@@ -2612,6 +2769,7 @@ impl PipelineRunner {
             &paths.masks,
             additional,
             prepared.has_alpha,
+            Some((prepared.working_width, prepared.working_height)),
             Some(paths.logs.join("ffmpeg-bridge.log")),
             &self.process_manager,
             Some(self.process_observer(
@@ -2660,6 +2818,10 @@ impl PipelineRunner {
             + "\n";
         tokio::fs::write(&image_list, image_list_text).await?;
         let preset = metadata.quality.preset();
+        let sfm_max_image_size = state
+            .resolution_plan
+            .map(|plan| plan.sfm_max_image_size)
+            .unwrap_or(preset.sfm_max_image_size);
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
             0.0,
@@ -2674,7 +2836,7 @@ impl PipelineRunner {
             colmap_images,
             colmap_masks,
             Some(&image_list),
-            preset.sfm_max_image_size,
+            sfm_max_image_size,
             preset.sfm_max_features,
             paths.logs.join("colmap-bridge-features.log"),
             &self.process_manager,
@@ -3374,6 +3536,12 @@ async fn prepared_frames_from_checkpoint(
             {
                 return Ok(None);
             }
+            if state.resolution_plan.is_some_and(|resolution| {
+                (extraction.width, extraction.height)
+                    != (resolution.working_width, resolution.working_height)
+            }) {
+                return Ok(None);
+            }
             Ok(Some(PreparedFrames {
                 input_type: ProjectInputType::Video,
                 video: Some(video),
@@ -3383,6 +3551,8 @@ async fn prepared_frames_from_checkpoint(
                 image_format: extraction.image_format.as_str().into(),
                 mask_count: extraction.mask_count,
                 has_alpha: extraction.has_alpha,
+                working_width: extraction.width,
+                working_height: extraction.height,
             }))
         }
         ProjectInputType::Images => {
@@ -3413,6 +3583,8 @@ async fn prepared_frames_from_checkpoint(
             {
                 return Ok(None);
             }
+            let working_width = image_sequence.width;
+            let working_height = image_sequence.height;
             Ok(Some(PreparedFrames {
                 input_type: ProjectInputType::Images,
                 video: None,
@@ -3422,6 +3594,8 @@ async fn prepared_frames_from_checkpoint(
                 image_format: "images".into(),
                 mask_count: prepared.mask_count,
                 has_alpha: prepared.has_alpha,
+                working_width,
+                working_height,
             }))
         }
     }
@@ -3562,6 +3736,14 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
         frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
+    }
+}
+
+fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
+    if video.rotation.rem_euclid(180) == 90 {
+        (video.height, video.width)
+    } else {
+        (video.width, video.height)
     }
 }
 
@@ -3851,11 +4033,11 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
-        tokio::fs::write(paths.frames.join("frame_000001.jpg"), b"one")
-            .await
+        image::RgbImage::new(2, 2)
+            .save(paths.frames.join("frame_000001.jpg"))
             .unwrap();
-        tokio::fs::write(paths.frames.join("frame_000002.jpg"), b"two")
-            .await
+        image::RgbImage::new(2, 2)
+            .save(paths.frames.join("frame_000002.jpg"))
             .unwrap();
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.video = Some(VideoInfo {
@@ -4000,11 +4182,11 @@ mod tests {
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
         tokio::fs::create_dir_all(&paths.masks).await.unwrap();
-        tokio::fs::write(paths.frames.join("frame_000001.png"), b"rgba")
-            .await
+        image::RgbaImage::new(2, 2)
+            .save(paths.frames.join("frame_000001.png"))
             .unwrap();
-        tokio::fs::write(paths.masks.join("frame_000001.png.png"), b"mask")
-            .await
+        image::GrayImage::new(2, 2)
+            .save(paths.masks.join("frame_000001.png.png"))
             .unwrap();
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.video = Some(VideoInfo {
@@ -4051,8 +4233,8 @@ mod tests {
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
         tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
-        tokio::fs::write(paths.frames.join("frame_000001.jpg"), b"jpeg")
-            .await
+        image::RgbImage::new(2, 2)
+            .save(paths.frames.join("frame_000001.jpg"))
             .unwrap();
         tokio::fs::write(paths.colmap.join("database.db"), b"")
             .await

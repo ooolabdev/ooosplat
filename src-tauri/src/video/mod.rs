@@ -15,4 +15,7 @@ pub use image_sequence::{
     ImagePreparationProgress, ImageSequenceInfo, ImageSequenceNaming, ImageSequenceScan,
     PreparedImageSequence, ScannedImage, LARGE_SEQUENCE_WARNING_COUNT,
 };
-pub use probe::{parse_ffprobe_json, prepared_video_dimensions, VideoInfo};
+pub use probe::{
+    parse_ffprobe_json, prepared_video_dimensions, scaled_video_dimensions, video_can_scale_to,
+    VideoInfo,
+};
