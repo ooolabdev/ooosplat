@@ -55,6 +55,8 @@ import {
   GAUSSIAN_VIDEO_WIDTH,
   checkGaussianVideoCapability,
   encodeGaussianVideo,
+  gaussianVideoDimensions,
+  captureGuideSize,
 } from "./GaussianVideoExport";
 
 function createCanvas() {
@@ -67,7 +69,7 @@ function createCanvas() {
     fill: vi.fn(),
     fillRect: vi.fn(),
     fillText: vi.fn(),
-    measureText: vi.fn(() => ({ width: 160 })),
+    measureText: vi.fn(() => ({ width: 80 })),
     restore: vi.fn(),
     roundRect: vi.fn(),
     save: vi.fn(),
@@ -97,6 +99,39 @@ afterEach(() => {
 });
 
 describe("GaussianVideoExport", () => {
+  it("uses orientation-specific encoder dimensions", async () => {
+    expect(gaussianVideoDimensions()).toEqual({width:1080,height:1920});
+    expect(gaussianVideoDimensions("landscape")).toEqual({width:1920,height:1080});
+    mediabunny.canEncodeVideo.mockResolvedValue(true);
+    await checkGaussianVideoCapability("landscape");
+    expect(mediabunny.canEncodeVideo).toHaveBeenCalledWith("avc",expect.objectContaining({width:1920,height:1080}));
+  });
+  it.each(["portrait","landscape"] as const)("fits the %s framing guide inside both wide and narrow viewports", (orientation) => {
+    for (const [width,height] of [[1400,600],[300,900],[1100,700]]) {
+      const guide=captureGuideSize(width,height,orientation);
+      expect(guide.width).toBeLessThanOrEqual(width-28+1e-8);
+      expect(guide.height).toBeLessThanOrEqual(height-28+1e-8);
+      const dimensions=gaussianVideoDimensions(orientation);
+      expect(guide.width/guide.height).toBeCloseTo(dimensions.width/dimensions.height);
+    }
+  });
+  it.each(["portrait", "landscape"] as const)("encodes %s frames with a half-size bottom-right watermark", async (orientation) => {
+    const {canvas,context}=createCanvas();
+    const dimensions = gaussianVideoDimensions(orientation);
+    canvas.width = dimensions.width;
+    canvas.height = dimensions.height;
+    const renderFrameAt=vi.fn(async()=>undefined);
+    await encodeGaussianVideo({canvas,logo:canvas,orientation,renderFrameAt,signal:new AbortController().signal});
+    expect(renderFrameAt).toHaveBeenCalledTimes(690);
+    const x = canvas.width - 48 - 141;
+    const y = canvas.height - 48 - 47;
+    expect(context.roundRect).toHaveBeenLastCalledWith(x,y,141,47,8);
+    expect(context.drawImage).toHaveBeenLastCalledWith(canvas,x+6,y+6,35,35);
+    expect(context.fillText).toHaveBeenLastCalledWith("OOOSplat",x+50,y+24);
+    expect(context.font).toBe('700 20px Arial, "Segoe UI", sans-serif');
+    expect(context.shadowBlur).toBe(4);
+    expect(mediabunny.state.output?.finalize).toHaveBeenCalledOnce();
+  });
   it("reports whether the current WebView can encode AVC", async () => {
     mediabunny.canEncodeVideo.mockResolvedValueOnce(true);
     await expect(checkGaussianVideoCapability()).resolves.toEqual({ supported: true, reason: null });

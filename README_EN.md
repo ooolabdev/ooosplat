@@ -69,7 +69,8 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - The preview ground grid uses persistent rendering resources to reduce repeated work during long sessions, and the model Transform scale range is expanded to `0.001–10000`.
 - Use rectangle, sphere, and box Gaussian selection tools. Rectangle selection projects centers through the scene for non-destructive deletion, while sphere and box crops keep points inside the live selection volume.
 - Crop and deletion state is saved automatically. “Save” writes the current result to the single `edit.ply`; later saves safely replace it, while the original `final.ply` is never overwritten.
-- Play a 5-second reveal, an 8-second shockwave, and a continuous camera orbit, then export a watermarked 1080×1920, 30 fps, 23-second H.264 MP4.
+- Play a 5-second reveal, an 8-second shockwave, and a continuous camera orbit. Choose portrait (1080×1920) or landscape (1920×1080) composition and export a watermarked 30 fps, 23-second H.264 MP4.
+- The Export menu also creates a full-quality, single-file offline HTML viewer with the runtime and model embedded. Double-click to rotate, pan, zoom, and manually play the animation without internet access. Current transforms, crops, deletions, and all retained Gaussian / SH data are preserved; `final.ply` and `edit.ply` are not modified. File size is roughly 4/3 of the corresponding PLY, plus the viewer. Very large models remain subject to browser and device capacity.
 - Reveal `final.ply` in the platform file manager or move the complete project to the system trash.
 - Resize the left and right panels by dragging the divider, and scale the full interface from 80% to 140%.
 - Support Chinese characters, spaces, long file names, and UNC project paths.
@@ -160,7 +161,7 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 6. Review the automatically detected COLMAP acceleration status and its explanation, then select “Start Generation.”
 7. Follow live stages, metrics, and logs on the left. When processing finishes, select “Preview” under “02 Task History.”
 8. Edit the model in the “Adjust” mode under “03 Preview.” Changes are saved automatically; “Save” creates or updates `edit.ply`.
-9. Switch to “Animation” for the portrait composition and staged playback. “Export Video” writes a 23-second portrait MP4 into the project directory.
+9. Switch to “Animation,” choose Portrait or Landscape in the center of the command bar, and use “Export → Export video” for a 23-second MP4. Both Adjust and Animation offer “Export → Export offline HTML” to share the current edits. Exports can be cancelled, and the output folder can be opened on completion.
 10. To add detail, choose “High-res reshoot” on a completed project under “02 Task History.” Use the same device, lens, orientation, resolution, and zoom as the source project, and keep enough overlap with the original capture.
 
 Usage notes:
@@ -195,6 +196,8 @@ Each generation creates a separate directory under the projects root:
   edit.ply              Current edited result; safely replaced on later saves (optional)
   preview.mp4           First optional animation-preview video export
   preview-2.mp4         Later video exports are automatically numbered
+  preview-landscape.mp4 Landscape video (later exports are automatically numbered)
+  preview.html          Offline viewer (later exports use preview-2.html, etc.)
   state.json            Pipeline state
   source\
     input.<ext>         Source-video copy (video projects)
@@ -408,6 +411,8 @@ Each project keeps a source-video copy, extracted frames, COLMAP data, and Brush
 Yes. Select “Preview” on a completed project in “02 Task History” to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, undo, and redo. Edit state is stored in the project; “Save” creates or updates the single `edit.ply`, while the original `final.ply` remains unchanged. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, and watermarked portrait MP4 export. `.sog` and `.spz` are not supported yet.
 
 ## Technology
+
+The preview Export menu supports portrait/landscape video and single-file offline HTML. HTML initially displays the complete edited result, with manual animation playback that pauses on mouse interaction. It prefers WebGPU and falls back to WebGL2, and contains no project paths, source media, logs, or telemetry. Development and build commands generate the offline runtime first; before running Rust alone, run `npm run build:html-viewer` if needed.
 
 - Desktop framework: Tauri 2
 - Backend: Rust and Tokio

@@ -102,11 +102,18 @@ export async function commitGaussianEditSave(editId: string, mask: Uint8Array): 
 }
 export async function resetGaussianEdits(projectId: string): Promise<GaussianEditState> { return invoke("reset_gaussian_edits", { projectId }); }
 export async function onGaussianExportProgress(handler: (event: GaussianExportProgress) => void): Promise<UnlistenFn> { return listen<GaussianExportProgress>("gaussian-export-progress", ({ payload }) => handler(payload)); }
-export async function beginGaussianVideoExport(projectId: string): Promise<GaussianVideoExportSession> { return invoke("begin_gaussian_video_export", { projectId }); }
+export async function beginGaussianVideoExport(projectId: string, orientation: import("../types/pipeline").VideoOrientation = "portrait", editRevision?:number): Promise<GaussianVideoExportSession> { return invoke("begin_gaussian_video_export", { projectId, orientation, ...(editRevision === undefined ? {} : {editRevision}) }); }
 export async function commitGaussianVideoExport(exportId: string, bytes: Uint8Array): Promise<GaussianVideoExportResult> {
   return invoke("commit_gaussian_video_export", bytes, { headers: { "x-ooosplat-export-id": exportId } });
 }
 export async function cancelGaussianVideoExport(exportId: string): Promise<void> { return invoke("cancel_gaussian_video_export", { exportId }); }
+
+export async function beginGaussianHtmlExport(projectId: string, editRevision: number, view: import("../types/pipeline").GaussianHtmlView, locale: string): Promise<GaussianVideoExportSession> {
+  return invoke("begin_gaussian_html_export", { projectId, editRevision, view, locale });
+}
+export async function commitGaussianHtmlExport(exportId: string): Promise<import("../types/pipeline").GaussianHtmlExportResult> { return invoke("commit_gaussian_html_export", { exportId }); }
+export async function cancelGaussianHtmlExport(exportId: string): Promise<void> { return invoke("cancel_gaussian_html_export", { exportId }); }
+export async function onGaussianHtmlExportProgress(handler: (event: import("../types/pipeline").GaussianHtmlExportProgress) => void): Promise<UnlistenFn> { return listen<import("../types/pipeline").GaussianHtmlExportProgress>("gaussian-html-export-progress", ({ payload }) => handler(payload)); }
 
 export async function revealProject(project: ProjectSummary): Promise<void> {
   await invoke("open_project_location", { projectId: project.id, location: "project" });

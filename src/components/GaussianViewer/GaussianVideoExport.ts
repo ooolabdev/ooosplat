@@ -9,12 +9,27 @@ import {
   VIDEO_DURATION_SECONDS,
 } from "./PreviewAnimation";
 import { getCurrentLocale, translate } from "../../i18n";
+import type { VideoOrientation } from "../../types/pipeline";
 
 export const GAUSSIAN_VIDEO_WIDTH = 1080;
 export const GAUSSIAN_VIDEO_HEIGHT = 1920;
 export const GAUSSIAN_VIDEO_FPS = 30;
 export const GAUSSIAN_VIDEO_BITRATE = 12_000_000;
 export const GAUSSIAN_VIDEO_FRAME_COUNT = VIDEO_DURATION_SECONDS * GAUSSIAN_VIDEO_FPS;
+
+export function gaussianVideoDimensions(orientation: VideoOrientation = "portrait") {
+  return orientation === "landscape"
+    ? { width: GAUSSIAN_VIDEO_HEIGHT, height: GAUSSIAN_VIDEO_WIDTH }
+    : { width: GAUSSIAN_VIDEO_WIDTH, height: GAUSSIAN_VIDEO_HEIGHT };
+}
+
+export function captureGuideSize(width: number, height: number, orientation: VideoOrientation) {
+  const output = gaussianVideoDimensions(orientation);
+  const availableWidth = Math.max(0, width - 28);
+  const availableHeight = Math.max(0, height - 28);
+  const scale = Math.min(availableWidth / output.width, availableHeight / output.height);
+  return { width: output.width * scale, height: output.height * scale };
+}
 
 export type GaussianVideoEncodingPhase = "rendering" | "finalizing";
 
@@ -30,7 +45,7 @@ export interface GaussianVideoCapability {
   reason: string | null;
 }
 
-export async function checkGaussianVideoCapability(): Promise<GaussianVideoCapability> {
+export async function checkGaussianVideoCapability(orientation: VideoOrientation = "portrait"): Promise<GaussianVideoCapability> {
   const locale = getCurrentLocale();
   if (!window.isSecureContext) {
     return { supported: false, reason: translate(locale, "video.insecure") };
@@ -41,8 +56,7 @@ export async function checkGaussianVideoCapability(): Promise<GaussianVideoCapab
   try {
     const supported = await canEncodeVideo("avc", {
       bitrate: GAUSSIAN_VIDEO_BITRATE,
-      width: GAUSSIAN_VIDEO_WIDTH,
-      height: GAUSSIAN_VIDEO_HEIGHT,
+      ...gaussianVideoDimensions(orientation),
     });
     return supported
       ? { supported: true, reason: null }
@@ -58,32 +72,34 @@ export async function checkGaussianVideoCapability(): Promise<GaussianVideoCapab
 export function drawOoosplatWatermark(
   context: CanvasRenderingContext2D,
   logo: CanvasImageSource,
+  canvasWidth = GAUSSIAN_VIDEO_WIDTH,
+  canvasHeight = GAUSSIAN_VIDEO_HEIGHT,
 ) {
   const margin = 48;
-  const logoSize = 70;
-  const gap = 18;
+  const logoSize = 35;
+  const gap = 9;
   const label = "OOOSplat";
   context.save();
-  context.font = '700 40px Arial, "Segoe UI", sans-serif';
+  context.font = '700 20px Arial, "Segoe UI", sans-serif';
   context.textBaseline = "middle";
   const textWidth = context.measureText(label).width;
-  const width = logoSize + gap + textWidth + 34;
-  const height = 94;
-  const x = GAUSSIAN_VIDEO_WIDTH - margin - width;
-  const y = GAUSSIAN_VIDEO_HEIGHT - margin - height;
+  const width = logoSize + gap + textWidth + 17;
+  const height = 47;
+  const x = canvasWidth - margin - width;
+  const y = canvasHeight - margin - height;
 
   context.globalAlpha = 0.82;
   context.fillStyle = "rgba(8, 14, 25, 0.62)";
   context.beginPath();
-  context.roundRect(x, y, width, height, 16);
+  context.roundRect(x, y, width, height, 8);
   context.fill();
 
   context.globalAlpha = 0.94;
-  context.drawImage(logo, x + 12, y + 12, logoSize, logoSize);
+  context.drawImage(logo, x + 6, y + 6, logoSize, logoSize);
   context.shadowColor = "rgba(0, 0, 0, 0.55)";
-  context.shadowBlur = 8;
+  context.shadowBlur = 4;
   context.fillStyle = "#ffffff";
-  context.fillText(label, x + 12 + logoSize + gap, y + height / 2 + 1);
+  context.fillText(label, x + 6 + logoSize + gap, y + height / 2 + 0.5);
   context.restore();
 }
 
@@ -93,15 +109,18 @@ export async function encodeGaussianVideo({
   renderFrameAt,
   signal,
   onProgress,
+  orientation = "portrait",
 }: {
   canvas: HTMLCanvasElement;
   logo: CanvasImageSource;
   renderFrameAt: (timeSeconds: number, context: CanvasRenderingContext2D) => Promise<void>;
   signal: AbortSignal;
   onProgress?: (progress: GaussianVideoEncodingProgress) => void;
+  orientation?: VideoOrientation;
 }) {
-  if (canvas.width !== GAUSSIAN_VIDEO_WIDTH || canvas.height !== GAUSSIAN_VIDEO_HEIGHT) {
-    throw new Error(translate(getCurrentLocale(), "video.invalidCanvas"));
+  const dimensions = gaussianVideoDimensions(orientation);
+  if (canvas.width !== dimensions.width || canvas.height !== dimensions.height) {
+    throw new Error(translate(getCurrentLocale(), "export.canvasSize", dimensions));
   }
   const context = canvas.getContext("2d", { alpha: false });
   if (!context) throw new Error(translate(getCurrentLocale(), "video.noCanvas"));
@@ -132,7 +151,7 @@ export async function encodeGaussianVideo({
       signal.throwIfAborted();
       const time = frame * frameDuration;
       await renderFrameAt(time, context);
-      drawOoosplatWatermark(context, logo);
+      drawOoosplatWatermark(context, logo, canvas.width, canvas.height);
       signal.throwIfAborted();
       await source.add(time, frameDuration);
       onProgress?.({

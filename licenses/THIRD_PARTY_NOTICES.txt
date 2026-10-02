@@ -4,6 +4,9 @@ OOOSplat — Third-party notices
 This notice indexes the native engines and preview libraries directly
 distributed with or downloaded by OOOSplat. Each component remains subject
 to its own license.
+Single-file offline HTML exports embed the same PlayCanvas Engine runtime and
+OOOSplat viewer code. Each exported HTML includes the PlayCanvas MIT license
+and the OOOSplat Apache-2.0 license. Exported model ownership is unchanged.
 For the macOS runtime, BUNDLED-COMPONENTS.json is generated from the dylibs
 actually copied into the release and records their Homebrew formula, declared
 license, homepage, and packaged files. Release verification rejects an

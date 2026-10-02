@@ -19,6 +19,15 @@ const configs = [
   "tauri.macos.conf.json",
 ];
 
+const common = JSON.parse(fs.readFileSync(path.join(configDirectory, "tauri.conf.json"), "utf8"));
+const viewerSource = "../.cache/html-viewer/runtime.js";
+if (common.bundle?.resources?.[viewerSource] !== "html-viewer/runtime.js") {
+  throw new Error("The shared offline HTML viewer resource must be bundled on every platform.");
+}
+if (!fs.existsSync(normalized(viewerSource))) {
+  throw new Error("Offline HTML viewer not built. Run npm run build:html-viewer first.");
+}
+
 function normalized(value) {
   return path.resolve(configDirectory, value.replace(/[\\/]$/, ""));
 }
@@ -33,6 +42,7 @@ for (const configName of configs) {
   const configPath = path.join(configDirectory, configName);
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const resources = config.bundle?.resources;
+  if (Array.isArray(resources)) throw new Error(`${configName} must merge the common resource map.`);
   const sources = Array.isArray(resources) ? resources : Object.keys(resources ?? {});
 
   for (const source of sources) {

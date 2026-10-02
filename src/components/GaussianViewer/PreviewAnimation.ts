@@ -26,6 +26,17 @@ export interface EffectBounds {
   halfExtents: [number, number, number];
 }
 
+// Covers the full model even when the effect uses robust (outlier-resistant) bounds.
+export function effectRadialLimitForBounds(full: EffectBounds, effect: EffectBounds) {
+  let limit=1;
+  for (const x of [-1,1]) for (const y of [-1,1]) for (const z of [-1,1]) {
+    const signs=[x,y,z];
+    const normalized=signs.map((sign,index)=>(full.center[index]+sign*full.halfExtents[index]-effect.center[index])/Math.max(effect.halfExtents[index],0.0001));
+    limit=Math.max(limit,Math.hypot(...normalized)/Math.sqrt(3));
+  }
+  return limit;
+}
+
 export function robustEffectBounds(
   centers: ArrayLike<number> | null | undefined,
   fallback: EffectBounds,

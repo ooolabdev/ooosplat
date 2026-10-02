@@ -45,6 +45,9 @@ pub fn run_app() {
             commands::begin_gaussian_video_export,
             commands::commit_gaussian_video_export,
             commands::cancel_gaussian_video_export,
+            commands::html_export::begin_gaussian_html_export,
+            commands::html_export::commit_gaussian_html_export,
+            commands::html_export::cancel_gaussian_html_export,
             commands::initialize_telemetry,
             commands::set_telemetry_consent,
         ])

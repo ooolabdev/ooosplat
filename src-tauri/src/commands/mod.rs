@@ -10,6 +10,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+pub mod html_export;
+
 use crate::{
     engines::{
         ffprobe::probe_video, health::check_colmap_acceleration as detect_colmap_acceleration,
@@ -200,6 +202,7 @@ pub struct PreviewController {
     metadata_write: Mutex<()>,
     export: Mutex<()>,
     video_export: Mutex<Option<GaussianVideoExportSession>>,
+    html_export: Mutex<Option<html_export::HtmlExportSession>>,
     edit_save: Mutex<Option<GaussianEditSaveSession>>,
 }
 
@@ -239,6 +242,28 @@ struct GaussianVideoExportSession {
     project_id: Uuid,
     destination: PathBuf,
     temporary: PathBuf,
+    orientation: VideoOrientation,
+    edit_revision: u64,
+    transform: GaussianTransform,
+    cancel: tokio_util::sync::CancellationToken,
+    running: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoOrientation {
+    #[default]
+    Portrait,
+    Landscape,
+}
+
+impl VideoOrientation {
+    fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::Portrait => (1080, 1920),
+            Self::Landscape => (1920, 1080),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -853,6 +878,21 @@ pub async fn delete_project(
     let id =
         Uuid::parse_str(&project_id).map_err(|_| SplatError::Process("项目 ID 无效".into()))?;
     let _lifecycle = preview.lifecycle.lock().await;
+    if preview
+        .html_export
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|session| session.project_id == id)
+        || preview
+            .video_export
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.project_id == id)
+    {
+        return Err(SplatError::Process("请先完成或取消导出再删除项目".into()));
+    }
     let session = {
         let mut active = preview.active.lock().await;
         if active
@@ -867,6 +907,7 @@ pub async fn delete_project(
     if let Some(session) = session {
         discard_preview_asset(&app, session).await;
     }
+
     let mut edit_save = preview.edit_save.lock().await;
     if edit_save
         .as_ref()
@@ -936,6 +977,11 @@ pub async fn prepare_gaussian_preview(
     project_id: String,
 ) -> Result<GaussianPreviewDescriptor> {
     let _lifecycle = state.lifecycle.lock().await;
+    if state.html_export.lock().await.is_some() || state.video_export.lock().await.is_some() {
+        return Err(SplatError::Process(
+            "导出期间不能重新加载或切换预览项目".into(),
+        ));
+    }
     let id = parse_project_id(&project_id)?;
     let (project_root, path, metadata) = catalog::registered_final_ply_for_project(id).await?;
     let info = inspect_gaussian_ply(&path)?;
@@ -999,6 +1045,17 @@ pub async fn release_gaussian_preview(
 ) -> Result<()> {
     let _lifecycle = state.lifecycle.lock().await;
     let id = parse_project_id(&project_id)?;
+    let mut html_export = state.html_export.lock().await;
+    if let Some(session) = html_export
+        .as_ref()
+        .filter(|session| session.project_id == id)
+    {
+        session.cancel.cancel();
+        if !session.running {
+            *html_export = None;
+        }
+    }
+    drop(html_export);
     let session = {
         let mut active = state.active.lock().await;
         if active
@@ -1024,12 +1081,13 @@ pub async fn release_gaussian_preview(
     drop(edit_save);
 
     let mut video_export = state.video_export.lock().await;
-    if video_export
+    if let Some(session) = video_export
         .as_ref()
-        .is_some_and(|session| session.project_id == id)
+        .filter(|session| session.project_id == id)
     {
-        if let Some(session) = video_export.take() {
-            let _ = tokio::fs::remove_file(session.temporary).await;
+        session.cancel.cancel();
+        if !session.running {
+            *video_export = None;
         }
     }
     Ok(())
@@ -1257,18 +1315,25 @@ pub async fn export_transformed_gaussian(
     })
 }
 
-const GAUSSIAN_VIDEO_WIDTH: u32 = 1080;
-const GAUSSIAN_VIDEO_HEIGHT: u32 = 1920;
 const GAUSSIAN_VIDEO_FPS: u32 = 30;
 const GAUSSIAN_VIDEO_DURATION_MS: u64 = 23_000;
 const MAX_GAUSSIAN_VIDEO_BYTES: usize = 1024 * 1024 * 1024;
 
+#[cfg(test)]
 fn next_gaussian_video_path(root: &Path) -> PathBuf {
+    next_gaussian_video_path_for_orientation(root, VideoOrientation::Portrait)
+}
+
+fn next_gaussian_video_path_for_orientation(root: &Path, orientation: VideoOrientation) -> PathBuf {
+    let stem = match orientation {
+        VideoOrientation::Portrait => "preview",
+        VideoOrientation::Landscape => "preview-landscape",
+    };
     for number in 1_u32.. {
         let name = if number == 1 {
-            "preview.mp4".to_owned()
+            format!("{stem}.mp4")
         } else {
-            format!("preview-{number}.mp4")
+            format!("{stem}-{number}.mp4")
         };
         let candidate = root.join(name);
         if !candidate.exists() {
@@ -1288,9 +1353,17 @@ fn contains_mp4_ftyp(bytes: &[u8]) -> bool {
 pub async fn begin_gaussian_video_export(
     state: State<'_, PreviewController>,
     project_id: String,
+    orientation: Option<VideoOrientation>,
+    edit_revision: Option<u64>,
 ) -> Result<GaussianVideoExportReservation> {
+    let _lifecycle = state.lifecycle.lock().await;
     let project_id = parse_project_id(&project_id)?;
-    let (root, _, _) = catalog::registered_final_ply_for_project(project_id).await?;
+    let (root, _, metadata) = catalog::registered_final_ply_for_project(project_id).await?;
+    if edit_revision.is_some_and(|revision| revision != metadata.editing.revision) {
+        return Err(SplatError::Process(
+            "编辑状态尚未保存完成，请重试导出".into(),
+        ));
+    }
 
     let active = state.active.lock().await;
     if active
@@ -1303,6 +1376,12 @@ pub async fn begin_gaussian_video_export(
     }
     drop(active);
 
+    if state.html_export.lock().await.is_some() {
+        return Err(SplatError::Process(
+            "已有 HTML 正在导出，请等待或取消。".into(),
+        ));
+    }
+
     let mut video_export = state.video_export.lock().await;
     if video_export.is_some() {
         return Err(SplatError::Process(
@@ -1311,13 +1390,19 @@ pub async fn begin_gaussian_video_export(
     }
 
     let export_id = Uuid::new_v4();
-    let destination = next_gaussian_video_path(&root);
+    let orientation = orientation.unwrap_or_default();
+    let destination = next_gaussian_video_path_for_orientation(&root, orientation);
     let temporary = root.join(format!(".ooosplat-preview-{export_id}.mp4.tmp"));
     *video_export = Some(GaussianVideoExportSession {
         export_id,
         project_id,
         destination: destination.clone(),
         temporary,
+        orientation,
+        edit_revision: metadata.editing.revision,
+        transform: metadata.transform,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        running: false,
     });
 
     Ok(GaussianVideoExportReservation {
@@ -1330,6 +1415,9 @@ async fn write_gaussian_video(
     session: &GaussianVideoExportSession,
     bytes: &[u8],
 ) -> Result<GaussianVideoExportResult> {
+    if session.cancel.is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
     if bytes.is_empty() {
         return Err(SplatError::Process("视频编码器返回了空文件。".into()));
     }
@@ -1354,11 +1442,26 @@ async fn write_gaussian_video(
             .create_new(true)
             .open(&session.temporary)
             .await?;
-        file.write_all(bytes).await?;
+        for chunk in bytes.chunks(1024 * 1024) {
+            if session.cancel.is_cancelled() {
+                return Err(SplatError::Cancelled);
+            }
+            file.write_all(chunk).await?;
+        }
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&session.temporary, &session.destination).await?;
+        if session.cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let temporary = session.temporary.clone();
+        let destination = session.destination.clone();
+        tokio::task::spawn_blocking(move || {
+            html_export::publish_html_file(&temporary, &destination)
+        })
+        .await
+        .map_err(|error| SplatError::Process(format!("视频发布失败：{error}")))??;
+        let _ = tokio::fs::remove_file(&session.temporary).await;
         Result::<()>::Ok(())
     }
     .await;
@@ -1371,8 +1474,8 @@ async fn write_gaussian_video(
     Ok(GaussianVideoExportResult {
         path: preview_client_path(&session.destination),
         file_size: bytes.len() as u64,
-        width: GAUSSIAN_VIDEO_WIDTH,
-        height: GAUSSIAN_VIDEO_HEIGHT,
+        width: session.orientation.dimensions().0,
+        height: session.orientation.dimensions().1,
         fps: GAUSSIAN_VIDEO_FPS,
         duration_ms: GAUSSIAN_VIDEO_DURATION_MS,
     })
@@ -1400,12 +1503,33 @@ pub async fn commit_gaussian_video_export(
 
     let mut video_export = state.video_export.lock().await;
     let session = video_export
-        .as_ref()
-        .filter(|session| session.export_id == export_id)
-        .cloned()
+        .as_mut()
+        .filter(|session| session.export_id == export_id && !session.running)
         .ok_or_else(|| SplatError::Process("视频导出会话不存在或已经结束。".into()))?;
-    let result = write_gaussian_video(&session, bytes).await;
-    *video_export = None;
+    session.running = true;
+    let session = session.clone();
+    drop(video_export);
+    let _metadata_guard = state.metadata_write.lock().await;
+    let result = async {
+        let (_, _, metadata) =
+            catalog::registered_final_ply_for_project(session.project_id).await?;
+        if metadata.editing.revision != session.edit_revision
+            || metadata.transform != session.transform
+        {
+            return Err(SplatError::Process(
+                "导出期间编辑状态发生变化，请重试".into(),
+            ));
+        }
+        write_gaussian_video(&session, bytes).await
+    }
+    .await;
+    let mut video_export = state.video_export.lock().await;
+    if video_export
+        .as_ref()
+        .is_some_and(|session| session.export_id == export_id)
+    {
+        *video_export = None;
+    }
     result
 }
 
@@ -1417,12 +1541,13 @@ pub async fn cancel_gaussian_video_export(
     let export_id = Uuid::parse_str(&export_id)
         .map_err(|_| SplatError::Process("视频导出令牌无效。".into()))?;
     let mut video_export = state.video_export.lock().await;
-    if video_export
+    if let Some(session) = video_export
         .as_ref()
-        .is_some_and(|session| session.export_id == export_id)
+        .filter(|session| session.export_id == export_id)
     {
-        if let Some(session) = video_export.take() {
-            let _ = tokio::fs::remove_file(session.temporary).await;
+        session.cancel.cancel();
+        if !session.running {
+            *video_export = None;
         }
     }
     Ok(())
@@ -1446,7 +1571,7 @@ mod tests {
     use super::{
         classify_pipeline_failure, contains_mp4_ftyp, create_preview_asset,
         next_gaussian_video_path, preview_client_path, write_gaussian_video,
-        GaussianVideoExportSession, PipelineCommandError,
+        GaussianVideoExportSession, PipelineCommandError, VideoOrientation,
     };
     use crate::error::SplatError;
     use crate::pipeline::{PipelineEngine, PipelineStage};
@@ -1585,6 +1710,11 @@ mod tests {
             project_id: Uuid::new_v4(),
             destination: destination.clone(),
             temporary: temporary.clone(),
+            orientation: VideoOrientation::Portrait,
+            edit_revision: 0,
+            transform: crate::project::GaussianTransform::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            running: false,
         };
         let bytes = b"\0\0\0\x18ftypisom\0\0\0\0payload";
 
@@ -1603,6 +1733,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn landscape_video_uses_its_own_numbering_and_real_dimensions() {
+        let root = tempdir().unwrap();
+        let first = super::next_gaussian_video_path_for_orientation(
+            root.path(),
+            VideoOrientation::Landscape,
+        );
+        assert_eq!(first.file_name().unwrap(), "preview-landscape.mp4");
+        let session = GaussianVideoExportSession {
+            export_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            destination: first.clone(),
+            temporary: root.path().join(".landscape.tmp"),
+            orientation: VideoOrientation::Landscape,
+            edit_revision: 0,
+            transform: crate::project::GaussianTransform::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            running: false,
+        };
+        let result = write_gaussian_video(&session, b"\0\0\0\x18ftypisom\0\0\0\0payload")
+            .await
+            .unwrap();
+        assert_eq!(
+            (result.width, result.height, result.fps, result.duration_ms),
+            (1920, 1080, 30, 23000)
+        );
+        assert_eq!(
+            super::next_gaussian_video_path_for_orientation(
+                root.path(),
+                VideoOrientation::Landscape
+            )
+            .file_name()
+            .unwrap(),
+            "preview-landscape-2.mp4"
+        );
+        assert_eq!(
+            next_gaussian_video_path(root.path()).file_name().unwrap(),
+            "preview.mp4"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_mp4_is_rejected_without_leaving_a_temporary_file() {
         let root = tempdir().expect("temporary project");
         let session = GaussianVideoExportSession {
@@ -1610,11 +1781,23 @@ mod tests {
             project_id: Uuid::new_v4(),
             destination: root.path().join("preview.mp4"),
             temporary: root.path().join(".preview.tmp"),
+            orientation: VideoOrientation::Portrait,
+            edit_revision: 0,
+            transform: crate::project::GaussianTransform::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            running: false,
         };
 
         write_gaussian_video(&session, b"not-an-mp4")
             .await
             .expect_err("invalid MP4 must be rejected");
+        assert!(!session.destination.exists());
+        assert!(!session.temporary.exists());
+        session.cancel.cancel();
+        assert!(matches!(
+            write_gaussian_video(&session, b"\0\0\0\x18ftypisom\0\0\0\0payload").await,
+            Err(SplatError::Cancelled)
+        ));
         assert!(!session.destination.exists());
         assert!(!session.temporary.exists());
     }

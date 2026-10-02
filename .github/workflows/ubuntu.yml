@@ -50,6 +50,7 @@ jobs:
           npm run verify:telemetry:release
           npm test
           npm run build
+          npm run verify:bundle-resources
 
       - name: Verify license metadata and mappings
         run: npm run verify:licenses

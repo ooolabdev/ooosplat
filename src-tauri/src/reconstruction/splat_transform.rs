@@ -445,8 +445,23 @@ pub fn export_transformed_ply_with_edits(
     project_root: &Path,
     transform: GaussianTransform,
     edits: GaussianExportEdits<'_>,
-    mut progress: impl FnMut(u64, u64),
+    progress: impl FnMut(u64, u64),
 ) -> Result<(PathBuf, PlyInfo)> {
+    let output = project_root.join("edit.ply");
+    let info = export_transformed_ply_to(source, &output, transform, edits, progress, || Ok(()))?;
+    Ok((output, info))
+}
+
+/// Export to a caller-owned destination without publishing or changing edit.ply.
+pub fn export_transformed_ply_to(
+    source: &Path,
+    output: &Path,
+    transform: GaussianTransform,
+    edits: GaussianExportEdits<'_>,
+    mut progress: impl FnMut(u64, u64),
+    check_cancelled: impl Fn() -> Result<()>,
+) -> Result<PlyInfo> {
+    check_cancelled()?;
     let transform = transform.validate()?;
     let (transform, rotation) = engine_transform_to_ply(transform);
     let source = std::fs::canonicalize(source)?;
@@ -466,6 +481,10 @@ pub fn export_transformed_ply_with_edits(
     let mut retained = 0_u64;
     let mut row = vec![0_u8; layout.stride];
     for index in 0..layout.count {
+        if index % ROWS_PER_CHUNK as u64 == 0 {
+            check_cancelled()?;
+            progress(index, layout.count.saturating_mul(2));
+        }
         reader.read_exact(&mut row)?;
         if keep_row(&row, index, &layout, transform, rotation, edits) {
             retained += 1;
@@ -479,8 +498,7 @@ pub fn export_transformed_ply_with_edits(
     reader = BufReader::new(File::open(&source)?);
     let layout = parse_layout(&mut reader)?;
 
-    let output = project_root.join("edit.ply");
-    let temporary = project_root.join(format!(".edit-{}.ply.tmp", Uuid::new_v4()));
+    let temporary = output.with_file_name(format!(".edit-{}.ply.tmp", Uuid::new_v4()));
 
     let result = (|| -> Result<()> {
         let file = OpenOptions::new()
@@ -493,6 +511,7 @@ pub fn export_transformed_ply_with_edits(
         let mut chunk = vec![0_u8; layout.stride * ROWS_PER_CHUNK];
         let mut output_chunk = Vec::with_capacity(layout.stride * ROWS_PER_CHUNK);
         while rows_done < layout.count {
+            check_cancelled()?;
             let rows = ((layout.count - rows_done) as usize).min(ROWS_PER_CHUNK);
             let bytes = rows * layout.stride;
             reader.read_exact(&mut chunk[..bytes])?;
@@ -507,9 +526,16 @@ pub fn export_transformed_ply_with_edits(
             }
             writer.write_all(&output_chunk)?;
             rows_done += rows as u64;
-            progress(rows_done, layout.count);
+            progress(layout.count + rows_done, layout.count.saturating_mul(2));
         }
-        std::io::copy(&mut reader, &mut writer)?;
+        loop {
+            check_cancelled()?;
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&chunk[..read])?;
+        }
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
@@ -531,11 +557,11 @@ pub fn export_transformed_ply_with_edits(
         let _ = std::fs::remove_file(&temporary);
         return Err(SplatError::Process("导出 PLY 的 Splat 数量校验失败".into()));
     }
-    if let Err(error) = publish_export(&temporary, &output) {
+    if let Err(error) = check_cancelled().and_then(|()| publish_export(&temporary, output)) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
-    Ok((output, info))
+    Ok(info)
 }
 
 // PlayCanvas uses real SH coefficients grouped by channel and by bands of 3, 5 and 7.
@@ -907,5 +933,70 @@ mod tests {
         let mut row = vec![0_u8; layout.stride];
         reader.read_exact(&mut row).unwrap();
         assert!((read_float(&row, layout.offsets["x"]) - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dedicated_html_model_preserves_existing_edit_and_source_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("final.ply");
+        write_fixture_rows(
+            &source,
+            &[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        );
+        let original = std::fs::read(&source).unwrap();
+        let edit = directory.path().join("edit.ply");
+        std::fs::write(&edit, b"existing edit").unwrap();
+        let output = directory.path().join("html-model.ply");
+        let info = export_transformed_ply_to(
+            &source,
+            &output,
+            GaussianTransform {
+                position: [10.0, 0.0, 0.0],
+                ..GaussianTransform::default()
+            },
+            GaussianExportEdits {
+                crop: Some(GaussianCrop::Box {
+                    center: [8.0, 0.0, 0.0],
+                    size: [10.0, 2.0, 2.0],
+                }),
+                deleted_mask: Some(&[1]),
+            },
+            |_, _| {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(info.splat_count, 2);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&edit).unwrap(), b"existing edit");
+        let mut reader = BufReader::new(File::open(output).unwrap());
+        let layout = parse_layout(&mut reader).unwrap();
+        let mut row = vec![0; layout.stride];
+        reader.read_exact(&mut row).unwrap();
+        assert!((read_float(&row, layout.offsets["x"]) + 8.0).abs() < 1e-5);
+    }
+    #[test]
+    fn cancelled_dedicated_export_cleans_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("final.ply");
+        write_fixture(&source);
+        let output = directory.path().join("html-model.ply");
+        let progress = std::cell::Cell::new(0);
+        let result = export_transformed_ply_to(
+            &source,
+            &output,
+            GaussianTransform::default(),
+            GaussianExportEdits::default(),
+            |done, _| progress.set(done),
+            || {
+                if progress.get() > 0 {
+                    Err(SplatError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

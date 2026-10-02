@@ -4,6 +4,19 @@ export type Locale = "zh-CN" | "en";
 export type TranslationParams = Record<string, string | number>;
 
 const zhCN = {
+  "export.label": "导出",
+  "export.video": "导出视频",
+  "export.html": "导出离线 HTML",
+  "export.orientation": "视频方向",
+  "export.portrait": "竖屏",
+  "export.landscape": "横屏",
+  "export.preparing": "准备编辑结果",
+  "export.packing": "打包模型",
+  "export.completed": "完成",
+  "export.canvasSize": "视频画布必须为 {width} × {height}。",
+  "export.textureCapacity": "显卡支持的最大纹理尺寸为 {maximum}，不足以导出所选尺寸的视频。",
+  "export.failed": "HTML 导出失败：{detail}",
+  "export.htmlWarning": "将完整画质的当前编辑结果打包为单个 HTML 文件，双击即可离线查看和播放动画。文件约为对应 PLY 的 4/3（未过滤源文件估算约 {size}，另加查看器）。大模型能否打开仍取决于浏览器和设备能力。原始模型和 edit.ply 不会被覆盖。",
   "planner.label": "自动优化（实验性）",
   "planner.hint": "开启后，将优化重建与训练参数并自动补救，通常可缩短生成时长，提升（尤其是图片素材）细节表现",
   "common.close": "关闭",
@@ -454,6 +467,19 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
+  "export.label": "Export",
+  "export.video": "Export video",
+  "export.html": "Export offline HTML",
+  "export.orientation": "Video orientation",
+  "export.portrait": "Portrait",
+  "export.landscape": "Landscape",
+  "export.preparing": "Preparing edited result",
+  "export.packing": "Packaging model",
+  "export.completed": "Completed",
+  "export.canvasSize": "The video canvas must be {width} × {height}.",
+  "export.textureCapacity": "This GPU's maximum texture size is {maximum}, which cannot accommodate the selected video dimensions.",
+  "export.failed": "HTML export failed: {detail}",
+  "export.htmlWarning": "Package the current edits at full quality into a single HTML file. Double-click to view offline and play the animation. File size is about 4/3 of the corresponding PLY (unfiltered source estimate: {size}, plus the viewer). Large models still depend on browser and device capacity. The original model and edit.ply will not be overwritten.",
   "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat optimizes reconstruction and training parameters and automatically applies recovery, usually reducing generation time and improving detail, especially for image inputs",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
   "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",

@@ -12,9 +12,15 @@ import {
   animationEffectsActive,
   orbitDegreesAt,
   robustEffectBounds,
+  effectRadialLimitForBounds,
 } from "./PreviewAnimation";
 
 describe("PreviewAnimation", () => {
+  it("uses identical full-model radial coverage in the app and offline viewer",()=>{
+    const effect={center:[0,0,0] as [number,number,number],halfExtents:[1,1,1] as [number,number,number]};
+    expect(effectRadialLimitForBounds(effect,effect)).toBe(1);
+    expect(effectRadialLimitForBounds({...effect,halfExtents:[10,10,10]},effect)).toBeCloseTo(10);
+  });
   it("uses the fixed 5 + 8 + 10 second export timeline", () => {
     expect(REVEAL_DURATION_SECONDS).toBe(5);
     expect(SHOCKWAVE_DURATION_SECONDS).toBe(8);

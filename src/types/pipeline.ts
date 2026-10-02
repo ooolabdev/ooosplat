@@ -198,6 +198,31 @@ export interface GaussianVideoExportSession {
   destinationPath: string;
 }
 
+export type VideoOrientation = "portrait" | "landscape";
+export interface GaussianHtmlView {
+  target: [number, number, number];
+  yaw: number;
+  pitch: number;
+  distance: number;
+  horizontalFrameOffset: number;
+  projection: number;
+  orthoHeight: number;
+  orthographicView: GaussianOrthographicView | null;
+  fov: number;
+  nearClip: number;
+  farClip: number;
+}
+export interface GaussianHtmlExportProgress {
+  exportId: string;
+  phase: "model" | "packing" | "completed";
+  progress: number;
+}
+export interface GaussianHtmlExportResult {
+  path: string;
+  fileSize: number;
+  splatCount: number;
+}
+
 export interface GaussianVideoExportResult {
   path: string;
   fileSize: number;
