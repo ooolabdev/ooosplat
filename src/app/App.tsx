@@ -2,11 +2,13 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import {
   ArrowDownToLine, Blend, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clapperboard, Cpu, Download, Eye,
   FileBox, Film, FolderOpen, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
-  Square, Trash2, X, Zap,
+  Send, Square, Trash2, X, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
+import { ErrorReportDialog } from "../components/ErrorReportDialog";
+import { CompactError } from "../components/CompactError";
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
@@ -45,9 +47,11 @@ const countFromProgressEvent = (event: PipelineEvent, stage: string): { current:
 };
 
 type FailureDialogState = {
-  kind: PipelineFailureKind;
+  kind: PipelineFailureKind | "generic";
   projectId: string | null;
   rawMessage: string;
+  failureId: string | null;
+  engine: string;
 };
 
 const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> => new Promise<T>((resolve, reject) => {
@@ -72,8 +76,7 @@ const inferFailureDialog = (error: unknown, fallbackStage?: string, fallbackProj
         ? "brush_dataset"
         : "brush_gpu";
   }
-  if (!kind) return null;
-  return { kind, projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage };
+  return { kind: kind ?? "generic", projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
 };
 
 function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }: {
@@ -84,11 +87,15 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
   onOpenLogs: () => void;
 }) {
   const { locale, t } = useI18n();
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportSent, setReportSent] = useState(false);
+  useEffect(() => { setReportOpen(false); setReportSent(false); }, [failure]);
   const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage";
   const dataset = failure.kind === "brush_dataset";
   const deviceLost = failure.kind === "brush_device_lost";
-  const title = mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
-  const description = failure.kind === "mapper_source"
+  const generic = failure.kind === "generic";
+  const title = generic ? t("failure.genericTitle") : mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
+  const description = generic ? t("failure.genericDescription") : failure.kind === "mapper_source"
     ? t("failure.mapperSource")
     : failure.kind === "mapper_storage"
       ? t("failure.mapperStorage")
@@ -97,7 +104,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
         : deviceLost
           ? t("failure.brushDeviceLost")
         : t("failure.brushGpu");
-  const tips: TranslationKey[] = failure.kind === "mapper_source"
+  const tips: TranslationKey[] = generic ? ["failure.genericTip1", "failure.storageTip1"] : failure.kind === "mapper_source"
     ? ["failure.mapperTip1", "failure.mapperTip2", "failure.mapperTip3"]
     : failure.kind === "mapper_storage"
       ? ["failure.storageTip1", "failure.storageTip2"]
@@ -109,17 +116,19 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && action === null) onClose();
+      if (event.key === "Escape" && action === null && !reportOpen) onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [action, onClose]);
+  }, [action, onClose, reportOpen]);
+
+  if (reportOpen && failure.failureId) return <ErrorReportDialog key={failure.failureId} failureId={failure.failureId} onBack={() => setReportOpen(false)} onSent={() => setReportSent(true)} />;
 
   return <div className="failure-guidance-backdrop" role="dialog" aria-modal="true" aria-labelledby="failure-guidance-title">
     <section className="failure-guidance-dialog">
       <div className="failure-guidance-heading">
         <span><CircleAlert size={22} /></span>
-        <div><small>{mapper ? "COLMAP" : "Brush"}</small><h2 id="failure-guidance-title">{title}</h2></div>
+        <div><small>{generic ? failure.engine : mapper ? "COLMAP" : "Brush"}</small><h2 id="failure-guidance-title">{title}</h2></div>
         <button type="button" aria-label={t("common.close")} disabled={action !== null} onClick={onClose}><X size={17} /></button>
       </div>
       <p>{description}</p>
@@ -128,6 +137,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
       {failure.rawMessage && <details><summary>{t("failure.details")}</summary><pre>{deviceLost ? localizePipelineMessage(locale, failure.rawMessage) : failure.rawMessage}</pre></details>}
       <div className="failure-guidance-actions">
         <button type="button" className="secondary" disabled={action !== null || !failure.projectId} onClick={onOpenLogs}>{action === "logs" ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{t("failure.openLogs")}</button>
+        <button type="button" className="secondary" disabled={action !== null || !failure.failureId || reportSent} title={!failure.failureId ? t("report.notAvailable") : undefined} onClick={() => setReportOpen(true)}><Send size={14} />{t(reportSent ? "report.sentShort" : "report.open")}</button>
         <button type="button" className="primary" disabled={action !== null || !failure.projectId} onClick={onRetry}>{action === "retry" ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}{t("failure.retry")}</button>
       </div>
     </section>
@@ -204,7 +214,7 @@ function ProjectRow({ project, busy, previewing, previewDisabled, deleting, reve
         <span className="status-copy">{t(statusKey[project.status])}</span>
       </div>
       <p className="project-path" title={project.projectPath}>{project.projectPath}</p>
-      {project.failureMessage && <p className="project-failure">{localizePipelineMessage(locale, project.failureMessage)}</p>}
+      {project.failureMessage && <p className="project-failure"><CompactError message={project.failureMessage} /></p>}
       {project.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
     </div>
     <dl className="project-stats">
@@ -1013,7 +1023,7 @@ export function App() {
           </div>
         </section>}
 
-        {store.error && <div className="inline-error"><CircleAlert size={16} /><span>{localizePipelineMessage(locale, store.error)}</span><button type="button" onClick={() => store.setError(null)}>{t("common.close")}</button></div>}
+        {store.error && <div className="inline-error" role="alert"><CircleAlert size={16} /><CompactError message={store.error} /><button type="button" onClick={() => store.setError(null)}>{t("common.close")}</button></div>}
       </section>
 
       <div

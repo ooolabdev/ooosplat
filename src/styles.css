@@ -259,7 +259,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 }
 .cancellation-status strong { display: block; margin-bottom: 7px; font-size: 15px; }
 .cancellation-status p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
-.inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
+.inline-error { margin-top: 16px; padding: 10px 0; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: start; color: var(--red); border-top: 1px solid #e4c1bd; border-bottom: 1px solid #e4c1bd; font-size: 12px; line-height: 1.5; }
 .inline-error button { color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
 .reshoot-inline-error { margin: 0; grid-template-columns: 18px 1fr; }
 
@@ -277,11 +277,20 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .failure-guidance-dialog details { margin: 16px 20px 0; border-top: 1px solid var(--line); }
 .failure-guidance-dialog summary { padding: 11px 0 7px; color: #69758a; cursor: pointer; font-size: 10px; }
 .failure-guidance-dialog pre { max-height: 130px; margin: 0; padding: 9px 10px; overflow: auto; color: #dce3ee; background: #202735; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.55 "Cascadia Mono", monospace; }
-.failure-guidance-actions { padding: 18px 20px 20px; display: flex; justify-content: flex-end; gap: 8px; }
+.failure-guidance-actions { padding: 18px 20px 20px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .failure-guidance-actions button { min-height: 36px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid; cursor: pointer; font-size: 11px; font-weight: 700; }
 .failure-guidance-actions .secondary { color: #556278; background: transparent; border-color: #bac4d1; }
 .failure-guidance-actions .primary { color: #fff; background: var(--blue); border-color: var(--blue-dark); }
 .failure-guidance-actions button:disabled { cursor: default; opacity: .5; }
+.error-report-dialog { width: min(680px, calc(100vw - 48px)); }
+.failure-guidance-heading > .report-shield { color: var(--blue); background: #edf2ff; border-color: #cad6f4; }
+.report-summary { margin: 18px 20px 0; padding: 12px; display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 8px 12px; border: 1px solid var(--line); font-size: 11px; line-height: 1.55; }
+.report-summary span { color: var(--muted); }
+.report-summary strong { overflow-wrap: anywhere; }
+.error-report-dialog > .report-preview { max-height: 260px; margin: 10px 20px 0; }
+.error-report-dialog > .report-retention { color: var(--muted); font-size: 11px; }
+.error-report-dialog > .report-problem { color: var(--red); }
+.error-report-dialog > .report-success { display: flex; align-items: flex-start; gap: 7px; color: var(--green); overflow-wrap: anywhere; }
 
 .refresh-action { padding: 7px 0; display: flex; align-items: center; gap: 6px; color: var(--muted); background: transparent; border: 0; cursor: pointer; font-size: 11px; }
 .archive-summary { margin-bottom: 24px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line-dark); border-bottom: 1px solid var(--line-dark); }
@@ -309,6 +318,10 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .status-copy { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 10px; }
 .project-path { margin: 8px 0 0 14px; overflow: hidden; color: var(--muted); font: 11px/1.45 "Cascadia Mono", "Microsoft YaHei UI", monospace; text-overflow: ellipsis; white-space: nowrap; }
 .project-failure { margin: 8px 0 0 14px; color: var(--red); font-size: 11px; line-height: 1.5; }
+.compact-error { display: block; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
+.compact-error:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.error-detail-tooltip { position: fixed; z-index: 200; padding: 12px 14px; overflow: auto; color: var(--ink); background: var(--paper); border: 1px solid var(--line-dark); box-shadow: 0 6px 20px rgba(19, 26, 39, .16); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; font: 11px/1.65 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
+.error-detail-tooltip:focus-visible { outline: 2px solid var(--blue); }
 .project-quality-warning { margin: 8px 0 0 14px; display: flex; align-items: center; gap: 6px; color: var(--amber); font-size: 10px; line-height: 1.45; }
 .completion-result { margin-top: 18px; border: 1px solid var(--line-dark); background: #f2f5f9; }
 .completion-result-heading { min-height: 40px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }

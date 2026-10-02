@@ -12,9 +12,13 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(), open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
-import { beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
 
 describe("backend browser guards", () => {
+  it("submits only opaque diagnostic tokens, never frontend paths or report payloads", async () => {
+    await prepareErrorReport("failure-token"); expect(mocks.invoke).toHaveBeenLastCalledWith("prepare_error_report", {failureId:"failure-token"});
+    await sendErrorReport("draft-token"); expect(mocks.invoke).toHaveBeenLastCalledWith("send_error_report", {draftId:"draft-token"});
+  });
   it("sends validated export intentions instead of arbitrary paths or video dimensions",async()=>{
     await beginGaussianVideoExport("id");expect(mocks.invoke).toHaveBeenLastCalledWith("begin_gaussian_video_export",{projectId:"id",orientation:"portrait"});
     await beginGaussianVideoExport("id","landscape");expect(mocks.invoke).toHaveBeenLastCalledWith("begin_gaussian_video_export",{projectId:"id",orientation:"landscape"});

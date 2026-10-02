@@ -365,7 +365,14 @@ pub(super) fn publish_html_file(source: &Path, destination: &Path) -> Result<()>
 }
 #[cfg(not(windows))]
 pub(super) fn publish_html_file(source: &Path, destination: &Path) -> Result<()> {
+    publish_html_file_by_link(source, destination)
+}
+#[cfg(any(not(windows), test))]
+fn publish_html_file_by_link(source: &Path, destination: &Path) -> Result<()> {
     std::fs::hard_link(source, destination)?;
+    // Consume the temporary path just like MoveFileExW: otherwise reusing it
+    // would modify the published file through the shared hard-link inode.
+    std::fs::remove_file(source)?;
     Ok(())
 }
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -518,14 +525,29 @@ mod tests {
     }
     #[test]
     fn publication_is_atomic_and_never_overwrites() {
+        check_publication(publish_html_file);
+    }
+
+    #[test]
+    fn hard_link_publication_consumes_the_source_without_overwriting() {
+        // Exercise the Unix path on Windows too, so CI-only differences cannot regress.
+        check_publication(publish_html_file_by_link);
+    }
+
+    fn check_publication(publish: fn(&Path, &Path) -> Result<()>) {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("temp");
         let target = root.path().join("preview.html");
         std::fs::write(&source, b"complete").unwrap();
-        publish_html_file(&source, &target).unwrap();
+        publish(&source, &target).unwrap();
+        assert!(
+            !source.exists(),
+            "publication must consume the temporary path"
+        );
         std::fs::write(&source, b"new").unwrap();
-        assert!(publish_html_file(&source, &target).is_err());
+        assert!(publish(&source, &target).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        assert_eq!(std::fs::read(&source).unwrap(), b"new");
     }
 
     fn view() -> HtmlView {

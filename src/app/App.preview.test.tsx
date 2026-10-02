@@ -31,10 +31,14 @@ const mocks = vi.hoisted(() => ({
   revealProject: vi.fn(),
   revealProjectLogs: vi.fn(),
   notifyPreviewDisposed: vi.fn(),
+  prepareErrorReport: vi.fn(),
+  sendErrorReport: vi.fn(),
 }));
 
 vi.mock("../lib/backend", () => ({
   cancelPipeline: mocks.cancelPipeline,
+  prepareErrorReport: mocks.prepareErrorReport,
+  sendErrorReport: mocks.sendErrorReport,
   checkEngines: vi.fn().mockResolvedValue([]),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: mocks.confirmLargeImageSequence,
@@ -135,6 +139,8 @@ describe("App preview workspace", () => {
     mocks.revealFile.mockReset().mockResolvedValue(undefined);
     mocks.revealProject.mockReset().mockResolvedValue(undefined);
     mocks.revealProjectLogs.mockReset().mockResolvedValue(undefined);
+    mocks.prepareErrorReport.mockReset();
+    mocks.sendErrorReport.mockReset();
     mocks.resumePipeline.mockReset().mockResolvedValue({
       projectId: project.id, projectPath: project.projectPath, finalPly: project.finalPly,
       fileSize: project.fileSize, splatCount: project.splatCount, inputImages: 100,
@@ -455,6 +461,18 @@ describe("App preview workspace", () => {
     await act(async () => { resumeButton?.click(); });
     await flush();
     expect(container.querySelector(".failure-guidance-dialog")).toBeNull();
+  });
+
+  it.each(["probingVideo", "extractingFrames", "extractingFeatures", "matching", "validatingReconstruction", "exporting"])("offers voluntary reporting for %s failures even with analytics off", async (failedStage) => {
+    mocks.initializeTelemetry.mockResolvedValue({ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured" });
+    await act(async () => { root.render(<LanguageProvider><App key="analytics-disabled" /></LanguageProvider>); }); await flush();
+    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message: "engine failed", failedStage, engine: "system", projectId: project.id, failureId: "failure-token" });
+    await act(async () => { useAppStore.setState({ projects: [{ ...project, status: "failed", finalPly: null }] }); });
+    await act(async () => { [...container.querySelectorAll("button")].find(button => button.textContent === "继续任务")?.click(); }); await flush();
+    const report = [...container.querySelectorAll("button")].find(button => button.textContent === "发送错误报告");
+    expect(report?.disabled).toBe(false); expect(mocks.sendErrorReport).not.toHaveBeenCalled();
+    expect(container.querySelector(".failure-guidance-dialog h2")?.textContent).toBe("任务未能完成");
+    expect(mocks.setTelemetryConsent).not.toHaveBeenCalled();
   });
 
   it("blocks the interface while a slow cancellation is still terminating processes", async () => {
@@ -784,5 +802,21 @@ describe("App preview workspace", () => {
     });
     await flush();
     expect(container.querySelector(".project-quality-warning")?.textContent).toContain("62.0%");
+  });
+
+  it("summarizes long errors in both task panes and reveals their full detail on hover", async () => {
+    const detail = "Brush exited with code 1\n" + "Detailed engine output\n".repeat(100);
+    await act(async () => useAppStore.setState({ error: detail, projects: [{ ...project, status: "failed", finalPly: null, failureMessage: detail }] }));
+    for (const selector of [".inline-error .compact-error", ".project-failure .compact-error"]) {
+      const error = container.querySelector<HTMLElement>(selector)!;
+      expect(error.textContent).toBe("模型训练失败");
+      expect(container.textContent).not.toContain("Detailed engine output");
+      await act(async () => error.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })));
+      expect(document.querySelector("[role=tooltip]")?.textContent).toBe(detail);
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    }
+    await act(async () => container.querySelector<HTMLButtonElement>(".inline-error button")!.click());
+    expect(container.querySelector(".inline-error")).toBeNull();
+    expect(container.querySelector(".project-failure")).not.toBeNull();
   });
 });

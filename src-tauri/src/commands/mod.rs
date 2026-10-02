@@ -62,6 +62,7 @@ use crate::{
 #[derive(Default)]
 pub struct PipelineController {
     active: Mutex<Option<Arc<PipelineRunner>>>,
+    pub(crate) diagnostics: crate::diagnostics::DiagnosticService,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +82,8 @@ pub struct PipelineCommandError {
     project_path: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logs_directory: Option<Box<PathBuf>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_id: Option<Box<Uuid>>,
 }
 
 impl From<SplatError> for PipelineCommandError {
@@ -98,6 +101,7 @@ impl From<SplatError> for PipelineCommandError {
             project_id: None,
             project_path: None,
             logs_directory: None,
+            failure_id: None,
         }
     }
 }
@@ -126,6 +130,7 @@ impl PipelineCommandError {
             project_id: project_id.map(|value| value.to_string()),
             project_path: project_path.map(Box::new),
             logs_directory: logs_directory.map(Box::new),
+            failure_id: None,
         }
     }
 }
@@ -191,8 +196,69 @@ fn classify_pipeline_failure(
                 }),
             )
         }
-        _ => (None, None),
+        Some(PipelineStage::ProbingVideo | PipelineStage::ExtractingFrames) => {
+            (Some(PipelineEngine::Ffmpeg), None)
+        }
+        Some(
+            PipelineStage::ExtractingFeatures
+            | PipelineStage::Matching
+            | PipelineStage::ValidatingReconstruction,
+        ) => (Some(PipelineEngine::Colmap), None),
+        _ => (Some(PipelineEngine::System), None),
     }
+}
+
+async fn record_command_failure(
+    state: &PipelineController,
+    mut error: PipelineCommandError,
+    input_paths: &[PathBuf],
+) -> PipelineCommandError {
+    if error.code != "cancelled" {
+        let mut paths = error
+            .project_path
+            .as_deref()
+            .map(|path| vec![path.clone()])
+            .unwrap_or_default();
+        paths.extend_from_slice(input_paths);
+        let project_id = error
+            .project_id
+            .as_ref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        error.failure_id = Some(Box::new(
+            state
+                .diagnostics
+                .capture(
+                    error.failed_stage,
+                    error.engine,
+                    error.failure_kind,
+                    &error.message,
+                    project_id,
+                    &paths,
+                )
+                .await,
+        ));
+    }
+    error
+}
+
+async fn finish_pipeline(
+    state: &PipelineController,
+    result: Result<PipelineResult>,
+    runner: &PipelineRunner,
+    input_paths: &[PathBuf],
+) -> std::result::Result<PipelineResult, PipelineCommandError> {
+    // Capture logs before unlocking the task, so retries/deletion cannot change the snapshot.
+    let result = match result {
+        Ok(output) => Ok(output),
+        Err(error) => Err(record_command_failure(
+            state,
+            PipelineCommandError::from_runner(error, runner),
+            input_paths,
+        )
+        .await),
+    };
+    *state.active.lock().await = None;
+    result
 }
 
 #[derive(Default)]
@@ -752,8 +818,13 @@ pub async fn start_pipeline(
     if let Err(error) = &result {
         runner.emit_terminal(error);
     }
-    *state.active.lock().await = None;
-    result.map_err(|error| PipelineCommandError::from_runner(error, &runner))
+    finish_pipeline(
+        state.inner(),
+        result,
+        &runner,
+        &[PathBuf::from(path), PathBuf::from(projects_root)],
+    )
+    .await
 }
 
 #[tauri::command]
@@ -763,13 +834,18 @@ pub async fn resume_pipeline(
     telemetry: State<'_, TelemetryService>,
     project_id: String,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let project_id = parse_project_id(&project_id)?;
-    let (project_root, metadata) = catalog::load_registered_project(project_id).await?;
-    let state_bytes = tokio::fs::read(project_root.join("state.json"))
-        .await
-        .map_err(SplatError::from)?;
-    let pipeline_state: PipelineStateFile =
-        serde_json::from_slice(&state_bytes).map_err(SplatError::from)?;
+    let preflight = async {
+        let project_id = parse_project_id(&project_id)?;
+        let (project_root, metadata) = catalog::load_registered_project(project_id).await?;
+        let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
+        let pipeline_state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
+        Ok::<_, SplatError>((project_id, metadata, pipeline_state))
+    }
+    .await;
+    let (project_id, metadata, pipeline_state) = match preflight {
+        Ok(value) => value,
+        Err(error) => return Err(record_command_failure(state.inner(), error.into(), &[]).await),
+    };
     let emitter = app.clone();
     let effectiveness = PlannerEffectivenessTracker::default();
     let telemetry_session = Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
@@ -815,8 +891,7 @@ pub async fn resume_pipeline(
     if let Err(error) = &result {
         runner.emit_terminal(error);
     }
-    *state.active.lock().await = None;
-    result.map_err(|error| PipelineCommandError::from_runner(error, &runner))
+    finish_pipeline(state.inner(), result, &runner, &[metadata.source_path]).await
 }
 
 #[tauri::command]
@@ -1597,6 +1672,32 @@ mod tests {
         assert!(std::mem::size_of::<PipelineCommandError>() <= 128);
     }
 
+    #[tokio::test]
+    async fn failure_snapshots_cover_generic_errors_but_never_cancelled_tasks() {
+        let controller = super::PipelineController::default();
+        let cancelled =
+            super::record_command_failure(&controller, SplatError::Cancelled.into(), &[]).await;
+        assert!(cancelled.failure_id.is_none());
+        let failed = super::record_command_failure(
+            &controller,
+            SplatError::Process("image import failed".into()).into(),
+            &[],
+        )
+        .await;
+        assert!(failed.failure_id.is_some());
+        assert_eq!(failed.code, "pipeline_failed");
+        for stage in [
+            PipelineStage::ExtractingFeatures,
+            PipelineStage::Matching,
+            PipelineStage::ValidatingReconstruction,
+        ] {
+            assert_eq!(
+                classify_pipeline_failure(Some(stage), "failure").0,
+                Some(PipelineEngine::Colmap)
+            );
+        }
+    }
+
     #[test]
     fn classifies_mapper_and_brush_failures_for_plain_language_guidance() {
         assert_eq!(
@@ -1845,9 +1946,27 @@ pub async fn start_incremental_reshoot_pipeline(
     telemetry: State<'_, TelemetryService>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let source_project_id = Uuid::parse_str(&request.source_project_id)
-        .map_err(|_| PipelineCommandError::from(SplatError::Process("原项目 ID 无效".into())))?;
-    let (_, source_metadata) = catalog::load_registered_project(source_project_id).await?;
+    let preflight = async {
+        let id = Uuid::parse_str(&request.source_project_id)
+            .map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
+        let (_, metadata) = catalog::load_registered_project(id).await?;
+        Ok::<_, SplatError>((id, metadata))
+    }
+    .await;
+    let (source_project_id, source_metadata) = match preflight {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(record_command_failure(
+                state.inner(),
+                error.into(),
+                &[
+                    PathBuf::from(&request.reshoot_path),
+                    PathBuf::from(&request.projects_root),
+                ],
+            )
+            .await)
+        }
+    };
     let emitter = app.clone();
     let telemetry_session = Arc::new(PipelineTelemetrySession::new(
         telemetry.inner().clone(),
@@ -1889,6 +2008,14 @@ pub async fn start_incremental_reshoot_pipeline(
     if let Err(error) = &result {
         runner.emit_terminal(error);
     }
-    *state.active.lock().await = None;
-    result.map_err(|error| PipelineCommandError::from_runner(error, &runner))
+    finish_pipeline(
+        state.inner(),
+        result,
+        &runner,
+        &[
+            PathBuf::from(request.reshoot_path),
+            PathBuf::from(request.projects_root),
+        ],
+    )
+    .await
 }

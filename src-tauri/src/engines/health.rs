@@ -756,6 +756,10 @@ fn choose_acceleration(
     )
 }
 
+pub(crate) async fn diagnostic_gpu_devices() -> Vec<GpuDeviceInfo> {
+    probe_gpu_devices().await.unwrap_or_default()
+}
+
 async fn probe_gpu_devices() -> std::result::Result<Vec<GpuDeviceInfo>, ProbeError> {
     let candidate = nvidia_smi_candidates()
         .into_iter()

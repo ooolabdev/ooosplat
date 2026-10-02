@@ -34,7 +34,8 @@
     "build:bundle": "npm run build:html-viewer && npm run verify:bundle-resources && npm run verify:engines && npm run verify:licenses && npm run build",
     "build:bundle:windows": "npm run build:html-viewer && npm run verify:bundle-resources && npm run verify:engines:windows && npm run verify:licenses:windows && npm run build",
     "package:windows": "npm run verify:telemetry:release && npm run tauri -- build --bundles nsis && node scripts/collect-windows-installer.mjs",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:diagnostics",
+    "test:diagnostics": "node --experimental-strip-types --test server/diagnostics/report.node-test.ts",
     "test:watch": "vitest",
     "tauri": "tauri"
   },

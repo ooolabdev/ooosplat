@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod diagnostics;
 pub mod engines;
 pub mod error;
 pub mod pipeline;
@@ -50,6 +51,8 @@ pub fn run_app() {
             commands::html_export::cancel_gaussian_html_export,
             commands::initialize_telemetry,
             commands::set_telemetry_consent,
+            diagnostics::prepare_error_report,
+            diagnostics::send_error_report,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OOOSplat");

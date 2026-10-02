@@ -2,6 +2,8 @@
 
 [中文](README.md) | [English](README_EN.md)
 
+This development branch supports actual training progress and live resource monitoring with diagnostic OOOBrush. Install the updated Brush first; existing releases do not automatically include these changes. See [installation, logging and verification](docs/brush-runtime.md).
+
 <p align="center">
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>
@@ -222,7 +224,7 @@ Application settings and the project index are stored in:
 
 ## Anonymous Usage Statistics
 
-OOOSplat collects anonymous usage statistics by default to track stability and per-stage timings. Turn it off at any time under **Settings -> Privacy** in the top right; nothing is sent once it is off.
+OOOSplat collects anonymous usage statistics by default to track stability and per-stage timings. Turn it off at any time under **Settings -> Privacy** in the top right; no anonymous analytics requests are sent once it is off.
 
 What is sent:
 
@@ -237,7 +239,13 @@ What is sent:
 | Auto Optimize effectiveness metrics | Anonymous media dimensions and counts, plan, registration result, bridge recovery, Brush configuration, Splat count, and stage timings used to compare planner effectiveness |
 | Failing stage and error code | Enumerated values such as `colmap_mapper_failed`; no raw error text |
 
-What is never sent: any source media, including videos, images, and PLY files; file names, paths, and project names; logs and command output; user names or any personal information.
+Anonymous analytics never sends: source media, including videos, images, and PLY files; file names, paths, and project names; logs and command output; user names or any personal information.
+
+### Voluntary error reports
+
+After generation fails, choose **Send error report**, review the complete redacted report, then choose **Agree and send**. Reports include the failure reason, error details, the latest failure-time log excerpt (up to 200 lines / 64 KiB), app version, system version, and all detectable graphics cards. They exclude media, models, device serials, and anonymous installation identifiers. Paths, filenames, and usernames are removed. Unavailable hardware fields are left empty; the actual GPU is never guessed.
+
+Consent is separate and one-time: you can send a report even with anonymous analytics disabled, without enabling it. Cancelling the preview uploads nothing; failures can only be retried manually, and successful delivery shows a report ID. Local reports and previews remain valid for the current app session without a review time limit, and are cleared when the app closes. Reports received by the server are retained for 30 days. If the receiving service has not been deployed or the network is unavailable, the app reports delivery failure rather than claiming success. See the [receiving service integration guide](server/diagnostics/README.md).
 
 ## Bundled Engines
 

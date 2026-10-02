@@ -4,6 +4,7 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
+import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
 import { previewAssetUrl } from "./previewAssetUrl";
 
@@ -60,6 +61,8 @@ export async function startReshootPipeline(request: { sourceProjectId: string; r
   return invoke("start_incremental_reshoot_pipeline", { request });
 }
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }
+export async function prepareErrorReport(failureId: string): Promise<ErrorReportDraft> { return invoke("prepare_error_report", { failureId }); }
+export async function sendErrorReport(draftId: string): Promise<ErrorReportReceipt> { return invoke("send_error_report", { draftId }); }
 export async function onPipelineEvent(handler: (event: PipelineEvent) => void): Promise<UnlistenFn> { return listen<PipelineEvent>("pipeline-event", ({ payload }) => handler(payload)); }
 export async function initializeTelemetry(): Promise<TelemetryPreferences> { return invoke("initialize_telemetry"); }
 export async function setTelemetryConsent(enabled: boolean): Promise<TelemetryPreferences> { return invoke("set_telemetry_consent", { enabled }); }
