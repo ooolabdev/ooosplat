@@ -150,6 +150,8 @@ sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
 
 ## 安装与使用
 
+测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
+
 1. Windows 运行 `OOOSplat-0.5.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.5.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.5.0-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在“01 创建新任务”的输入类型下拉栏选择“视频”或“图片”，再点击输入框选择视频文件或图片序列文件夹。

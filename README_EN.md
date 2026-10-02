@@ -150,6 +150,8 @@ The `.deb` installs FFmpeg, FFprobe, and CPU COLMAP through Ubuntu's package man
 
 ## Installation and Use
 
+Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
+
 1. On Windows, run `OOOSplat-0.5.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.5.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.5.0-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Under “01 Create New Task,” choose Video or Images from the input-type menu, then click the input field to select a video file or image-sequence folder.
