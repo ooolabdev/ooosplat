@@ -21,11 +21,14 @@ describe("preview video capture", () => {
     expect(() => verticalFovForCapture(52, 0)).toThrow("相机视野");
   });
 
-  it("flips WebGL bottom-up RGBA rows into Canvas top-down order", () => {
+  it("flips WebGL RGBA rows through both the direct and shared readback paths", () => {
     const bottomRow = [1, 2, 3, 255, 4, 5, 6, 255];
     const topRow = [7, 8, 9, 255, 10, 11, 12, 255];
     const target = new Uint8ClampedArray(16);
     copyFlippedRgbaRows(new Uint8Array([...bottomRow, ...topRow]), target, 2, 2);
+    expect([...target]).toEqual([...topRow, ...bottomRow]);
+    target.fill(0);
+    copyRgbaReadbackRows(new Uint8Array([...bottomRow, ...topRow]), target, 2, 2, true);
     expect([...target]).toEqual([...topRow, ...bottomRow]);
   });
 
@@ -34,14 +37,6 @@ describe("preview video capture", () => {
     const bottomRow = [7, 8, 9, 255, 10, 11, 12, 255];
     const target = new Uint8ClampedArray(16);
     copyRgbaReadbackRows(new Uint8Array([...topRow, ...bottomRow]), target, 2, 2, false);
-    expect([...target]).toEqual([...topRow, ...bottomRow]);
-  });
-
-  it("normalizes WebGL readback through the shared backend path", () => {
-    const bottomRow = [1, 2, 3, 255, 4, 5, 6, 255];
-    const topRow = [7, 8, 9, 255, 10, 11, 12, 255];
-    const target = new Uint8ClampedArray(16);
-    copyRgbaReadbackRows(new Uint8Array([...bottomRow, ...topRow]), target, 2, 2, true);
     expect([...target]).toEqual([...topRow, ...bottomRow]);
   });
 });

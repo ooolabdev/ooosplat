@@ -1686,14 +1686,20 @@ mod tests {
         .await;
         assert!(failed.failure_id.is_some());
         assert_eq!(failed.code, "pipeline_failed");
-        for stage in [
-            PipelineStage::ExtractingFeatures,
-            PipelineStage::Matching,
-            PipelineStage::ValidatingReconstruction,
+        for (stage, engine) in [
+            (PipelineStage::ProbingVideo, PipelineEngine::Ffmpeg),
+            (PipelineStage::ExtractingFrames, PipelineEngine::Ffmpeg),
+            (PipelineStage::ExtractingFeatures, PipelineEngine::Colmap),
+            (PipelineStage::Matching, PipelineEngine::Colmap),
+            (
+                PipelineStage::ValidatingReconstruction,
+                PipelineEngine::Colmap,
+            ),
+            (PipelineStage::Exporting, PipelineEngine::System),
         ] {
             assert_eq!(
                 classify_pipeline_failure(Some(stage), "failure").0,
-                Some(PipelineEngine::Colmap)
+                Some(engine)
             );
         }
     }

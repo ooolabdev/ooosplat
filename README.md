@@ -2,8 +2,6 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-本地开发分支已支持新版 OOOBrush 的实际训练进度和实时资源面板。需要先安装诊断版 Brush；现有发布包不自动获得这些改动。见[安装、日志配置与验证说明](docs/brush-runtime.md)。
-
 <p align="center">
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>

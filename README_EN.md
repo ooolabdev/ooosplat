@@ -2,8 +2,6 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-This development branch supports actual training progress and live resource monitoring with diagnostic OOOBrush. Install the updated Brush first; existing releases do not automatically include these changes. See [installation, logging and verification](docs/brush-runtime.md).
-
 <p align="center">
   <img src="assets/readme-logo.svg" alt="OOOSplat Logo" width="180">
 </p>

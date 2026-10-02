@@ -463,10 +463,10 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".failure-guidance-dialog")).toBeNull();
   });
 
-  it.each(["probingVideo", "extractingFrames", "extractingFeatures", "matching", "validatingReconstruction", "exporting"])("offers voluntary reporting for %s failures even with analytics off", async (failedStage) => {
+  it("offers voluntary reporting for a generic failure even with analytics off", async () => {
     mocks.initializeTelemetry.mockResolvedValue({ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured" });
     await act(async () => { root.render(<LanguageProvider><App key="analytics-disabled" /></LanguageProvider>); }); await flush();
-    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message: "engine failed", failedStage, engine: "system", projectId: project.id, failureId: "failure-token" });
+    mocks.resumePipeline.mockRejectedValueOnce({ code: "pipeline_failed", message: "engine failed", failedStage: "matching", engine: "colmap", projectId: project.id, failureId: "failure-token" });
     await act(async () => { useAppStore.setState({ projects: [{ ...project, status: "failed", finalPly: null }] }); });
     await act(async () => { [...container.querySelectorAll("button")].find(button => button.textContent === "继续任务")?.click(); }); await flush();
     const report = [...container.querySelectorAll("button")].find(button => button.textContent === "发送错误报告");
