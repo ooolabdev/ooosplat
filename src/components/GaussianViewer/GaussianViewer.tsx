@@ -127,6 +127,7 @@ import { TransformPanel } from "./TransformPanel";
 import { SelectionPanel } from "./SelectionPanel";
 import { PreviewExportMenu, PreviewOrientationControl } from "./PreviewExportControls";
 import { EDITABLE_SPLAT_ASSET_OPTIONS, splatTextureCapacityError } from "./SplatLoadPolicy";
+import { createSplatRangeSource, shouldUseSplatRange } from "./SplatRangeSource";
 import { ViewerControls, type ViewerCameraState } from "./ViewerControls";
 
 type ViewerMode = "adjust" | "preview";
@@ -239,6 +240,7 @@ function waitForSplatFrame(
 
 interface SplatSceneProps {
   assetUrl: string;
+  fileSize: number;
   splatCount: number;
   transform: GaussianTransform;
   mode: ViewerMode;
@@ -251,7 +253,7 @@ interface SplatSceneProps {
   onAnimationStatus: (status: AnimationStatus) => void;
 }
 
-const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ assetUrl, transform, mode, tool, crop, deletedMask, selectionMask, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
+const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ assetUrl, fileSize, transform, mode, tool, crop, deletedMask, selectionMask, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
   const { t } = useI18n();
   const app = useApp();
   const cameraRef = useRef<PcEntity>(null);
@@ -275,7 +277,20 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   editorStateRef.current = { crop, mode, tool, deletedMask, selectionMask };
   app.scene.gsplatCentersEnabled = true;
   app.scene.gsplat.colorUpdateAngle = 0;
-  const { asset, loading, error, subscribe } = useSplat(assetUrl, EDITABLE_SPLAT_ASSET_OPTIONS);
+  const rangeSource = useMemo(
+    () => shouldUseSplatRange(fileSize) ? createSplatRangeSource(assetUrl, fileSize) : null,
+    [assetUrl, fileSize],
+  );
+  const splatAssetOptions = useMemo(() => rangeSource ? {
+    data: EDITABLE_SPLAT_ASSET_OPTIONS.data,
+    file: {
+      size: fileSize,
+      contents: rangeSource.response,
+    },
+  } : EDITABLE_SPLAT_ASSET_OPTIONS, [fileSize, rangeSource]);
+  const { asset, loading, error, subscribe } = useSplat(assetUrl, splatAssetOptions);
+
+  useEffect(() => () => rangeSource?.abort(), [rangeSource]);
   const preparedAsset = useMemo(() => {
     if (!asset) return null;
     const resource = asset.resource as GSplatResource;
@@ -434,10 +449,15 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
 
   useEffect(() => {
     if (contextLostRef.current) return;
-    if (error) onStatus({ phase: "error", progress: 0, error, renderer });
+    if (error) onStatus({
+      phase: "error",
+      progress: 0,
+      error: rangeSource ? t("viewer.rangeRead", { detail: error }) : error,
+      renderer,
+    });
     else if (asset) onStatus({ phase: "mounting", progress: 1, error: null, renderer });
     else if (loading) onStatus({ phase: "loading", progress: 0, error: null, renderer });
-  }, [asset, error, loading, onStatus, renderer]);
+  }, [asset, error, loading, onStatus, rangeSource, renderer, t]);
 
   useEffect(() => {
     if (!asset) return;
@@ -1502,7 +1522,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     <div className="preview-editor">
       <div ref={viewportElementRef} inert={htmlBusy || htmlConfirm || videoBusy || gaussianExporting} className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
         <Application key={`${store.descriptor.projectId}-${rendererRevision}`} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
-          <SplatScene ref={sceneApiRef} assetUrl={previewAssetUrl} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} onOrthographicViewChange={setOrthographicView} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
+          <SplatScene ref={sceneApiRef} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} onOrthographicViewChange={setOrthographicView} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
         </Application>
         {mode === "preview" && <div ref={captureGuideRef} className={`portrait-capture-guide orientation-${orientation}`} style={guideSize} aria-hidden="true">
           <div className="portrait-frame-label"><span>{gaussianVideoDimensions(orientation).width} × {gaussianVideoDimensions(orientation).height}</span><span>30 FPS</span></div>
