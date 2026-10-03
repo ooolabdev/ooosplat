@@ -64,10 +64,18 @@ export function verifyColmap(root, platform, pin, { run = true } = {}) {
     for (const license of component.licenseFiles ?? []) if (!covered.has(`licenses/${license}`)) throw new Error(`Missing component license file: ${license}`);
   }
   const licensed = new Set(inventory.components.flatMap(component => component.files));
+  const sourceNotices = new Set(inventory.sourceLicenseFiles.map(license => `licenses/${license}`));
   for (const file of filesUnder(root)) {
     const relative = path.relative(root, file).split(path.sep).join("/");
     if (/\.(?:dll|so(?:\..*)?|dylib)$/i.test(file) && !licensed.has(relative)) throw new Error(`Missing dependency license inventory: ${relative}`);
-    if (/(?:^|\/)(?:include|share|cmake|pkgconfig|tests)(?:\/|$)|(?:_test\.exe|\.pdb|\.a|\.lib|vocab_tree.*\.bin)$/i.test(relative)) throw new Error(`Development/unused artifact shipped: ${relative}`);
+    const inventoriedNotice = relative.startsWith("licenses/") && sourceNotices.has(relative);
+    // Installed notices can retain share/doc paths. GCC's COPYING.LIB is a
+    // license, not a Windows static library. Both still require verified hashes
+    // and an explicit source-license inventory entry; other .lib files fail.
+    const developmentDirectory = /(?:^|\/)(?:include|share|cmake|pkgconfig|tests)(?:\/|$)/i.test(relative) && !inventoriedNotice;
+    const developmentFile = /(?:_test\.exe|\.pdb|\.a|\.lib|vocab_tree.*\.bin)$/i.test(relative)
+      && !(inventoriedNotice && /^COPYING\.LIB$/i.test(path.basename(relative)));
+    if (developmentDirectory || developmentFile) throw new Error(`Development/unused artifact shipped: ${relative}`);
   }
   if (!run) return;
   const environment = { ...process.env, PATH: platform === "windows" ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32") : "/usr/bin:/bin:/usr/sbin:/sbin" };

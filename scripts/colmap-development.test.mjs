@@ -4,14 +4,21 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { localConfiguration, localInvocation } from "./local-tauri.mjs";
 import { artifactSummary, placements } from "./colmap-artifact-summary.mjs";
 import { dependencyPath, deploymentVersion, versionAtMost } from "./verify-macos-colmap-runtime.mjs";
 import { collectComponentNotices, isLicenseNotice } from "./collect-macos-component-notices.mjs";
-import { sha256 } from "./colmap-runtime.mjs";
+import { sha256, buildLock } from "./colmap-runtime.mjs";
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const read = file => fs.readFileSync(path.join(workspace, file), "utf8");
+// Git's Windows checkout uses CRLF; source-policy assertions must be identical.
+const read = file => fs.readFileSync(path.join(workspace, file), "utf8").replace(/\r\n/g, "\n");
+function matrixSelector(workflow) {
+  const match = workflow.replace(/\r\n/g, "\n").match(/node -e '\n([\s\S]+?)\n          '/);
+  assert.ok(match, "Workflow must contain the embedded platform selector");
+  return match[1].replace(/^ {12}/gm, "");
+}
 // Tauri merges inline configurations using JSON Merge Patch (RFC 7396).
 function mergePatch(target, patch) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) return patch;
@@ -80,17 +87,72 @@ test("manual workflow only builds selected platforms and never publishes a Relea
   assert.match(workflow, /short_sha.*github\.run_number.*github\.run_attempt/);
   assert.match(workflow, /build-colmap-macos\.sh/);
   // Exercise the actual embedded matrix selector, rather than a duplicate.
-  const script = workflow.match(/node -e '\n([\s\S]+?)\n          '/)[1].replace(/^ {12}/gm, "");
-  for (const requested of ["all", "windows", "linux", "macos"]) {
-    let output;
-    const env = { REQUESTED_PLATFORM: requested, GITHUB_SHA: "a".repeat(40), GITHUB_OUTPUT: "mock" };
-    const fakeFs = { appendFileSync: (_file, value) => { output = value; } };
-    Function("require", "process", script)(() => fakeFs, { env });
-    const matrix = JSON.parse(output.split("\n")[0].slice("matrix=".length));
-    assert.equal(matrix.include.length, requested === "all" ? 3 : 1);
-    if (requested !== "all") assert.equal(matrix.include[0].platform, requested);
-    assert.match(output, /short_sha=aaaaaaaa/);
+  for (const newline of ["\n", "\r\n"]) {
+    const script = matrixSelector(workflow.replace(/\n/g, newline));
+    for (const requested of ["all", "windows", "linux", "macos"]) {
+      let output;
+      const env = { REQUESTED_PLATFORM: requested, GITHUB_SHA: "a".repeat(40), GITHUB_OUTPUT: "mock" };
+      const fakeFs = { appendFileSync: (_file, value) => { output = value; } };
+      Function("require", "process", script)(() => fakeFs, { env });
+      const matrix = JSON.parse(output.split("\n")[0].slice("matrix=".length));
+      assert.equal(matrix.include.length, requested === "all" ? 3 : 1);
+      if (requested !== "all") assert.equal(matrix.include[0].platform, requested);
+      assert.match(output, /short_sha=aaaaaaaa/);
+    }
   }
+});
+
+test("CUDA installation pins the patch release without network/apt drift", () => {
+  const workflow = read(".github/workflows/colmap-engines.yml");
+  assert.match(workflow, /cuda: '13\.2\.0'/);
+  assert.match(workflow, /method: local/);
+  assert.match(workflow, /linux-local-args: '\["--toolkit"\]'/);
+  assert.doesNotMatch(workflow, /method: network/);
+  const linux = read("scripts/build-colmap-linux.sh");
+  assert.match(linux, /Missing build prerequisite/);
+  assert.match(linux, /check_version CUDA/);
+  assert.match(linux, /export PATH="\$cuda_root\/bin:\$PATH"/);
+});
+
+test("Linux preflight reports missing tools and rejects CUDA patch drift before building", {
+  skip: process.platform !== "linux" && !process.env.OOOSPLAT_TEST_BASH,
+}, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-preflight-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, "version.json"), "{}");
+  const source = read("scripts/build-colmap-linux.sh");
+  // Execute the builder's real preflight with deterministic tool responses.
+  // No source downloads or compiler invocations are performed by this test.
+  const preflight = source.slice(source.indexOf("cuda_root="), source.indexOf('cache="$workspace'));
+  const script = `set -Eeuo pipefail
+    read_lock() {
+      case "$1" in
+        cmakeVersion) echo '${buildLock.cmakeVersion}' ;;
+        ninjaVersion) echo '${buildLock.ninjaVersion}' ;;
+        cudaVersion) echo '${buildLock.cudaVersion}' ;;
+        *) exit 99 ;;
+      esac
+    }
+    command() { [[ "$2" != "\${MOCK_MISSING_TOOL:-}" ]]; }
+    cmake() { printf 'cmake version ${buildLock.cmakeVersion}\\nMore version information\\n'; }
+    ninja() { echo '${buildLock.ninjaVersion}'; }
+    node() { echo "$MOCK_CUDA_VERSION"; }
+    ${preflight}
+    echo PRECHECK_PASSED`;
+  const run = (version, missing = "") => spawnSync(process.env.OOOSPLAT_TEST_BASH || "bash", ["-c", script], {
+    encoding: "utf8", windowsHide: true,
+    env: { ...process.env, CUDA_PATH: root.replaceAll("\\", "/"), MOCK_CUDA_VERSION: version, MOCK_MISSING_TOOL: missing },
+  });
+  const good = run(buildLock.cudaVersion);
+  assert.equal(good.status, 0, good.error?.message || good.stderr);
+  assert.match(good.stdout, /PRECHECK_PASSED/);
+  const drift = run("13.2.2");
+  assert.equal(drift.status, 1);
+  assert.match(drift.stderr, /CUDA version differs from build lock: expected 13\.2\.0, got 13\.2\.2/);
+  assert.doesNotMatch(drift.stdout, /PRECHECK_PASSED/);
+  const missing = run(buildLock.cudaVersion, "patchelf");
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Missing build prerequisite: patchelf/);
 });
 
 test("macOS-only and mixed builders use the same compiler/relocation functions", () => {

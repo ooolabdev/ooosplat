@@ -72,6 +72,30 @@ test("test binaries and vocabulary resources are forbidden even when hashed", t 
     assert.throws(() => verifyColmap(f.root, "linux", f.reseal(), { run: false }), /Development\/unused/);
   }
 });
+
+test("inventoried COPYING.LIB and installed share/doc notices are not development libraries", t => {
+  const f = fixture(t, "macos");
+  const notices = ["homebrew/gcc/COPYING.LIB", "homebrew/jpeg/share/doc/LICENSE"];
+  const inventory = JSON.parse(fs.readFileSync(path.join(f.root, "BUNDLED-COMPONENTS.json"), "utf8"));
+  for (const notice of notices) {
+    f.write(`licenses/${notice}`, "Required upstream license text");
+    inventory.sourceLicenseFiles.push(notice);
+  }
+  f.write("BUNDLED-COMPONENTS.json", JSON.stringify(inventory));
+  assert.doesNotThrow(() => verifyColmap(f.root, "macos", f.reseal(), { run: false }));
+});
+
+test("license paths cannot bypass static library or debug-symbol exclusions", t => {
+  for (const name of ["COPYING.LIB", "development.lib", "LICENSE.pdb", "LICENSE.a", "vocab_tree.bin"]) {
+    const f = fixture(t, "macos"), notice = `homebrew/test/${name}`;
+    f.write(`licenses/${notice}`, "must not ship");
+    const inventory = JSON.parse(fs.readFileSync(path.join(f.root, "BUNDLED-COMPONENTS.json"), "utf8"));
+    // Even hashed COPYING.LIB needs an explicit notice inventory entry.
+    if (name !== "COPYING.LIB") inventory.sourceLicenseFiles.push(notice);
+    f.write("BUNDLED-COMPONENTS.json", JSON.stringify(inventory));
+    assert.throws(() => verifyColmap(f.root, "macos", f.reseal(), { run: false }), /Development\/unused/);
+  }
+});
 test("traversal entries cannot escape the runtime", t => {
   const f = fixture(t);
   f.write("SHA256SUMS", `${"0".repeat(64)}  ../secret\n`);

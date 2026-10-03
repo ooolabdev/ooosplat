@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "COLMAP build failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { echo 'Linux x86_64 required' >&2; exit 1; }
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 lock="$workspace/engines/colmap-build.json"
 read_lock() { node -p 'require(process.argv[1])[process.argv[2]]' "$lock" "$1"; }
-for command_name in curl git tar cmake ninja nvcc node ldd patchelf; do command -v "$command_name" >/dev/null; done
-[[ "$(cmake --version | head -n1)" == "cmake version $(read_lock cmakeVersion)" ]]
-[[ "$(ninja --version)" == "$(read_lock ninjaVersion)" ]]
 cuda_root="${CUDA_PATH:-/usr/local/cuda-13.2}"
-[[ "$(node -p 'require(process.argv[1]).cuda.version' "$cuda_root/version.json")" == "$(read_lock cudaVersion)" ]]
+# Prefer the selected toolkit even when called outside Actions.
+export PATH="$cuda_root/bin:$PATH"
+for command_name in curl git tar cmake ninja nvcc node ldd patchelf; do
+  command -v "$command_name" >/dev/null || { echo "Missing build prerequisite: $command_name" >&2; exit 1; }
+done
+check_version() {
+  local component="$1" actual="$2" expected="$3"
+  echo "$component: $actual (locked: $expected)"
+  [[ "$actual" == "$expected" ]] || { echo "$component version differs from build lock: expected $expected, got $actual" >&2; exit 1; }
+}
+cmake_output="$(cmake --version)"
+check_version CMake "${cmake_output%%$'\n'*}" "cmake version $(read_lock cmakeVersion)"
+check_version Ninja "$(ninja --version)" "$(read_lock ninjaVersion)"
+[[ -f "$cuda_root/version.json" ]] || { echo "Missing CUDA toolkit metadata: $cuda_root/version.json" >&2; exit 1; }
+check_version CUDA "$(node -p 'require(process.argv[1]).cuda.version' "$cuda_root/version.json")" "$(read_lock cudaVersion)"
 cache="$workspace/.cache/colmap-linux-build"
 mkdir -p "$cache"
 task_directory="$(mktemp -d "$cache/build-XXXXXX")"

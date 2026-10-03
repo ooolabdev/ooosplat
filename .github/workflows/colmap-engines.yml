@@ -82,7 +82,11 @@ jobs:
         id: cuda
         with:
           cuda: '13.2.0'
-          method: network
+          # Linux network/apt installation only pins major.minor and drifts to
+          # newer patches. Use the version-specific installer on both platforms.
+          method: local
+          linux-local-args: '["--toolkit"]'
+          log-file-suffix: '${{ matrix.platform }}-${{ matrix.architecture }}.txt'
       - name: Restore pinned macOS dependency caches
         if: matrix.platform == 'macos'
         uses: actions/cache@v5
