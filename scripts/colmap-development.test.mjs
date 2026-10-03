@@ -110,21 +110,33 @@ test("CUDA installation pins the patch release without network/apt drift", () =>
   assert.doesNotMatch(workflow, /method: network/);
   const linux = read("scripts/build-colmap-linux.sh");
   assert.match(linux, /Missing build prerequisite/);
-  assert.match(linux, /check_version CUDA/);
   assert.match(linux, /export PATH="\$cuda_root\/bin:\$PATH"/);
+  assert.match(linux, /node "\$workspace\/scripts\/verify-cuda-toolkit\.mjs" linux "\$cuda_root"\n/);
+  assert.match(linux, /node "\$workspace\/scripts\/verify-cuda-toolkit\.mjs" linux "\$cuda_root" "\$build"/);
+  assert.doesNotMatch(linux, /require\(process\.argv\[1\]\)\.cuda\.version|check_version CUDA/);
+  const windows = read("scripts/build-colmap-windows.ps1");
+  assert.match(windows, /'verify-cuda-toolkit\.mjs'\), 'windows', \$env:CUDA_PATH\)/);
+  assert.match(windows, /'verify-cuda-toolkit\.mjs'\), 'windows', \$env:CUDA_PATH, \$build\)/);
+  assert.doesNotMatch(windows, /\$cudaInfo\.cuda\.version|V13\\\.2\\\.\\d\+/);
+  for (const builder of [linux, windows]) {
+    assert.match(builder, /-DCMAKE_CUDA_ARCHITECTURES:STRING=/);
+    assert.match(builder, /-DCMAKE_CUDA_COMPILER:FILEPATH=/);
+    assert.match(builder, /-DCUDAToolkit_ROOT:PATH=/);
+  }
 });
 
-test("Linux preflight reports missing tools and rejects CUDA patch drift before building", {
+test("Linux preflight reports missing tools, checks build tools and delegates CUDA identity", {
   skip: process.platform !== "linux" && !process.env.OOOSPLAT_TEST_BASH,
 }, t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-preflight-test-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(root, "version.json"), "{}");
   const source = read("scripts/build-colmap-linux.sh");
   // Execute the builder's real preflight with deterministic tool responses.
-  // No source downloads or compiler invocations are performed by this test.
+  // CUDA field validation uses complete official fixtures in cuda-toolkit.test;
+  // this test covers shell prerequisites and the actual shared checker call.
   const preflight = source.slice(source.indexOf("cuda_root="), source.indexOf('cache="$workspace'));
   const script = `set -Eeuo pipefail
+    workspace="$MOCK_WORKSPACE"
     read_lock() {
       case "$1" in
         cmakeVersion) echo '${buildLock.cmakeVersion}' ;;
@@ -134,23 +146,29 @@ test("Linux preflight reports missing tools and rejects CUDA patch drift before 
       esac
     }
     command() { [[ "$2" != "\${MOCK_MISSING_TOOL:-}" ]]; }
-    cmake() { printf 'cmake version ${buildLock.cmakeVersion}\\nMore version information\\n'; }
-    ninja() { echo '${buildLock.ninjaVersion}'; }
-    node() { echo "$MOCK_CUDA_VERSION"; }
+    cmake() { printf 'cmake version %s\\nMore version information\\n' "$MOCK_CMAKE_VERSION"; }
+    ninja() { echo "$MOCK_NINJA_VERSION"; }
+    node() {
+      [[ "$1" == "$workspace/scripts/verify-cuda-toolkit.mjs" && "$2" == linux && "$3" == "$cuda_root" ]] || return 91
+      echo CUDA_SHARED_CHECK_CALLED
+    }
     ${preflight}
     echo PRECHECK_PASSED`;
-  const run = (version, missing = "") => spawnSync(process.env.OOOSPLAT_TEST_BASH || "bash", ["-c", script], {
+  const run = ({ cmake = buildLock.cmakeVersion, ninja = buildLock.ninjaVersion, missing = "" } = {}) => spawnSync(process.env.OOOSPLAT_TEST_BASH || "bash", ["-c", script], {
     encoding: "utf8", windowsHide: true,
-    env: { ...process.env, CUDA_PATH: root.replaceAll("\\", "/"), MOCK_CUDA_VERSION: version, MOCK_MISSING_TOOL: missing },
+    env: { ...process.env, CUDA_PATH: root.replaceAll("\\", "/"), MOCK_WORKSPACE: workspace.replaceAll("\\", "/"), MOCK_CMAKE_VERSION: cmake, MOCK_NINJA_VERSION: ninja, MOCK_MISSING_TOOL: missing },
   });
-  const good = run(buildLock.cudaVersion);
+  const good = run();
   assert.equal(good.status, 0, good.error?.message || good.stderr);
+  assert.match(good.stdout, /CUDA_SHARED_CHECK_CALLED/);
   assert.match(good.stdout, /PRECHECK_PASSED/);
-  const drift = run("13.2.2");
-  assert.equal(drift.status, 1);
-  assert.match(drift.stderr, /CUDA version differs from build lock: expected 13\.2\.0, got 13\.2\.2/);
-  assert.doesNotMatch(drift.stdout, /PRECHECK_PASSED/);
-  const missing = run(buildLock.cudaVersion, "patchelf");
+  for (const [name, options] of [["CMake", { cmake: "4.0.0" }], ["Ninja", { ninja: "1.0.0" }]]) {
+    const drift = run(options);
+    assert.equal(drift.status, 1);
+    assert.match(drift.stderr, new RegExp(`${name} version differs from build lock`));
+    assert.doesNotMatch(drift.stdout, /CUDA_SHARED_CHECK_CALLED|PRECHECK_PASSED/);
+  }
+  const missing = run({ missing: "patchelf" });
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /Missing build prerequisite: patchelf/);
 });

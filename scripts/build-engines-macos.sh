@@ -78,7 +78,7 @@ tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
 rm -rf -- "$stage/include" "$stage/share"
 for ffmpeg_library in "$stage/lib"/*; do
   [[ -f "$ffmpeg_library" ]] || continue
-  printf '%s\t%s\n' "$(basename "$ffmpeg_library")" "$ffmpeg_library" >> "$dependency_origins"
+  printf '%s\t%s\tbuilt-ffmpeg\n' "$(basename "$ffmpeg_library")" "$ffmpeg_library" >> "$dependency_origins"
 done
 
 source "$workspace/scripts/colmap-macos-common.sh"

@@ -7,14 +7,15 @@ function Invoke-Checked([string]$Command, [string[]]$Arguments) {
   & $Command @Arguments
   if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE" }
 }
+if (-not $env:CUDA_PATH) { throw 'CUDA_PATH must identify the locked CUDA toolkit.' }
+$env:PATH = "$(Join-Path $env:CUDA_PATH 'bin');$env:PATH"
 foreach ($command in 'git', 'curl.exe', 'tar', 'cmake', 'ninja', 'nvcc', 'cl', 'node') {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Missing $command. Use a Visual Studio x64 developer shell with CUDA $($lock.cudaVersion)." }
 }
 if ((cmake --version | Select-Object -First 1) -ne "cmake version $($lock.cmakeVersion)") { throw 'CMake version differs from build lock.' }
 if ((ninja --version) -ne $lock.ninjaVersion) { throw 'Ninja version differs from build lock.' }
-if ((nvcc --version | Out-String) -notmatch 'V13\.2\.\d+') { throw 'CUDA 13.2 compiler required.' }
-$cudaInfo = Get-Content -Raw (Join-Path $env:CUDA_PATH 'version.json') | ConvertFrom-Json
-if ($cudaInfo.cuda.version -ne $lock.cudaVersion) { throw 'CUDA toolkit patch version differs from build lock.' }
+Invoke-Checked 'node' @((Join-Path $PSScriptRoot 'verify-cuda-toolkit.mjs'), 'windows', $env:CUDA_PATH)
+$cudaCompiler = Join-Path $env:CUDA_PATH 'bin/nvcc.exe'
 $cache = Join-Path $workspace '.cache/colmap-windows-build'
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $taskDirectory = Join-Path $cache ([guid]::NewGuid().ToString('N'))
@@ -38,9 +39,11 @@ $options = @('-S', $source, '-B', $build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Rel
   "-DCMAKE_INSTALL_PREFIX=$stage", "-DGIT_COMMIT_ID=$($lock.commit)", '-DGIT_COMMIT_DATE=Unknown',
   "-DCMAKE_TOOLCHAIN_FILE=$vcpkg/scripts/buildsystems/vcpkg.cmake", '-DVCPKG_TARGET_TRIPLET=x64-windows-release',
   '-DVCPKG_USE_LEGACY_APPLOCAL=ON', '-DBUILD_SHARED_LIBS=OFF', '-DCUDA_ENABLED=ON', '-DCASPAR_ENABLED=ON', '-DCASPAR_USE_DOUBLE=OFF',
-  "-DCMAKE_CUDA_ARCHITECTURES=$($lock.cudaArchitectures -join ';')", "-DCUDAToolkit_ROOT=$env:CUDA_PATH")
+  "-DCMAKE_CUDA_ARCHITECTURES:STRING=$($lock.cudaArchitectures -join ';')",
+  "-DCMAKE_CUDA_COMPILER:FILEPATH=$cudaCompiler", "-DCUDAToolkit_ROOT:PATH=$env:CUDA_PATH")
 foreach ($feature in $lock.disabledFeatures) { $options += "-D${feature}_ENABLED=OFF" }
 Invoke-Checked 'cmake' $options
+Invoke-Checked 'node' @((Join-Path $PSScriptRoot 'verify-cuda-toolkit.mjs'), 'windows', $env:CUDA_PATH, $build)
 Invoke-Checked 'cmake' @('--build', $build, '--parallel', '4')
 Invoke-Checked 'cmake' @('--install', $build)
 $installed = Join-Path $build 'vcpkg_installed/x64-windows-release'

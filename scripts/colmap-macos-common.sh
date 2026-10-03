@@ -62,6 +62,79 @@ for fetched in poselib faiss; do
 done
 }
 
+# A staged pathname does not establish provenance. Only the mixed builder's
+# explicitly registered FFmpeg outputs may use its LGPL build notice. Homebrew
+# FFmpeg (including transitive OpenImageIO dependencies) uses formula metadata.
+classify_macos_component_origin() {
+  local source_dependency="$1" origin_kind="${2:-}" remainder
+  component=""
+  component_source=""
+  case "$source_dependency" in
+    "$brew_root/Cellar/"*)
+      remainder="${source_dependency#"$brew_root/Cellar/"}"
+      component="${remainder%%/*}"
+      component_source="homebrew"
+      ;;
+    "$brew_root/opt/"*)
+      remainder="${source_dependency#"$brew_root/opt/"}"
+      component="${remainder%%/*}"
+      component_source="homebrew"
+      ;;
+    "$stage/lib/"*)
+      [[ "$origin_kind" == built-ffmpeg ]] || {
+        echo "Unregistered staged dependency origin: $source_dependency" >&2
+        return 1
+      }
+      component="ffmpeg"
+      component_source="built-ffmpeg"
+      ;;
+  esac
+  [[ -n "$component" ]] || { echo "Cannot map $source_dependency to a licensed component." >&2; return 1; }
+}
+
+collect_macos_runtime_component_notices() {
+components_tsv="$build/components.tsv"
+: > "$components_tsv"
+while IFS=$'\t' read -r library source_dependency origin_kind; do
+  [[ -n "$library" ]] || continue
+  classify_macos_component_origin "$source_dependency" "$origin_kind"
+  if [[ "$component_source" == built-ffmpeg ]]; then
+    [[ -f "$stage/licenses/FFmpeg-LGPL-2.1.txt" ]] || {
+      echo "Missing notice for explicitly registered mixed-build FFmpeg." >&2
+      exit 1
+    }
+    license="LGPL-2.1-or-later"
+    homepage="https://ffmpeg.org/"
+  else
+    info="$(brew info --json=v2 "$component")"
+    license="$(node -e 'const i=JSON.parse(process.argv[1]).formulae[0]; process.stdout.write(i.license||"")' "$info")"
+    homepage="$(node -e 'const i=JSON.parse(process.argv[1]).formulae[0]; process.stdout.write(i.homepage||"")' "$info")"
+    [[ -n "$license" ]] || { echo "Homebrew formula $component has no license metadata." >&2; exit 1; }
+    if [[ ! -d "$stage/licenses/homebrew/$component" ]]; then
+      info_file="$build/$component-formula.json"
+      printf '%s\n' "$info" > "$info_file"
+      node "$workspace/scripts/collect-macos-component-notices.mjs" \
+        "$info_file" "$(brew --prefix "$component")" \
+        "$stage/licenses/homebrew/$component" "$build/license-sources"
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\tlib/%s\n' "$component" "$component_source" "$license" "$homepage" "$library" >> "$components_tsv"
+done < "$dependency_origins"
+
+node -e '
+const fs=require("fs");
+const lines=fs.readFileSync(process.argv[1],"utf8").trim().split(/\n/).filter(Boolean);
+const map=new Map();
+for(const line of lines){const [name,source,license,homepage,file]=line.split("\t"); const key=`${source}:${name}`; const item=map.get(key)||{name,source,license,homepage,files:[]}; item.files.push(file); map.set(key,item);}
+const licenseRoot=process.argv[3];
+const sourceLicenseFiles=[];
+const walk=directory=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true})){const full=`${directory}/${entry.name}`; if(entry.isDirectory()) walk(full); else sourceLicenseFiles.push(full.slice(licenseRoot.length+1));}};
+walk(licenseRoot);
+const output={schemaVersion:1,note:"Generated from the dylibs actually copied into the macOS runtime. Source and statically linked component notices are packaged under licenses/.",components:[...map.values()].map(v=>({...v,licenseFiles:v.source==="built-ffmpeg"?["FFmpeg-LGPL-2.1.txt"]:sourceLicenseFiles.filter(f=>f.startsWith(`homebrew/${v.name}/`)),files:[...new Set(v.files)].sort()})).sort((a,b)=>a.name.localeCompare(b.name)||a.source.localeCompare(b.source)),sourceLicenseFiles:sourceLicenseFiles.sort()};
+fs.writeFileSync(process.argv[2],JSON.stringify(output,null,2)+"\n");
+' "$components_tsv" "$stage/BUNDLED-COMPONENTS.json" "$stage/licenses"
+}
+
 bundle_macos_runtime() {
 brew_root="$(brew --prefix 2>/dev/null || true)"
 resolve_rpath_dependency() {
@@ -129,48 +202,7 @@ while ((${#queue[@]})); do
   fi
 done
 
-components_tsv="$build/components.tsv"
-: > "$components_tsv"
-while IFS=$'\t' read -r library source_dependency; do
-  [[ -n "$library" ]] || continue
-  component=""
-  case "$source_dependency" in
-    "$stage/lib/"*) component="ffmpeg" ;;
-    "$brew_root/Cellar/"*) remainder="${source_dependency#"$brew_root/Cellar/"}"; component="${remainder%%/*}" ;;
-    "$brew_root/opt/"*) remainder="${source_dependency#"$brew_root/opt/"}"; component="${remainder%%/*}" ;;
-  esac
-  [[ -n "$component" ]] || { echo "Cannot map $source_dependency to a licensed component." >&2; exit 1; }
-  if [[ "$component" == "ffmpeg" ]]; then
-    license="LGPL-2.1-or-later"
-    homepage="https://ffmpeg.org/"
-  else
-    info="$(brew info --json=v2 "$component")"
-    license="$(node -e 'const i=JSON.parse(process.argv[1]).formulae[0]; process.stdout.write(i.license||"")' "$info")"
-    homepage="$(node -e 'const i=JSON.parse(process.argv[1]).formulae[0]; process.stdout.write(i.homepage||"")' "$info")"
-    [[ -n "$license" ]] || { echo "Homebrew formula $component has no license metadata." >&2; exit 1; }
-    if [[ ! -d "$stage/licenses/homebrew/$component" ]]; then
-      info_file="$build/$component-formula.json"
-      printf '%s\n' "$info" > "$info_file"
-      node "$workspace/scripts/collect-macos-component-notices.mjs" \
-        "$info_file" "$(brew --prefix "$component")" \
-        "$stage/licenses/homebrew/$component" "$build/license-sources"
-    fi
-  fi
-  printf '%s\t%s\t%s\tlib/%s\n' "$component" "$license" "$homepage" "$library" >> "$components_tsv"
-done < "$dependency_origins"
-
-node -e '
-const fs=require("fs");
-const lines=fs.readFileSync(process.argv[1],"utf8").trim().split(/\n/).filter(Boolean);
-const map=new Map();
-for(const line of lines){const [name,license,homepage,file]=line.split("\t"); const item=map.get(name)||{name,license,homepage,files:[]}; item.files.push(file); map.set(name,item);}
-const licenseRoot=process.argv[3];
-const sourceLicenseFiles=[];
-const walk=directory=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true})){const full=`${directory}/${entry.name}`; if(entry.isDirectory()) walk(full); else sourceLicenseFiles.push(full.slice(licenseRoot.length+1));}};
-walk(licenseRoot);
-const output={schemaVersion:1,note:"Generated from the dylibs actually copied into the macOS runtime. Source and statically linked component notices are packaged under licenses/.",components:[...map.values()].map(v=>({...v,licenseFiles:v.name==="ffmpeg"?["FFmpeg-LGPL-2.1.txt"]:sourceLicenseFiles.filter(f=>f.startsWith(`homebrew/${v.name}/`)),files:[...new Set(v.files)].sort()})).sort((a,b)=>a.name.localeCompare(b.name)),sourceLicenseFiles:sourceLicenseFiles.sort()};
-fs.writeFileSync(process.argv[2],JSON.stringify(output,null,2)+"\n");
-' "$components_tsv" "$stage/BUNDLED-COMPONENTS.json" "$stage/licenses"
+collect_macos_runtime_component_notices
 
 node "$workspace/scripts/materialize-runtime-links.mjs" "$stage"
 while IFS= read -r macho; do

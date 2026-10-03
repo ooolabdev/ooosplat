@@ -2,11 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildLock, workspace, fileHash, filesUnder, verifyColmap } from "./colmap-runtime.mjs";
+import { verifyCudaToolkit, verifyCudaCmake } from "./verify-cuda-toolkit.mjs";
 const [platform, stageArg, sourceArg, buildArg, installedArg] = process.argv.slice(2);
 if (!["windows", "linux"].includes(platform)) throw new Error("Expected windows or linux");
 const [stage, source, build, installed] = [stageArg, sourceArg, buildArg, installedArg].map(p => path.resolve(p));
 // Deletions are limited to this freshly created build's staging directory.
 if (!stage.startsWith(`${path.join(workspace, ".cache", `colmap-${platform}-build`)}${path.sep}`)) throw new Error("Unsafe staging directory");
+if (!process.env.CUDA_PATH) throw new Error("CUDA_PATH is required to record the actual build toolkit");
+const cudaToolkit = {
+  ...verifyCudaToolkit(platform, process.env.CUDA_PATH),
+  cmake: verifyCudaCmake(build, process.env.CUDA_PATH),
+};
 const cacheText = fs.readFileSync(path.join(build, "CMakeCache.txt"), "utf8");
 const preTrimBytes = filesUnder(stage).reduce((sum, file) => sum + fs.statSync(file).size, 0);
 for (const [feature, value] of [...buildLock.disabledFeatures.map(f => [f, "OFF"]), ["CUDA", "ON"], ["CASPAR", "ON"]]) {
@@ -99,7 +105,7 @@ Object.assign(colmapFeatures, { CUDA: true, CASPAR: true, CERES: true, CASPAR_US
 const compiler = spawnSync(platform === "windows" ? "cl" : "c++", platform === "windows" ? [] : ["--version"], { encoding: "utf8" });
 const info = { schemaVersion: 1, platform, architecture: "x64", generatedAt: new Date().toISOString(),
   colmap: { version: buildLock.version, commit: buildLock.commit, sourceUrl: buildLock.sourceUrl, sourceSha256: buildLock.sourceSha256 },
-  colmapFeatures, cudaVersion: buildLock.cudaVersion, cudaArchitectures: buildLock.cudaArchitectures,
+  colmapFeatures, cudaVersion: buildLock.cudaVersion, cudaToolkit, cudaArchitectures: buildLock.cudaArchitectures,
   dependencies: { vcpkgCommit: buildLock.vcpkgCommit }, compiler: `${compiler.stdout ?? ""}${compiler.stderr ?? ""}`.trim(),
   cmakeVersion: buildLock.cmakeVersion, ninjaVersion: buildLock.ninjaVersion, trimPolicy: buildLock.trimPolicy };
 fs.writeFileSync(path.join(stage, "BUILD-INFO.json"), JSON.stringify(info, null, 2) + "\n");
@@ -119,6 +125,6 @@ fs.writeFileSync(`${archive}.sha256`, `${fileHash(archive)}  ${path.basename(arc
 const report = { archive: path.basename(archive), archiveSha256: fileHash(archive), integritySha256: fileHash(path.join(stage, "SHA256SUMS")),
   preTrimBytes,
   compressedBytes: fs.statSync(archive).size, runtimeBytes: filesUnder(stage).reduce((sum, file) => sum + fs.statSync(file).size, 0),
-  features: colmapFeatures, gpuExecutionValidated: false, note: "Real NVIDIA mapper local/global BA acceptance remains separate from CLI verification." };
+  features: colmapFeatures, cudaToolkit, gpuExecutionValidated: false, note: "Real NVIDIA mapper local/global BA acceptance remains separate from CLI verification." };
 fs.writeFileSync(`${archive}.build-report.json`, JSON.stringify(report, null, 2) + "\n");
 console.log(JSON.stringify(report, null, 2));

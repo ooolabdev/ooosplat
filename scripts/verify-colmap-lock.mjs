@@ -3,6 +3,17 @@ import path from "node:path";
 import { workspace, buildLock, assertHashPin } from "./colmap-runtime.mjs";
 assertHashPin(buildLock.sourceSha256, "COLMAP source");
 if (buildLock.version !== "4.2.1" || buildLock.commit !== "bd1fcf654d2dd8fefa1466999c190a246f83f4b9") throw new Error("Unexpected COLMAP release");
+if (buildLock.cudaVersion !== "13.2.0") throw new Error("Unexpected CUDA release");
+const cudaIdentity = buildLock.cudaToolkitIdentity;
+for (const [name, version] of Object.entries({ cuda_nvcc: "13.2.51", cuda_cudart: "13.2.51", cuda_crt: "13.2.51", libcurand: "10.4.2.51" })) {
+  if (cudaIdentity?.components?.[name] !== version) throw new Error(`Unexpected CUDA component lock: ${name}`);
+}
+for (const [platform, metadataVersion] of Object.entries({ windows: "13.2.0", linux: "13.2.20260303" })) {
+  const identity = cudaIdentity?.platforms?.[platform];
+  if (identity?.metadataVersion !== metadataVersion) throw new Error(`Unexpected ${platform} CUDA metadata identity`);
+  assertHashPin(identity.metadataSha256, `${platform} CUDA metadata source`);
+  if (!identity.metadataUrl?.startsWith("https://developer.download.nvidia.com/compute/cuda/repos/") || !identity.metadataUrl.endsWith("/version_13.2.0.json")) throw new Error("Unexpected CUDA metadata source");
+}
 const manifests = ["manifest.json", "manifest.linux.json", "manifest.macos.json"].map(name => JSON.parse(fs.readFileSync(path.join(workspace, "engines", name), "utf8")));
 const entries = [manifests[0].engines.find(e => e.name === "COLMAP"), manifests[1].colmap, manifests[2].engines.find(e => e.name === "COLMAP")];
 for (const entry of entries) if (entry.version !== buildLock.version || entry.commit !== buildLock.commit) throw new Error("Platforms must use the same COLMAP source commit");

@@ -1,0 +1,150 @@
+{
+   "cuda" : {
+      "name" : "CUDA SDK",
+      "version" : "13.2.20260303"
+   },
+   "cuda_cccl" : {
+      "name" : "CUDA C++ Core Compute Libraries",
+      "version" : "13.2.27"
+   },
+   "cuda_crt" : {
+      "name" : "CUDA crt Compiler for CUDA applications",
+      "version" : "13.2.51"
+   },
+   "cuda_ctadvisor" : {
+      "name" : "CUDA Compile Time Advisor",
+      "version" : "13.2.51"
+   },
+   "cuda_cudart" : {
+      "name" : "CUDA Runtime (cudart)",
+      "version" : "13.2.51"
+   },
+   "cuda_culibos" : {
+      "name" : "CUDA DEV culibos is a Math Libraries",
+      "version" : "13.2.51"
+   },
+   "cuda_cuobjdump" : {
+      "name" : "cuobjdump",
+      "version" : "13.2.51"
+   },
+   "cuda_cupti" : {
+      "name" : "CUPTI",
+      "version" : "13.2.23"
+   },
+   "cuda_cuxxfilt" : {
+      "name" : "CUDA cu++ filt",
+      "version" : "13.2.51"
+   },
+   "cuda_gdb" : {
+      "name" : "CUDA GDB",
+      "version" : "13.2.20"
+   },
+   "cuda_nsight" : {
+      "name" : "Nsight Eclipse Plugins",
+      "version" : "13.2.20"
+   },
+   "cuda_nvcc" : {
+      "name" : "CUDA NVCC",
+      "version" : "13.2.51"
+   },
+   "cuda_nvdisasm" : {
+      "name" : "CUDA nvdisasm",
+      "version" : "13.2.51"
+   },
+   "cuda_nvml_dev" : {
+      "name" : "CUDA NVML Headers",
+      "version" : "13.2.51"
+   },
+   "cuda_nvprune" : {
+      "name" : "CUDA nvprune",
+      "version" : "13.2.51"
+   },
+   "cuda_nvrtc" : {
+      "name" : "CUDA NVRTC",
+      "version" : "13.2.51"
+   },
+   "cuda_nvtx" : {
+      "name" : "CUDA NVTX",
+      "version" : "13.2.20"
+   },
+   "cuda_opencl" : {
+      "name" : "CUDA OpenCL",
+      "version" : "13.2.51"
+   },
+   "cuda_profiler_api" : {
+      "name" : "CUDA Profiler API",
+      "version" : "13.2.20"
+   },
+   "cuda_sandbox_dev" : {
+      "name" : "NVIDIA Sandbox Utils",
+      "version" : "13.2.51"
+   },
+   "cuda_sanitizer_api" : {
+      "name" : "CUDA Compute Sanitizer API",
+      "version" : "13.2.23"
+   },
+   "libcublas" : {
+      "name" : "CUDA cuBLAS",
+      "version" : "13.3.0.5"
+   },
+   "libcufft" : {
+      "name" : "CUDA cuFFT",
+      "version" : "12.2.0.37"
+   },
+   "libcufile" : {
+      "name" : "GPUDirect Storage (cufile)",
+      "version" : "1.17.0.44"
+   },
+   "libcurand" : {
+      "name" : "CUDA cuRAND",
+      "version" : "10.4.2.51"
+   },
+   "libcusolver" : {
+      "name" : "CUDA cuSOLVER",
+      "version" : "12.1.0.51"
+   },
+   "libcusparse" : {
+      "name" : "CUDA cuSPARSE",
+      "version" : "12.7.9.17"
+   },
+   "libnpp" : {
+      "name" : "CUDA NPP",
+      "version" : "13.1.0.44"
+   },
+   "libnvfatbin" : {
+      "name" : "Fatbin interaction library",
+      "version" : "13.2.51"
+   },
+   "libnvjitlink" : {
+      "name" : "JIT Linker Library",
+      "version" : "13.2.51"
+   },
+   "libnvjpeg" : {
+      "name" : "CUDA nvJPEG",
+      "version" : "13.0.4.44"
+   },
+   "libnvptxcompiler" : {
+      "name" : "CUDA PTX compiler",
+      "version" : "13.2.51"
+   },
+   "libnvvm" : {
+      "name" : "NVVM",
+      "version" : "13.2.51"
+   },
+   "nsight_compute" : {
+      "name" : "Nsight Compute",
+      "version" : "2026.1.0.9"
+   },
+   "nsight_systems" : {
+      "name" : "Nsight Systems",
+      "version" : "2025.6.3.343"
+   },
+   "nvidia_driver" : {
+      "name" : "NVIDIA Linux Driver",
+      "version" : "595.45.04"
+   },
+   "nvidia_fs" : {
+      "name" : "NVIDIA file-system",
+      "version" : "2.28.2"
+   }
+}

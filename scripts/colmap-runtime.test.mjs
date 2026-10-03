@@ -15,6 +15,13 @@ function fixture(t, platform = "linux") {
     ...Object.fromEntries(buildLock.disabledFeatures.map(f => [f, false])),
     CUDA: platform !== "macos", CASPAR: platform !== "macos", CERES: true, CASPAR_USE_DOUBLE: false,
   }, cudaVersion: buildLock.cudaVersion, cudaArchitectures: buildLock.cudaArchitectures };
+  if (platform !== "macos") info.cudaToolkit = {
+    releaseVersion: buildLock.cudaVersion,
+    metadataVersion: buildLock.cudaToolkitIdentity.platforms[platform].metadataVersion,
+    components: { ...buildLock.cudaToolkitIdentity.components },
+    compiler: { path: "/build/toolkit/bin/nvcc", version: buildLock.cudaToolkitIdentity.components.cuda_nvcc },
+    cmake: { compiler: { path: "/build/toolkit/bin/nvcc", version: buildLock.cudaToolkitIdentity.components.cuda_nvcc }, architectures: [...buildLock.cudaArchitectures] },
+  };
   write("BUILD-INFO.json", JSON.stringify(info));
   write("BUNDLED-COMPONENTS.json", JSON.stringify({ components: [{ name: "test", files: [], licenseFiles: ["COLMAP-LICENSE.txt"] }], sourceLicenseFiles: ["COLMAP-LICENSE.txt"] }));
   const reseal = () => {
@@ -64,6 +71,22 @@ test("unlicensed shared library is retained but blocks packaging", t => {
   f.write("lib/libunknown.so.1", "library");
   assert.throws(() => verifyColmap(f.root, "linux", f.reseal(), { run: false }), /Missing dependency license inventory/);
   assert.ok(fs.existsSync(path.join(f.root, "lib/libunknown.so.1")));
+});
+
+test("runtime metadata reports real CUDA identity rather than only the release label", t => {
+  for (const mutate of [
+    info => { delete info.cudaToolkit; },
+    info => { info.cudaToolkit.metadataVersion = "13.2.20260623"; },
+    info => { info.cudaToolkit.components.cuda_cudart = "13.2.86"; },
+    info => { info.cudaToolkit.compiler.version = "13.2.86"; },
+    info => { info.cudaToolkit.cmake.compiler.version = "13.2.86"; },
+    info => { info.cudaToolkit.cmake.architectures = [86]; },
+  ]) {
+    const f = fixture(t);
+    mutate(f.info);
+    f.write("BUILD-INFO.json", JSON.stringify(f.info));
+    assert.throws(() => verifyColmap(f.root, "linux", f.reseal(), { run: false }), /CUDA|cuda/i);
+  }
 });
 test("test binaries and vocabulary resources are forbidden even when hashed", t => {
   for (const name of ["bin/sift_test.exe", "bin/colmap.pdb", "bin/vocab_tree_faiss_flickr100K_words256K.bin"]) {

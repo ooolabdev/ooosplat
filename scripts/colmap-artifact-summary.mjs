@@ -13,13 +13,16 @@ export function artifactSummary(platform, report, artifactUrl) {
   const placement = placements[platform];
   if (!placement) throw new Error(`Unsupported platform: ${platform}`);
   const size = bytes => `${(bytes / 1024 / 1024).toFixed(2)} MiB (${bytes} bytes)`;
+  const cudaIdentity = report.cudaToolkit
+    ? `\n- Actual CUDA identity: metadata \`${report.cudaToolkit.metadataVersion}\`; nvcc \`${report.cudaToolkit.compiler.version}\`; components \`${JSON.stringify(report.cudaToolkit.components)}\``
+    : "";
   return `## COLMAP-only: ${platform} ${placement.architecture}
 
 [Download Actions Artifact](${artifactUrl}) — expires after 30 days.
 
 - Archive: \`${report.archive}\`
 - COLMAP source: \`${buildLock.version}\` / \`${buildLock.commit}\`
-- Build backends: ${platform === "macos" ? "Ceres CPU; no CUDA/Caspar" : `CUDA ${buildLock.cudaVersion}, Caspar f32 and Ceres CPU; architectures ${buildLock.cudaArchitectures.join(";")}`}
+- Build backends: ${platform === "macos" ? "Ceres CPU; no CUDA/Caspar" : `CUDA ${buildLock.cudaVersion}, Caspar f32 and Ceres CPU; architectures ${buildLock.cudaArchitectures.join(";")}`}${cudaIdentity}
 - Archive SHA-256 (optional reference, not required locally): \`${report.archiveSha256}\`
 - Before trimming: ${size(report.preTrimBytes)}
 - Runtime: ${size(report.runtimeBytes)}

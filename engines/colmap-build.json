@@ -8,6 +8,26 @@
   "cmakeVersion": "4.3.2",
   "ninjaVersion": "1.12.1",
   "cudaVersion": "13.2.0",
+  "cudaToolkitIdentity": {
+    "components": {
+      "cuda_nvcc": "13.2.51",
+      "cuda_cudart": "13.2.51",
+      "cuda_crt": "13.2.51",
+      "libcurand": "10.4.2.51"
+    },
+    "platforms": {
+      "linux": {
+        "metadataVersion": "13.2.20260303",
+        "metadataUrl": "https://developer.download.nvidia.com/compute/cuda/repos/runfile/x86_64/version_13.2.0.json",
+        "metadataSha256": "d4fc6183d1a103906f70cc253c054e5ccab0297c421b2bb6201d970a01f9e357"
+      },
+      "windows": {
+        "metadataVersion": "13.2.0",
+        "metadataUrl": "https://developer.download.nvidia.com/compute/cuda/repos/windows/x86_64/version_13.2.0.json",
+        "metadataSha256": "fe5067ed60a1e93d1c41c4480601c962cd8b39b7e9335b48673c09f318040de5"
+      }
+    }
+  },
   "cudaArchitectures": [75, 80, 86, 89, 90, 100, 120],
   "minimumDriver": "580.00",
   "minimumComputeCapability": "7.5",

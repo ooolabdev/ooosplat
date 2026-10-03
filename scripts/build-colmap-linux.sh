@@ -19,8 +19,7 @@ check_version() {
 cmake_output="$(cmake --version)"
 check_version CMake "${cmake_output%%$'\n'*}" "cmake version $(read_lock cmakeVersion)"
 check_version Ninja "$(ninja --version)" "$(read_lock ninjaVersion)"
-[[ -f "$cuda_root/version.json" ]] || { echo "Missing CUDA toolkit metadata: $cuda_root/version.json" >&2; exit 1; }
-check_version CUDA "$(node -p 'require(process.argv[1]).cuda.version' "$cuda_root/version.json")" "$(read_lock cudaVersion)"
+node "$workspace/scripts/verify-cuda-toolkit.mjs" linux "$cuda_root"
 cache="$workspace/.cache/colmap-linux-build"
 mkdir -p "$cache"
 task_directory="$(mktemp -d "$cache/build-XXXXXX")"
@@ -48,7 +47,10 @@ cmake -S "$source" -B "$build" -G Ninja \
   -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBUILD_SHARED_LIBS=OFF \
   -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
   -DCUDA_ENABLED=ON -DCASPAR_ENABLED=ON -DCASPAR_USE_DOUBLE=OFF \
-  -DCMAKE_CUDA_ARCHITECTURES="$architectures" -DCUDAToolkit_ROOT="$cuda_root" "${options[@]}"
+  -DCMAKE_CUDA_ARCHITECTURES:STRING="$architectures" \
+  -DCMAKE_CUDA_COMPILER:FILEPATH="$cuda_root/bin/nvcc" \
+  -DCUDAToolkit_ROOT:PATH="$cuda_root" "${options[@]}"
+node "$workspace/scripts/verify-cuda-toolkit.mjs" linux "$cuda_root" "$build"
 cmake --build "$build" --parallel "${OOOSPLAT_BUILD_JOBS:-4}"
 cmake --install "$build"
 installed="$build/vcpkg_installed/x64-linux-dynamic"

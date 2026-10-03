@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { validateCudaMetadata } from "./verify-cuda-toolkit.mjs";
 
 export const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const buildLock = JSON.parse(fs.readFileSync(path.join(workspace, "engines/colmap-build.json"), "utf8"));
@@ -51,6 +52,18 @@ export function verifyColmap(root, platform, pin, { run = true } = {}) {
   const features = info.colmapFeatures;
   if (!features || buildLock.disabledFeatures.some(feature => features[feature] !== false) || features.CASPAR !== (platform !== "macos") || features.CUDA !== (platform !== "macos") || features.CERES !== true || features.CASPAR_USE_DOUBLE !== false) throw new Error("COLMAP feature policy mismatch");
   if (platform !== "macos" && (info.cudaVersion !== buildLock.cudaVersion || JSON.stringify(info.cudaArchitectures) !== JSON.stringify(buildLock.cudaArchitectures))) throw new Error("CUDA build lock mismatch");
+  if (platform !== "macos") {
+    const actual = info.cudaToolkit;
+    if (!actual || actual.releaseVersion !== buildLock.cudaVersion) throw new Error("Missing actual CUDA toolkit identity");
+    const metadata = { cuda: { version: actual.metadataVersion } };
+    for (const [name, version] of Object.entries(actual.components ?? {})) metadata[name] = { version };
+    validateCudaMetadata(platform, metadata, { log: () => {} });
+    const nvccVersion = buildLock.cudaToolkitIdentity.components.cuda_nvcc;
+    if (actual.compiler?.version !== nvccVersion || actual.cmake?.compiler?.version !== nvccVersion
+      || JSON.stringify(actual.cmake?.architectures) !== JSON.stringify(buildLock.cudaArchitectures)) {
+      throw new Error("Actual CUDA compiler/configuration identity mismatch");
+    }
+  }
   const binary = path.join(root, "bin", platform === "windows" ? "colmap.exe" : "colmap");
   const covered = new Set(fs.readFileSync(path.join(root, "SHA256SUMS"), "utf8").split(/\r?\n/).filter(Boolean).map(line => line.slice(66)));
   if (!covered.has(`bin/${path.basename(binary)}`)) throw new Error("COLMAP executable is not hash locked");
