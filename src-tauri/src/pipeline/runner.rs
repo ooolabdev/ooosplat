@@ -1935,6 +1935,30 @@ impl PipelineRunner {
                     gpu_index,
                 )
                 .await?;
+                // Sequential matching only links neighbouring frames, so on a
+                // closed capture path the end of the sequence is never matched
+                // against its beginning. Those pairs are what keep an orbit
+                // reconstruction from drifting where the path closes.
+                let loop_pair_list = paths.colmap.join("loop-closure-pairs.txt");
+                let loop_pairs =
+                    colmap::write_loop_closure_pair_list(&loop_pair_list, &paths.frames, None)?;
+                if loop_pairs > 0 {
+                    self.events.stage(
+                        PipelineStage::Matching,
+                        0.0,
+                        format!("COLMAP 正在进行回路闭合（{loop_pairs} 组首尾帧对）"),
+                    );
+                    colmap::match_pairs(
+                        &self.engines.colmap,
+                        &database,
+                        &loop_pair_list,
+                        paths.logs.join("colmap-loop-closure.log"),
+                        &self.process_manager,
+                        None,
+                        gpu_index,
+                    )
+                    .await?;
+                }
             }
             state.stage = PipelineStage::Matching;
             state.matching_complete = true;
