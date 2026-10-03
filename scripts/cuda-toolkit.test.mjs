@@ -17,7 +17,9 @@ const nvccOutput = version => `nvcc: NVIDIA (R) Cuda compiler driver\nCuda compi
 function toolkit(t, platform = hostPlatform, newline = "\n") {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-cuda-test-"));
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
-  const root = path.join(temporary, "中文 toolkit");
+  // macOS /var is a symlink to /private/var. Compare canonical paths, just as
+  // the production verifier does, rather than treating aliases as toolkits.
+  const root = path.join(fs.realpathSync(temporary), "中文 toolkit");
   const compiler = path.join(root, "bin", platform === "windows" ? "nvcc.exe" : "nvcc");
   fs.mkdirSync(path.dirname(compiler), { recursive: true });
   fs.writeFileSync(compiler, "mock compiler; tests inject execution");
@@ -133,6 +135,14 @@ test("a wrong toolkit root or a missing compiler cannot reuse PATH metadata", t 
   assert.throws(() => verifyCudaToolkit(hostPlatform, wrongRoot, { execute: f.execute, log: quiet }));
   fs.unlinkSync(f.compiler);
   assert.throws(() => verifyCudaToolkit(hostPlatform, f.root, { execute: f.execute, log: quiet }));
+});
+
+test("a filesystem alias of the selected toolkit resolves to the same compiler", t => {
+  const f = toolkit(t);
+  const alias = path.join(path.dirname(f.root), "toolkit alias");
+  fs.symlinkSync(f.root, alias, process.platform === "win32" ? "junction" : "dir");
+  const actual = verifyCudaToolkit(hostPlatform, alias, { execute: f.execute, log: quiet });
+  assert.equal(actual.compiler.path, f.compiler);
 });
 
 test("CMake records the selected compiler, full version and locked STRING architectures with either newline", t => {
