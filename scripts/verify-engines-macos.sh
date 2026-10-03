@@ -24,6 +24,11 @@ for binary in ffmpeg ffprobe colmap brush_app; do
 done
 
 (cd "$runtime" && shasum -a 256 -c SHA256SUMS)
+integrity_pin="$(node -p 'require(process.argv[1]).distribution.integritySha256' "$manifest")"
+if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" == "1" && -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
+  integrity_pin="$(shasum -a 256 "$runtime/SHA256SUMS" | awk '{print $1}')"
+fi
+node "$workspace/scripts/colmap-runtime.mjs" "$runtime" macos "$integrity_pin"
 
 version_le() {
   local left_major="${1%%.*}" left_minor="${1#*.}" right_major="${2%%.*}" right_minor="${2#*.}"
@@ -91,8 +96,9 @@ if find "$runtime" -type f -print | grep -Ei 'cuda|cudnn|cudart|curand' >/dev/nu
   exit 1
 fi
 
+node "$workspace/scripts/brush-runtime.mjs" verify-macos-bundle macos "$runtime"
 brush_help="$(PATH="$restricted_path" "$runtime/bin/brush_app" --help 2>&1)"
-for flag in --total-steps --max-resolution --export-every --export-path --export-name; do
+for flag in --total-train-iters --max-resolution --export-every --export-path --export-name; do
   grep -q -- "$flag" <<<"$brush_help" || { echo "Brush is missing $flag" >&2; exit 1; }
 done
 

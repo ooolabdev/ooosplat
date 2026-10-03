@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential colmap curl ffmpeg file libvulkan1 mesa-vulkan-drivers \
+            build-essential curl ffmpeg file libvulkan1 mesa-vulkan-drivers \
             libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 
@@ -49,13 +49,15 @@ jobs:
         run: |
           npm run verify:telemetry:release
           npm test
+          npm run test:engine-scripts
+          npm run verify:colmap-lock
           npm run build
           npm run verify:bundle-resources
 
       - name: Verify license metadata and mappings
         run: npm run verify:licenses
 
-      - name: Install and verify bundled Brush
+      - name: Install and verify pinned COLMAP and Brush
         run: |
           npm run setup:engines
           npm run verify:engines
@@ -91,12 +93,13 @@ jobs:
           test "$actual_version" = "$expected_version"
           dependencies="$(dpkg-deb --field "$package" Depends)"
           grep -Eq '(^|, )ffmpeg([ ,]|$)' <<<"$dependencies"
-          grep -Eq '(^|, )colmap([ ,]|$)' <<<"$dependencies"
+          ! grep -Eq '(^|, )colmap([ ,]|$)' <<<"$dependencies"
           extracted="$(mktemp -d)"
           trap 'rm -rf -- "$extracted"' EXIT
           dpkg-deb --extract "$package" "$extracted"
           test -n "$(find "$extracted" -type f -name ooo-splat -perm -111 -print -quit)"
           test -n "$(find "$extracted" -type f -path '*/engines/linux/brush/brush_app' -perm -111 -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/linux/colmap/bin/colmap' -perm -111 -print -quit)"
           test -n "$(find "$extracted" -type f -path '*/engines/manifest.linux.json' -print -quit)"
           test -z "$(find "$extracted" -type f -name 'vocab_tree_faiss_flickr100K_words256K.bin' -print -quit)"
           dpkg-deb --info "$package"

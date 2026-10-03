@@ -1,5 +1,6 @@
 pub mod brush;
 pub mod colmap;
+pub mod colmap_ba;
 pub mod ffmpeg;
 pub mod ffprobe;
 pub mod health;

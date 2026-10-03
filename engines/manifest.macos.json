@@ -28,10 +28,13 @@
     ]
   },
   "distribution": {
-    "tag": "engines-macos-arm64-v0.2.0",
-    "archiveName": "ooosplat-engines-macos-arm64-v0.2.0.tar.xz",
-    "sourceUrl": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.2.0/ooosplat-engines-macos-arm64-v0.2.0.tar.xz",
-    "archiveSha256File": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.2.0/ooosplat-engines-macos-arm64-v0.2.0.tar.xz.sha256",
+    "tag": "engines-macos-arm64-v0.3.0",
+    "archiveName": "ooosplat-engines-macos-arm64-v0.3.0.tar.xz",
+    "sourceUrl": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.3.0/ooosplat-engines-macos-arm64-v0.3.0.tar.xz",
+    "archiveSha256File": "https://github.com/ooolabdev/ooosplat/releases/download/engines-macos-arm64-v0.3.0/ooosplat-engines-macos-arm64-v0.3.0.tar.xz.sha256",
+    "archiveSha256": null,
+    "integritySha256": null,
+    "buildStatus": "pending-first-build-and-hash-lock",
     "destination": "engines/macos/arm64",
     "integrityFile": "SHA256SUMS"
   },
@@ -47,19 +50,27 @@
     },
     {
       "name": "COLMAP",
-      "version": "4.0.4",
-      "sourceUrl": "https://github.com/colmap/colmap/archive/refs/tags/4.0.4.tar.gz",
-      "sourceSha256": "200309ABCA2A3EE05970B1F8A48D545FC71F435DFFE6764A8040F9F6F364DA32",
-      "buildPolicy": "Apple arm64 CPU CLI-only; CUDA, GUI, tests, and OpenGL disabled",
+      "version": "4.2.1",
+      "commit": "bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+      "sourceUrl": "https://codeload.github.com/colmap/colmap/tar.gz/bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+      "sourceSha256": "650B14EE60A365D63D4585ECF64DDEAC085AFE8B38E31FB860EDB66017932E36",
+      "buildPolicy": "Apple arm64 Ceres CPU CLI-only; CUDA, Caspar, GUI, OpenGL, MVS, ONNX, CGAL, LSD, downloads and tests disabled",
       "license": "BSD-3-Clause",
       "licenseFiles": ["licenses/COLMAP-LICENSE.txt"]
     },
     {
       "name": "Brush",
-      "version": "0.3.0",
-      "sourceUrl": "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz",
-      "sourceSha256": "65B2631398C839BE3C1D4D7160FE2326389DEC87830AAC0710985E6690A1048C",
-      "buildPolicy": "Official Apple arm64 release; rebuild tag v0.3.0 from source if its deployment target exceeds macOS 15.0",
+      "version": "1.0.0",
+      "releaseTag": "ooo-v1.0.0",
+      "commit": "866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5",
+      "target": "aarch64-apple-darwin",
+      "sourceUrl": "https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-aarch64-apple-darwin.tar.gz",
+      "archiveName": "OOOBrush-aarch64-apple-darwin.tar.gz",
+      "sourceSha256": "5A47AABF185B9CA5697D760D30F9FBB9E6DA7B199137BCC8C8FCF488F84C0869",
+      "binarySha256": "DA613B4ED1C551F41E448D8AB0DC9CAF0F80BFD9F6943542E1B02C93D19CA74A",
+      "buildInfoSha256": "7E67CE10E7B8373F60BC05A7EDCB383E1DEDC7358B7D252781160315D6F997D1",
+      "licenseSha256": "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30",
+      "buildPolicy": "Pinned OOOBrush headless brush-cli renamed bin/brush_app; viewer excluded; verify deployment target <= macOS 15.0",
       "license": "Apache-2.0",
       "licenseFiles": ["licenses/Brush-LICENSE.txt"]
     }

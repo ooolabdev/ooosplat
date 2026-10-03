@@ -1474,6 +1474,7 @@ impl PipelineRunner {
                     Some(mapper_names.len() as u64),
                     ObserverMode::Mapper,
                 )),
+                acceleration.gpu_index(),
             )
             .await?;
             checkpoint.incremental_reconstruction_complete = true;
@@ -1979,6 +1980,7 @@ impl PipelineRunner {
                     Some(prepared.extracted_frames),
                     ObserverMode::Mapper,
                 )),
+                gpu_index,
             )
             .await?;
             state.stage = PipelineStage::Reconstructing;
@@ -2913,6 +2915,7 @@ impl PipelineRunner {
                 Some(prepared.extracted_frames),
                 ObserverMode::Mapper,
             )),
+            gpu_index,
         )
         .await?;
         let (model, report) =

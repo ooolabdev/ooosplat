@@ -38,17 +38,21 @@ configure string can be inspected with `ffmpeg.exe -buildconf`.
 
 COLMAP
 ------
-Release: 4.0.4 Windows x64 CUDA asset
-Binary-reported version: 4.1.0.dev0, commit 5b76f53, with CUDA
+Release: 4.2.1, self-built on Windows, Linux and macOS
+Source commit: bd1fcf654d2dd8fefa1466999c190a246f83f4b9
 License: BSD 3-Clause License
 SPDX identifier: BSD-3-Clause
 License text: licenses/COLMAP-LICENSE.txt
-Release source: https://github.com/colmap/colmap/releases/tag/4.0.4
-Commit source: https://github.com/colmap/colmap/tree/5b76f53
-Release archive: https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-cuda.zip
+Release source: https://github.com/colmap/colmap/releases/tag/4.2.1
+Commit source: https://github.com/colmap/colmap/tree/bd1fcf654d2dd8fefa1466999c190a246f83f4b9
+Runtime releases: https://github.com/ooolabdev/ooosplat/releases
+Windows/Linux include Caspar f32 (Symforce-Caspar, Apache-2.0) and Ceres.
+Caspar and dependency notices are packaged under runtime licenses/ and
+listed in BUNDLED-COMPONENTS.json. GUI, OpenGL, MVS, ONNX, CGAL, LSD,
+downloads and test programs are disabled.
 
-COLMAP 4.0.4 macOS arm64 CPU CLI-only distribution: built by OOOSplat from
-https://github.com/colmap/colmap/archive/refs/tags/4.0.4.tar.gz with CUDA, GUI,
+COLMAP 4.2.1 macOS arm64 CPU CLI-only distribution: built by OOOSplat from
+https://codeload.github.com/colmap/colmap/tar.gz/bd1fcf654d2dd8fefa1466999c190a246f83f4b9 with CUDA, Caspar, GUI,
 tests, and nonessential OpenGL support disabled. Required redistributable
 libraries are included and relocated inside the application; Homebrew is used
 only on the build runner and is not required by users. Direct build details
@@ -57,9 +61,8 @@ BUNDLED-COMPONENTS.json and indexed by engines/manifest.macos.json.
 
 NVIDIA CUDA Runtime
 -------------------
-Components: cudart64_12.dll (CUDA Runtime), curand64_10.dll (cuRAND),
-            onnxruntime_providers_cuda.dll (ONNX Runtime CUDA provider)
-Origin: bundled inside the COLMAP 4.0.4 Windows x64 CUDA release asset
+Components: CUDA 13.2.0 Runtime and cuRAND (Windows DLLs/Linux shared libraries)
+Origin: OOOSplat self-built COLMAP 4.2.1 Windows/Linux CUDA + Caspar runtime
 License: NVIDIA CUDA Toolkit End User License Agreement — redistributable
          runtime files (Attachment A), unmodified
 License text: licenses/NVIDIA-CUDA-Runtime.txt
@@ -67,14 +70,23 @@ Upstream source: https://docs.nvidia.com/cuda/eula/index.html
 
 Brush
 -----
-Version: v0.3.0
+Version: OOOBrush ooo-v1.0.0 (headless brush-cli 1.0.0)
+Source commit: 866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5
 License: Apache License 2.0
 SPDX identifier: Apache-2.0
 License text: licenses/Brush-LICENSE.txt
-Upstream source: https://github.com/ArthurBrussee/brush/tree/v0.3.0
-Windows x64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip
-Ubuntu 24.04 Alpha, Linux x86_64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz
-macOS 15+ Apple Silicon arm64 release archive: https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz
+Fork source: https://github.com/ooolabdev/OOOBrush/tree/866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5
+Original upstream and attribution: https://github.com/ArthurBrussee/brush
+Windows x64 release archive: https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-x86_64-pc-windows-msvc.zip
+Ubuntu 24.04 Alpha, Linux x86_64 release archive: https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-x86_64-unknown-linux-gnu.tar.gz
+macOS 15+ Apple Silicon arm64 release archive: https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-aarch64-apple-darwin.tar.gz
+Only brush-cli is installed, aliased to brush_app(.exe) for path compatibility.
+The viewer executable is excluded. Each runtime retains the release LICENSE,
+BUILDINFO.json, UPSTREAM-README.md, UPSTREAM-SHA256SUMS (source archive only),
+and INSTALL-INFO.json recording the original binary and installed alias.
+The release binaries are unsigned/not notarized; macOS application packaging
+uses the existing signing policy. GPU training acceptance is not implied by
+CLI version/help smoke tests.
 
 PlayCanvas Engine
 -----------------

@@ -12,6 +12,10 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 }
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+# Validate/install COLMAP first so an unbuilt release cannot partially update
+# the other engines or silently accept the previously downloaded official zip.
+& node (Join-Path $PSScriptRoot 'setup-colmap-runtime.mjs') windows
+if ($LASTEXITCODE -ne 0) { throw 'Locked COLMAP runtime installation failed.' }
 if (-not $CacheDirectory) {
   $CacheDirectory = Join-Path $workspace '.cache\engines'
 }
@@ -42,6 +46,7 @@ function Test-RequiredFiles($Engine, [string]$Destination) {
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 foreach ($engine in $manifest.engines) {
+  if ($engine.name -eq 'COLMAP' -or $engine.name -eq 'Brush') { continue }
   $install = $engine.install
   if (-not $install) { throw "Engine '$($engine.name)' has no install configuration." }
 
@@ -101,5 +106,10 @@ foreach ($engine in $manifest.engines) {
     }
   }
 }
+
+$brushArguments = @('prepare', 'windows', '--cache', $CacheDirectory)
+if ($Force) { $brushArguments += '--force' }
+& node (Join-Path $PSScriptRoot 'brush-runtime.mjs') @brushArguments
+if ($LASTEXITCODE -ne 0) { throw 'Pinned OOOBrush installation failed.' }
 
 & (Join-Path $PSScriptRoot 'verify-engines.ps1')

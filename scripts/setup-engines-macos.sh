@@ -20,6 +20,11 @@ archive="$cache/$archive_name"
 checksum="$archive.sha256"
 
 mkdir -p "$cache" "$(dirname "$destination")"
+if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" != "1" ]]; then
+  [[ "$(read_manifest distribution.archiveSha256)" =~ ^[a-fA-F0-9]{64}$ && "$(read_manifest distribution.integritySha256)" =~ ^[a-fA-F0-9]{64}$ ]] || {
+    echo 'macOS engine archive is not yet hash-locked; build, review and lock the first release.' >&2; exit 1;
+  }
+fi
 if [[ -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
   source_archive="$OOOSPLAT_MACOS_ENGINE_ARCHIVE"
   [[ -f "$source_archive" ]] || { echo "Missing local engine archive: $source_archive" >&2; exit 1; }
@@ -36,7 +41,11 @@ else
   curl --fail --location --retry 3 "$checksum_url" --output "$checksum"
 fi
 
-expected="$(awk 'NF { print tolower($1); exit }' "$checksum")"
+expected="$(read_manifest distribution.archiveSha256)"
+if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" == "1" && -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
+  expected="$(awk 'NF { print tolower($1); exit }' "$checksum")"
+fi
+expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
 [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid release checksum file." >&2; exit 1; }
 actual="$(shasum -a 256 "$archive" | awk '{ print tolower($1) }')"
 [[ "$actual" == "$expected" ]] || { echo "macOS engine archive SHA-256 mismatch." >&2; exit 1; }
@@ -51,6 +60,11 @@ trap 'rm -rf -- "$temporary"' EXIT
 tar -xJf "$archive" -C "$temporary"
 runtime_root="$temporary/ooosplat-engines-macos-arm64"
 [[ -d "$runtime_root" ]] || { echo "Unexpected macOS engine archive layout." >&2; exit 1; }
+integrity_pin="$(read_manifest distribution.integritySha256)"
+if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" == "1" && -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
+  integrity_pin="$(shasum -a 256 "$runtime_root/SHA256SUMS" | awk '{print $1}')"
+fi
+node "$workspace/scripts/colmap-runtime.mjs" "$runtime_root" macos "$integrity_pin"
 
 staged="$temporary/runtime"
 mv "$runtime_root" "$staged"

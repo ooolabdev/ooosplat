@@ -4,6 +4,7 @@ set -euo pipefail
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="$workspace/src-tauri/target/release/ooo-splat"
 bundled_brush="$workspace/src-tauri/target/release/engines/linux/brush/brush_app"
+bundled_colmap="$workspace/src-tauri/target/release/engines/linux/colmap/bin/colmap"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "This launcher only supports Linux." >&2
@@ -22,7 +23,7 @@ npm run verify:engines
 npm run verify:licenses
 
 needs_build=false
-if [[ ! -x "$binary" || ! -x "$bundled_brush" ]]; then
+if [[ ! -x "$binary" || ! -x "$bundled_brush" || ! -x "$bundled_colmap" ]]; then
   needs_build=true
 else
   build_inputs=(
@@ -34,6 +35,8 @@ else
     "$workspace/src-tauri/Cargo.lock"
     "$workspace/src-tauri/tauri.conf.json"
     "$workspace/src-tauri/tauri.linux.conf.json"
+    "$workspace/engines/manifest.linux.json"
+    "$workspace/engines/linux/colmap"
     "$workspace/package.json"
     "$workspace/package-lock.json"
     "$workspace/index.html"

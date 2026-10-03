@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "version": "4.2.1",
+  "commit": "bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+  "sourceUrl": "https://codeload.github.com/colmap/colmap/tar.gz/bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+  "sourceSha256": "650B14EE60A365D63D4585ECF64DDEAC085AFE8B38E31FB860EDB66017932E36",
+  "vcpkgCommit": "127402f1c75bb3d5ff6bce04b285faa4930a5aca",
+  "cmakeVersion": "4.3.2",
+  "ninjaVersion": "1.12.1",
+  "cudaVersion": "13.2.0",
+  "cudaArchitectures": [75, 80, 86, 89, 90, 100, 120],
+  "minimumDriver": "580.00",
+  "minimumComputeCapability": "7.5",
+  "disabledFeatures": ["GUI", "OPENGL", "MVS", "ONNX", "CGAL", "LSD", "DOWNLOAD", "TESTS"],
+  "casparUseDouble": false,
+  "trimPolicy": "Only official build switches and development artifacts are removed. Preserve unresolved runtime/plugin dependencies and all required notices."
+}

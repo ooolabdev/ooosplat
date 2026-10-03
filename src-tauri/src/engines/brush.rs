@@ -7,10 +7,23 @@ use crate::{
     engines::ColmapAccelerationStatus,
     error::{Result, SplatError},
     presets::BrushTrainingPreset,
-    process::{ProcessManager, ProcessObserver, ProcessSpec},
+    process::{ProcessManager, ProcessObserver, ProcessOutput, ProcessSpec},
 };
 
-const BRUSH_GPU_LOG_FILTER: &str = "cubecl_wgpu=info,burn_wgpu=info";
+const BRUSH_GPU_LOG_FILTER: &str =
+    "brush_cli=info,brush_process=info,cubecl_wgpu=info,burn_wgpu=info";
+pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
+    "--total-train-iters",
+    "--max-resolution",
+    "--refine-every",
+    "--max-splats",
+    "--growth-grad-threshold",
+    "--growth-select-fraction",
+    "--growth-stop-iter",
+    "--export-every",
+    "--export-path",
+    "--export-name",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrushGpuLaunchPolicy {
@@ -90,6 +103,9 @@ impl BrushGpuLaunchPolicy {
             _ => OsString::from(BRUSH_GPU_LOG_FILTER),
         };
         environment.push((OsString::from("RUST_LOG"), rust_log));
+        if std::env::var_os("RUST_BACKTRACE").is_none() {
+            environment.push((OsString::from("RUST_BACKTRACE"), OsString::from("1")));
+        }
         environment
     }
 
@@ -114,7 +130,7 @@ fn train_args(
     preset: BrushTrainingPreset,
 ) -> Vec<OsString> {
     let mut args = vec![
-        OsString::from("--total-steps"),
+        OsString::from("--total-train-iters"),
         preset.total_steps.to_string().into(),
         OsString::from("--max-resolution"),
         preset.max_resolution.to_string().into(),
@@ -186,6 +202,14 @@ pub async fn train(
             &environment,
         )
         .await?;
+    resolve_train_output(&output, candidate, alternate)
+}
+
+fn resolve_train_output(
+    output: &ProcessOutput,
+    candidate: PathBuf,
+    alternate: PathBuf,
+) -> Result<PathBuf> {
     if !output.success {
         let detail = output.failure_detail();
         if is_out_of_memory_detail(&detail) {
@@ -318,7 +342,7 @@ mod tests {
         );
         assert_eq!(
             environment_value(&environment, "RUST_LOG"),
-            Some("app=debug,cubecl_wgpu=info,burn_wgpu=info")
+            Some("app=debug,brush_cli=info,brush_process=info,cubecl_wgpu=info,burn_wgpu=info")
         );
         assert!(!environment.iter().any(|(key, _)| key == "WGPU_BACKEND"));
         assert!(policy.log_summary().contains("backend=Vulkan"));
@@ -364,6 +388,55 @@ mod tests {
             environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
             None
         );
+    }
+
+    #[test]
+    fn new_cli_preserves_iterations_exports_and_unicode_paths() {
+        let dataset = Path::new("中文 数据集");
+        let output = Path::new("中文 导出目录");
+        let preset = resolve_brush_training_preset(Quality::Balanced, false, None, 1_600, 0).preset;
+        let args = train_args(dataset, output, preset);
+        assert_eq!(args.last(), Some(&dataset.as_os_str().to_owned()));
+        assert!(args.windows(2).any(|pair| pair[0] == "--total-train-iters"
+            && pair[1] == OsString::from(preset.total_steps.to_string())));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--export-path" && pair[1] == output.as_os_str()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--export-name" && pair[1] == "final.ply.tmp"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--total-steps" || arg == "--lod-levels"));
+    }
+
+    #[test]
+    fn completed_iterations_or_zero_exit_do_not_establish_successful_export() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("final.ply.tmp");
+        let alternate = directory.path().join("final.ply.tmp.ply");
+        let output = ProcessOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
+            stderr: "Export at iteration 4 failed".into(),
+        };
+        assert!(resolve_train_output(&output, candidate.clone(), alternate.clone()).is_err());
+        std::fs::write(&candidate, "candidate is validated as PLY by the pipeline").unwrap();
+        assert_eq!(
+            resolve_train_output(&output, candidate.clone(), alternate.clone()).unwrap(),
+            candidate
+        );
+        let failed = ProcessOutput {
+            success: false,
+            exit_code: Some(1),
+            stderr: "VK_ERROR_DEVICE_LOST".into(),
+            ..output
+        };
+        assert!(matches!(
+            resolve_train_output(&failed, candidate, alternate),
+            Err(SplatError::BrushDeviceLost(_))
+        ));
     }
 
     #[test]

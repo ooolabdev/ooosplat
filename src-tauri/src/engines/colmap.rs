@@ -8,6 +8,13 @@ use crate::{
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
+pub const LOCKED_VERSION: &str = "4.2.1";
+pub const LOCKED_COMMIT: &str = "bd1fcf654d2dd8fefa1466999c190a246f83f4b9";
+
+pub fn is_locked_build(help: &str) -> bool {
+    help.contains(&format!("COLMAP {LOCKED_VERSION}")) && help.contains(LOCKED_COMMIT)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ColmapCliFamily {
@@ -461,11 +468,19 @@ pub async fn map(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    run_colmap(
+    let args = with_ba(
         executable,
         mapper_args(database, images, None, output, allow_two_view_tracks),
+        gpu_index,
+        &log,
+    )
+    .await?;
+    run_colmap(
+        executable,
+        args,
         database.parent().unwrap_or(output),
         log,
         manager,
@@ -487,11 +502,19 @@ pub async fn map_from_existing(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    run_colmap(
+    let args = with_ba(
         executable,
         mapper_args(database, images, Some(input_model), output, false),
+        gpu_index,
+        &log,
+    )
+    .await?;
+    run_colmap(
+        executable,
+        args,
         database.parent().unwrap_or(output),
         log,
         manager,
@@ -540,17 +563,48 @@ pub async fn map_incremental(
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
+    gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    run_colmap(
+    let args = with_ba(
         executable,
         incremental_mapper_args(database, images, input, output, image_list),
+        gpu_index,
+        &log,
+    )
+    .await?;
+    run_colmap(
+        executable,
+        args,
         database.parent().unwrap_or(output),
         log,
         manager,
         observer,
     )
     .await
+}
+
+async fn with_ba(
+    executable: &Path,
+    mut args: Vec<OsString>,
+    gpu_index: Option<u32>,
+    log: &Path,
+) -> Result<Vec<OsString>> {
+    use tokio::io::AsyncWriteExt;
+    let selection = super::colmap_ba::select(executable, gpu_index).await;
+    super::colmap_ba::append_mapper_options(&mut args, &selection);
+    if let Some(parent) = log.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .await?;
+    file.write_all(format!("[OOOSplat] {}\n", selection.detail).as_bytes())
+        .await?;
+    tracing::info!("{}", selection.detail);
+    Ok(args)
 }
 
 fn incremental_mapper_args(
@@ -586,6 +640,18 @@ fn incremental_mapper_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_runtime_identity_matches_the_shared_build_lock() {
+        let lock: serde_json::Value =
+            serde_json::from_str(include_str!("../../../engines/colmap-build.json")).unwrap();
+        assert_eq!(lock["commit"], LOCKED_COMMIT);
+        assert_eq!(lock["version"], LOCKED_VERSION);
+        assert!(is_locked_build(&format!(
+            "COLMAP {LOCKED_VERSION} (Commit {LOCKED_COMMIT})"
+        )));
+        assert!(!is_locked_build("COLMAP 4.1.0.dev0 (Commit 5b76f53)"));
+    }
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()

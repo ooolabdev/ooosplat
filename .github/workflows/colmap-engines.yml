@@ -1,0 +1,127 @@
+name: COLMAP-only development runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build (COLMAP and runtime dependencies only)
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      short_sha: ${{ steps.platforms.outputs.short_sha }}
+    steps:
+      - name: Select requested platforms
+        id: platforms
+        env:
+          REQUESTED_PLATFORM: ${{ inputs.platform }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const platforms = [
+              { platform: "windows", architecture: "x64", runner: "windows-2025-vs2026" },
+              { platform: "linux", architecture: "x64", runner: "ubuntu-24.04" },
+              { platform: "macos", architecture: "arm64", runner: "macos-15" },
+            ];
+            const selected = platforms.filter(p => process.env.REQUESTED_PLATFORM === "all" || p.platform === process.env.REQUESTED_PLATFORM);
+            if (!selected.length) throw new Error("Unsupported platform");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({include:selected})}\nshort_sha=${process.env.GITHUB_SHA.slice(0,8)}\n`);
+          '
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Validate source/build lock and engine scripts
+        shell: bash
+        run: |
+          node scripts/verify-colmap-lock.mjs
+          node --test scripts/colmap-runtime.test.mjs scripts/colmap-development.test.mjs
+      - name: Set up Visual Studio x64 compiler
+        if: matrix.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Linux build prerequisites (not system COLMAP)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential curl zip unzip tar \
+            pkg-config gfortran autoconf automake libtool bison nasm patchelf \
+            libx11-dev libxext-dev libxi-dev libxmu-dev libgl1-mesa-dev libglu1-mesa-dev
+      - name: Install locked CMake and Ninja
+        if: matrix.platform != 'macos'
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '4.3.2'
+          ninjaVersion: '1.12.1'
+      - name: Install locked CUDA toolkit
+        if: matrix.platform != 'macos'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda
+        with:
+          cuda: '13.2.0'
+          method: network
+      - name: Restore pinned macOS dependency caches
+        if: matrix.platform == 'macos'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            .cache/ccache
+          key: colmap-only-macos-15-arm64-${{ hashFiles('engines/colmap-build.json', 'engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/colmap-macos-common.sh') }}
+      - name: Install pinned macOS build prerequisites
+        if: matrix.platform == 'macos'
+        run: bash scripts/setup-macos-build-deps.sh
+      - name: Build Windows COLMAP runtime
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+        run: ./scripts/build-colmap-windows.ps1
+      - name: Build Linux COLMAP runtime
+        if: matrix.platform == 'linux'
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+        run: bash scripts/build-colmap-linux.sh
+      - name: Build macOS COLMAP runtime (no Brush or FFmpeg)
+        if: matrix.platform == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+          CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+        run: bash scripts/build-colmap-macos.sh
+      - name: Upload COLMAP runtime and build report
+        id: artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: colmap-4.2.1-${{ matrix.platform }}-${{ matrix.architecture }}-${{ needs.prepare.outputs.short_sha }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: dist-engines/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Download and local placement instructions
+        env:
+          COLMAP_PLATFORM: ${{ matrix.platform }}
+          COLMAP_ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: node scripts/colmap-artifact-summary.mjs

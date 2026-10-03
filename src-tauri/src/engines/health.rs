@@ -115,8 +115,8 @@ impl ColmapAccelerationStatus {
     }
 }
 
-const DEFAULT_MINIMUM_DRIVER: &str = "528.33";
-const DEFAULT_MINIMUM_COMPUTE_CAPABILITY: &str = "5.0";
+const DEFAULT_MINIMUM_DRIVER: &str = "580.00";
+const DEFAULT_MINIMUM_COMPUTE_CAPABILITY: &str = "7.5";
 const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -143,7 +143,7 @@ impl EnginePaths {
         let paths = Self {
             ffmpeg: root.join("bin").join("ffmpeg"),
             ffprobe: root.join("bin").join("ffprobe"),
-            colmap: root.join("bin").join("colmap"),
+            colmap: macos_colmap_path(&root),
             brush: root.join("bin").join("brush_app"),
             root,
         };
@@ -151,8 +151,8 @@ impl EnginePaths {
         let paths = Self {
             ffmpeg: root.join("ffmpeg"),
             ffprobe: root.join("ffprobe"),
-            colmap: root.join("colmap"),
-            brush: root.join("brush_app"),
+            colmap: root.join("linux").join("colmap").join("bin").join("colmap"),
+            brush: root.join("linux").join("brush").join("brush_app"),
             root,
         };
         paths
@@ -187,20 +187,12 @@ impl EnginePaths {
                     std::slice::from_ref(&defaults.ffprobe),
                     "ffprobe",
                 ),
-                colmap: resolve_engine(
-                    "OOOSPLAT_COLMAP",
-                    std::slice::from_ref(&defaults.colmap),
-                    "colmap",
-                ),
-                brush: resolve_engine(
-                    "OOOSPLAT_BRUSH",
-                    &[
-                        defaults.brush.clone(),
-                        root.join("linux").join("brush").join("brush_app"),
-                        root.join("brush").join("brush_app"),
-                    ],
-                    "brush_app",
-                ),
+                colmap: defaults.colmap,
+                // Do not silently choose an old official Brush from PATH.
+                // Explicit diagnostic overrides are checked for the new CLI below.
+                brush: std::env::var_os("OOOSPLAT_BRUSH")
+                    .map(PathBuf::from)
+                    .unwrap_or(defaults.brush),
                 root,
             }
         };
@@ -259,9 +251,19 @@ impl EnginePaths {
             check_basic(EngineKind::Ffmpeg, &self.ffmpeg, &["-version"]),
             check_basic(EngineKind::Ffprobe, &self.ffprobe, &["-version"]),
             check_colmap(&self.colmap, &self.root),
-            check_basic(EngineKind::Brush, &self.brush, &["--help"]),
+            check_brush(&self.brush),
         );
         vec![ffmpeg, ffprobe, colmap, brush]
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_colmap_path(root: &Path) -> PathBuf {
+    let standalone = root.join("colmap").join("bin").join("colmap");
+    if standalone.is_file() {
+        standalone
+    } else {
+        root.join("bin").join("colmap")
     }
 }
 
@@ -352,6 +354,53 @@ async fn check_basic(kind: EngineKind, path: &Path, args: &[&str]) -> EngineStat
     }
 }
 
+async fn check_brush(path: &Path) -> EngineStatus {
+    let mut status = check_basic(EngineKind::Brush, path, &["--version"]).await;
+    if !status.can_start {
+        return status;
+    }
+    if status.version.as_deref() != Some("brush-cli 1.0.0") {
+        status.can_start = false;
+        status.detail = "需要 OOOBrush ooo-v1.0.0 的无界面 brush-cli；请重新准备 Brush".into();
+        return status;
+    }
+    let manager = ProcessManager::new();
+    match manager
+        .run(ProcessSpec {
+            executable: path.to_path_buf(),
+            args: vec![OsString::from("--help")],
+            working_directory: path.parent().map(Path::to_path_buf),
+            log_path: None,
+            observer: None,
+        })
+        .await
+    {
+        Ok(output) => {
+            let help = format!("{}\n{}", output.stdout, output.stderr);
+            let missing: Vec<_> = super::brush::REQUIRED_CLI_FLAGS
+                .iter()
+                .filter(|flag| !help.split_whitespace().any(|token| token == **flag))
+                .copied()
+                .collect();
+            status.can_start = output.success && missing.is_empty();
+            status.detail = if status.can_start {
+                "OOOBrush ooo-v1.0.0 无界面 CLI 可启动；GPU 训练将在任务中验证".into()
+            } else {
+                format!(
+                    "OOOBrush CLI 参数检查失败，缺失参数：{}，退出码：{:?}",
+                    missing.join(", "),
+                    output.exit_code
+                )
+            };
+        }
+        Err(error) => {
+            status.can_start = false;
+            status.detail = error.to_string();
+        }
+    }
+    status
+}
+
 async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     if !path.is_file() {
         let mut status = missing(EngineKind::Colmap, path);
@@ -416,6 +465,8 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     }
 
     let cli_family = detect_cli_family(&feature_help, &matching_help);
+    let locked_build = super::colmap::is_locked_build(&feature_help);
+    successful &= locked_build;
     successful &= cli_family.is_some();
     #[cfg(target_os = "macos")]
     let cpu_only = Some(true);
@@ -430,7 +481,8 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         ]
         .iter()
         .any(|marker| lower.contains(marker));
-        let bundled_cuda = path.parent().is_some_and(runtime_contains_cuda);
+        let bundled_cuda =
+            lower.contains("with cuda") || path.parent().is_some_and(runtime_contains_cuda);
         if bundled_cuda {
             Some(false)
         } else if explicit_cpu {
@@ -446,7 +498,7 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     let acceleration = if !successful {
         cpu_status(
             AccelerationReasonCode::ColmapUnavailable,
-            "COLMAP 必需命令无法正常启动，不能启用 GPU 加速".into(),
+            "COLMAP 必需命令不可用或版本/commit 不匹配；请安装锁定的 COLMAP 4.2.1 引擎包".into(),
             None,
             requirements_or_default(engines_root),
         )
@@ -478,6 +530,12 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         Some(false) => format!("{family_label}；{}", acceleration.reason),
         None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
     };
+    let ba = super::colmap_ba::select(path, acceleration.gpu_index()).await;
+    let detail = if !locked_build {
+        "COLMAP 版本/commit 不匹配；请安装锁定的 COLMAP 4.2.1 引擎包".into()
+    } else {
+        format!("{detail}；{}", ba.detail)
+    };
     EngineStatus {
         kind: EngineKind::Colmap,
         path: path.to_path_buf(),
@@ -493,26 +551,25 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn runtime_contains_cuda(directory: &Path) -> bool {
-    let mut found = [false; 3];
+    let mut found = [false; 2];
     scan_cuda_runtime(directory, &mut found);
     found.into_iter().all(|present| present)
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
-fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 3]) {
+fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 2]) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if path.is_dir() && !path.is_symlink() {
             scan_cuda_runtime(&path, found);
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        found[0] |= name.contains("cudart64_");
-        found[1] |= name.contains("curand64_");
-        found[2] |= name == "onnxruntime_providers_cuda.dll";
+        found[0] |= name.contains("cudart64_") || name.starts_with("libcudart.so");
+        found[1] |= name.contains("curand64_") || name.starts_with("libcurand.so");
     }
 }
 
@@ -536,7 +593,9 @@ struct NumericVersion(u32, u32);
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EngineManifest {
+    #[serde(default)]
     engines: Vec<ManifestEngine>,
+    colmap: Option<ManifestEngine>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -549,6 +608,7 @@ struct ManifestEngine {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestCudaCompatibility {
+    #[serde(alias = "minimumDriver")]
     minimum_windows_driver: String,
     minimum_compute_capability: String,
 }
@@ -574,7 +634,11 @@ fn requirements_or_default(engines_root: &Path) -> AccelerationRequirements {
 }
 
 fn load_requirements(engines_root: &Path) -> std::result::Result<AccelerationRequirements, String> {
-    let path = engines_root.join("manifest.json");
+    let path = engines_root.join(if cfg!(target_os = "linux") {
+        "manifest.linux.json"
+    } else {
+        "manifest.json"
+    });
     let bytes =
         std::fs::read(&path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
     let manifest: EngineManifest = serde_json::from_slice(&bytes)
@@ -582,6 +646,7 @@ fn load_requirements(engines_root: &Path) -> std::result::Result<AccelerationReq
     let compatibility = manifest
         .engines
         .into_iter()
+        .chain(manifest.colmap)
         .find(|engine| engine.name.eq_ignore_ascii_case("COLMAP"))
         .and_then(|engine| engine.cuda_compatibility)
         .ok_or_else(|| "引擎清单缺少 COLMAP cudaCompatibility".to_string())?;
@@ -855,10 +920,17 @@ mod tests {
 
     #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
-    fn linux_root_is_flat_and_discovery_can_fall_back_to_path() {
+    fn linux_colmap_is_managed_without_path_fallback() {
         let paths = EnginePaths::from_root("/opt/ooosplat-engines");
-        assert_eq!(paths.colmap, PathBuf::from("/opt/ooosplat-engines/colmap"));
+        assert_eq!(
+            paths.colmap,
+            PathBuf::from("/opt/ooosplat-engines/linux/colmap/bin/colmap")
+        );
         let discovered = EnginePaths::from_candidates(PathBuf::from("/missing/engines"));
+        assert_eq!(
+            discovered.colmap,
+            PathBuf::from("/missing/engines/linux/colmap/bin/colmap")
+        );
         // FFmpeg is not installed on every contributor machine or CI runner, so assert
         // the resolver contract instead of requiring the binary: an explicit override
         // wins, then PATH, and otherwise the managed path is kept so engine health can
@@ -895,6 +967,26 @@ mod tests {
         assert_eq!(paths.brush, root.join("brush").join("brush_app.exe"));
     }
 
+    #[tokio::test]
+    #[ignore = "Requires npm run setup:brush on a matching native host"]
+    async fn managed_ooobrush_cli_health_smoke() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("engines");
+        #[cfg(target_os = "macos")]
+        let root = root.join("macos").join("arm64");
+        let paths = EnginePaths::from_root(root);
+        let status = check_brush(&paths.brush).await;
+        assert!(
+            status.can_start,
+            "{}: {}",
+            paths.brush.display(),
+            status.detail
+        );
+        assert_eq!(status.version.as_deref(), Some("brush-cli 1.0.0"));
+    }
+
     fn device(index: u32, driver: &str, compute: &str) -> GpuDeviceInfo {
         GpuDeviceInfo {
             index,
@@ -922,6 +1014,13 @@ mod tests {
         let devices =
             parse_nvidia_smi_csv("0, NVIDIA GeForce RTX 3060 Ti, 560.81, 8.6, N/A\n").unwrap();
         assert_eq!(devices[0].total_memory_mb, None);
+        let devices = devices
+            .into_iter()
+            .map(|mut device| {
+                device.driver_version = DEFAULT_MINIMUM_DRIVER.into();
+                device
+            })
+            .collect();
         assert_eq!(
             choose_acceleration(devices, requirements()).backend,
             ColmapBackend::Gpu
@@ -939,7 +1038,7 @@ mod tests {
 
     #[test]
     fn accepts_exact_compatibility_boundaries() {
-        let status = choose_acceleration(vec![device(0, "528.33", "5.0")], requirements());
+        let status = choose_acceleration(vec![device(0, "580.00", "7.5")], requirements());
         assert_eq!(status.backend, ColmapBackend::Gpu);
         assert_eq!(status.reason_code, AccelerationReasonCode::GpuReady);
         assert_eq!(status.usable_gpu_total_memory_mb(), Some(8_192));
@@ -948,7 +1047,7 @@ mod tests {
 
     #[test]
     fn rejects_old_driver_and_low_compute_capability() {
-        let old_driver = choose_acceleration(vec![device(0, "528.32", "8.6")], requirements());
+        let old_driver = choose_acceleration(vec![device(0, "579.99", "8.6")], requirements());
         assert_eq!(old_driver.backend, ColmapBackend::Cpu);
         assert_eq!(old_driver.reason_code, AccelerationReasonCode::DriverTooOld);
         assert_eq!(
@@ -957,7 +1056,7 @@ mod tests {
         );
         assert_eq!(old_driver.usable_gpu_total_memory_mb(), None);
 
-        let old_gpu = choose_acceleration(vec![device(0, "560.81", "4.9")], requirements());
+        let old_gpu = choose_acceleration(vec![device(0, "580.00", "7.4")], requirements());
         assert_eq!(old_gpu.backend, ColmapBackend::Cpu);
         assert_eq!(
             old_gpu.reason_code,
@@ -969,9 +1068,9 @@ mod tests {
     fn selects_highest_compute_capability_then_lowest_index() {
         let status = choose_acceleration(
             vec![
-                device(2, "560.81", "8.6"),
-                device(1, "560.81", "8.9"),
-                device(0, "560.81", "8.9"),
+                device(2, "580.00", "8.6"),
+                device(1, "580.00", "8.9"),
+                device(0, "580.00", "8.9"),
             ],
             requirements(),
         );
@@ -1005,8 +1104,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("cudart64_12.dll"), []).unwrap();
         std::fs::write(directory.path().join("curand64_10.dll"), []).unwrap();
-        assert!(!runtime_contains_cuda(directory.path()));
-        std::fs::write(directory.path().join("onnxruntime_providers_cuda.dll"), []).unwrap();
         assert!(runtime_contains_cuda(directory.path()));
+    }
+
+    #[test]
+    fn macos_prefers_standalone_colmap_without_changing_other_engine_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let legacy = root.join("bin").join("colmap");
+        assert_eq!(macos_colmap_path(root), legacy);
+        let standalone = root.join("colmap").join("bin").join("colmap");
+        std::fs::create_dir_all(standalone.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, []).unwrap();
+        std::fs::write(&standalone, []).unwrap();
+        assert_eq!(macos_colmap_path(root), standalone);
+        std::fs::remove_file(&standalone).unwrap();
+        assert_eq!(macos_colmap_path(root), legacy);
     }
 }

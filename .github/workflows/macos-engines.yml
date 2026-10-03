@@ -3,6 +3,15 @@ name: macOS 15+ arm64 engine runtime
 on:
   workflow_dispatch:
   push:
+    branches:
+      - test/colmap-brush-upgrade
+    paths:
+      - engines/colmap-build.json
+      - engines/manifest.macos.json
+      - scripts/build-engines-macos.sh
+      - scripts/smoke-colmap-image-io.mjs
+      - scripts/fixtures/colmap-image-io.json
+      - .github/workflows/macos-engines.yml
     tags:
       - engines-macos-arm64-v*
 
@@ -50,6 +59,7 @@ jobs:
           path: |
             dist-engines/*.tar.xz
             dist-engines/*.sha256
+            dist-engines/*.build-report.json
           if-no-files-found: error
           retention-days: 14
 
@@ -60,6 +70,6 @@ jobs:
         run: |
           test "${GITHUB_REF_NAME}" = "$(node -e 'console.log(require("./engines/manifest.macos.json").distribution.tag)')"
           gh release create "$GITHUB_REF_NAME" \
-            dist-engines/*.tar.xz dist-engines/*.sha256 \
+            dist-engines/*.tar.xz dist-engines/*.sha256 dist-engines/*.build-report.json \
             --title "OOOSplat macOS arm64 engines ${GITHUB_REF_NAME}" \
             --notes "Pinned Apple Silicon runtime for OOOSplat. Contains LGPL shared FFmpeg/FFprobe, CPU CLI-only COLMAP, Brush, build metadata, dependency inventory, and SHA-256 checksums."

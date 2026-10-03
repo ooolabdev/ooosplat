@@ -97,7 +97,7 @@ foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../G
 
 $tauriWindows = (Read-Utf8Text "src-tauri/tauri.windows.conf.json") | ConvertFrom-Json
 $windowsResources = @($tauriWindows.bundle.resources.PSObject.Properties.Name)
-foreach ($resource in "../engines/manifest.json", "../engines/ffmpeg/", "../engines/colmap/bin/", "../engines/colmap/plugins/", "../engines/brush/") {
+foreach ($resource in "../engines/manifest.json", "../engines/ffmpeg/", "../engines/colmap/bin/", "../engines/colmap/licenses/", "../engines/brush/") {
     Assert-True ($windowsResources -contains $resource) "Windows Tauri resources are missing $resource."
 }
 $tauriLinux = (Read-Utf8Text "src-tauri/tauri.linux.conf.json") | ConvertFrom-Json
@@ -107,9 +107,10 @@ $linuxResources = @($tauriLinux.bundle.resources.PSObject.Properties.Name)
 foreach ($resource in "../engines/manifest.linux.json", "../engines/linux/brush/brush_app") {
     Assert-True ($linuxResources -contains $resource) "Linux Tauri resources are missing $resource."
 }
-foreach ($dependency in "ffmpeg", "colmap") {
+foreach ($dependency in "ffmpeg") {
     Assert-True (@($tauriLinux.bundle.linux.deb.depends) -contains $dependency) "Linux DEB dependencies are missing $dependency."
 }
+Assert-True (-not (@($tauriLinux.bundle.linux.deb.depends) -contains 'colmap')) 'Linux must not depend on unpinned system COLMAP.'
 $tauriMacos = (Read-Utf8Text "src-tauri/tauri.macos.conf.json") | ConvertFrom-Json
 Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "15.0") "macOS bundle must target macOS 15.0."
 $macosResources = @($tauriMacos.bundle.resources.PSObject.Properties.Name)
@@ -160,12 +161,12 @@ Assert-Contains $thirdParty $windowsFfmpeg[0].sourceUrl "THIRD_PARTY_NOTICES.txt
 
 $linuxManifest = (Read-Utf8Text "engines/manifest.linux.json") | ConvertFrom-Json
 Assert-True ($linuxManifest.schemaVersion -ge 2) "Linux engine manifest schemaVersion must include license mappings."
-Assert-True ($linuxManifest.brush.version -eq "0.3.0") "Linux Brush version is incorrect."
-Assert-True ($linuxManifest.brush.sourceUrl -eq "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz") "Linux Brush release archive is incorrect."
+Assert-True ($linuxManifest.brush.version -eq "1.0.0") "Linux Brush version is incorrect."
+Assert-True ($linuxManifest.brush.sourceUrl -eq "https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-x86_64-unknown-linux-gnu.tar.gz") "Linux Brush release archive is incorrect."
 Assert-True ($linuxManifest.brush.license -eq "Apache-2.0") "Linux Brush license identifier is incorrect."
 Assert-True (@($linuxManifest.brush.licenseFiles).Count -eq 1) "Linux Brush must map to one direct license file."
 Assert-True ($linuxManifest.brush.licenseFiles[0] -eq "licenses/Brush-LICENSE.txt") "Linux Brush license file mapping is incorrect."
-foreach ($marker in "Ubuntu 24.04 Alpha, Linux x86_64 release archive", "brush-app-x86_64-unknown-linux-gnu.tar.xz", "engines/manifest.linux.json") {
+foreach ($marker in "Ubuntu 24.04 Alpha, Linux x86_64 release archive", "OOOBrush-x86_64-unknown-linux-gnu.tar.gz", "engines/manifest.linux.json") {
     Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
 }
 
@@ -185,9 +186,12 @@ foreach ($engine in $macosManifest.engines) {
     Assert-True (@($engine.licenseFiles).Count -eq 1 -and $engine.licenseFiles[0] -eq $expected.File) "$($engine.name) macOS license mapping is incorrect."
     Assert-True ($engine.sourceSha256 -match '^[A-F0-9]{64}$') "$($engine.name) macOS source SHA-256 is invalid."
 }
-foreach ($marker in "macOS 15+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COLMAP 4.0.4 macOS arm64 CPU CLI-only", "brush-app-aarch64-apple-darwin.tar.xz", "engines/manifest.macos.json") {
+foreach ($marker in "macOS 15+ Apple Silicon arm64", "ffmpeg-8.1.2.tar.xz", "COLMAP 4.2.1 macOS arm64 CPU CLI-only", "OOOBrush-aarch64-apple-darwin.tar.gz", "engines/manifest.macos.json") {
     Assert-Contains $thirdParty $marker "THIRD_PARTY_NOTICES.txt"
 }
+
+& node (Join-Path $PSScriptRoot 'verify-licenses.mjs')
+Assert-True ($LASTEXITCODE -eq 0) 'Pinned OOOBrush platform identities, binary hashes and license mappings must pass the shared checks.'
 
 foreach ($component in "PlayCanvas Engine", "PlayCanvas React", "PlayCanvas splat-transform (adapted algorithm)", "SuperSplat selection workflow (adapted algorithm)") {
     Assert-Contains $thirdParty $component "THIRD_PARTY_NOTICES.txt"

@@ -1,31 +1,19 @@
-NVIDIA CUDA Runtime — redistribution notice
-============================================
+NVIDIA CUDA Runtime - redistribution notice
+==========================================
 
-OOOSplat bundles the following NVIDIA components as part of the COLMAP
-CUDA release asset (`colmap-x64-windows-cuda.zip`, release 4.0.4):
+OOOSplat's self-built COLMAP 4.2.1 Windows/Linux packages include unmodified
+redistributable runtime libraries from CUDA Toolkit 13.2.0, including CUDA
+Runtime and cuRAND. The actual inventory is recorded in each runtime's
+BUNDLED-COMPONENTS.json and BUILD-INFO.json.
 
-  - cudart64_12.dll                     CUDA Runtime
-  - curand64_10.dll                     cuRAND
-  - onnxruntime_providers_cuda.dll      ONNX Runtime CUDA provider
+These components are governed by the NVIDIA CUDA Toolkit End User License
+Agreement. Attachment A identifies the redistributable runtime components:
+https://docs.nvidia.com/cuda/eula/index.html
 
-`cudart64_12.dll` and `curand64_10.dll` are CUDA Toolkit runtime
-libraries. Under the NVIDIA CUDA Toolkit End User License Agreement
-(EULA), "Attachment A" lists these runtime files as redistributable
-together with an application intended for systems with NVIDIA GPUs,
-provided the target files are not modified (uncompressing archives
-excepted). The full EULA text is available at:
+The complete toolkit license distributed with the build is included in the
+runtime's licenses/ directory. This notice does not replace that agreement.
+No NVIDIA display driver is bundled. A compatible installed NVIDIA driver
+is required for SIFT GPU and Caspar acceleration; Ceres CPU remains available.
+ONNX Runtime is not included in these COLMAP packages.
 
-  https://docs.nvidia.com/cuda/eula/index.html
-
-`onnxruntime_providers_cuda.dll` is distributed under the ONNX Runtime
-license (MIT); it links NVIDIA CUDA libraries at runtime and is listed
-here for completeness.
-
-These files are bundled so COLMAP feature extraction and matching can
-use NVIDIA GPU acceleration when the user selects the GPU backend. A
-functioning NVIDIA display driver is still required on the end-user
-system.
-
-This notice is a redistribution statement and does not replace NVIDIA's
-End User License Agreement. NVIDIA product names and marks are owned by
-NVIDIA Corporation.
+NVIDIA product names and marks are owned by NVIDIA Corporation.

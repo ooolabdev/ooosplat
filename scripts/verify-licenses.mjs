@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { brushLock } from "./brush-runtime.mjs";
 
 const workspace = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -96,7 +97,7 @@ for (const resource of [
   "../engines/manifest.json",
   "../engines/ffmpeg/",
   "../engines/colmap/bin/",
-  "../engines/colmap/plugins/",
+  "../engines/colmap/licenses/",
   "../engines/brush/",
 ]) {
   assert(Object.hasOwn(tauriWindows.bundle?.resources ?? {}, resource), `Windows Tauri resources are missing ${resource}.`);
@@ -107,8 +108,12 @@ assert(tauriLinux.bundle?.targets?.includes("deb"), "Linux Tauri targets must in
 for (const resource of ["../engines/manifest.linux.json", "../engines/linux/brush/brush_app"]) {
   assert(Object.hasOwn(tauriLinux.bundle?.resources ?? {}, resource), `Linux Tauri resources are missing ${resource}.`);
 }
-for (const dependency of ["ffmpeg", "colmap"]) {
+for (const dependency of ["ffmpeg"]) {
   assert(tauriLinux.bundle?.linux?.deb?.depends?.includes(dependency), `Linux DEB dependencies are missing ${dependency}.`);
+}
+assert(!tauriLinux.bundle?.linux?.deb?.depends?.includes("colmap"), "Linux must not depend on unpinned system COLMAP.");
+for (const resource of ["../engines/linux/colmap/bin/", "../engines/linux/colmap/lib/", "../engines/linux/colmap/licenses/", "../engines/linux/colmap/SHA256SUMS", "../engines/linux/colmap/BUILD-INFO.json", "../engines/linux/colmap/BUNDLED-COMPONENTS.json"]) {
+  assert(Object.hasOwn(tauriLinux.bundle?.resources ?? {}, resource), `Missing Linux COLMAP resource ${resource}`);
 }
 const tauriMacos = JSON.parse(readText("src-tauri/tauri.macos.conf.json"));
 assert(tauriMacos.bundle?.macOS?.minimumSystemVersion === "15.0", "macOS bundle must target macOS 15.0.");
@@ -150,6 +155,14 @@ for (const engine of manifest.engines) {
 }
 
 const windowsFfmpeg = manifest.engines.find((engine) => engine.name === "FFmpeg / FFprobe");
+const windowsBrush = brushLock("windows");
+assert(manifest.requiredFiles.find(file => file.path === "engines/brush/brush_app.exe")?.sha256 === windowsBrush.binarySha256,
+  "Windows Brush required binary hash must match the pinned OOOBrush CLI.");
+for (const platform of ["windows", "linux", "macos"]) {
+  const brush = brushLock(platform);
+  assertContains(thirdParty, brush.sourceUrl, "THIRD_PARTY_NOTICES.txt");
+  assertContains(thirdParty, brush.commit, "THIRD_PARTY_NOTICES.txt");
+}
 assert(windowsFfmpeg, "Windows FFmpeg manifest entry is missing.");
 assert(
   !windowsFfmpeg.sourceUrl?.includes("/latest/"),
@@ -160,10 +173,10 @@ assertContains(thirdParty, windowsFfmpeg.sourceUrl, "THIRD_PARTY_NOTICES.txt");
 
 const linuxManifest = JSON.parse(readText("engines/manifest.linux.json"));
 assert(linuxManifest.schemaVersion >= 2, "Linux engine manifest schemaVersion must include license mappings.");
-assert(linuxManifest.brush?.version === "0.3.0", "Linux Brush version is incorrect.");
+assert(linuxManifest.brush?.version === "1.0.0", "Linux Brush version is incorrect.");
 assert(
   linuxManifest.brush?.sourceUrl ===
-    "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz",
+    "https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-x86_64-unknown-linux-gnu.tar.gz",
   "Linux Brush release archive is incorrect.",
 );
 assert(linuxManifest.brush?.license === "Apache-2.0", "Linux Brush license identifier is incorrect.");
@@ -173,7 +186,7 @@ assert(
 );
 for (const marker of [
   "Ubuntu 24.04 Alpha, Linux x86_64 release archive",
-  "brush-app-x86_64-unknown-linux-gnu.tar.xz",
+  "OOOBrush-x86_64-unknown-linux-gnu.tar.gz",
   "engines/manifest.linux.json",
 ]) {
   assertContains(thirdParty, marker, "THIRD_PARTY_NOTICES.txt");
@@ -198,8 +211,8 @@ for (const engine of macosManifest.engines) {
 for (const marker of [
   "macOS 15+ Apple Silicon arm64",
   "ffmpeg-8.1.2.tar.xz",
-  "COLMAP 4.0.4 macOS arm64 CPU CLI-only",
-  "brush-app-aarch64-apple-darwin.tar.xz",
+  "COLMAP 4.2.1 macOS arm64 CPU CLI-only",
+  "OOOBrush-aarch64-apple-darwin.tar.gz",
   "engines/manifest.macos.json",
 ]) {
   assertContains(thirdParty, marker, "THIRD_PARTY_NOTICES.txt");

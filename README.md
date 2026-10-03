@@ -54,7 +54,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 自动检测透明 MOV 的 Alpha 通道，同步提取 RGBA PNG 画面与 COLMAP Mask；透明区域不会参与特征提取，同时保留给 Brush 训练使用。
 - 自动检测透明 PNG，保留 Alpha 供 Brush 使用，并生成 COLMAP Mask 排除完全透明区域。
 - 已完成项目支持“高清补拍”：使用同一设备、同一镜头和相同分辨率补充视频或图片后，OOOSplat 会复用原数据库、共享相机与稀疏模型，只处理新增画面的特征、匹配和注册，再使用全部已注册画面完整重训 Brush。透明 MOV/PNG 补拍素材会保留 RGBA 并自动生成 Mask；补拍会创建独立派生项目，不覆盖原项目。
-- Windows 安装包内置 CUDA 版 COLMAP；macOS Alpha 内置 arm64 CPU 版 COLMAP；Ubuntu 使用系统 CPU 版 COLMAP。三个平台均使用固定并校验的 FFmpeg/Brush 方案。
+- 三个平台内置同一 commit 的 COLMAP 4.2.1；Windows/Linux 为自编译 CUDA + Caspar + Ceres 包，macOS 为 arm64 Ceres CPU 包。Brush 使用锁定的 OOOBrush ooo-v1.0.0 无界面 CLI；FFmpeg 策略保持不变。
 - COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
 - 精细档会依据检测到的显存选择 Brush 训练分辨率和 Splat 上限；若明确检测到显存不足，会安全降低一次训练配置后重试。Windows 单 NVIDIA 独显环境还会优先稳定选择该独显，并为显卡设备中断提供明确提示。
 - 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
@@ -104,7 +104,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - 支持 WebView2 Runtime。
 - 视频导出需要 WebView2 提供 WebCodecs AVC 编码能力；不支持时仍可在“动画”模式播放效果，但“导出视频”会显示不可用原因。
 - Brush 训练需要可用的 GPU 图形后端，建议使用独立显卡。
-- COLMAP 的 CUDA 加速需要 NVIDIA 显卡、Windows 驱动 528.33 或更高版本，以及 Compute Capability 5.0 或更高版本；不满足要求时程序会自动使用 CPU，无需用户配置。
+- COLMAP 的 CUDA 加速需要 NVIDIA 显卡、Windows 驱动 580.00 或更高版本，以及 Compute Capability 7.5 或更高版本；不满足要求时程序会自动使用 CPU，无需用户配置。
 - 项目磁盘需要容纳源素材副本、输入图像、COLMAP 数据、Brush 中间文件和最终 PLY。长视频、大型图片序列或精细档位可能占用大量空间。
 - 安装模式为整机安装，安装时可能需要管理员权限。
 
@@ -114,7 +114,7 @@ Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行�
 
 > 当前交付为未签名、未公证的 `.app`/`.dmg` Alpha，仅支持 M1 或更新的 Apple Silicon Mac，不支持 Intel Mac 或 Universal Binary。
 
-- 内置原生 arm64 FFmpeg 8.1.2、独立 FFprobe、COLMAP 4.0.4 CPU CLI-only 和 Brush v0.3.0。
+- 内置原生 arm64 FFmpeg 8.1.2、独立 FFprobe、COLMAP 4.2.1 Ceres CPU CLI-only 和 OOOBrush ooo-v1.0.0 CLI。
 - 用户不需要安装 Homebrew，也不会回退到 Homebrew 或系统 `PATH` 中的同名程序。
 - COLMAP 固定使用 CPU；Brush 独立选择可用的 Metal 图形后端，界面会明确显示该原因。
 - 首次打开未签名版本时，macOS Gatekeeper 可能阻止启动。请在 Finder 中右键应用并选择“打开”；正式版本将在后续接入 Apple 签名和公证。
@@ -126,20 +126,20 @@ Windows 内置的 COLMAP 使用同时支持 CPU 与 CUDA GPU 的构建，运行�
 - Ubuntu 24.04 LTS，x86_64。
 - Brush 支持的图形后端和对应驱动；Brush 官方支持 AMD、Intel 和 NVIDIA GPU。当前端到端验证使用 NVIDIA GPU，CPU-only 软件图形后端尚未验证，但不会被启动检查人为阻止。
 - 从源码构建需要 Node.js 22.12+、Rust stable 和 Tauri 2 的 WebKitGTK 开发依赖；安装 `.deb` 的用户不需要这些开发工具。
-- Ubuntu 24.04 系统 `ffmpeg`、`ffprobe` 和 CPU 版 `colmap`（仓库版本为 COLMAP 3.9）。
-- Brush v0.3.0 Linux x86_64，由 `npm run setup:engines` 下载并校验。
+- Ubuntu 24.04 系统 `ffmpeg`、`ffprobe`；COLMAP 4.2.1 使用校验后随应用分发的自编译版本，不使用 apt/PATH COLMAP。
+- OOOBrush ooo-v1.0.0 Linux x86_64 CLI，由 `npm run setup:engines` 下载并校验。
 
 Ubuntu 依赖安装：
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential curl file ffmpeg colmap \
+  build-essential curl file ffmpeg \
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
   libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 ```
 
-请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。Ubuntu 24.04 仓库中的无 CUDA COLMAP 构建会自动使用 CPU；Brush 会在运行时选择可用的图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
+请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。内置 COLMAP 在兼容 NVIDIA 设备上使用 CUDA/Caspar，否则使用 CPU/Ceres；Brush 独立选择图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
 从 GitHub Actions 下载 `OOOSplat-0.5.0-x64-linux` Artifact 后，可执行：
 
@@ -147,7 +147,7 @@ sudo apt install -y \
 sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
 ```
 
-`.deb` 会通过 Ubuntu 包管理器安装 FFmpeg、FFprobe 和 CPU 版 COLMAP；固定版本 Brush 已包含在安装包中。
+`.deb` 仅通过 Ubuntu 包管理器安装 FFmpeg/FFprobe；锁定的 COLMAP 和 Brush 已包含在安装包中。
 
 ## 安装与使用
 
@@ -250,8 +250,8 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 引擎 | 固定版本/构建 | 用途 |
 | --- | --- | --- |
 | FFmpeg / FFprobe | Windows x64 8.1 LGPL shared；macOS arm64 8.1.2 LGPL shared | 视频分析与抽帧 |
-| COLMAP | Windows 4.0.4 CUDA；macOS arm64 4.0.4 CPU CLI-only | 特征、匹配和相机重建 |
-| Brush | v0.3.0 Windows x64 / macOS arm64 | Gaussian Splatting 训练与 PLY 导出 |
+| COLMAP | 4.2.1 同一 commit；Windows/Linux CUDA + Caspar/Ceres；macOS Ceres CPU | 特征、匹配和相机重建 |
+| Brush | OOOBrush ooo-v1.0.0；Windows/Linux x64、macOS arm64 | 无界面 Gaussian Splatting 训练与 PLY 导出 |
 
 Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/manifest.json`](engines/manifest.json)、[`engines/manifest.linux.json`](engines/manifest.linux.json) 和 [`engines/manifest.macos.json`](engines/manifest.macos.json)。大型引擎文件不会提交到 Git；开发者通过 `npm run setup:engines` 恢复本地运行时。Release 打包前会校验来源、哈希、架构、动态库闭包和 Brush CLI 参数。
 
@@ -262,6 +262,22 @@ Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/man
 - Brush：Apache-2.0。
 
 ## 本地开发
+
+### 下载 COLMAP 开发包
+
+手动运行 Actions 中的 **COLMAP-only development runtime**，选择 `all` 或指定平台，
+构建成功后下载对应 Artifact。解开外层 ZIP 和内部运行归档，将顶层目录的内容放到：
+
+- Windows：`engines/colmap/`，可执行文件为 `bin/colmap.exe`。
+- Linux：`engines/linux/colmap/`，可执行文件为 `bin/colmap`。
+- macOS：`engines/macos/arm64/colmap/`，可执行文件为 `bin/colmap`。
+
+完整保留 COLMAP 运行库、许可证和元数据，不要多套一层目录。已有 FFmpeg 保持不变。
+随后运行 `npm run dev:local` 或 `npm run build:local`；这两个本地入口自动下载、校验并缓存锁定的 OOOBrush，COLMAP 则不安装、下载或校验，
+也不修改正式清单。应用运行时健康检查仍然保留，正式构建继续执行严格校验。
+
+Artifact 保留 30 天；手动流水线需先存在于默认分支才能触发。
+详细步骤见 [引擎开发包说明](engines/README.md#download-colmap-only-development-builds)。
 
 ### 开发环境
 
@@ -292,7 +308,7 @@ npm run tauri -- dev
 
 也可以在仓库根目录运行 `./scripts/start-app-linux.sh`，或使用 `npm run start:app:linux`。启动脚本会先校验本机引擎和许可映射，仅在源码更新时重新构建 Release 可执行文件。
 
-Ubuntu 24.04 Alpha 的 `setup:engines` 只安装校验后的 Brush 到 `engines/linux/brush/`；FFmpeg、FFprobe 和 CPU 版 COLMAP 保持为系统软件包。Tauri 将 Brush 作为资源打入 x86_64 `.deb`，并在 Debian 依赖中声明 FFmpeg 和 COLMAP。
+Ubuntu 24.04 Alpha 的 `setup:engines` 安装校验后的 COLMAP 到 `engines/linux/colmap/`，并安装 Brush；FFmpeg/FFprobe 保持为系统软件包。Tauri 将 COLMAP 和 Brush 打入 `.deb`，不再声明系统 COLMAP 依赖。
 
 Ubuntu 24.04 Alpha 自动检查位于 `.github/workflows/ubuntu.yml`。普通 GitHub runner 会执行前端、许可映射、Rust、Clippy、FFmpeg 集成、`.deb` 构建、包结构校验并上传安装包与 SHA-256；Brush 端到端验证需要具有可用图形后端的主机或自托管 runner。目前完整流水线仅在 NVIDIA 主机上验证，欢迎补充 AMD、Intel 和软件 Vulkan 的测试结果。
 
@@ -372,13 +388,13 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 开发或诊断时可以通过全局参数 `--engine-dir <路径>`，或环境变量 `OOOSPLAT_ENGINE_DIR`，覆盖默认引擎目录。
 
-Linux 还可分别使用 `OOOSPLAT_FFMPEG`、`OOOSPLAT_FFPROBE`、`OOOSPLAT_COLMAP` 和 `OOOSPLAT_BRUSH` 指定可执行文件；未指定时按仓库托管目录和系统 `PATH` 依次发现。
+Linux 的 FFmpeg/FFprobe 保留各自的环境变量与 PATH 发现方式；Brush 默认只使用托管目录 `linux/brush/brush_app`，显式 `OOOSPLAT_BRUSH` 诊断覆盖也必须支持新 CLI，不再自动回退 PATH。COLMAP 只使用托管目录 `linux/colmap/bin/colmap`，不接受单独的 `OOOSPLAT_COLMAP` 或 PATH 回退。
 
 ## 常见问题
 
 ### 如何让 COLMAP 使用显卡？
 
-无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。当前最低要求为 Windows 驱动 528.33、Compute Capability 5.0；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
+无需手动选择。应用会检查内置 COLMAP CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时自动使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。CUDA 13.2.0 的最低兼容要求为 NVIDIA 驱动 580.00、Compute Capability 7.5；Caspar 另需实际 BA 探测通过，失败仅回退 Ceres，不影响可用的 SIFT GPU；实际检测结果和未启用原因会显示在“01 创建新任务”中。Brush 与 COLMAP 相互独立，会在运行时选择可用的图形后端。
 
 ### 不同显卡组合会如何处理？
 

@@ -54,7 +54,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - Detect Alpha channels in transparent MOV files, extract RGBA PNG frames and matching COLMAP masks in one pass, and preserve transparency for Brush training.
 - Detect transparent PNG images automatically, preserve Alpha for Brush, and generate COLMAP masks for transparent regions.
 - Add high-resolution reshoots to completed projects. Capture video or images with the same device, lens, and resolution; OOOSplat reuses the original database, shared camera, and sparse model, processes only the new features, matches, and registrations, then retrains Brush from every registered image. Transparent MOV/PNG reshoots preserve RGBA and receive automatic masks. Each reshoot creates a separate derived project and never overwrites its source.
-- Bundle CUDA-enabled COLMAP on Windows and arm64 CPU-only COLMAP on macOS; Ubuntu uses its system CPU COLMAP. FFmpeg and Brush follow pinned, verified platform policies.
+- Bundle COLMAP 4.2.1 from the same commit on all platforms: self-built CUDA/Caspar/Ceres on Windows/Linux, Ceres CPU on Apple Silicon. Brush uses pinned OOOBrush ooo-v1.0.0 headless CLI; FFmpeg policy is unchanged.
 - Automatically check the bundled CUDA runtime, NVIDIA driver version, and GPU Compute Capability. COLMAP uses GPU acceleration for feature extraction and matching when the requirements are met, and otherwise falls back to CPU.
 - Detailed quality selects the Brush training resolution and Splat limit from detected VRAM. If an explicit out-of-memory failure occurs, OOOSplat safely retries once with a lower training profile. On Windows systems with one NVIDIA discrete GPU, Brush also prefers that adapter and provides clearer guidance for device-loss failures.
 - Show processing stages, engine output, key counters, elapsed time, and up to 500 UI log entries in real time.
@@ -104,7 +104,7 @@ As long as COLMAP produces at least one registered image and valid 3D points, th
 - WebView2 Runtime support.
 - Video export requires WebCodecs AVC support in WebView2. Animation mode remains available when encoding is unavailable, and the UI reports why export is disabled.
 - An available GPU graphics backend for Brush training; a discrete GPU is recommended.
-- COLMAP CUDA acceleration requires an NVIDIA GPU, Windows driver 528.33 or newer, and Compute Capability 5.0 or higher. OOOSplat automatically uses CPU when these requirements are not met; no manual configuration is required.
+- COLMAP CUDA acceleration requires an NVIDIA GPU, Windows driver 580.00 or newer, and Compute Capability 7.5 or higher. OOOSplat automatically uses CPU when these requirements are not met; no manual configuration is required.
 - Enough disk space for source-media copies, input images, COLMAP data, Brush intermediate files, and the final PLY. Long videos, large image sequences, and higher quality presets can require substantial space.
 - The installer uses a per-machine installation and may require administrator privileges.
 
@@ -114,7 +114,7 @@ The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OO
 
 > The current deliverable is an unsigned, unnotarized `.app`/`.dmg` Alpha for M1 or newer Apple Silicon Macs. Intel Macs and Universal Binaries are not supported.
 
-- Bundles native arm64 FFmpeg 8.1.2, a real standalone FFprobe, COLMAP 4.0.4 CPU CLI-only, and Brush v0.3.0.
+- Bundles native arm64 FFmpeg 8.1.2, a real standalone FFprobe, COLMAP 4.2.1 Ceres CPU CLI-only, and OOOBrush ooo-v1.0.0 CLI.
 - Users do not install Homebrew, and OOOSplat never falls back to a Homebrew or system `PATH` engine.
 - COLMAP always uses CPU in this Alpha. Brush independently selects an available Metal graphics backend, and the UI explains this distinction.
 - Gatekeeper may block the unsigned Alpha on first launch. In Finder, right-click the app and choose Open. Signing and notarization are planned for a later production release.
@@ -126,20 +126,20 @@ The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OO
 - Ubuntu 24.04 LTS, x86_64.
 - A graphics backend and driver supported by Brush. Brush officially supports AMD, Intel, and NVIDIA GPUs. Current end-to-end validation used NVIDIA; CPU-only software graphics backends remain unverified but are not artificially blocked by startup checks.
 - Source builds require Node.js 22.12+, Rust stable, and Tauri 2's WebKitGTK development dependencies; `.deb` users do not need these development tools.
-- Ubuntu 24.04 system `ffmpeg`, `ffprobe`, and CPU-only `colmap` (COLMAP 3.9 from the Ubuntu repository).
-- Brush v0.3.0 for Linux x86_64, installed and verified by `npm run setup:engines`.
+- Ubuntu system `ffmpeg`/`ffprobe`; self-built, hash-locked COLMAP 4.2.1 is bundled, never selected from apt or PATH.
+- OOOBrush ooo-v1.0.0 Linux x86_64 CLI, installed and verified by `npm run setup:engines`.
 
 Install Ubuntu dependencies with:
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential curl file ffmpeg colmap \
+  build-essential curl file ffmpeg \
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
   libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
 ```
 
-Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Ubuntu 24.04's non-CUDA COLMAP package automatically uses the CPU, while Brush selects an available graphics backend at runtime. Fully CPU-only software Vulkan has not yet been validated end to end.
+Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
 After downloading the `OOOSplat-0.5.0-x64-linux` Artifact from GitHub Actions, install it with:
 
@@ -147,7 +147,7 @@ After downloading the `OOOSplat-0.5.0-x64-linux` Artifact from GitHub Actions, i
 sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
 ```
 
-The `.deb` installs FFmpeg, FFprobe, and CPU COLMAP through Ubuntu's package manager; the pinned Brush runtime is included in the package.
+The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
 
 ## Installation and Use
 
@@ -250,8 +250,8 @@ Consent is separate and one-time: you can send a report even with anonymous anal
 | Engine | Pinned version/build | Purpose |
 | --- | --- | --- |
 | FFmpeg / FFprobe | Windows x64 8.1 LGPL shared; macOS arm64 8.1.2 LGPL shared | Video analysis and frame extraction |
-| COLMAP | Windows 4.0.4 CUDA; macOS arm64 4.0.4 CPU CLI-only | Feature extraction, matching, and camera reconstruction |
-| Brush | v0.3.0 for Windows x64 / macOS arm64 | Gaussian Splatting training and PLY export |
+| COLMAP | 4.2.1 same commit; Windows/Linux CUDA + Caspar/Ceres; macOS Ceres CPU | Feature extraction, matching, and camera reconstruction |
+| Brush | OOOBrush ooo-v1.0.0; Windows/Linux x64, macOS arm64 | Headless Gaussian Splatting training and PLY export |
 
 Windows, Ubuntu, and macOS source and integrity policies are recorded in [`engines/manifest.json`](engines/manifest.json), [`engines/manifest.linux.json`](engines/manifest.linux.json), and [`engines/manifest.macos.json`](engines/manifest.macos.json). Large engine files are not committed to Git; developers restore them with `npm run setup:engines`. Release builds verify sources, hashes, architecture, the dynamic-library closure, and Brush CLI compatibility.
 
@@ -262,6 +262,25 @@ Third-party licenses and notices are in [`licenses/`](licenses/):
 - Brush: Apache-2.0.
 
 ## Local Development
+
+### Download COLMAP Development Packages
+
+Manually run **COLMAP-only development runtime** in Actions, selecting `all` or
+one platform. Download the successful job's Artifact, extract its outer ZIP and
+inner runtime archive, and copy the top-level directory's **contents** into:
+
+- Windows: `engines/colmap/` (`bin/colmap.exe`).
+- Linux: `engines/linux/colmap/` (`bin/colmap`).
+- macOS: `engines/macos/arm64/colmap/` (`bin/colmap`).
+
+Keep libraries, licenses and metadata together; do not add another wrapper
+directory. Keep your existing FFmpeg, then use `npm run dev:local` or
+`npm run build:local`. These commands automatically prepare and cache pinned
+OOOBrush, but do not install, download or verify COLMAP, or modify formal manifests. Application runtime health
+checks and strict normal release verification remain unchanged.
+
+Artifacts expire after 30 days. The manual workflow must exist on the default
+branch before it can be dispatched. See the [engine development package guide](engines/README.md#download-colmap-only-development-builds).
 
 ### Development Environment
 
@@ -292,7 +311,7 @@ npm run tauri -- dev
 
 From the repository root, `./scripts/start-app-linux.sh` (or `npm run start:app:linux`) verifies the local engines and license mappings, rebuilds the release executable only when the sources changed, and starts OOOSplat.
 
-Ubuntu 24.04 Alpha engine setup installs only verified Brush under `engines/linux/brush/`; FFmpeg, FFprobe, and CPU COLMAP remain system packages. Tauri embeds Brush in the x86_64 `.deb` and declares FFmpeg and COLMAP as Debian dependencies.
+Ubuntu setup restores verified COLMAP under `engines/linux/colmap/` and Brush under `engines/linux/brush/`. FFmpeg/FFprobe remain system packages. The `.deb` embeds COLMAP/Brush and does not depend on system COLMAP.
 
 The Ubuntu 24.04 Alpha CI workflow is in `.github/workflows/ubuntu.yml`. Standard GitHub runners cover frontend tests/build, license mappings, Rust tests, Clippy, FFmpeg integration, `.deb` creation, package validation, and upload of the installer plus SHA-256. Brush end-to-end coverage requires a host or self-hosted runner with a working graphics backend. The complete pipeline is currently validated on NVIDIA; AMD, Intel, and software Vulkan test results are welcome.
 
@@ -372,13 +391,13 @@ cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- generate "D:
 
 For development or diagnostics, use the global `--engine-dir <path>` argument or the `OOOSPLAT_ENGINE_DIR` environment variable to override the default engine directory.
 
-On Linux, `OOOSPLAT_FFMPEG`, `OOOSPLAT_FFPROBE`, `OOOSPLAT_COLMAP`, and `OOOSPLAT_BRUSH` can override individual executables. Otherwise, OOOSplat searches managed repository locations and the system `PATH`.
+Linux FFmpeg/FFprobe retain their individual environment/PATH discovery. Brush defaults to managed `linux/brush/brush_app`, with no PATH fallback; explicit `OOOSPLAT_BRUSH` diagnostic overrides must support the new CLI. COLMAP is resolved only as `linux/colmap/bin/colmap` below the managed root, with no individual `OOOSPLAT_COLMAP` or PATH fallback.
 
 ## FAQ
 
 ### Why is COLMAP using the CPU instead of the GPU?
 
-OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 528.33 and Compute Capability 5.0 or higher. If detection fails or a requirement is not met, COLMAP automatically falls back to CPU and the application shows the specific reason. Brush is independent of COLMAP and selects an available graphics backend at runtime.
+OOOSplat enables COLMAP GPU acceleration only when the bundled CUDA runtime is healthy and it can confirm an NVIDIA driver version of at least 580.00 and Compute Capability 7.5 or higher. Caspar additionally requires a successful tiny BA execution probe. A failed Caspar probe selects Ceres CPU without disabling otherwise available SIFT GPU acceleration. Detection failures select CPU and report the reason. Brush is independent of COLMAP and selects an available graphics backend at runtime.
 
 ### How does OOOSplat handle different GPU combinations?
 

@@ -1,12 +1,38 @@
 {
   "schemaVersion": 2,
   "generatedAt": "2026-08-21",
-  "systemEngines": ["ffmpeg", "ffprobe", "colmap"],
+  "systemEngines": ["ffmpeg", "ffprobe"],
+  "colmap": {
+    "name": "COLMAP",
+    "version": "4.2.1",
+    "commit": "bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+    "sourceUrl": "https://github.com/ooolabdev/ooosplat/releases/download/engines-linux-x64-v0.1.0/ooosplat-colmap-linux-x64-v0.1.0.tar.xz",
+    "archiveName": "ooosplat-colmap-linux-x64-v0.1.0.tar.xz",
+    "archiveSha256": null,
+    "integritySha256": null,
+    "buildStatus": "pending-first-build-and-hash-lock",
+    "destination": "engines/linux/colmap",
+    "license": "BSD-3-Clause",
+    "licenseFiles": ["licenses/COLMAP-LICENSE.txt"],
+    "cudaCompatibility": {
+      "toolkitVersion": "13.2.0",
+      "architecturePolicy": "75;80;86;89;90;100;120",
+      "minimumDriver": "580.00",
+      "minimumComputeCapability": "7.5"
+    }
+  },
   "brush": {
-    "version": "0.3.0",
-    "sourceUrl": "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz",
-    "archiveSha256": "4f0f9a8785d1951c62df26aae247c02c5bba32b00f40b06df4e1c9b867399e20",
-    "binarySha256": "13d28ee06a388bc4e987774e890b594d60a75bba26064e82b4ee338a78f158a4",
+    "version": "1.0.0",
+    "releaseTag": "ooo-v1.0.0",
+    "commit": "866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5",
+    "target": "x86_64-unknown-linux-gnu",
+    "sourceUrl": "https://github.com/ooolabdev/OOOBrush/releases/download/ooo-v1.0.0/OOOBrush-x86_64-unknown-linux-gnu.tar.gz",
+    "archiveName": "OOOBrush-x86_64-unknown-linux-gnu.tar.gz",
+    "archiveSha256": "EEA89703D98B2FCC090309746EF4EF54271EF402C2B67E644ED7AC1390DCFB4E",
+    "binarySha256": "CA819F94716C04ADD531E69E5F6812A2D1E9A8CEFBC2803DA000D905D4FCCB0A",
+    "buildInfoSha256": "EC6C2CBC304E74A3FC6833998DCC4B220EC409F7C849102DAD539648C607072E",
+    "licenseSha256": "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30",
+    "buildPolicy": "Pinned OOOBrush headless brush-cli renamed brush_app; viewer excluded",
     "destination": "engines/linux/brush/brush_app",
     "license": "Apache-2.0",
     "licenseFiles": ["licenses/Brush-LICENSE.txt"]

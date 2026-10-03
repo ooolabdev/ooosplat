@@ -326,7 +326,8 @@ fn estimate_non_brush_ms(frame_count: f64, quality: Quality, input_kind: Runtime
     anchor_ms * (frame_count / anchor_frames).powf(exponent)
 }
 
-/// Brush v0.3.0 does not expose its current training step on stdout/stderr.
+/// OOOBrush exposes diagnostic iterations, but this UI still uses the existing
+/// duration-based estimate rather than treating diagnostic logs as progress.
 /// This duration model is therefore used only to provide a clearly labelled,
 /// best-effort progress indicator while the process is alive.
 pub(crate) fn estimate_brush_stage_ms(quality: Quality) -> u64 {
