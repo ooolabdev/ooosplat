@@ -1,12 +1,6 @@
 name: COLMAP-only development runtime
 
 on:
-  # Temporary bootstrap: dispatch is not registered on the default branch yet.
-  push:
-    branches:
-      - test/colmap-brush-upgrade
-    paths:
-      - .github/workflows/colmap-engines.yml
   workflow_dispatch:
     inputs:
       platform:
@@ -33,7 +27,7 @@ jobs:
       - name: Select requested platforms
         id: platforms
         env:
-          REQUESTED_PLATFORM: ${{ inputs.platform || 'all' }}
+          REQUESTED_PLATFORM: ${{ inputs.platform }}
         run: |
           node -e '
             const fs = require("node:fs");

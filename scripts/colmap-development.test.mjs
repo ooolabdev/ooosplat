@@ -73,10 +73,7 @@ test("manual workflow only builds selected platforms and never publishes a Relea
   const workflow = read(".github/workflows/colmap-engines.yml");
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /default: all/);
-  // Temporary branch-scoped bootstrap must not allow unrelated pushes.
-  assert.match(workflow, /^  push:\n    branches:\n      - test\/colmap-brush-upgrade\n    paths:\n      - \.github\/workflows\/colmap-engines\.yml/m);
-  assert.match(workflow, /REQUESTED_PLATFORM: \$\{\{ inputs\.platform \|\| 'all' \}\}/);
-  assert.doesNotMatch(workflow, /^  (pull_request|schedule):/m);
+  assert.doesNotMatch(workflow, /^  (push|pull_request|schedule):/m);
   assert.doesNotMatch(workflow, /contents: write|gh release|build-engines-macos\.sh|npm run tauri/);
   assert.match(workflow, /fail-fast: false/);
   assert.match(workflow, /retention-days: 30/);
