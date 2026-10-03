@@ -39,8 +39,8 @@ describe("backend browser guards", () => {
 
   it("uses validated backend commands for runtime state and project folders", async () => {
     (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-    mocks.invoke.mockResolvedValueOnce({ pipelineRunning: false, previewProjectId: null });
-    await expect(getAppRuntimeStatus()).resolves.toEqual({ pipelineRunning: false, previewProjectId: null });
+    mocks.invoke.mockResolvedValueOnce({ pipelineRunning: false, previewProjectId: null, taskAcceleration: null });
+    await expect(getAppRuntimeStatus()).resolves.toEqual({ pipelineRunning: false, previewProjectId: null, taskAcceleration: null });
     await revealProject({ id: "project-id" } as Parameters<typeof revealProject>[0]);
     await revealProjectLogs("project-id");
 

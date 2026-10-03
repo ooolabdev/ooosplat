@@ -298,6 +298,7 @@ pub struct PipelineRunner {
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
+    current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
     planner_enabled: bool,
     effectiveness: Option<PlannerEffectivenessTracker>,
 }
@@ -324,6 +325,7 @@ impl PipelineRunner {
                 started: Instant::now(),
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
+            current_acceleration: Arc::new(std::sync::Mutex::new(None)),
             planner_enabled,
             effectiveness: None,
         }
@@ -361,10 +363,17 @@ impl PipelineRunner {
         }
     }
 
+    pub fn current_acceleration(&self) -> Option<crate::engines::ColmapAccelerationStatus> {
+        self.current_acceleration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn verify_pipeline_engines(
         &self,
     ) -> Result<crate::engines::ColmapAccelerationStatus> {
-        let statuses = self.engines.check_all().await;
+        let statuses = self.engines.check_all_for_task().await;
         for required in [
             EngineKind::Ffmpeg,
             EngineKind::Ffprobe,
@@ -387,11 +396,16 @@ impl PipelineRunner {
         }
         colmap::require_verified_cli(&self.engines.colmap)?;
         brush::require_verified_cli(&self.engines.brush)?;
-        statuses
+        let acceleration = statuses
             .into_iter()
             .find(|status| status.kind == EngineKind::Colmap)
             .and_then(|status| status.acceleration)
-            .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))
+            .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))?;
+        *self
+            .current_acceleration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(acceleration.clone());
+        Ok(acceleration)
     }
 
     #[allow(clippy::too_many_arguments)]

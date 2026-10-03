@@ -14,7 +14,11 @@ pub mod html_export;
 
 use crate::{
     engines::{
-        ffprobe::probe_video, health::check_colmap_acceleration as detect_colmap_acceleration,
+        ffprobe::probe_video,
+        health::{
+            check_colmap_acceleration as refresh_colmap_acceleration,
+            check_colmap_acceleration_cached as detect_colmap_acceleration,
+        },
         ColmapAccelerationStatus, EnginePaths, EngineStatus,
     },
     error::{Result, SplatError},
@@ -142,12 +146,34 @@ fn classify_pipeline_failure(
     let lower = message.to_ascii_lowercase();
     match stage {
         Some(PipelineStage::Reconstructing) => {
+            let source_error = [
+                "no good initial image pair",
+                "could not find a good initial image pair",
+                "failed to find an initial image pair",
+                "discarding reconstruction",
+                "failed to create any sparse model",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
             let storage_error = [
                 "io error",
                 "i/o error",
-                "database",
-                "disk",
+                "database is locked",
+                "database locked",
+                "unable to open database",
+                "failed to open database",
+                "cannot open database",
+                "unable to open database file",
+                "read-only database",
+                "readonly database",
+                "no space left",
+                "disk full",
+                "input/output error",
                 "no such file",
+                "file not found",
+                "being used by another process",
+                "used by another process",
+                "sharing violation",
                 "access denied",
                 "permission denied",
             ]
@@ -155,7 +181,9 @@ fn classify_pipeline_failure(
             .any(|needle| lower.contains(needle));
             (
                 Some(PipelineEngine::Colmap),
-                Some(if storage_error {
+                Some(if source_error {
+                    "mapper_source"
+                } else if storage_error {
                     "mapper_storage"
                 } else {
                     "mapper_source"
@@ -277,6 +305,7 @@ pub struct PreviewController {
 pub struct AppRuntimeStatus {
     pipeline_running: bool,
     preview_project_id: Option<String>,
+    task_acceleration: Option<ColmapAccelerationStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -416,7 +445,7 @@ pub async fn check_engines(app: tauri::AppHandle) -> Vec<EngineStatus> {
 
 #[tauri::command]
 pub async fn check_colmap_acceleration(app: tauri::AppHandle) -> ColmapAccelerationStatus {
-    detect_colmap_acceleration(&paths_for_app(&app)).await
+    refresh_colmap_acceleration(&paths_for_app(&app)).await
 }
 
 #[tauri::command]
@@ -442,7 +471,7 @@ pub async fn probe_and_plan(
         let resolution = planner_enabled.then(|| {
             resolve_planner_resolution_plan(
                 quality,
-                acceleration.usable_gpu_total_memory_mb(),
+                acceleration.planning_gpu_total_memory_mb(),
                 image_sequence.width,
                 image_sequence.height,
                 false,
@@ -453,7 +482,7 @@ pub async fn probe_and_plan(
                 resolve_brush_training_preset(
                     quality,
                     false,
-                    acceleration.usable_gpu_total_memory_mb(),
+                    acceleration.planning_gpu_total_memory_mb(),
                     image_sequence.width.max(image_sequence.height),
                     0,
                 )
@@ -461,7 +490,7 @@ pub async fn probe_and_plan(
             |resolution| {
                 resolve_brush_training_preset_for_plan(
                     quality,
-                    acceleration.usable_gpu_total_memory_mb(),
+                    acceleration.planning_gpu_total_memory_mb(),
                     image_sequence.width.max(image_sequence.height),
                     0,
                     &resolution,
@@ -504,7 +533,7 @@ pub async fn probe_and_plan(
         let resolution = planner_enabled.then(|| {
             resolve_planner_resolution_plan(
                 quality,
-                acceleration.usable_gpu_total_memory_mb(),
+                acceleration.planning_gpu_total_memory_mb(),
                 source_width,
                 source_height,
                 true,
@@ -515,7 +544,7 @@ pub async fn probe_and_plan(
                 resolve_brush_training_preset(
                     quality,
                     false,
-                    acceleration.usable_gpu_total_memory_mb(),
+                    acceleration.planning_gpu_total_memory_mb(),
                     source_width.max(source_height),
                     0,
                 )
@@ -523,7 +552,7 @@ pub async fn probe_and_plan(
             |resolution| {
                 resolve_brush_training_preset_for_plan(
                     quality,
-                    acceleration.usable_gpu_total_memory_mb(),
+                    acceleration.planning_gpu_total_memory_mb(),
                     source_width.max(source_height),
                     0,
                     &resolution,
@@ -623,7 +652,7 @@ pub async fn estimate_project_runtime(
     });
     let samples = catalog::runtime_samples().await;
     let acceleration = detect_colmap_acceleration(&paths_for_app(&app)).await;
-    let detected_total_memory_mb = acceleration.usable_gpu_total_memory_mb();
+    let detected_total_memory_mb = acceleration.planning_gpu_total_memory_mb();
     let mut estimate = match metadata.input_type {
         ProjectInputType::Video => {
             let video = match state.video.clone() {
@@ -907,7 +936,12 @@ pub async fn get_app_runtime_status(
     pipeline: State<'_, PipelineController>,
     preview: State<'_, PreviewController>,
 ) -> Result<AppRuntimeStatus> {
-    let pipeline_running = pipeline.active.lock().await.is_some();
+    let active_pipeline = pipeline.active.lock().await;
+    let pipeline_running = active_pipeline.is_some();
+    let task_acceleration = active_pipeline
+        .as_ref()
+        .and_then(|runner| runner.current_acceleration());
+    drop(active_pipeline);
     let preview_project_id = preview
         .active
         .lock()
@@ -917,6 +951,7 @@ pub async fn get_app_runtime_status(
     Ok(AppRuntimeStatus {
         pipeline_running,
         preview_project_id,
+        task_acceleration,
     })
 }
 
@@ -1726,6 +1761,27 @@ mod tests {
                 "Device lost while allocating a buffer",
             ),
             (Some(PipelineEngine::Brush), Some("brush_device_lost")),
+        );
+
+        let real_mapper_log = r#"
+            Loading database
+            Loading cameras...
+            Loading matches...
+            Finding good initial image pair
+            No good initial image pair found.
+            Discarding reconstruction because it is too small
+            Failed to create any sparse model
+        "#;
+        assert_eq!(
+            classify_pipeline_failure(Some(PipelineStage::Reconstructing), real_mapper_log),
+            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+        );
+        assert_eq!(
+            classify_pipeline_failure(
+                Some(PipelineStage::Reconstructing),
+                "SQLite error: database is locked",
+            ),
+            (Some(PipelineEngine::Colmap), Some("mapper_storage")),
         );
     }
 

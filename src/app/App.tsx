@@ -10,7 +10,7 @@ import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import {
-  cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
+  cancelPipeline, checkColmapAcceleration, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setPlannerEnabled, setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
@@ -239,6 +239,9 @@ export function App() {
   const loadGaussian = useGaussianTransformStore((state) => state.load);
   const closeGaussian = useGaussianTransformStore((state) => state.close);
   const isRunning = store.phase === "running";
+  const systemAcceleration = store.colmapAcceleration;
+  const systemDetectionTemporary = systemAcceleration?.detectionState === "temporarilyUnavailable";
+  const systemAccelerationWarning = systemDetectionTemporary || Boolean(systemAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(systemAcceleration.reasonCode) && systemAcceleration.backend !== "gpu");
   const liveLogRef = useRef<HTMLDivElement>(null);
   const followLiveLogRef = useRef(true);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -255,6 +258,7 @@ export function App() {
   const runElapsedOffset = useRef(0);
   const cancellationOverlayTimer = useRef<number | null>(null);
   const pipelineRunningRef = useRef(isRunning);
+  const accelerationRequestRevision = useRef(0);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
   const [isCancellationRequested, setIsCancellationRequested] = useState(false);
   const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
@@ -345,6 +349,7 @@ export function App() {
   const reconcileRuntimeState = useCallback(async () => {
     const runtime = await getAppRuntimeStatus();
     const appState = useAppStore.getState();
+    appState.setTaskColmapAcceleration(runtime.taskAcceleration ?? null);
     if (!runtime.pipelineRunning && !pipelineCommandPending.current && appState.phase === "running") {
       appState.setPhase("idle");
       clearCancellationFeedback();
@@ -362,24 +367,54 @@ export function App() {
     return runtime;
   }, [clearCancellationFeedback, closeGaussian, viewMode]);
 
+  const refreshSystemAcceleration = useCallback(async () => {
+    const revision = ++accelerationRequestRevision.current;
+    const acceleration = await checkColmapAcceleration();
+    if (revision === accelerationRequestRevision.current && acceleration) {
+      useAppStore.getState().setColmapAcceleration(acceleration);
+    }
+  }, []);
+
   useEffect(() => {
-    void Promise.all([checkEngines(), getProjectOverview()])
-      .then(([engines, overview]) => {
-        store.setEngines(engines);
+    void getProjectOverview()
+      .then((overview) => {
         store.setProjectsRoot(overview.projectsRoot);
         store.setPlannerEnabled(overview.plannerEnabled ?? true);
         store.setProjects(overview.projects);
-        store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
       })
       .catch((error) => store.setError(messageOf(error)));
+    const revision = ++accelerationRequestRevision.current;
+    void checkEngines()
+      .then((engines) => {
+        store.setEngines(engines);
+        if (revision === accelerationRequestRevision.current) {
+          store.setColmapAcceleration(engines.find((engine) => engine.kind === "colmap")?.acceleration ?? null);
+        }
+      })
+      .catch(() => undefined);
   }, [store.setEngines, store.setProjects, store.setProjectsRoot, store.setPlannerEnabled, store.setColmapAcceleration, store.setError]);
 
   useEffect(() => {
+    const retry = () => {
+      if (document.visibilityState === "visible") void refreshSystemAcceleration().catch(() => undefined);
+    };
+    const interval = window.setInterval(retry, 15_000);
+    document.addEventListener("visibilitychange", retry);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", retry);
+    };
+  }, [refreshSystemAcceleration]);
+
+  useEffect(() => {
     if (viewMode === "tasks") void reconcileRuntimeState().catch(() => undefined);
-    const onFocus = () => { void reconcileRuntimeState().catch(() => undefined); };
+    const onFocus = () => {
+      void reconcileRuntimeState().catch(() => undefined);
+      void refreshSystemAcceleration().catch(() => undefined);
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [reconcileRuntimeState, viewMode]);
+  }, [reconcileRuntimeState, refreshSystemAcceleration, viewMode]);
 
   useEffect(() => {
     void initializeTelemetry()
@@ -956,11 +991,12 @@ export function App() {
           </div>
         </div>
 
-        <div className={`acceleration-status ${store.colmapAcceleration?.backend === "gpu" ? "gpu" : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? "warning" : "cpu"}`} aria-live="polite">
-          <span className="acceleration-icon">{store.colmapAcceleration?.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : store.colmapAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(store.colmapAcceleration.reasonCode) ? <CircleAlert size={17} /> : store.colmapAcceleration ? <Cpu size={17} /> : <LoaderCircle className="spin" size={17} />}</span>
+        <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.backend === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
+          <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
           <span>
-            <strong>{store.colmapAcceleration == null ? t("gpu.detecting") : store.colmapAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
-            <small>{store.colmapAcceleration == null ? t("gpu.reading") : store.colmapAcceleration.backend === "gpu" && store.colmapAcceleration.device ? `${store.colmapAcceleration.device.name}${store.colmapAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (store.colmapAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: store.colmapAcceleration.device.driverVersion })} · Compute Capability ${store.colmapAcceleration.device.computeCapability}` : store.colmapAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, store.colmapAcceleration.reason) : `${localizePipelineMessage(locale, store.colmapAcceleration.reason)} · ${t("gpu.requirements", { driver: store.colmapAcceleration.requirements.minimumDriverVersion, capability: store.colmapAcceleration.requirements.minimumComputeCapability })}`}</small>
+            <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
+            <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.backend === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
+            {isRunning && store.taskColmapAcceleration && <small>{t("gpu.currentTask")} · {store.taskColmapAcceleration.backend === "gpu" ? t("gpu.taskGpu", { device: store.taskColmapAcceleration.device?.name ?? "NVIDIA GPU" }) : t("gpu.taskCpu")}</small>}
           </span>
         </div>
 

@@ -4,6 +4,7 @@ export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed"
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
 export type ColmapBackend = "cpu" | "gpu";
+export type GpuDetectionState = "ready" | "temporarilyUnavailable" | "unavailable";
 export type AccelerationReasonCode =
   | "gpuReady" | "macOsCpuOnly" | "colmapUnavailable" | "colmapCudaUnavailable" | "requirementsUnavailable"
   | "nvidiaSmiNotFound" | "probeFailed" | "probeTimeout" | "noNvidiaGpu"
@@ -13,6 +14,7 @@ export interface GpuDeviceInfo { index: number; name: string; driverVersion: str
 export interface AccelerationRequirements { minimumDriverVersion: string; minimumComputeCapability: string; }
 export interface ColmapAccelerationStatus {
   backend: ColmapBackend;
+  detectionState: GpuDetectionState;
   reasonCode: AccelerationReasonCode;
   reason: string;
   device: GpuDeviceInfo | null;
@@ -146,7 +148,11 @@ export interface ProjectSummary {
 
 export interface AppSettings { schemaVersion: number; projectsRoot: string; plannerEnabled: boolean; }
 export interface ProjectOverview { projectsRoot: string; plannerEnabled: boolean; projects: ProjectSummary[]; }
-export interface AppRuntimeStatus { pipelineRunning: boolean; previewProjectId: string | null; }
+export interface AppRuntimeStatus {
+  pipelineRunning: boolean;
+  previewProjectId: string | null;
+  taskAcceleration: ColmapAccelerationStatus | null;
+}
 
 export type GaussianFormat = "ply" | "sog" | "spz";
 export interface GaussianTransform {

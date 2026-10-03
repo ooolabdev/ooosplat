@@ -9,6 +9,7 @@ interface AppState {
   projects: ProjectSummary[];
   quality: Quality;
   colmapAcceleration: ColmapAccelerationStatus | null;
+  taskColmapAcceleration: ColmapAccelerationStatus | null;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
   plan: FramePlan | null;
@@ -27,6 +28,7 @@ interface AppState {
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
+  setTaskColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
   setAnalysis: (inputType: InputType, video: VideoInfo | null, imageSequence: ImageSequenceInfo | null, plan: FramePlan, estimate: RuntimeEstimate) => void;
   setEstimate: (estimate: RuntimeEstimate | null) => void;
   setEngines: (engines: EngineStatus[]) => void;
@@ -45,6 +47,7 @@ export const useAppStore = create<AppState>((set) => ({
   projects: [],
   quality: "balanced",
   colmapAcceleration: null,
+  taskColmapAcceleration: null,
   video: null,
   imageSequence: null,
   plan: null,
@@ -79,11 +82,12 @@ export const useAppStore = create<AppState>((set) => ({
   setProjects: (projects) => set({ projects }),
   setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null }),
   setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
+  setTaskColmapAcceleration: (taskColmapAcceleration) => set({ taskColmapAcceleration }),
   setAnalysis: (inputType, video, imageSequence, plan, estimate) => set({ inputType, video, imageSequence, plan, estimate }),
   setEstimate: (estimate) => set({ estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
-  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, events: [], result: null, error: null }),
+  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, events: [], result: null, error: null, taskColmapAcceleration: null }),
   receiveEvent: (event) => set((state) => {
     if (state.latestEvent && event.sequence > 0 && event.sequence <= state.latestEvent.sequence) return state;
     const events = [...state.events, event].slice(-500);
@@ -93,7 +97,7 @@ export const useAppStore = create<AppState>((set) => ({
       latestEvent: event,
       progress: terminal ? state.progress : Math.max(state.progress, Math.min(100, event.progress)),
       progressMessage: event.message,
-      colmapAcceleration: event.acceleration ?? state.colmapAcceleration,
+      taskColmapAcceleration: event.acceleration ?? state.taskColmapAcceleration,
     };
   }),
   setResult: (result) => set({ result }),

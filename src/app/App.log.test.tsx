@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/backend", () => ({
   cancelPipeline: vi.fn(),
   checkEngines: vi.fn().mockResolvedValue([]),
+  checkColmapAcceleration: vi.fn().mockResolvedValue(null),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: vi.fn().mockResolvedValue(true),
   estimateProjectRuntime: vi.fn(),
@@ -87,12 +88,12 @@ describe("App live log", () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null,
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
-    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null });
+    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null, taskAcceleration: null });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({
       analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured",
     });

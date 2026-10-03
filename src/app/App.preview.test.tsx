@@ -40,6 +40,7 @@ vi.mock("../lib/backend", () => ({
   prepareErrorReport: mocks.prepareErrorReport,
   sendErrorReport: mocks.sendErrorReport,
   checkEngines: vi.fn().mockResolvedValue([]),
+  checkColmapAcceleration: vi.fn().mockResolvedValue(null),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: mocks.confirmLargeImageSequence,
   estimateProjectRuntime: mocks.estimateProjectRuntime,
@@ -116,7 +117,7 @@ describe("App preview workspace", () => {
     }
     useGaussianTransformStore.getState().close();
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null,
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
       latestEvent: null, events: [], result: null, error: null,
     });
@@ -134,6 +135,7 @@ describe("App preview workspace", () => {
     mocks.getAppRuntimeStatus.mockReset().mockImplementation(async () => ({
       pipelineRunning: false,
       previewProjectId: useGaussianTransformStore.getState().descriptor?.projectId ?? null,
+      taskAcceleration: null,
     }));
     mocks.exportPly.mockReset().mockResolvedValue("E:\\Exports\\final.ply");
     mocks.revealFile.mockReset().mockResolvedValue(undefined);
