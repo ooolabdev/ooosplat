@@ -10,6 +10,7 @@ import { artifactSummary, placements } from "./colmap-artifact-summary.mjs";
 import { dependencyPath, deploymentVersion, versionAtMost } from "./verify-macos-colmap-runtime.mjs";
 import { collectComponentNotices, isLicenseNotice } from "./collect-macos-component-notices.mjs";
 import { sha256, buildLock } from "./colmap-runtime.mjs";
+import { compileWindowsCudaProbe, verifyWindowsCudaBuildFlags, windowsCudaFlags } from "./windows-cuda-preflight.mjs";
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Git's Windows checkout uses CRLF; source-policy assertions must be identical.
@@ -186,6 +187,118 @@ test("macOS-only and mixed builders use the same compiler/relocation functions",
   assert.match(common, /-DCASPAR_ENABLED=OFF/);
   assert.match(common, /codesign --force --sign -/);
   assert.doesNotMatch(common, /download_verified.*(?:Brush|FFmpeg)/);
+});
+
+test("Windows CCCL compile preflight precedes dependency work and actual compile flags are verified", () => {
+  const source = read("scripts/build-colmap-windows.ps1");
+  assert.ok(source.includes(`$env:CUDAFLAGS = '${windowsCudaFlags.join(" ")}'`));
+  const probe = source.indexOf("'windows-cuda-preflight.mjs'), 'probe'");
+  assert.ok(probe > 0);
+  for (const dependency of ["$archive =", "'clone', '--no-checkout'", "bootstrap-vcpkg.bat", "Invoke-Checked 'cmake' $options"]) {
+    assert.ok(probe < source.indexOf(dependency), `CCCL probe must precede ${dependency}`);
+  }
+  assert.match(source, /-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON/);
+  const verify = source.indexOf("'windows-cuda-preflight.mjs'), 'verify-build'");
+  assert.ok(verify > source.indexOf("Invoke-Checked 'cmake' $options"));
+  assert.ok(verify < source.indexOf("Invoke-Checked 'cmake' @('--build'"));
+  const fixture = read("scripts/fixtures/cuda/windows-cccl-smoke.cu");
+  assert.match(fixture, /#include <cuda\/std\/type_traits>/);
+  assert.match(fixture, /_MSVC_TRADITIONAL != 0/);
+  assert.match(fixture, /cooperative_groups::reduce/);
+  assert.doesNotMatch(fixture, /int main|<<<|cudaLaunch|CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING/);
+});
+
+test("Windows CCCL probe uses the conforming host flags and compiles without running a GPU", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-windows-cccl-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const compiler = path.join(root, "toolkit space", "bin", "nvcc.exe");
+  const outputDirectory = path.join(root, "中文 compile probe");
+  const flags = windowsCudaFlags.join(" ");
+  const result = compileWindowsCudaProbe(compiler, outputDirectory, { flags, log: () => {}, execute: (command, args, options) => {
+    assert.equal(command, compiler);
+    for (const flag of windowsCudaFlags) assert.ok(args.includes(flag));
+    assert.ok(args.includes("--compile"));
+    assert.ok(args.includes("--gpu-architecture=compute_75"));
+    assert.ok(args.some(arg => arg.endsWith("windows-cccl-smoke.cu")));
+    assert.ok(args.at(-1).endsWith(".obj"));
+    assert.equal(options.timeout, 120000);
+    assert.ok(!args.includes("--run") && !args.includes("-run"));
+    fs.writeFileSync(args.at(-1), "compiled object fixture");
+    return { status: 0, stdout: "compiler completed", stderr: "" };
+  } });
+  assert.equal(result.flags, flags);
+  assert.ok(fs.existsSync(result.object));
+  for (const response of [
+    { status: 1, stdout: "", stderr: "fatal error C1189: traditional preprocessor" },
+    { status: null, error: new Error("timed out"), stdout: "", stderr: "" },
+  ]) {
+    assert.throws(() => compileWindowsCudaProbe(compiler, outputDirectory, { flags, execute: () => response, log: () => {} }), /preflight failed/);
+  }
+  assert.throws(() => compileWindowsCudaProbe(compiler, path.join(root, "no object"), { flags, execute: () => ({ status: 0 }), log: () => {} }), /without producing an object/);
+  for (const invalidFlags of ["-allow-unsupported-compiler", `${flags} -Xcompiler=/Zc:preprocessor-`, `${flags} -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING`]) {
+    assert.throws(() => compileWindowsCudaProbe(compiler, outputDirectory, { flags: invalidFlags, execute: () => { throw new Error("Must not execute compiler"); }, log: () => {} }), /missing required|disables or bypasses/);
+  }
+});
+
+test("Windows CMake compilation inventory must actually preserve the host preprocessor flag", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-windows-cuda-flags-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const flags = windowsCudaFlags.join(" ");
+  const base = [
+    { file: "D:/source/Symforce-Caspar/generated/f32/caspar_mappings.cu", command: `"C:/CUDA toolkit/bin/nvcc.exe" ${flags} -c source.cu` },
+    { file: "D:/source/Symforce-Caspar/generated/f32/kernel_example.cu", arguments: ["nvcc.exe", ...windowsCudaFlags, "-c", "source.cu"] },
+    { file: "D:/source/SiftGPU/ProgramCU.cu", command: `nvcc.exe ${flags} -c source.cu` },
+  ];
+  const writeBuild = (commands, cudaFlags = flags, newline = "\n") => {
+    fs.writeFileSync(path.join(root, "CMakeCache.txt"), `CMAKE_CUDA_FLAGS:STRING=${cudaFlags}${newline}`);
+    fs.writeFileSync(path.join(root, "compile_commands.json"), JSON.stringify(commands));
+  };
+  for (const newline of ["\n", "\r\n"]) {
+    writeBuild(base, flags, newline);
+    assert.deepEqual(verifyWindowsCudaBuildFlags(root, { log: () => {} }), { flags, cudaCommands: 3, casparCommands: 2 });
+  }
+  for (const commands of [[], base.slice(2), [{ ...base[0], command: "nvcc.exe -allow-unsupported-compiler -c source.cu" }], [{ ...base[0], command: `nvcc.exe ${flags} -Xcompiler=/Zc:preprocessor- -c source.cu` }]]) {
+    writeBuild(commands);
+    assert.throws(() => verifyWindowsCudaBuildFlags(root, { log: () => {} }), /Missing actual|missing required|disables or bypasses/);
+  }
+  writeBuild(base, "-allow-unsupported-compiler");
+  assert.throws(() => verifyWindowsCudaBuildFlags(root, { log: () => {} }), /CMake cached CUDA flags/);
+});
+
+test("Windows builder stops before dependency work when the actual preflight command fails", { skip: process.platform !== "win32" }, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-windows-preflight-order-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = read("scripts/build-colmap-windows.ps1");
+  const invokeChecked = source.slice(source.indexOf("function Invoke-Checked"), source.indexOf("if (-not $env:CUDA_PATH)"));
+  const preflight = source.slice(source.indexOf("if (-not $env:CUDA_PATH)"), source.indexOf("$archive =")).replaceAll("$PSScriptRoot", "$mockScriptRoot");
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $workspace = $env:MOCK_WORKSPACE
+    $mockScriptRoot = Join-Path $workspace 'scripts'
+    $lock = $env:MOCK_BUILD_LOCK | ConvertFrom-Json
+    function Get-Command { 'mock prerequisite' }
+    function cmake { "cmake version $($lock.cmakeVersion)" }
+    function ninja { $lock.ninjaVersion }
+    function node {
+      $global:LASTEXITCODE = 0
+      if ($args[0] -like '*windows-cuda-preflight.mjs') {
+        Write-Output 'CCCL_PROBE_CALLED'
+        $global:LASTEXITCODE = [int]$env:MOCK_PREFLIGHT_EXIT
+      }
+    }
+    ${invokeChecked}
+    ${preflight}
+    Write-Output 'DEPENDENCY_WORK_STARTED'
+  `;
+  for (const exit of [0, 1]) {
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8", windowsHide: true, env: { ...process.env, CUDA_PATH: path.join(root, "toolkit"), MOCK_WORKSPACE: root, MOCK_BUILD_LOCK: JSON.stringify(buildLock), MOCK_PREFLIGHT_EXIT: String(exit) },
+    });
+    assert.equal(result.status, exit, result.error?.message || result.stderr);
+    assert.match(result.stdout, /CCCL_PROBE_CALLED/);
+    if (exit) assert.doesNotMatch(result.stdout, /DEPENDENCY_WORK_STARTED/);
+    else assert.match(result.stdout, /DEPENDENCY_WORK_STARTED/);
+  }
 });
 
 test("artifact summaries show exact folders, optional hashes and GPU acceptance status", () => {

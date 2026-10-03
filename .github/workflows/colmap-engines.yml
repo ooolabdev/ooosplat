@@ -57,7 +57,7 @@ jobs:
         shell: bash
         run: |
           node scripts/verify-colmap-lock.mjs
-          node --test scripts/colmap-runtime.test.mjs scripts/colmap-development.test.mjs scripts/cuda-toolkit.test.mjs scripts/colmap-macos-notices.test.mjs
+          node --test scripts/colmap-runtime.test.mjs scripts/colmap-development.test.mjs scripts/cuda-toolkit.test.mjs scripts/collect-linux-runtime.test.mjs scripts/colmap-macos-notices.test.mjs
       - name: Set up Visual Studio x64 compiler
         if: matrix.platform == 'windows'
         uses: ilammy/msvc-dev-cmd@v1

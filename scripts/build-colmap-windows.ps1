@@ -20,6 +20,10 @@ $cache = Join-Path $workspace '.cache/colmap-windows-build'
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $taskDirectory = Join-Path $cache ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $taskDirectory | Out-Null
+# CUDA 13.2's CCCL requires the conforming MSVC preprocessor. Test the same
+# compiler flags before downloading/building the expensive dependency tree.
+$env:CUDAFLAGS = '-allow-unsupported-compiler -Xcompiler=/Zc:preprocessor'
+Invoke-Checked 'node' @((Join-Path $PSScriptRoot 'windows-cuda-preflight.mjs'), 'probe', $cudaCompiler, (Join-Path $taskDirectory 'cuda-preflight'))
 $archive = Join-Path $cache "colmap-$($lock.commit).tar.gz"
 if (-not (Test-Path $archive) -or (Get-FileHash $archive -Algorithm SHA256).Hash -ne $lock.sourceSha256) {
   Invoke-Checked 'curl.exe' @('--fail', '--location', '--retry', '3', $lock.sourceUrl, '--output', $archive)
@@ -33,17 +37,17 @@ Invoke-Checked 'git' @('-C', $vcpkg, 'checkout', '--detach', $lock.vcpkgCommit)
 Invoke-Checked (Join-Path $vcpkg 'bootstrap-vcpkg.bat') @('-disableMetrics')
 $build = Join-Path $taskDirectory 'build'
 $stage = Join-Path $taskDirectory 'ooosplat-colmap-windows-x64'
-# Match the locked upstream CUDA host-compiler setup, without changing sources.
-$env:CUDAFLAGS = '-allow-unsupported-compiler'
 $options = @('-S', $source, '-B', $build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
   "-DCMAKE_INSTALL_PREFIX=$stage", "-DGIT_COMMIT_ID=$($lock.commit)", '-DGIT_COMMIT_DATE=Unknown',
   "-DCMAKE_TOOLCHAIN_FILE=$vcpkg/scripts/buildsystems/vcpkg.cmake", '-DVCPKG_TARGET_TRIPLET=x64-windows-release',
   '-DVCPKG_USE_LEGACY_APPLOCAL=ON', '-DBUILD_SHARED_LIBS=OFF', '-DCUDA_ENABLED=ON', '-DCASPAR_ENABLED=ON', '-DCASPAR_USE_DOUBLE=OFF',
+  '-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON',
   "-DCMAKE_CUDA_ARCHITECTURES:STRING=$($lock.cudaArchitectures -join ';')",
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$cudaCompiler", "-DCUDAToolkit_ROOT:PATH=$env:CUDA_PATH")
 foreach ($feature in $lock.disabledFeatures) { $options += "-D${feature}_ENABLED=OFF" }
 Invoke-Checked 'cmake' $options
 Invoke-Checked 'node' @((Join-Path $PSScriptRoot 'verify-cuda-toolkit.mjs'), 'windows', $env:CUDA_PATH, $build)
+Invoke-Checked 'node' @((Join-Path $PSScriptRoot 'windows-cuda-preflight.mjs'), 'verify-build', $build)
 Invoke-Checked 'cmake' @('--build', $build, '--parallel', '4')
 Invoke-Checked 'cmake' @('--install', $build)
 $installed = Join-Path $build 'vcpkg_installed/x64-windows-release'
