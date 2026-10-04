@@ -13,6 +13,27 @@ export function archiveEntriesSafe(listing) {
   });
 }
 
+// Tauri copies resources more than once while Cargo builds tests and the final
+// application. Some macOS runtime libraries are intentionally archived 0444;
+// preserving that mode makes the first copy read-only and the next copy fails
+// with EACCES. Keep the published bytes and checksums unchanged, but make the
+// installed staging tree owner-writable before Tauri consumes it.
+export function normalizeMacosRuntimePermissions(root) {
+  const visit = directory => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        fs.chmodSync(target, fs.statSync(target).mode | 0o700);
+        visit(target);
+      } else if (entry.isFile()) {
+        fs.chmodSync(target, fs.statSync(target).mode | 0o200);
+      }
+    }
+  };
+  fs.chmodSync(root, fs.statSync(root).mode | 0o700);
+  visit(root);
+}
+
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { windowsHide: true, ...options });
   if (result.error || result.status !== 0) throw new Error(`${command} failed: ${result.error?.message ?? result.stderr ?? result.status}`);
@@ -50,6 +71,7 @@ export function installColmapRuntime(platform, { localArchive = process.env.OOOS
   const destination = safeDestination(expected.destination);
   try {
     verifyColmap(destination, platform, expected.integritySha256, { requireRelease: true });
+    if (platform === "macos") normalizeMacosRuntimePermissions(destination);
     console.log(`Ready: locked COLMAP ${runtimeLock.releaseTag} runtime`);
     return destination;
   } catch { /* Install the reviewed archive; never use PATH or a stale runtime. */ }
@@ -81,6 +103,7 @@ export function installColmapRuntime(platform, { localArchive = process.env.OOOS
     fs.mkdirSync(staged);
     run("tar", ["-xf", archive, "-C", staged], { stdio: "inherit", timeout: 10 * 60_000 });
     verifyColmap(staged, platform, expected.integritySha256, { requireRelease: true });
+    if (platform === "macos") normalizeMacosRuntimePermissions(staged);
     const readme = path.join(destination, "README.md");
     if (fs.existsSync(readme)) fs.copyFileSync(readme, path.join(staged, "README.md"));
     fs.mkdirSync(path.dirname(destination), { recursive: true });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveEntriesSafe, commitColmapRuntime } from "./setup-colmap-runtime.mjs";
+import { archiveEntriesSafe, commitColmapRuntime, normalizeMacosRuntimePermissions } from "./setup-colmap-runtime.mjs";
 import { assertHashPin, fileHash, filesUnder, isLockedColmapHelp, runtimeLock, verifyIntegrity, verifyColmap } from "./colmap-runtime.mjs";
 
 function releaseFixture(t, platform = "linux") {
@@ -129,6 +129,21 @@ test("changed, unlisted and traversal files are rejected", t => {
 test("archive listing accepts direct roots and rejects traversal or absolute paths", () => {
   assert.equal(archiveEntriesSafe("bin/\nbin/colmap\nBUILD-INFO.json\n"), true);
   for (const listing of ["", "../escape\n", "/absolute\n", "C:/absolute\n", "bin/../../escape\n"]) assert.equal(archiveEntriesSafe(listing), false);
+});
+
+test("macOS runtime permissions make read-only library copies replaceable", { skip: process.platform === "win32" }, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-colmap-permissions-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const library = path.join(root, "lib", "runtime.dylib");
+  fs.mkdirSync(path.dirname(library));
+  fs.writeFileSync(library, "runtime", { mode: 0o444 });
+  fs.chmodSync(library, 0o444);
+
+  normalizeMacosRuntimePermissions(root);
+
+  assert.equal(fs.statSync(library).mode & 0o200, 0o200);
+  fs.writeFileSync(library, "replacement");
+  assert.equal(fs.readFileSync(library, "utf8"), "replacement");
 });
 
 test("failed installation verification restores the previous runtime", t => {
