@@ -130,6 +130,8 @@ export interface PipelineResult {
 
 export interface ProjectSummary {
   id: string;
+  workspaceTaskId?: string | null;
+  taskKind?: "generation" | "reshoot";
   name: string;
   status: ProjectStatus;
   projectPath: string;
@@ -150,8 +152,24 @@ export interface AppSettings { schemaVersion: number; projectsRoot: string; plan
 export interface ProjectOverview { projectsRoot: string; plannerEnabled: boolean; projects: ProjectSummary[]; }
 export interface AppRuntimeStatus {
   pipelineRunning: boolean;
+  pipelineProjectId?: string | null;
+  pipelineWorkspaceTaskId?: string | null;
   previewProjectId: string | null;
   taskAcceleration: ColmapAccelerationStatus | null;
+}
+
+export interface ProjectTaskLogLine { source: string; message: string; }
+export interface ProjectTaskDetail {
+  project: ProjectSummary;
+  inputType: InputType;
+  stage: string;
+  progress: number;
+  inputImages: number | null;
+  registeredImages: number | null;
+  video: VideoInfo | null;
+  imageSequence: ImageSequenceInfo | null;
+  sourceProjectId: string | null;
+  logs: ProjectTaskLogLine[];
 }
 
 export type GaussianFormat = "ply" | "sog" | "spz";

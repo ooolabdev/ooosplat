@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::InvokeBody, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -40,7 +40,7 @@ use crate::{
     },
     process::ProcessManager,
     project::{
-        catalog::{self, AppSettings, ProjectOverview},
+        catalog::{self, AppSettings, ProjectOverview, ProjectSummary},
         manager::atomic_write_json,
         GaussianCrop, GaussianEditing, GaussianTransform, PipelineStateFile, ProjectInputType,
         ProjectStatus,
@@ -304,8 +304,32 @@ pub struct PreviewController {
 #[serde(rename_all = "camelCase")]
 pub struct AppRuntimeStatus {
     pipeline_running: bool,
+    pipeline_project_id: Option<String>,
+    pipeline_workspace_task_id: Option<String>,
     preview_project_id: Option<String>,
     task_acceleration: Option<ColmapAccelerationStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTaskLogLine {
+    source: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTaskDetail {
+    project: ProjectSummary,
+    input_type: ProjectInputType,
+    stage: PipelineStage,
+    progress: f64,
+    input_images: Option<u64>,
+    registered_images: Option<u64>,
+    video: Option<VideoInfo>,
+    image_sequence: Option<ImageSequenceInfo>,
+    source_project_id: Option<String>,
+    logs: Vec<ProjectTaskLogLine>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -765,6 +789,125 @@ pub async fn get_project_overview(
     Ok(overview)
 }
 
+fn persisted_task_stage(state: &PipelineStateFile, status: ProjectStatus) -> PipelineStage {
+    match status {
+        ProjectStatus::Completed => PipelineStage::Completed,
+        _ if state.brush_complete => PipelineStage::Exporting,
+        _ if state.reconstruction_complete => PipelineStage::TrainingSplats,
+        _ if state.matching_complete => PipelineStage::Reconstructing,
+        _ if state.features_complete => PipelineStage::Matching,
+        _ if state
+            .frames
+            .as_ref()
+            .and_then(|frames| frames.extracted_frames)
+            .is_some_and(|count| count > 0) =>
+        {
+            PipelineStage::ExtractingFeatures
+        }
+        _ => PipelineStage::ExtractingFrames,
+    }
+}
+
+async fn read_project_log_tail(logs_directory: &Path) -> Result<Vec<ProjectTaskLogLine>> {
+    const MAX_FILE_BYTES: u64 = 64 * 1024;
+    const MAX_TOTAL_BYTES: usize = 256 * 1024;
+    const MAX_LINES: usize = 500;
+    let mut files = Vec::new();
+    if !logs_directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = tokio::fs::read_dir(logs_directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !entry.file_type().await?.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("log")
+        {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        let modified = metadata.modified().ok();
+        files.push((modified, path, metadata.len()));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut lines = Vec::new();
+    let mut total_bytes = 0_usize;
+    for (_, path, length) in files {
+        let mut file = tokio::fs::File::open(&path).await?;
+        let start = length.saturating_sub(MAX_FILE_BYTES);
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut bytes = Vec::with_capacity((length - start) as usize);
+        file.read_to_end(&mut bytes).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        let source = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("system")
+            .to_string();
+        let mut file_lines = text.lines();
+        if start > 0 {
+            let _ = file_lines.next();
+        }
+        for message in file_lines {
+            if message.is_empty() {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(message.len());
+            lines.push(ProjectTaskLogLine {
+                source: source.clone(),
+                message: message.to_string(),
+            });
+            while lines.len() > MAX_LINES || total_bytes > MAX_TOTAL_BYTES {
+                if let Some(removed) = lines.first() {
+                    total_bytes = total_bytes.saturating_sub(removed.message.len());
+                }
+                lines.remove(0);
+            }
+        }
+    }
+    Ok(lines)
+}
+
+#[tauri::command]
+pub async fn get_project_task_detail(project_id: String) -> Result<ProjectTaskDetail> {
+    let id = parse_project_id(&project_id)?;
+    let (project_root, metadata) = catalog::load_registered_project(id).await?;
+    let overview = catalog::get_overview().await?;
+    let project = overview
+        .projects
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| SplatError::Process("项目不存在".into()))?;
+    let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
+    let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
+    let progress = if project.status == ProjectStatus::Completed {
+        100.0
+    } else {
+        resume_checkpoint_fraction(&state).0 * 100.0
+    };
+    let stage = persisted_task_stage(&state, project.status);
+    let logs = read_project_log_tail(&project_root.join("logs")).await?;
+    let input_images = metadata.output.as_ref().map(|output| output.input_images);
+    let registered_images = metadata
+        .output
+        .as_ref()
+        .map(|output| output.registered_images);
+    Ok(ProjectTaskDetail {
+        project,
+        input_type: metadata.input_type,
+        stage,
+        progress,
+        input_images,
+        registered_images,
+        video: state.video,
+        image_sequence: state.image_sequence,
+        source_project_id: metadata
+            .reshoot
+            .as_ref()
+            .map(|reshoot| reshoot.source_project_id.to_string()),
+        logs,
+    })
+}
+
 #[tauri::command]
 pub async fn set_projects_root(
     projects_root: String,
@@ -793,6 +936,7 @@ pub async fn set_telemetry_consent(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
@@ -801,6 +945,7 @@ pub async fn start_pipeline(
     quality: Quality,
     projects_root: String,
     planner_enabled: Option<bool>,
+    workspace_task_id: Option<String>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
     let emitter = app.clone();
     let planner_enabled = planner_enabled.unwrap_or(true);
@@ -818,12 +963,20 @@ pub async fn start_pipeline(
         effectiveness.clone(),
     ));
     let event_telemetry = telemetry_session.clone();
+    let workspace_task_id = workspace_task_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| {
+            PipelineCommandError::from(SplatError::Process("工作区任务 ID 无效".into()))
+        })?;
     let runner = Arc::new(
         PipelineRunner::new_with_planner(paths_for_app(&app), planner_enabled, move |event| {
             event_telemetry.observe(&event);
             let _ = emitter.emit("pipeline-event", event);
         })
-        .with_effectiveness_tracker(effectiveness),
+        .with_effectiveness_tracker(effectiveness)
+        .with_workspace_task_id(workspace_task_id),
     );
     {
         let mut active = state.active.lock().await;
@@ -938,6 +1091,9 @@ pub async fn get_app_runtime_status(
 ) -> Result<AppRuntimeStatus> {
     let active_pipeline = pipeline.active.lock().await;
     let pipeline_running = active_pipeline.is_some();
+    let pipeline_identity = active_pipeline
+        .as_ref()
+        .and_then(|runner| runner.current_project_identity());
     let task_acceleration = active_pipeline
         .as_ref()
         .and_then(|runner| runner.current_acceleration());
@@ -950,6 +1106,10 @@ pub async fn get_app_runtime_status(
         .map(|session| session.project_id.to_string());
     Ok(AppRuntimeStatus {
         pipeline_running,
+        pipeline_project_id: pipeline_identity.map(|value| value.0.to_string()),
+        pipeline_workspace_task_id: pipeline_identity
+            .and_then(|value| value.1)
+            .map(|value| value.to_string()),
         preview_project_id,
         task_acceleration,
     })
@@ -1680,11 +1840,13 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 mod tests {
     use super::{
         classify_pipeline_failure, contains_mp4_ftyp, create_preview_asset,
-        next_gaussian_video_path, preview_client_path, write_gaussian_video,
-        GaussianVideoExportSession, PipelineCommandError, VideoOrientation,
+        next_gaussian_video_path, persisted_task_stage, preview_client_path, read_project_log_tail,
+        write_gaussian_video, GaussianVideoExportSession, PipelineCommandError, VideoOrientation,
     };
     use crate::error::SplatError;
     use crate::pipeline::{PipelineEngine, PipelineStage};
+    use crate::presets::Quality;
+    use crate::project::{PipelineStateFile, ProjectStatus};
     use std::{fs, path::Path};
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -1705,6 +1867,43 @@ mod tests {
     #[test]
     fn pipeline_command_error_stays_below_clippy_large_error_threshold() {
         assert!(std::mem::size_of::<PipelineCommandError>() <= 128);
+    }
+
+    #[test]
+    fn persisted_task_stage_preserves_terminal_status_and_checkpoint_position() {
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.features_complete = true;
+        state.matching_complete = true;
+        assert_eq!(
+            persisted_task_stage(&state, ProjectStatus::Interrupted),
+            PipelineStage::Reconstructing
+        );
+        assert_eq!(
+            persisted_task_stage(&state, ProjectStatus::Failed),
+            PipelineStage::Reconstructing
+        );
+        assert_eq!(
+            persisted_task_stage(&state, ProjectStatus::Cancelled),
+            PipelineStage::Reconstructing
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_log_tail_is_bounded_to_the_latest_five_hundred_lines() {
+        let root = tempdir().expect("temporary log directory");
+        let logs = root.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let content = (0..620)
+            .map(|index| format!("line-{index:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(logs.join("brush.log"), content).unwrap();
+
+        let lines = read_project_log_tail(&logs).await.unwrap();
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines.first().unwrap().message, "line-0120");
+        assert_eq!(lines.last().unwrap().message, "line-0619");
+        assert!(lines.iter().all(|line| line.source == "brush"));
     }
 
     #[tokio::test]
@@ -1973,6 +2172,7 @@ pub struct IncrementalReshootRequest {
     reshoot_path: String,
     input_type: ReshootInputType,
     projects_root: String,
+    workspace_task_id: Option<String>,
 }
 
 #[tauri::command]
@@ -2039,10 +2239,22 @@ pub async fn start_incremental_reshoot_pipeline(
         },
     ));
     let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(PipelineRunner::new(paths_for_app(&app), move |event| {
-        event_telemetry.observe(&event);
-        let _ = emitter.emit("pipeline-event", event);
-    }));
+    let runner = Arc::new(
+        PipelineRunner::new(paths_for_app(&app), move |event| {
+            event_telemetry.observe(&event);
+            let _ = emitter.emit("pipeline-event", event);
+        })
+        .with_workspace_task_id(
+            request
+                .workspace_task_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|_| {
+                    PipelineCommandError::from(SplatError::Process("工作区任务 ID 无效".into()))
+                })?,
+        ),
+    );
     {
         let mut active = state.active.lock().await;
         if active.is_some() {

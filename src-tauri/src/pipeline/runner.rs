@@ -289,6 +289,7 @@ pub struct PipelineFailureContext {
 #[derive(Debug, Clone)]
 struct ActiveProjectContext {
     project_id: uuid::Uuid,
+    workspace_task_id: Option<uuid::Uuid>,
     project_path: PathBuf,
     logs_directory: PathBuf,
 }
@@ -299,6 +300,7 @@ pub struct PipelineRunner {
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
+    workspace_task_id: Option<uuid::Uuid>,
     planner_enabled: bool,
     effectiveness: Option<PlannerEffectivenessTracker>,
 }
@@ -326,6 +328,7 @@ impl PipelineRunner {
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
             current_acceleration: Arc::new(std::sync::Mutex::new(None)),
+            workspace_task_id: None,
             planner_enabled,
             effectiveness: None,
         }
@@ -334,6 +337,19 @@ impl PipelineRunner {
     pub fn with_effectiveness_tracker(mut self, tracker: PlannerEffectivenessTracker) -> Self {
         self.effectiveness = Some(tracker);
         self
+    }
+
+    pub fn with_workspace_task_id(mut self, workspace_task_id: Option<uuid::Uuid>) -> Self {
+        self.workspace_task_id = workspace_task_id;
+        self
+    }
+
+    pub fn current_project_identity(&self) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
+        self.active_project
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|project| (project.project_id, project.workspace_task_id))
     }
 
     pub fn cancel(&self) {
@@ -740,6 +756,10 @@ impl PipelineRunner {
         } else {
             project_manager.create(input, quality).await?
         };
+        metadata.workspace_task_id = self.workspace_task_id;
+        project_manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
         state.planner_enabled = self.planner_enabled;
         state.resolution_policy_version = self
@@ -997,6 +1017,7 @@ impl PipelineRunner {
         };
         let stored_source = metadata.source_path.clone();
         metadata.name = format!("{}_高清补拍", source_metadata.name);
+        metadata.workspace_task_id = self.workspace_task_id;
         metadata.transform = source_metadata.transform;
         metadata.editing = Default::default();
         metadata.reshoot = Some(ReshootProvenance {
@@ -1074,6 +1095,7 @@ impl PipelineRunner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveProjectContext {
             project_id: paths.id,
+            workspace_task_id: metadata.workspace_task_id,
             project_path: paths.project.clone(),
             logs_directory: paths.logs.clone(),
         });

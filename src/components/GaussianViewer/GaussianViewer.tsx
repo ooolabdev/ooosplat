@@ -1469,7 +1469,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     <header className="preview-header">
       <div className="preview-heading">
         <button className="preview-back-icon" type="button" title={t("viewer.back")} aria-label={t("viewer.back")} disabled={busy} onClick={() => requestNavigation("exit")}><ArrowLeft size={19} /></button>
-        <h1>{t("viewer.title")}</h1>
+        <h1>{t("viewer.heading")}</h1>
       </div>
       <div className="preview-mode-control">
         <div className={`preview-mode-toggle mode-${mode}`} role="group" aria-label={t("viewer.modeAria")}>

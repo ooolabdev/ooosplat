@@ -33,6 +33,7 @@ pub fn run_app() {
             commands::open_project_location,
             commands::export_ply,
             commands::get_project_overview,
+            commands::get_project_task_detail,
             commands::set_projects_root,
             commands::set_planner_enabled,
             commands::delete_project,

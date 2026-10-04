@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -50,14 +50,15 @@ export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatu
 export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true): Promise<ProbeAndPlan> { return invoke("probe_and_plan", { path, quality, plannerEnabled }); }
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
+export async function getProjectTaskDetail(projectId: string): Promise<ProjectTaskDetail> { return invoke("get_project_task_detail", { projectId }); }
 export async function getAppRuntimeStatus(): Promise<AppRuntimeStatus> { return invoke("get_app_runtime_status"); }
 export async function setProjectsRoot(projectsRoot: string): Promise<AppSettings> { return invoke("set_projects_root", { projectsRoot }); }
 export async function setPlannerEnabled(enabled: boolean): Promise<AppSettings> { return invoke("set_planner_enabled", { enabled }); }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot, plannerEnabled }); }
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId }); }
 export async function resumePipeline(projectId: string): Promise<PipelineResult> { return invoke("resume_pipeline", { projectId }); }
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId }); }
 export async function probeReshootInput(projectId: string, path: string, inputType: InputType): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType }); }
-export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string }): Promise<PipelineResult> {
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string }): Promise<PipelineResult> {
   return invoke("start_incremental_reshoot_pipeline", { request });
 }
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }

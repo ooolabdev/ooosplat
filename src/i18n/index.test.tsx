@@ -71,13 +71,13 @@ describe("interface language", () => {
   it("switches immediately, localizes formatting, and persists the explicit choice", async () => {
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     await act(async () => root.render(<LanguageProvider><Harness /></LanguageProvider>));
-    expect(container.textContent).toContain("01 创建新任务");
+    expect(container.textContent).toContain("创建新任务");
     expect(container.textContent).toContain("1 分 2 秒");
 
     const button = container.querySelector("button")!;
     await act(async () => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
-    expect(container.textContent).toContain("01 Create New Task");
+    expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("1m 2s");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
     expect(document.documentElement.lang).toBe("en");

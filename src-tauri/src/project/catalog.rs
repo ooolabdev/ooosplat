@@ -136,6 +136,8 @@ struct ProjectIndex {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
     pub id: Uuid,
+    pub workspace_task_id: Option<Uuid>,
+    pub task_kind: &'static str,
     pub name: String,
     pub status: ProjectStatus,
     pub project_path: PathBuf,
@@ -438,6 +440,12 @@ async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
     let output = metadata.output.as_ref();
     Ok(ProjectSummary {
         id: metadata.id,
+        workspace_task_id: metadata.workspace_task_id,
+        task_kind: if metadata.reshoot.is_some() {
+            "reshoot"
+        } else {
+            "generation"
+        },
         name: if metadata.name.is_empty() {
             project
                 .file_name()
@@ -523,6 +531,7 @@ mod tests {
             schema_version: crate::project::metadata::schema_version(),
             app_id: PROJECT_APP_ID.into(),
             id: Uuid::new_v4(),
+            workspace_task_id: None,
             name: "test".into(),
             created_at: Utc::now(),
             started_at: None,
@@ -635,6 +644,7 @@ mod tests {
             schema_version: 2,
             app_id: "another.application".into(),
             id,
+            workspace_task_id: None,
             name: "foreign".into(),
             created_at: Utc::now(),
             started_at: None,

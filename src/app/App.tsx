@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  ArrowDownToLine, Blend, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clapperboard, Cpu, Download, Eye,
-  FileBox, Film, FolderOpen, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
+  Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, Eye,
+  Film, FolderOpen, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
   Send, Square, Trash2, X, Zap,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
@@ -11,7 +11,7 @@ import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import {
   cancelPipeline, checkColmapAcceleration, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
-  estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
+  estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setPlannerEnabled, setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, inspectReshootSource, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
@@ -21,8 +21,9 @@ import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type 
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, PipelineEvent, ProjectStatus, ProjectSummary, Quality, ReshootInputInfo, ReshootSourceInfo } from "../types/pipeline";
+import type { EngineStatus, InputType, PipelineEvent, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
+import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
 const CANCELLATION_OVERLAY_DELAY_MS = 300;
@@ -192,13 +193,15 @@ function engineReady(engine: EngineStatus) {
   return engine.canStart;
 }
 
-function ProjectRow({ project, busy, previewing, previewDisabled, deleting, revealing, onPreview, onReshoot, onResume, onReveal, onDelete }: {
+function ProjectRow({ project, selected, busy, previewing, previewDisabled, deleting, revealing, onSelect, onPreview, onReshoot, onResume, onReveal, onDelete }: {
   project: ProjectSummary;
+  selected: boolean;
   busy: boolean;
   previewing: boolean;
   previewDisabled: boolean;
   deleting: boolean;
   revealing: boolean;
+  onSelect: (project: ProjectSummary) => void;
   onPreview: (project: ProjectSummary) => void;
   onReshoot: (project: ProjectSummary) => void;
   onResume: (project: ProjectSummary) => void;
@@ -206,7 +209,7 @@ function ProjectRow({ project, busy, previewing, previewDisabled, deleting, reve
   onDelete: (project: ProjectSummary) => void;
 }) {
   const { locale, t, formatDate, formatDuration } = useI18n();
-  return <article className="project-row">
+  return <article className={selected ? "project-row selected" : "project-row"} tabIndex={0} role="button" aria-pressed={selected} onClick={() => onSelect(project)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(project); } }}>
     <div className="project-row-main">
       <div className="project-title-line">
         <span className={`project-status ${project.status}`} />
@@ -224,12 +227,22 @@ function ProjectRow({ project, busy, previewing, previewDisabled, deleting, reve
       <div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[project.quality])}</dd></div>
     </dl>
     <div className="project-actions">
-      {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={() => onPreview(project)}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? t("project.opening") : t("project.preview")}</button>}
-      {project.status === "completed" && <button className="reshoot-link" type="button" disabled={busy || previewDisabled} onClick={() => onReshoot(project)}><Film size={14} />{t("project.reshoot")}</button>}
-      {project.status !== "completed" && <button className="resume-link" type="button" disabled={busy} onClick={() => onResume(project)}><Play size={14} fill="currentColor" />{t("project.resume")}</button>}
-      <button type="button" disabled={revealing} onClick={() => onReveal(project)}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t("project.reveal")}</button>
-      <button className="danger-link" type="button" disabled={busy || deleting} onClick={() => onDelete(project)}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t("project.delete")}</button>
+      {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={(event) => { event.stopPropagation(); onSelect(project); onPreview(project); }}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? t("project.opening") : t("project.preview")}</button>}
+      {project.status === "completed" && <button className="reshoot-link" type="button" disabled={busy || previewDisabled} onClick={(event) => { event.stopPropagation(); onSelect(project); onReshoot(project); }}><Film size={14} />{t("project.reshoot")}</button>}
+      {project.status !== "completed" && project.status !== "running" && <button className="resume-link" type="button" disabled={busy} onClick={(event) => { event.stopPropagation(); onSelect(project); onResume(project); }}><Play size={14} fill="currentColor" />{t("project.resume")}</button>}
+      <button type="button" disabled={revealing} onClick={(event) => { event.stopPropagation(); onSelect(project); onReveal(project); }}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t("project.reveal")}</button>
+      <button className="danger-link" type="button" disabled={busy || deleting} onClick={(event) => { event.stopPropagation(); onDelete(project); }}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t("project.delete")}</button>
     </div>
+  </article>;
+}
+
+function DraftRow({ draft, selected, onSelect, onDelete }: { draft: TaskDraft; selected: boolean; onSelect: () => void; onDelete: () => void }) {
+  const { t } = useI18n();
+  return <article className={selected ? "project-row draft-row selected" : "project-row draft-row"} tabIndex={0} role="button" aria-pressed={selected} onClick={onSelect} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(); } }}>
+    <div className="project-title-line"><span className={draft.running ? "project-status running" : "project-status"} /><strong>{draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))}</strong><span className="status-copy">{t(draft.running ? "task.running" : "task.idle")}</span></div>
+    <p className="project-path">{draft.inputPath ?? t("workspace.awaitingInput")}</p>
+    {draft.error && <p className="project-failure"><CompactError message={draft.error} /></p>}
+    <div className="project-actions"><button className="danger-link" type="button" disabled={draft.running} onClick={(event) => { event.stopPropagation(); onDelete(); }}><Trash2 size={14} />{t("project.delete")}</button></div>
   </article>;
 }
 
@@ -278,16 +291,19 @@ export function App() {
   const [privacySettingsOpen, setPrivacySettingsOpen] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
-  const [reshootProject, setReshootProject] = useState<ProjectSummary | null>(null);
-  const [reshootSource, setReshootSource] = useState<ReshootSourceInfo | null>(null);
-  const [reshootInputType, setReshootInputType] = useState<InputType>("video");
-  const [reshootPath, setReshootPath] = useState<string | null>(null);
-  const [reshootPlan, setReshootPlan] = useState<ReshootInputInfo | null>(null);
-  const [reshootError, setReshootError] = useState<string | null>(null);
+  const [taskWorkspace, setTaskWorkspace] = useState(loadTaskWorkspace);
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(() => taskWorkspace.drafts.find((draft) => draft.running)?.id ?? null);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [projectDetail, setProjectDetail] = useState<ProjectTaskDetail | null>(null);
+  const [projectDetailLoading, setProjectDetailLoading] = useState(false);
   const [reshootBusy, setReshootBusy] = useState(false);
+  const drafts = taskWorkspace.drafts;
+  const selectedTask = taskWorkspace.selected;
+  const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
+  const selectedProject = selectedTask.kind === "project" ? store.projects.find((project) => project.id === selectedTask.id) ?? projectDetail?.project ?? null : null;
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
-  const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed"), [store.projects]);
+  const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects]);
   const progressEvent = useMemo(() => {
     if (!store.latestEvent || !["failed", "cancelled"].includes(store.latestEvent.stage)) return store.latestEvent;
     return [...store.events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage)) ?? null;
@@ -329,6 +345,46 @@ export function App() {
     return t(stages[index]?.[1] ?? "stage.preparing");
   }, [t]);
 
+  const updateDraft = useCallback((id: string, update: Partial<TaskDraft> | ((draft: TaskDraft) => Partial<TaskDraft>)) => {
+    setTaskWorkspace((workspace) => ({
+      ...workspace,
+      drafts: workspace.drafts.map((draft) => draft.id === id ? { ...draft, ...(typeof update === "function" ? update(draft) : update) } : draft),
+    }));
+  }, []);
+
+  const selectDraft = useCallback((id: string) => {
+    setTaskWorkspace((workspace) => ({ ...workspace, selected: { kind: "draft", id } }));
+    setProjectDetail(null);
+  }, []);
+
+  const selectProject = useCallback((project: ProjectSummary) => {
+    setTaskWorkspace((workspace) => ({ ...workspace, selected: { kind: "project", id: project.id } }));
+    setProjectDetail(null);
+  }, []);
+
+  const addGenerationDraft = useCallback(() => {
+    setTaskWorkspace((workspace) => {
+      const draft = createGenerationDraft(workspace.nextOrdinal);
+      return { drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: workspace.nextOrdinal + 1 };
+    });
+  }, []);
+
+  const removeDraft = useCallback((id: string) => {
+    setTaskWorkspace((workspace) => {
+      const target = workspace.drafts.find((draft) => draft.id === id);
+      if (!target || target.running) return workspace;
+      let drafts = workspace.drafts.filter((draft) => draft.id !== id);
+      let nextOrdinal = workspace.nextOrdinal;
+      if (!drafts.some((draft) => draft.kind === "generation" && !draft.running)) {
+        drafts = [...drafts, createGenerationDraft(nextOrdinal++)];
+      }
+      const selected = workspace.selected.kind === "draft" && workspace.selected.id === id
+        ? { kind: "draft" as const, id: drafts[0].id }
+        : workspace.selected;
+      return { drafts, selected, nextOrdinal };
+    });
+  }, []);
+
   const clearCancellationFeedback = useCallback(() => {
     if (cancellationOverlayTimer.current != null) {
       window.clearTimeout(cancellationOverlayTimer.current);
@@ -350,9 +406,34 @@ export function App() {
     const runtime = await getAppRuntimeStatus();
     const appState = useAppStore.getState();
     appState.setTaskColmapAcceleration(runtime.taskAcceleration ?? null);
-    if (!runtime.pipelineRunning && !pipelineCommandPending.current && appState.phase === "running") {
-      appState.setPhase("idle");
+    if (runtime.pipelineRunning) {
+      setTaskWorkspace((workspace) => {
+        const persistedId = runtime.pipelineWorkspaceTaskId;
+        const fallbackId = workspace.selected.kind === "draft"
+          ? workspace.selected.id
+          : workspace.drafts.find((draft) => draft.running)?.id;
+        const runningId = persistedId ?? fallbackId ?? null;
+        if (!runningId) return workspace;
+        setActiveDraftId(runningId);
+        return {
+          ...workspace,
+          drafts: workspace.drafts.map((draft) => draft.id === runningId
+            ? { ...draft, running: true, linkedProjectId: runtime.pipelineProjectId ?? draft.linkedProjectId }
+            : { ...draft, running: false }),
+        };
+      });
+    } else {
+      setTaskWorkspace((workspace) => ({
+        ...workspace,
+        drafts: workspace.drafts.map((draft) => draft.running ? { ...draft, running: false } : draft),
+      }));
+    }
+    setActiveProjectId(runtime.pipelineProjectId ?? null);
+    if (!runtime.pipelineRunning && !pipelineCommandPending.current) {
+      if (appState.phase === "running") appState.setPhase("idle");
       clearCancellationFeedback();
+      setActiveDraftId(null);
+      setActiveProjectId(null);
     }
     const active = activePreviewSession.current;
     if (viewMode === "tasks" && active && runtime.previewProjectId !== active.projectId) {
@@ -381,6 +462,22 @@ export function App() {
         store.setProjectsRoot(overview.projectsRoot);
         store.setPlannerEnabled(overview.plannerEnabled ?? true);
         store.setProjects(overview.projects);
+        setTaskWorkspace((workspace) => {
+          const linked = new Set(overview.projects.map((project) => project.workspaceTaskId).filter(Boolean));
+          const drafts = workspace.drafts.filter((draft) => !linked.has(draft.id));
+          const promotedProject = workspace.selected.kind === "draft"
+            ? overview.projects.find((project) => project.workspaceTaskId === workspace.selected.id)
+            : null;
+          const selectedExists = workspace.selected.kind === "draft"
+            ? drafts.some((draft) => draft.id === workspace.selected.id)
+            : overview.projects.some((project) => project.id === workspace.selected.id);
+          const selected = promotedProject
+            ? { kind: "project" as const, id: promotedProject.id }
+            : selectedExists
+              ? workspace.selected
+              : { kind: "draft" as const, id: drafts[0].id };
+          return { ...workspace, drafts, selected };
+        });
       })
       .catch((error) => store.setError(messageOf(error)));
     const revision = ++accelerationRequestRevision.current;
@@ -479,6 +576,26 @@ export function App() {
   }, [uiScale]);
 
   useEffect(() => {
+    saveTaskWorkspace(taskWorkspace.drafts, taskWorkspace.selected, taskWorkspace.nextOrdinal);
+  }, [taskWorkspace]);
+
+  useEffect(() => {
+    if (selectedTask.kind !== "project") return;
+    if (isRunning && selectedTask.id === activeProjectId) {
+      setProjectDetail(null);
+      setProjectDetailLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setProjectDetailLoading(true);
+    void getProjectTaskDetail(selectedTask.id)
+      .then((detail) => { if (!cancelled) setProjectDetail(detail); })
+      .catch((error) => { if (!cancelled) store.setError(messageOf(error)); })
+      .finally(() => { if (!cancelled) setProjectDetailLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedTask.kind, selectedTask.id, activeProjectId, isRunning, store.setError, messageOf]);
+
+  useEffect(() => {
     if (viewMode !== "tasks") return;
     const timer = window.setTimeout(() => {
       if (controlPaneRef.current) controlPaneRef.current.scrollTop = taskScrollPositions.current.control;
@@ -514,34 +631,36 @@ export function App() {
     }
   };
 
-  const analyze = async (path: string, quality: Quality, plannerEnabled = store.plannerEnabled) => {
-    store.setPhase("analyzing");
-    store.setError(null);
+  const analyze = async (draftId: string, path: string, quality: Quality, plannerEnabled = store.plannerEnabled) => {
+    updateDraft(draftId, { error: null, needsValidation: false });
     try {
       const result = await probeAndPlan(path, quality, plannerEnabled);
-      store.setAnalysis(result.inputType, result.video, result.imageSequence, result.plan, result.estimate);
-      store.setPhase("idle");
+      updateDraft(draftId, { inputType: result.inputType, video: result.video, imageSequence: result.imageSequence, plan: result.plan, estimate: result.estimate, error: null });
     } catch (error) {
-      store.setError(messageOf(error));
-      store.setPhase("failed");
+      updateDraft(draftId, { video: null, imageSequence: null, plan: null, estimate: null, error: messageOf(error) });
     }
   };
 
   const chooseInput = async (inputType: InputType) => {
+    if (!selectedDraft || selectedDraft.kind !== "generation") return;
     try {
       const selected = inputType === "images" ? await selectImageSequence() : await selectVideo();
       if (selected) {
-        store.setInputPath(selected, inputType);
-        await analyze(selected, store.quality);
+        if (!isRunning) {
+          store.setInputPath(selected, inputType);
+          setActiveDraftId(null);
+        }
+        updateDraft(selectedDraft.id, { inputPath: selected, inputType, video: null, imageSequence: null, plan: null, estimate: null, error: null });
+        await analyze(selectedDraft.id, selected, selectedDraft.quality);
       }
     } catch (error) {
-      store.setError(messageOf(error));
+      updateDraft(selectedDraft.id, { error: messageOf(error) });
     }
   };
 
   const chooseInputType = (inputType: InputType) => {
     setInputMenuOpen(false);
-    if (inputType !== store.inputType) store.setInputPath(null, inputType);
+    if (selectedDraft && inputType !== selectedDraft.inputType) updateDraft(selectedDraft.id, { inputPath: null, inputType, video: null, imageSequence: null, plan: null, estimate: null, error: null });
   };
 
   const chooseRoot = async () => {
@@ -556,8 +675,9 @@ export function App() {
   };
 
   const chooseQuality = async (quality: Quality) => {
-    store.setQuality(quality);
-    if (store.inputPath) await analyze(store.inputPath, quality);
+    if (!selectedDraft || selectedDraft.kind !== "generation") return;
+    updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
+    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality);
   };
 
   const changePlannerEnabled = async () => {
@@ -566,7 +686,7 @@ export function App() {
     try {
       const settings = await setPlannerEnabled(enabled);
       store.setPlannerEnabled(settings.plannerEnabled);
-      if (store.inputPath) await analyze(store.inputPath, store.quality, settings.plannerEnabled);
+      if (selectedDraft?.kind === "generation" && selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, settings.plannerEnabled);
     } catch (error) {
       store.setError(messageOf(error));
     }
@@ -588,11 +708,12 @@ export function App() {
   };
 
   const generate = async () => {
-    if (!store.inputPath || !store.plan || !store.projectsRoot) return;
+    const draft = selectedDraft;
+    if (!draft || draft.kind !== "generation" || !draft.inputPath || !draft.plan || !store.projectsRoot) return;
     if (
-      store.inputType === "images"
-      && store.imageSequence?.requiresLargeSequenceConfirmation
-      && !(await confirmLargeImageSequence(store.imageSequence.imageCount))
+      draft.inputType === "images"
+      && draft.imageSequence?.requiresLargeSequenceConfirmation
+      && !(await confirmLargeImageSequence(draft.imageSequence.imageCount))
     ) return;
     clearCancellationFeedback();
     runElapsedOffset.current = 0;
@@ -600,9 +721,16 @@ export function App() {
     setLiveElapsedMs(0);
     setFailureDialog(null);
     pipelineCommandPending.current = true;
+    setActiveDraftId(draft.id);
+    setTaskWorkspace((workspace) => {
+      let drafts = workspace.drafts.map((item) => item.id === draft.id ? { ...item, running: true, error: null } : item);
+      let nextOrdinal = workspace.nextOrdinal;
+      if (!drafts.some((item) => item.kind === "generation" && !item.running)) drafts = [...drafts, createGenerationDraft(nextOrdinal++)];
+      return { ...workspace, drafts, nextOrdinal };
+    });
     store.beginRun();
     try {
-      const result = await startPipeline(store.inputPath, store.quality, store.projectsRoot, store.plannerEnabled);
+      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, store.plannerEnabled, draft.id);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -613,6 +741,7 @@ export function App() {
       }
       const message = messageOf(error);
       store.setError(message);
+      updateDraft(draft.id, { error: message });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       store.setPhase(cancelled ? "cancelled" : "failed");
@@ -621,12 +750,23 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
     } finally {
-      try { await refreshProjects(); } catch { /* the generated project remains on disk */ }
+      try {
+        const overview = await refreshProjects();
+        const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
+        if (project) {
+          setTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
+        } else {
+          updateDraft(draft.id, { running: false });
+        }
+      } catch { updateDraft(draft.id, { running: false }); }
+      setActiveDraftId(null);
       pipelineCommandPending.current = false;
     }
   };
 
   const resume = async (project: ProjectSummary) => {
+    selectProject(project);
+    setActiveProjectId(project.id);
     clearCancellationFeedback();
     runElapsedOffset.current = project.durationMs ?? 0;
     runStartedAt.current = Date.now();
@@ -657,8 +797,13 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage, project.id));
       }
     } finally {
-      try { await refreshProjects(); } catch { /* the project remains on disk */ }
+      try {
+        const overview = await refreshProjects();
+        const refreshed = overview.projects.find((item) => item.id === project.id);
+        if (refreshed) selectProject(refreshed);
+      } catch { /* the project remains on disk */ }
       pipelineCommandPending.current = false;
+      setActiveProjectId(null);
     }
   };
 
@@ -669,6 +814,10 @@ export function App() {
       await reconcileRuntimeState();
       if (await confirmAndDeleteProject(project)) {
         await refreshProjects();
+        if (selectedTask.kind === "project" && selectedTask.id === project.id) {
+          const fallback = drafts.find((draft) => !draft.running) ?? drafts[0];
+          if (fallback) selectDraft(fallback.id);
+        }
       }
     } catch (error) {
       store.setError(messageOf(error));
@@ -757,50 +906,29 @@ export function App() {
     }
   };
 
-  const openReshoot = async (project: ProjectSummary) => {
+  const openReshoot = (project: ProjectSummary) => {
     if (isRunning || reshootBusy) return;
-    setReshootProject(project);
-    setReshootSource(null);
-    setReshootPath(null);
-    setReshootPlan(null);
-    setReshootError(null);
-    setReshootInputType("video");
-    setReshootBusy(true);
-    try {
-      const source = await inspectReshootSource(project.id);
-      setReshootSource(source);
-      if (!source.eligible) {
-        const message = source.reason ?? t("reshoot.ineligible");
-        setReshootError(message);
-        store.setError(message);
-      }
-    } catch (error) {
-      store.setError(messageOf(error));
-      setReshootProject(null);
-    } finally {
-      setReshootBusy(false);
-    }
+    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality);
+    setTaskWorkspace((workspace) => ({ drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: workspace.nextOrdinal + 1 }));
   };
 
   const chooseReshootInput = async (inputType: InputType) => {
-    if (!reshootProject || reshootBusy) return;
-    setReshootInputType(inputType);
+    const draft = selectedDraft;
+    if (!draft || draft.kind !== "reshoot" || !draft.sourceProjectId || reshootBusy) return;
+    updateDraft(draft.id, { inputType });
     const selected = inputType === "images" ? await selectImageSequence() : await selectVideo();
     if (!selected) return;
     setReshootBusy(true);
-    setReshootPath(selected);
-    setReshootPlan(null);
-    setReshootError(null);
+    updateDraft(draft.id, { inputPath: selected, reshootPlan: null, error: null });
     try {
-      const plan = await probeReshootInput(reshootProject.id, selected, inputType);
-      setReshootPlan(plan);
+      const plan = await probeReshootInput(draft.sourceProjectId, selected, inputType);
+      updateDraft(draft.id, { reshootPlan: plan, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible") });
       if (!plan.compatible) {
-        setReshootError(plan.incompatibilityReason ?? t("reshoot.ineligible"));
         store.setError(plan.incompatibilityReason);
       }
     } catch (error) {
       const message = messageOf(error);
-      setReshootError(message);
+      updateDraft(draft.id, { error: message });
       store.setError(message);
     } finally {
       setReshootBusy(false);
@@ -808,28 +936,41 @@ export function App() {
   };
 
   const runReshoot = async () => {
-    if (!reshootProject || !reshootPath || !reshootPlan?.compatible || isRunning || !store.projectsRoot) return;
-    const sourceProjectId = reshootProject.id;
-    setReshootProject(null);
+    const draft = selectedDraft;
+    if (!draft || draft.kind !== "reshoot" || !draft.sourceProjectId || !draft.inputPath || !draft.reshootPlan?.compatible || isRunning || !store.projectsRoot) return;
+    const source = await inspectReshootSource(draft.sourceProjectId);
+    if (!source.eligible) {
+      updateDraft(draft.id, { reshootSource: source, error: source.reason ?? t("reshoot.ineligible") });
+      return;
+    }
+    const finalPlan = await probeReshootInput(draft.sourceProjectId, draft.inputPath, draft.inputType);
+    if (!finalPlan.compatible) {
+      updateDraft(draft.id, { reshootPlan: finalPlan, error: finalPlan.incompatibilityReason ?? t("reshoot.ineligible") });
+      return;
+    }
     clearCancellationFeedback();
     runElapsedOffset.current = 0;
     runStartedAt.current = Date.now();
     setLiveElapsedMs(0);
     setFailureDialog(null);
     pipelineCommandPending.current = true;
+    setActiveDraftId(draft.id);
+    updateDraft(draft.id, { running: true, error: null });
     store.beginRun();
     try {
       const result = await startReshootPipeline({
-        sourceProjectId,
-        reshootPath,
-        inputType: reshootInputType,
+        sourceProjectId: draft.sourceProjectId,
+        reshootPath: draft.inputPath,
+        inputType: draft.inputType,
         projectsRoot: store.projectsRoot,
+        workspaceTaskId: draft.id,
       });
       store.setResult(result);
       store.setPhase("completed");
     } catch (error) {
       const message = messageOf(error);
       store.setError(message);
+      updateDraft(draft.id, { error: message });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       store.setPhase(cancelled ? "cancelled" : "failed");
@@ -838,31 +979,46 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
     } finally {
-      try { await refreshProjects(); } catch { /* derived project remains on disk */ }
+      try {
+        const overview = await refreshProjects();
+        const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
+        if (project) setTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
+        else updateDraft(draft.id, { running: false });
+      } catch { updateDraft(draft.id, { running: false }); }
+      setActiveDraftId(null);
       pipelineCommandPending.current = false;
     }
   };
 
-  const previewCompletedResult = () => {
-    const project = store.result && store.projects.find((item) => item.id === store.result?.projectId);
-    if (project) void previewProject(project);
-  };
-
-  const exportCompletedResult = async () => {
-    if (!store.result) return;
-    try {
-      await exportPly(store.result);
-    } catch (error) {
-      store.setError(messageOf(error));
+  useEffect(() => {
+    const draft = selectedDraft;
+    if (!draft?.needsValidation || draft.running) return;
+    updateDraft(draft.id, { needsValidation: false, error: null });
+    if (draft.kind === "generation") {
+      if (draft.inputPath) void analyze(draft.id, draft.inputPath, draft.quality);
+      return;
     }
-  };
-
-  const revealCompletedResult = async () => {
-    if (!store.result) return;
-    const project = store.projects.find((item) => item.id === store.result?.projectId);
-    if (project) await showProject(project);
-    else store.setError(t("failure.logsUnavailable"));
-  };
+    if (!draft.sourceProjectId) return;
+    let cancelled = false;
+    setReshootBusy(true);
+    void inspectReshootSource(draft.sourceProjectId)
+      .then(async (source) => {
+        if (cancelled) return;
+        updateDraft(draft.id, { reshootSource: source, error: source.eligible ? null : source.reason ?? t("reshoot.ineligible") });
+        if (source.eligible && draft.inputPath) {
+          const plan = await probeReshootInput(draft.sourceProjectId!, draft.inputPath, draft.inputType);
+          if (!cancelled) updateDraft(draft.id, { reshootPlan: plan, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason });
+        }
+      })
+      .catch((error) => { if (!cancelled) updateDraft(draft.id, { error: messageOf(error) }); })
+      .finally(() => { if (!cancelled) setReshootBusy(false); });
+    return () => {
+      cancelled = true;
+      setReshootBusy(false);
+    };
+  // Validation is intentionally lazy and keyed only by selection.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTask.kind, selectedTask.id]);
 
   const closeFailureDialog = useCallback(() => {
     if (failureDialogAction === null) setFailureDialog(null);
@@ -921,6 +1077,12 @@ export function App() {
     }
   }, [releasePreviewSession]);
 
+  const selectedShowsLiveRun = (isRunning || store.events.length > 0) && (
+    (selectedTask.kind === "draft" && selectedTask.id === activeDraftId)
+    || (selectedTask.kind === "project" && selectedTask.id === activeProjectId)
+  );
+  const detailStageIndex = stagePosition(projectDetail?.stage);
+
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
       <Suspense fallback={<section className="preview-pane active preview-workspace"><div className="preview-empty"><LoaderCircle className="spin" size={24} /><strong>{t("preview.preparingModule")}</strong></div></section>}>
@@ -942,27 +1104,27 @@ export function App() {
 
     <section className="workspace" ref={workspaceRef} style={{ "--left-pane-width": `${leftPanePercent}%` } as CSSProperties}>
       <section className="control-pane" ref={controlPaneRef} aria-label={t("task.console")}>
-        <div className="pane-header"><h1>{t("task.create")}</h1><span className={isRunning ? "run-state active" : "run-state"}>{isRunning ? t("task.running") : t("task.idle")}</span></div>
+        <div className="pane-header"><h1>{selectedProject?.name ?? (selectedDraft?.kind === "reshoot" ? draftDisplayName(selectedDraft, t("workspace.newTask"), t("project.reshoot")) : t("task.create"))}</h1><span className={selectedShowsLiveRun ? "run-state active" : "run-state"}>{selectedProject ? t(statusKey[selectedProject.status]) : selectedShowsLiveRun ? t("task.running") : t("task.idle")}</span></div>
 
-        <div className="form-section">
+        {selectedDraft?.kind === "generation" && <><div className="form-section">
           <label className="field-label">{t("input.label")}</label>
           <div className="input-picker">
             <div className="input-type-picker">
-              <button className="input-picker-toggle" type="button" disabled={isRunning} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
-                {store.inputType === "images" ? <Images size={16} /> : <Clapperboard size={16} />}
-                <span>{store.inputType === "images" ? t("input.images") : t("input.video")}</span>
+              <button className="input-picker-toggle" type="button" disabled={selectedDraft.running} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
+                {selectedDraft.inputType === "images" ? <Images size={16} /> : <Clapperboard size={16} />}
+                <span>{selectedDraft.inputType === "images" ? t("input.images") : t("input.video")}</span>
                 <ChevronDown size={14} />
               </button>
               {inputMenuOpen && <div className="input-picker-menu" role="menu">
-                <button type="button" role="menuitemradio" aria-checked={store.inputType === "video"} onClick={() => chooseInputType("video")}><Clapperboard size={15} /><span><strong>{t("input.video")}</strong><small>{t("input.videoTypes")}</small></span></button>
-                <button type="button" role="menuitemradio" aria-checked={store.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>{t("input.images")}</strong><small>{t("input.imageTypes")}</small></span></button>
+                <button type="button" role="menuitemradio" aria-checked={selectedDraft.inputType === "video"} onClick={() => chooseInputType("video")}><Clapperboard size={15} /><span><strong>{t("input.video")}</strong><small>{t("input.videoTypes")}</small></span></button>
+                <button type="button" role="menuitemradio" aria-checked={selectedDraft.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>{t("input.images")}</strong><small>{t("input.imageTypes")}</small></span></button>
               </div>}
             </div>
-            <button className="path-picker" type="button" disabled={isRunning} onClick={() => void chooseInput(store.inputType)}>
-              {store.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
+            <button className="path-picker" type="button" disabled={selectedDraft.running} onClick={() => void chooseInput(selectedDraft.inputType)}>
+              {selectedDraft.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
               <span>
-                <strong>{store.inputPath ? basename(store.inputPath) : store.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
-                <small>{store.inputPath ?? (store.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint"))}</small>
+                <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
+                <small>{selectedDraft.inputPath ?? (selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint"))}</small>
               </span>
             </button>
           </div>
@@ -970,7 +1132,7 @@ export function App() {
 
         <div className="form-section">
           <label className="field-label">{t("project.root")}</label>
-          <button className="path-picker compact" type="button" disabled={isRunning} onClick={() => void chooseRoot()}>
+          <button className="path-picker compact" type="button" disabled={selectedDraft.running} onClick={() => void chooseRoot()}>
             <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
           </button>
           <p className="field-note">{t("project.rootHint")}</p>
@@ -980,7 +1142,7 @@ export function App() {
           <label className="field-label">{t("quality.label")}</label>
           <div className="quality-settings">
             <div className="quality-list" role="radiogroup">
-              {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={isRunning} aria-checked={store.quality === quality.value} className={store.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
+              {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                 <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
               </button>)}
             </div>
@@ -1000,26 +1162,47 @@ export function App() {
           </span>
         </div>
 
-        {(store.video || store.imageSequence) && store.plan && <div className="source-metrics">
-          <span><small>{store.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{store.imageSequence ? t("common.images", { count: formatNumber(store.imageSequence.imageCount) }) : formatVideoDuration(store.video!.duration)}</b></span>
-          <span><small>{t("metrics.resolution")}</small><b>{store.imageSequence?.width ?? store.video?.width} × {store.imageSequence?.height ?? store.video?.height}</b></span>
-          <span><small>{store.inputType === "images" ? t("metrics.processingImages") : t("metrics.estimatedFrames")}</small><b>{store.inputType === "images" ? t("metrics.keepAll") : t("metrics.approx", { value: formatNumber(store.plan.estimatedFrames) })}</b></span>
-          <span title={store.estimate ? localizePipelineMessage(locale, store.estimate.basis) : undefined}><small>{t("metrics.estimate")}</small><b>{store.estimate ? t("metrics.approx", { value: formatDuration(store.estimate.estimatedMs) }) : t("metrics.analyzing")}</b>{store.estimate && <em>{formatDuration(store.estimate.lowerBoundMs)}–{formatDuration(store.estimate.upperBoundMs)}</em>}</span>
+        {(selectedDraft.video || selectedDraft.imageSequence) && selectedDraft.plan && <div className="source-metrics">
+          <span><small>{selectedDraft.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{selectedDraft.imageSequence ? t("common.images", { count: formatNumber(selectedDraft.imageSequence.imageCount) }) : formatVideoDuration(selectedDraft.video!.duration)}</b></span>
+          <span><small>{t("metrics.resolution")}</small><b>{selectedDraft.imageSequence?.width ?? selectedDraft.video?.width} × {selectedDraft.imageSequence?.height ?? selectedDraft.video?.height}</b></span>
+          <span><small>{selectedDraft.inputType === "images" ? t("metrics.processingImages") : t("metrics.estimatedFrames")}</small><b>{selectedDraft.inputType === "images" ? t("metrics.keepAll") : t("metrics.approx", { value: formatNumber(selectedDraft.plan.estimatedFrames) })}</b></span>
+          <span title={selectedDraft.estimate ? localizePipelineMessage(locale, selectedDraft.estimate.basis) : undefined}><small>{t("metrics.estimate")}</small><b>{selectedDraft.estimate ? t("metrics.approx", { value: formatDuration(selectedDraft.estimate.estimatedMs) }) : t("metrics.analyzing")}</b>{selectedDraft.estimate && <em>{formatDuration(selectedDraft.estimate.lowerBoundMs)}–{formatDuration(selectedDraft.estimate.upperBoundMs)}</em>}</span>
         </div>}
 
-        {(store.video?.hasAlpha || store.imageSequence?.hasAlpha) && <div className="alpha-source-status" role="status">
+        {(selectedDraft.video?.hasAlpha || selectedDraft.imageSequence?.hasAlpha) && <div className="alpha-source-status" role="status">
           <Blend size={17} />
-          <span><strong>{store.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{store.inputType === "images" ? t("alpha.imagesHint") : t("alpha.videoHint", { format: store.video?.pixelFormat || "Alpha" })}</small></span>
+          <span><strong>{selectedDraft.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{selectedDraft.inputType === "images" ? t("alpha.imagesHint") : t("alpha.videoHint", { format: selectedDraft.video?.pixelFormat || "Alpha" })}</small></span>
         </div>}
 
-        {store.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>{t("sequence.title")}</strong><small>{t("sequence.hint")}</small></span></div>}
+        {selectedDraft.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>{t("sequence.title")}</strong><small>{t("sequence.hint")}</small></span></div>}
 
-        {!isRunning && <button className="primary-action" type="button" disabled={!store.inputPath || !store.plan || !store.projectsRoot || store.phase === "analyzing" || missingEngines.length > 0} onClick={() => void generate()}>
-          {store.phase === "analyzing" ? <LoaderCircle className="spin" size={17} /> : <Play size={16} fill="currentColor" />}
-          {store.phase === "analyzing" ? t("generate.analyzing") : t("generate.start")}
-        </button>}
+        <button className="primary-action" type="button" disabled={isRunning || !selectedDraft.inputPath || !selectedDraft.plan || !store.projectsRoot || missingEngines.length > 0} onClick={() => void generate()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+        {selectedDraft.error && <div className="inline-error" role="alert"><CircleAlert size={16} /><CompactError message={selectedDraft.error} /><button type="button" onClick={() => updateDraft(selectedDraft.id, { error: null })}>{t("common.close")}</button></div>}
+        </>}
 
-        {(isRunning || store.events.length > 0) && <section className="live-process">
+        {selectedDraft?.kind === "reshoot" && <section className="reshoot-task-page">
+          <p className="reshoot-task-intro">{t("reshoot.sameCameraHint")}</p>
+          <ul className="reshoot-capture-tips"><li>{t("reshoot.sameDevice")}</li><li>{t("reshoot.sameFraming")}</li><li>{t("reshoot.keepOverlap")}</li></ul>
+          {selectedDraft.reshootSource && <dl className="reshoot-source-summary"><div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[selectedDraft.quality])}</dd></div><div><dt>{t("metrics.resolution")}</dt><dd>{selectedDraft.reshootSource.width} × {selectedDraft.reshootSource.height}</dd></div><div><dt>{t("reshoot.camera")}</dt><dd>{selectedDraft.reshootSource.cameraModel} · ID {selectedDraft.reshootSource.cameraId}</dd></div></dl>}
+          <div className="reshoot-input-options"><button type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} onClick={() => void chooseReshootInput("video")}><Clapperboard size={18} /><strong>{t("reshoot.chooseVideo")}</strong><small>{t("reshoot.chooseVideoHint")}</small></button><button type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} onClick={() => void chooseReshootInput("images")}><Images size={18} /><strong>{t("reshoot.chooseImages")}</strong><small>{t("reshoot.chooseImagesHint")}</small></button></div>
+          {reshootBusy && <p className="reshoot-analysis"><LoaderCircle className="spin" size={14} />{t("reshoot.analyzing")}</p>}
+          {selectedDraft.reshootPlan && <div className={selectedDraft.reshootPlan.compatible ? "reshoot-plan compatible" : "reshoot-plan incompatible"}><strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : ""}</strong><span>{selectedDraft.reshootPlan.imageCount != null ? t("reshoot.imageCount", { count: selectedDraft.reshootPlan.imageCount }) : t("reshoot.duration", { value: formatVideoDuration(selectedDraft.reshootPlan.duration ?? 0) })}</span><span>{selectedDraft.reshootPlan.preparedWidth} × {selectedDraft.reshootPlan.preparedHeight} · {selectedDraft.reshootPlan.hasAlpha ? t("reshoot.alphaDetected") : t("reshoot.opaque")}</span><span>{t("reshoot.estimated", { value: formatDuration(selectedDraft.reshootPlan.estimate.estimatedMs) })}</span></div>}
+          {selectedDraft.error && <div className="inline-error" role="alert"><CircleAlert size={16} /><CompactError message={selectedDraft.error} /><button type="button" onClick={() => updateDraft(selectedDraft.id, { error: null })}>{t("common.close")}</button></div>}
+          <button className="primary-action" type="button" disabled={isRunning || reshootBusy || !selectedDraft.reshootPlan?.compatible} onClick={() => void runReshoot()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+        </section>}
+
+        {selectedProject && <section className="project-detail-page">
+          {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : <>
+            <p className="project-path" title={selectedProject.projectPath}>{selectedProject.projectPath}</p>
+            <dl className="project-detail-stats"><div><dt>{t("result.splats")}</dt><dd>{selectedProject.splatCount == null ? "-" : formatNumber(selectedProject.splatCount)}</dd></div><div><dt>{t("result.fileSize")}</dt><dd>{formatBytes(selectedProject.fileSize, locale)}</dd></div><div><dt>{t("result.registered")}</dt><dd>{projectDetail?.registeredImages == null ? "-" : `${formatNumber(projectDetail.registeredImages)} / ${formatNumber(projectDetail.inputImages ?? 0)}`}</dd></div><div><dt>{t("result.points")}</dt><dd>{selectedProject.points3d == null ? "-" : formatNumber(selectedProject.points3d)}</dd></div><div><dt>{t("project.elapsed")}</dt><dd>{formatDuration(selectedProject.durationMs)}</dd></div><div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[selectedProject.quality])}</dd></div><div><dt>{t("progress.stage")}</dt><dd>{currentStageLabel(projectDetail?.stage, detailStageIndex)}</dd></div></dl>
+            {selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
+            {selectedProject.failureMessage && <div className="inline-error" role="alert"><CircleAlert size={16} /><CompactError message={selectedProject.failureMessage} /></div>}
+            <div className="project-detail-actions">{selectedProject.status === "completed" ? <><button type="button" onClick={() => void previewProject(selectedProject)}><Eye size={14} />{t("project.preview")}</button><button type="button" disabled={isRunning} onClick={() => void openReshoot(selectedProject)}><Film size={14} />{t("project.reshoot")}</button></> : selectedProject.status !== "running" && <button type="button" disabled={isRunning} onClick={() => void resume(selectedProject)}><Play size={14} />{t("project.resume")}</button>}<button type="button" onClick={() => void showProject(selectedProject)}><FolderOpen size={14} />{t("project.reveal")}</button><button type="button" disabled={isRunning} onClick={() => void removeProject(selectedProject)}><Trash2 size={14} />{t("project.delete")}</button></div>
+            {projectDetail && <section className="live-process historical"><div className="live-heading"><div><strong>{t("progress.title")}</strong></div><span className="mono">{projectDetail.progress.toFixed(1)}%</span></div><ol className="stage-timeline">{stages.map(([key, label], index) => <li key={key} className={index < detailStageIndex || selectedProject.status === "completed" ? "done" : index === detailStageIndex ? selectedProject.status === "failed" ? "failed" : selectedProject.status === "cancelled" ? "cancelled" : "active" : ""}><span /><b>{t(label)}</b></li>)}</ol><div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: projectDetail.logs.length })}</small></div><div className="live-log">{projectDetail.logs.map((line, index) => <div className="log-line historical" key={`${line.source}-${index}`}><time /><span>{line.source}</span><p>{line.message}</p></div>)}</div></section>}
+          </>}
+        </section>}
+
+        {selectedShowsLiveRun && <section className="live-process">
           <div className="live-heading"><div><span className="live-dot" /><strong>{t("progress.title")}</strong></div><span className="mono">{store.progress.toFixed(1)}%</span></div>
           <p className="current-message">{currentMessage}</p>
           <div className="process-metrics">
@@ -1040,23 +1223,6 @@ export function App() {
             {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString(locale, { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message)}</p></div>)}
           </div>
           {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? t("progress.terminating") : t("progress.cancel")}</button>}
-        </section>}
-
-        {store.phase === "completed" && store.result && <section className="completion-result" aria-labelledby="completion-result-title">
-          <div className="completion-result-heading"><div><span className="result-status-dot" /><strong id="completion-result-title">{t("result.title")}</strong></div><span>{t("result.completed")}</span></div>
-          <dl className="completion-result-stats">
-            <div><dt>{t("result.splats")}</dt><dd>{formatNumber(store.result.splatCount)}</dd></div>
-            <div><dt>{t("result.fileSize")}</dt><dd>{formatBytes(store.result.fileSize, locale)}</dd></div>
-            <div><dt>{t("result.registered")}</dt><dd>{formatNumber(store.result.registeredImages)} / {formatNumber(store.result.inputImages)}</dd></div>
-            <div><dt>{t("result.points")}</dt><dd>{formatNumber(store.result.points3d)}</dd></div>
-            <div><dt>{t("result.elapsed")}</dt><dd>{formatDuration(store.result.durationMs)}</dd></div>
-          </dl>
-          {store.result.registeredRatio < 0.8 && <p className="completion-warning" role="status"><CircleAlert size={15} />{t("result.lowRegistration", { value: (store.result.registeredRatio * 100).toFixed(1) })}</p>}
-          <div className="completion-result-actions">
-            <button type="button" disabled={!store.projects.some((project) => project.id === store.result?.projectId && project.status === "completed")} onClick={previewCompletedResult}><Eye size={14} />{t("project.preview")}</button>
-            <button type="button" onClick={() => void exportCompletedResult()}><Download size={14} />{t("result.export")}</button>
-            <button type="button" onClick={() => void revealCompletedResult()}><FolderOpen size={14} />{t("result.reveal")}</button>
-          </div>
         </section>}
 
         {store.error && <div className="inline-error" role="alert"><CircleAlert size={16} /><CompactError message={store.error} /><button type="button" onClick={() => store.setError(null)}>{t("common.close")}</button></div>}
@@ -1090,13 +1256,12 @@ export function App() {
       ><span /></div>
 
       <section className="projects-pane" ref={projectsPaneRef} aria-label={t("history.aria")}>
-        <div className="pane-header"><h2>{t("history.title")}</h2><button className="refresh-action" type="button" disabled={isRunning} onClick={() => void refreshProjects()}><RotateCcw size={14} />{t("history.refresh")}</button></div>
-        <div className="archive-summary"><span><b>{completed.length}</b><small>{t("history.completed")}</small></span><span><b>{unfinished.length}</b><small>{t("history.unfinished")}</small></span></div>
+        <div className="pane-header"><h2>{t("history.title")}</h2><button className="refresh-action" type="button" onClick={() => void refreshProjects()}><RotateCcw size={14} />{t("history.refresh")}</button></div>
+        <div className="archive-summary task-summary"><span><b>{drafts.length}</b><small>{t("workspace.newTasks")}</small></span><span><b>{completed.length}</b><small>{t("history.completed")}</small></span><span><b>{unfinished.length}</b><small>{t("history.unfinished")}</small></span></div>
 
-        {completed.length === 0 && unfinished.length === 0 && <div className="empty-state"><FileBox size={30} strokeWidth={1.4} /><strong>{t("history.emptyTitle")}</strong><p>{t("history.emptyHint")}</p></div>}
-
-        {completed.length > 0 && <div className="project-group"><div className="group-heading"><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
-        {unfinished.length > 0 && <div className="project-group unfinished"><div className="group-heading"><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} busy={isRunning} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onPreview={() => undefined} onReshoot={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>}
+        <div className="project-group new-task-group"><div className="group-heading"><span>{t("workspace.newTasks")}</span><button className="group-add-action" type="button" onClick={addGenerationDraft}><Plus size={13} />{t("workspace.addTask")}</button></div>{drafts.map((draft) => <DraftRow key={draft.id} draft={draft} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => selectDraft(draft.id)} onDelete={() => removeDraft(draft.id)} />)}</div>
+        <div className="project-group"><div className="group-heading"><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></div>{completed.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={isRunning} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
+        <div className="project-group unfinished"><div className="group-heading"><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></div>{unfinished.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={isRunning} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={() => undefined} onReshoot={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
       </section>
     </section>
     </div>
@@ -1109,28 +1274,6 @@ export function App() {
       </div>}
       <button className="zoom-trigger" type="button" aria-expanded={showZoomControls} onClick={() => setShowZoomControls((visible) => !visible)}>{uiScale}%</button>
     </aside>
-    {reshootProject && <div className="reshoot-input-backdrop" role="dialog" aria-modal="true" aria-labelledby="reshoot-input-title">
-      <section className="reshoot-input-dialog reshoot-workflow-dialog">
-        <div className="reshoot-dialog-heading"><div><small>{reshootProject.name}</small><h2 id="reshoot-input-title">{t("reshoot.importTitle")}</h2></div><button type="button" aria-label={t("common.close")} disabled={reshootBusy || isRunning} onClick={() => setReshootProject(null)}><X size={16} /></button></div>
-        <p>{t("reshoot.sameCameraHint")}</p>
-        <ul className="reshoot-capture-tips"><li>{t("reshoot.sameDevice")}</li><li>{t("reshoot.sameFraming")}</li><li>{t("reshoot.keepOverlap")}</li></ul>
-        {reshootSource && <dl className="reshoot-source-summary"><div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[reshootSource.quality])}</dd></div><div><dt>{t("metrics.resolution")}</dt><dd>{reshootSource.width} × {reshootSource.height}</dd></div><div><dt>{t("reshoot.camera")}</dt><dd>{reshootSource.cameraModel} · ID {reshootSource.cameraId}</dd></div></dl>}
-        <div className="reshoot-input-options">
-          <button type="button" disabled={reshootBusy || !reshootSource?.eligible} onClick={() => void chooseReshootInput("video")}><Clapperboard size={18} /><strong>{t("reshoot.chooseVideo")}</strong><small>{t("reshoot.chooseVideoHint")}</small></button>
-          <button type="button" disabled={reshootBusy || !reshootSource?.eligible} onClick={() => void chooseReshootInput("images")}><Images size={18} /><strong>{t("reshoot.chooseImages")}</strong><small>{t("reshoot.chooseImagesHint")}</small></button>
-        </div>
-        {reshootBusy && <p className="reshoot-analysis"><LoaderCircle className="spin" size={14} />{t("reshoot.analyzing")}</p>}
-        {reshootError && <div className="inline-error reshoot-inline-error" role="alert"><CircleAlert size={16} /><span>{localizePipelineMessage(locale, reshootError)}</span></div>}
-        {reshootPlan && <div className={reshootPlan.compatible ? "reshoot-plan compatible" : "reshoot-plan incompatible"}>
-          <strong>{reshootPath ? basename(reshootPath) : ""}</strong>
-          <span>{reshootPlan.imageCount != null ? t("reshoot.imageCount", { count: reshootPlan.imageCount }) : t("reshoot.duration", { value: formatVideoDuration(reshootPlan.duration ?? 0) })}</span>
-          <span>{reshootPlan.preparedWidth} × {reshootPlan.preparedHeight} · {reshootPlan.hasAlpha ? t("reshoot.alphaDetected") : t("reshoot.opaque")}</span>
-          <span>{t("reshoot.estimated", { value: formatDuration(reshootPlan.estimate.estimatedMs) })}</span>
-          {!reshootPlan.compatible && <b>{reshootPlan.incompatibilityReason}</b>}
-        </div>}
-        <div className="reshoot-dialog-actions"><button type="button" className="secondary" disabled={reshootBusy || isRunning} onClick={() => setReshootProject(null)}>{t("common.cancel")}</button><button type="button" className="primary" disabled={reshootBusy || isRunning || !reshootPlan?.compatible} onClick={() => void runReshoot()}><Play size={14} fill="currentColor" />{t("generate.start")}</button></div>
-      </section>
-    </div>}
     {showCancellationOverlay && isRunning && <div className="cancellation-backdrop" role="dialog" aria-modal="true" aria-labelledby="cancellation-title" aria-describedby="cancellation-description">
       <div className="cancellation-status" aria-live="assertive" aria-busy="true">
         <span className="cancellation-spinner" aria-hidden="true"><LoaderCircle className="spin" size={26} /></span>
