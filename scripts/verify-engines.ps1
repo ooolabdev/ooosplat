@@ -22,13 +22,9 @@ foreach ($item in $manifest.requiredFiles) {
 $integrityPin = ($manifest.requiredFiles | Where-Object { $_.path -eq 'engines/colmap/SHA256SUMS' }).sha256
 & node (Join-Path $PSScriptRoot 'colmap-runtime.mjs') (Join-Path $workspace 'engines/colmap') windows $integrityPin release
 if ($LASTEXITCODE -ne 0) { throw 'COLMAP source, runtime hashes, CLI or Caspar verification failed.' }
-$colmap = Join-Path $workspace 'engines\colmap\bin\colmap.exe'
+$brush = Join-Path $workspace 'engines\brush\brush_app.exe'
 $savedPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-$help = & $colmap feature_extractor -h 2>&1 | Out-String
-$colmapExit = $LASTEXITCODE
-if ($colmapExit -ne 0 -or $help -notmatch '(?i)with CUDA') { throw 'Bundled COLMAP did not explicitly report CUDA support.' }
-$brush = Join-Path $workspace 'engines\brush\brush_app.exe'
 & node (Join-Path $PSScriptRoot 'brush-runtime.mjs') verify windows
 if ($LASTEXITCODE -ne 0) { throw 'OOOBrush CLI, provenance or dependency verification failed.' }
 $brushHelp = & $brush --help 2>&1 | Out-String

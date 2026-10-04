@@ -40,7 +40,7 @@ download_verified() {
 }
 
 rm -rf -- "$build" "$cache/stage"
-mkdir -p "$sources" "$build" "$stage/bin" "$stage/lib" "$output"
+mkdir -p "$sources" "$build" "$stage/bin" "$stage/lib" "$stage/licenses" "$output"
 dependency_origins="$build/dependency-origins.tsv"
 : > "$dependency_origins"
 

@@ -35,6 +35,8 @@ jobs:
       - name: Frontend, runtime policy, and license checks
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           npm run verify:telemetry:release
           npm test
           npm run test:engine-scripts
@@ -46,6 +48,8 @@ jobs:
       - name: Install and verify pinned engines
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           npm run setup:engines
           npm run verify:engines
           node scripts/smoke-colmap-image-io.mjs engines/colmap/bin/colmap.exe
@@ -53,6 +57,8 @@ jobs:
       - name: Rust formatting, tests, and clippy
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

@@ -1,20 +1,20 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-21",
+  "generatedAt": "2026-10-04",
   "engines": [
     {
       "name": "FFmpeg / FFprobe",
       "requestedSeries": "8.1",
-      "actualVersion": "n8.1.2-44-g7c533d0f86-20260821",
+      "actualVersion": "n8.1.3-14-g330caae0c1-20261003",
       "distribution": "BtbN win64 LGPL shared 8.1",
-      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
-      "archiveSha256": "e30201900132c0e3da178c63c7dac65aa0a0dcd971779546ae964b86b47bd499",
+      "sourceUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-03-18-14/ffmpeg-n8.1.3-14-g330caae0c1-win64-lgpl-shared-8.1.zip",
+      "archiveSha256": "11A4B44BC69721274909619A779D82544C8B83A6557C5B1BE92DCE9A41A968BE",
       "license": "LGPL-2.1-or-later; GPL/nonfree codecs disabled",
       "licenseFiles": [
         "licenses/FFmpeg-LGPL-2.1.txt"
       ],
       "install": {
-        "archiveName": "ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip",
+        "archiveName": "ffmpeg-n8.1.3-14-g330caae0c1-win64-lgpl-shared-8.1.zip",
         "destination": "engines/ffmpeg",
         "anchorFile": "ffmpeg.exe",
         "rootFromAnchorParent": 0
@@ -77,8 +77,8 @@
     }
   ],
   "requiredFiles": [
-    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "00D5996AE9E6DD4C5C11AB3040AE9CFBF78E0EC80492D8B5D2AF3559DAF41A0D" },
-    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "729402BBF566C6C616181D80ED8BEAD82F4858CD98058E347FBEE97DDE5C0EF9" },
+    { "path": "engines/ffmpeg/ffmpeg.exe", "sha256": "CBBD35C98C9378B7F3C0DB18D52BF926B44A419984D69F0A96ADFEA59703CEB7" },
+    { "path": "engines/ffmpeg/ffprobe.exe", "sha256": "A5B0B3099BBA84D94EA3B2764B09B9CCF0B7FA1D19055B61901B2D092EE3F051" },
     { "path": "engines/colmap/SHA256SUMS", "sha256": "79EEA38B9F9A4D55FE79C2FAE8DCBEBE4873D2DAB8A20DEBB0DFE596301A8C87" },
     { "path": "engines/brush/brush_app.exe", "sha256": "F65BBA1C7FCBDBB13E9299897ECB885F90F30555BEE9452A526E372EACF338DF" }
   ]

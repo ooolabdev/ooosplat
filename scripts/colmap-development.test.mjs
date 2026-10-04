@@ -117,6 +117,26 @@ test("ordinary application workflows consume the pinned runtime and never compil
   assert.match(read("scripts/setup-engines-macos.sh"), /setup-colmap-runtime\.mjs" macos/);
 });
 
+test("source and legacy engine builders are manual-only while application workflows stay automatic", () => {
+  for (const workflowName of ["colmap-engines", "macos-engines"]) {
+    const workflow = read(`.github/workflows/${workflowName}.yml`);
+    assert.match(workflow, /^  workflow_dispatch:/m);
+    assert.doesNotMatch(workflow, /^  (push|pull_request|schedule):/m);
+  }
+  for (const workflowName of ["windows", "ubuntu", "macos"]) {
+    assert.match(read(`.github/workflows/${workflowName}.yml`), /^  push:/m);
+  }
+});
+
+test("platform build scripts fail early and prepare macOS license destinations", () => {
+  const windows = read(".github/workflows/windows.yml");
+  assert.match(windows, /\$PSNativeCommandUseErrorActionPreference = \$true/);
+  const macos = read("scripts/build-engines-macos.sh");
+  assert.match(macos, /mkdir -p[^\n]*"\$stage\/licenses"/);
+  const packageJson = JSON.parse(read("package.json"));
+  assert.match(packageJson.scripts["build:bundle"], /clean:tauri-engine-resources/);
+});
+
 test("CUDA installation pins the patch release without network/apt drift", () => {
   const workflow = read(".github/workflows/colmap-engines.yml");
   assert.match(workflow, /cuda: '13\.2\.0'/);

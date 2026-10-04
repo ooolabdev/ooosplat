@@ -2,18 +2,6 @@ name: macOS 15+ arm64 engine runtime
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - test/colmap-brush-upgrade
-    paths:
-      - engines/colmap-runtime.json
-      - engines/manifest.macos.json
-      - scripts/build-engines-macos.sh
-      - scripts/smoke-colmap-image-io.mjs
-      - scripts/fixtures/colmap-image-io.json
-      - .github/workflows/macos-engines.yml
-    tags:
-      - engines-macos-arm64-v*
 
 permissions:
   contents: write
