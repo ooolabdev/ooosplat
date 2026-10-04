@@ -9,7 +9,8 @@
       "../engines/macos/arm64/licenses/": "engines/macos/arm64/licenses/",
       "../engines/macos/arm64/SHA256SUMS": "engines/macos/arm64/SHA256SUMS",
       "../engines/macos/arm64/BUILD-INFO.json": "engines/macos/arm64/BUILD-INFO.json",
-      "../engines/macos/arm64/BUNDLED-COMPONENTS.json": "engines/macos/arm64/BUNDLED-COMPONENTS.json"
+      "../engines/macos/arm64/BUNDLED-COMPONENTS.json": "engines/macos/arm64/BUNDLED-COMPONENTS.json",
+      "../engines/macos/arm64/colmap/": "engines/macos/arm64/colmap/"
     },
     "macOS": {
       "frameworks": [],

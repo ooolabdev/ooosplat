@@ -49,24 +49,26 @@ jobs:
         run: |
           npm run verify:telemetry:release
           npm test
+          npm run test:engine-scripts
+          npm run verify:colmap-lock
           npm run build
           npm run verify:bundle-resources
           npm run verify:licenses
 
-      - name: Restore macOS build caches
+      - name: Restore macOS non-COLMAP engine build caches
         uses: actions/cache@v5
         with:
           path: |
             ~/Library/Caches/Homebrew
             .cache/ccache
             .cache/macos-engine-build/sources
-          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
+          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'engines/colmap-runtime.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
           save-always: true
 
       - name: Install engine build prerequisites
         run: bash scripts/setup-macos-build-deps.sh
 
-      - name: Build and verify bundled arm64 engines
+      - name: Build FFmpeg/Brush and install the pinned COLMAP Release
         run: npm run build:engines:macos
 
       - name: Rust formatting, tests, and clippy
@@ -89,11 +91,16 @@ jobs:
           plist="$app/Contents/Info.plist"
           executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
           test -x "$app/Contents/MacOS/$executable"
-          for engine in ffmpeg ffprobe colmap brush_app; do
+          for engine in ffmpeg ffprobe brush_app; do
             test -x "$app/Contents/Resources/engines/macos/arm64/bin/$engine"
             file "$app/Contents/Resources/engines/macos/arm64/bin/$engine" | grep -q arm64
           done
-          test -z "$(find "$app/Contents/Resources" -type f -name 'vocab_tree_faiss_flickr100K_words256K.bin' -print -quit)"
+          colmap_root="$app/Contents/Resources/engines/macos/arm64/colmap"
+          test -x "$colmap_root/bin/colmap"
+          file "$colmap_root/bin/colmap" | grep -q arm64
+          test -s "$colmap_root/lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin"
+          test -s "$colmap_root/BUILD-INFO.json"
+          test -s "$colmap_root/BUNDLED-COMPONENTS.json"
           hdiutil verify "$dmg"
 
       - name: Package downloadable files

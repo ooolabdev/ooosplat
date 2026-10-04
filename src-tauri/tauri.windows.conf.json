@@ -5,11 +5,7 @@
     "resources": {
       "../engines/manifest.json": "engines/manifest.json",
       "../engines/ffmpeg/": "engines/ffmpeg/",
-      "../engines/colmap/bin/": "engines/colmap/bin/",
-      "../engines/colmap/licenses/": "engines/colmap/licenses/",
-      "../engines/colmap/BUILD-INFO.json": "engines/colmap/BUILD-INFO.json",
-      "../engines/colmap/BUNDLED-COMPONENTS.json": "engines/colmap/BUNDLED-COMPONENTS.json",
-      "../engines/colmap/SHA256SUMS": "engines/colmap/SHA256SUMS",
+      "../engines/colmap/": "engines/colmap/",
       "../engines/brush/": "engines/brush/"
     }
   }

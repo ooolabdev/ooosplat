@@ -6,7 +6,7 @@ on:
     branches:
       - test/colmap-brush-upgrade
     paths:
-      - engines/colmap-build.json
+      - engines/colmap-runtime.json
       - engines/manifest.macos.json
       - scripts/build-engines-macos.sh
       - scripts/smoke-colmap-image-io.mjs
@@ -43,7 +43,7 @@ jobs:
             ~/Library/Caches/Homebrew
             .cache/ccache
             .cache/macos-engine-build/sources
-          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
+          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'engines/colmap-runtime.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
           save-always: true
 
       - name: Install pinned build prerequisites
@@ -72,4 +72,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             dist-engines/*.tar.xz dist-engines/*.sha256 dist-engines/*.build-report.json \
             --title "OOOSplat macOS arm64 engines ${GITHUB_REF_NAME}" \
-            --notes "Pinned Apple Silicon runtime for OOOSplat. Contains LGPL shared FFmpeg/FFprobe, CPU CLI-only COLMAP, Brush, build metadata, dependency inventory, and SHA-256 checksums."
+            --notes "Pinned Apple Silicon non-COLMAP runtime for OOOSplat. Contains LGPL shared FFmpeg/FFprobe, Brush, build metadata, dependency inventory, and SHA-256 checksums. OOOSplat consumes COLMAP separately from ooolabdev/ooosplat-colmap."

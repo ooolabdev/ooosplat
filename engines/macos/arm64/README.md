@@ -1,6 +1,6 @@
-Apple Silicon macOS runtime. `npm run setup:engines:macos` downloads and verifies
-the arm64 FFmpeg/FFprobe/COLMAP/Brush closure into `bin/` and `lib/`; the
-binaries themselves are never committed.
+Apple Silicon macOS runtime. `npm run setup:engines:macos` prepares the arm64
+FFmpeg/FFprobe and Brush closure in `bin/` and `lib/`, then restores the locked
+COLMAP Release separately under `colmap/`; binaries are never committed.
 
 This README is tracked so the directory exists in a fresh clone.
 `src-tauri/tauri.macos.conf.json` declares the directory as a bundle resource,

@@ -89,7 +89,7 @@ describe("App live log", () => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
-      latestEvent: null, events: [], result: null, error: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
     mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null });
@@ -240,7 +240,7 @@ describe("App live log", () => {
     expect(container.querySelector(".live-log")?.textContent).toContain("COLMAP startup");
   });
 
-  it("derives the Splat training step from stage progress", async () => {
+  it("does not invent a Splat training step from stage progress", async () => {
     await act(async () => {
       useAppStore.getState().receiveEvent({
         ...event(1), stage: "trainingSplats", kind: "heartbeat", message: "Brush estimate", current: null, total: 30_000, stageProgress: 50,
@@ -248,10 +248,35 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅（15,000/30,000）。此步骤可能耗时较长，请耐心等待");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅…。此步骤可能耗时较长，请耐心等待");
 
     await act(async () => { container.querySelector<HTMLButtonElement>(".language-action")!.click(); });
-    expect(container.querySelector(".current-message")?.textContent).toBe("Generating Gaussian splats (15,000/30,000). This step may take a while. Please wait.");
+    expect(container.querySelector(".current-message")?.textContent).toBe("Generating Gaussian splats…. This step may take a while. Please wait.");
+  });
+
+  it("shows the actual Brush step reported by the runtime snapshot", async () => {
+    await act(async () => {
+      useAppStore.getState().receiveEvent({
+        ...event(1),
+        kind: "runtime",
+        current: null,
+        runtime: {
+          processId: 42,
+          phase: "training",
+          updatedAt: new Date().toISOString(),
+          lastOutputAgeMs: 0,
+          training: { iteration: 12_345, total: 30_000, startIter: 0, lod: 0, stepsPerSecond: 100, remainingSeconds: 176.55, splatCount: null, psnr: null, ssim: null },
+          device: "RTX",
+          backend: "Vulkan",
+          config: {},
+          resources: null,
+        },
+      });
+      useAppStore.getState().receiveEvent({ ...event(2), current: 12_345 });
+    });
+    await flush();
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅（12,345/30,000）。此步骤可能耗时较长，请耐心等待");
+    expect(container.querySelector(".runtime-panel")?.textContent).toContain("12,345 / 30,000");
   });
 
   it("keeps terminal messages instead of presenting them as active work", async () => {

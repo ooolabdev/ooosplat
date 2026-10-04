@@ -14,12 +14,7 @@
       "../engines/linux/brush/INSTALL-INFO.json": "engines/linux/brush/INSTALL-INFO.json",
       "../engines/linux/brush/UPSTREAM-SHA256SUMS": "engines/linux/brush/UPSTREAM-SHA256SUMS",
       "../engines/linux/brush/UPSTREAM-README.md": "engines/linux/brush/UPSTREAM-README.md",
-      "../engines/linux/colmap/bin/": "engines/linux/colmap/bin/",
-      "../engines/linux/colmap/lib/": "engines/linux/colmap/lib/",
-      "../engines/linux/colmap/licenses/": "engines/linux/colmap/licenses/",
-      "../engines/linux/colmap/BUILD-INFO.json": "engines/linux/colmap/BUILD-INFO.json",
-      "../engines/linux/colmap/BUNDLED-COMPONENTS.json": "engines/linux/colmap/BUNDLED-COMPONENTS.json",
-      "../engines/linux/colmap/SHA256SUMS": "engines/linux/colmap/SHA256SUMS"
+      "../engines/linux/colmap/": "engines/linux/colmap/"
     },
     "linux": {
       "deb": {

@@ -41,4 +41,6 @@ ccache --set-config=max_size=2G
 # so pinned arm64 bottles are valid build inputs. Runtime dylibs are copied into
 # the application and rewritten to @rpath by build-engines-macos.sh; end users
 # do not need Homebrew or access to the system PATH.
-brew install "${runtime_formulae[@]}"
+if ((${#runtime_formulae[@]})); then
+  brew install "${runtime_formulae[@]}"
+fi

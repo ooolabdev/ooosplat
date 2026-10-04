@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SplatError};
 
+pub mod resources;
+
 #[cfg(unix)]
 fn signal_process_group(process_id: u32, signal: libc::c_int) -> std::io::Result<()> {
     // The child is made the leader of a new process group before spawn, so a
@@ -175,6 +177,7 @@ pub enum ProcessUpdate {
     Started { process_id: u32 },
     Line { stream: ProcessStream, line: String },
     Heartbeat { elapsed_ms: u64 },
+    Resources(resources::ProcessResources),
 }
 
 pub type ProcessObserver = Arc<dyn Fn(ProcessUpdate) + Send + Sync>;
@@ -350,6 +353,10 @@ impl ProcessManager {
             log_file.clone(),
         ));
         let finished = Arc::new(AtomicBool::new(false));
+        let resource_task = spec
+            .observer
+            .clone()
+            .map(|observer| resources::spawn(process_id, observer));
         let heartbeat_task = spec.observer.clone().map(|observer| {
             let finished = finished.clone();
             tokio::spawn(async move {
@@ -387,6 +394,7 @@ impl ProcessManager {
                     let _ = child.wait().await;
                 }
                 finished.store(true, Ordering::Relaxed);
+                drop(resource_task);
                 stdout_task.abort();
                 stderr_task.abort();
                 if let Some(task) = heartbeat_task { task.abort(); }
@@ -399,6 +407,9 @@ impl ProcessManager {
             }
         };
         finished.store(true, Ordering::Relaxed);
+        if let Some(task) = resource_task {
+            task.stop().await;
+        }
         if let Some(task) = heartbeat_task {
             let _ = task.await;
         }

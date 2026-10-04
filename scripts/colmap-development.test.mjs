@@ -37,8 +37,8 @@ test("local Tauri invocation bypasses COLMAP checks and does not modify manifest
       const invocation = localInvocation(action, platform, ["--help"]);
       assert.equal(invocation.command, process.execPath);
       assert.equal(invocation.args[1], action);
-      assert.equal(invocation.args[2], "--config");
-      assert.equal(JSON.parse(invocation.args[3]).build.beforeBuildCommand, "npm run build");
+      assert.deepEqual(invocation.args.slice(2, 5), ["--features", "local-colmap", "--config"]);
+      assert.equal(JSON.parse(invocation.args[5]).build.beforeBuildCommand, "npm run build");
       assert.equal(invocation.args.at(-1), "--help");
       assert.doesNotMatch(JSON.stringify(invocation), /verify:engines|setup:engines|lock-engine|archiveSha256/);
     }
@@ -56,8 +56,7 @@ test("local macOS config replaces old COLMAP with the separate dependency direct
   const local = mergePatch(base, localConfiguration("darwin"));
   const resources = local.bundle.resources;
   const root = "../engines/macos/arm64";
-  assert.equal(resources[`${root}/colmap/bin/`], "engines/macos/arm64/colmap/bin/");
-  assert.equal(resources[`${root}/colmap/lib/`], "engines/macos/arm64/colmap/lib/");
+  assert.equal(resources[`${root}/colmap/`], "engines/macos/arm64/colmap/");
   assert.equal(resources[`${root}/bin/`], undefined);
   assert.equal(resources[`${root}/SHA256SUMS`], undefined);
   for (const executable of ["ffmpeg", "ffprobe", "brush_app"]) assert.ok(resources[`${root}/bin/${executable}`]);
@@ -67,11 +66,15 @@ test("local macOS config replaces old COLMAP with the separate dependency direct
   assert.equal(JSON.stringify(base), original, "Formal config is not modified");
 });
 
-test("Windows and Linux local builds retain native resource maps and normal builds retain checks", () => {
+test("Windows and Linux local builds replace strict COLMAP entries with the complete developer directory", () => {
   for (const [platform, name] of [["win32", "windows"], ["linux", "linux"]]) {
     const base = mergePatch(JSON.parse(read("src-tauri/tauri.conf.json")), JSON.parse(read(`src-tauri/tauri.${name}.conf.json`)));
     const local = mergePatch(base, localConfiguration(platform));
-    assert.deepEqual(local.bundle.resources, base.bundle.resources);
+    const root = platform === "win32" ? "../engines/colmap" : "../engines/linux/colmap";
+    const destination = platform === "win32" ? "engines/colmap/" : "engines/linux/colmap/";
+    assert.equal(local.bundle.resources[`${root}/`], destination);
+    assert.equal(local.bundle.resources[`${root}/bin/`], undefined);
+    assert.ok(Object.keys(local.bundle.resources).some(resource => !resource.startsWith(root)), "Other engine resources remain mapped");
     assert.match(base.build.beforeBuildCommand, /verify:engines|build:bundle/);
     assert.doesNotMatch(local.build.beforeBuildCommand, /verify|setup/);
   }
@@ -101,6 +104,17 @@ test("manual workflow only builds selected platforms and never publishes a Relea
       assert.match(output, /short_sha=aaaaaaaa/);
     }
   }
+});
+
+test("ordinary application workflows consume the pinned runtime and never compile COLMAP", () => {
+  for (const workflowName of ["windows", "ubuntu", "macos"]) {
+    const workflow = read(`.github/workflows/${workflowName}.yml`);
+    assert.match(workflow, /setup:engines|build:engines:macos/);
+    assert.doesNotMatch(workflow, /build-colmap-(?:windows|linux|macos)|build:engines:(?:windows|linux)|build:colmap:macos/);
+  }
+  const mixedMacos = read("scripts/build-engines-macos.sh");
+  assert.doesNotMatch(mixedMacos, /^build_macos_colmap$|colmap_archive=/m);
+  assert.match(read("scripts/setup-engines-macos.sh"), /setup-colmap-runtime\.mjs" macos/);
 });
 
 test("CUDA installation pins the patch release without network/apt drift", () => {
@@ -174,12 +188,13 @@ test("Linux preflight reports missing tools, checks build tools and delegates CU
   assert.match(missing.stderr, /Missing build prerequisite: patchelf/);
 });
 
-test("macOS-only and mixed builders use the same compiler/relocation functions", () => {
+test("macOS mixed runtime no longer compiles COLMAP while the manual COLMAP-only builder remains", () => {
   const mixed = read("scripts/build-engines-macos.sh"), only = read("scripts/build-colmap-macos.sh");
-  for (const script of [mixed, only]) {
-    assert.match(script, /source "\$workspace\/scripts\/colmap-macos-common\.sh"/);
-    for (const functionName of ["build_macos_colmap", "collect_macos_colmap_notices", "bundle_macos_runtime"]) assert.match(script, new RegExp(`^${functionName}$`, "m"));
-  }
+  assert.match(mixed, /source "\$workspace\/scripts\/colmap-macos-common\.sh"/);
+  assert.match(mixed, /^bundle_macos_runtime$/m);
+  assert.doesNotMatch(mixed, /^build_macos_colmap$|^collect_macos_colmap_notices$|colmap_archive=/m);
+  for (const functionName of ["build_macos_colmap", "collect_macos_colmap_notices", "bundle_macos_runtime"]) assert.match(only, new RegExp(`^${functionName}$`, "m"));
+  assert.match(read("scripts/setup-engines-macos.sh"), /setup-colmap-runtime\.mjs" macos/);
   assert.doesNotMatch(only, /brush_archive|ffmpeg_archive|engine_field (?:Brush|'FFmpeg)|setup-engines-macos/);
   assert.match(only, /package-colmap-macos-runtime\.mjs/);
   const common = read("scripts/colmap-macos-common.sh");

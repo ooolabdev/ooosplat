@@ -12,7 +12,16 @@ pub const LOCKED_VERSION: &str = "4.2.1";
 pub const LOCKED_COMMIT: &str = "bd1fcf654d2dd8fefa1466999c190a246f83f4b9";
 
 pub fn is_locked_build(help: &str) -> bool {
-    help.contains(&format!("COLMAP {LOCKED_VERSION}")) && help.contains(LOCKED_COMMIT)
+    let short_commit = &LOCKED_COMMIT[..7];
+    [LOCKED_COMMIT, short_commit].into_iter().any(|commit| {
+        let marker = format!("COLMAP {LOCKED_VERSION} (Commit {commit}");
+        help.match_indices(&marker).any(|(index, _)| {
+            help[index + marker.len()..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_whitespace() || character == ')')
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -650,6 +659,15 @@ mod tests {
         assert!(is_locked_build(&format!(
             "COLMAP {LOCKED_VERSION} (Commit {LOCKED_COMMIT})"
         )));
+        assert!(is_locked_build(
+            "COLMAP 4.2.1 (Commit bd1fcf6 on 2026-09-29 with CUDA, std hash maps)"
+        ));
+        assert!(!is_locked_build(
+            "COLMAP 4.2.1 (Commit bd1fcf60 on 2026-09-29 with CUDA, std hash maps)"
+        ));
+        assert!(!is_locked_build(
+            "COLMAP 4.2.1 (Commit 0000000 on 2026-09-29 with CUDA, std hash maps)"
+        ));
         assert!(!is_locked_build("COLMAP 4.1.0.dev0 (Commit 5b76f53)"));
     }
 

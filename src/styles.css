@@ -163,6 +163,35 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .primary-action:hover:not(:disabled) { background: var(--blue-dark); }
 
 .live-process { margin-top: 28px; padding-top: 23px; border-top: 1px solid var(--line-dark); }
+.runtime-panel { margin: 14px 0 18px; padding: 13px 14px; border: 1px solid var(--line); background: var(--paper); min-width: 0; }
+.runtime-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
+.runtime-heading > span, .runtime-note, .runtime-output, .runtime-gpus > small { font-size: 11px; color: var(--muted); }
+.runtime-step-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin-top: 13px; font-size: 12px; }
+.runtime-step-heading b { margin-left: auto; font-size: 17px; font-variant-numeric: tabular-nums; }
+.runtime-step-heading small { font-size: 11px; }
+.runtime-track { display: block; width: 100%; height: 5px; margin: 8px 0 12px; accent-color: var(--blue); }
+.runtime-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.runtime-metrics dt { font-size: 11px; color: var(--muted); }
+.runtime-metrics dd { margin: 4px 0 0; font-size: 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.runtime-metrics small { font-size: 10px; color: var(--muted); }
+.runtime-output { margin: 11px 0; }
+.runtime-output span { display: block; margin-top: 4px; }
+.runtime-output.quiet { color: var(--amber); }
+.runtime-resources { padding-top: 11px; border-top: 1px solid var(--line); }
+.runtime-resources.stale { color: var(--muted); }
+.runtime-gpus { margin-top: 12px; }
+.runtime-gpus p { font-size: 12px; margin: 6px 0; }
+.runtime-gpu { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; margin-top: 8px; font-size: 12px; }
+.runtime-gpu span { overflow-wrap: anywhere; }
+.runtime-gpu > span:last-child { grid-column: 1 / -1; font-variant-numeric: tabular-nums; color: var(--muted); }
+.runtime-details { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; }
+.runtime-details summary { cursor: pointer; color: var(--blue-dark); }
+.runtime-details summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.runtime-details dl { display: grid; gap: 7px; }
+.runtime-details dl > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 8px; }
+.runtime-details dt { color: var(--muted); }
+.runtime-details dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) { .runtime-metrics { grid-template-columns: 1fr; gap: 8px; } }
 .live-heading { justify-content: space-between; }
 .live-heading > div { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }

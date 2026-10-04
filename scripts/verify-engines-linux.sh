@@ -20,7 +20,7 @@ node "$workspace/scripts/brush-runtime.mjs" verify linux
 
 colmap="$workspace/engines/linux/colmap/bin/colmap"
 pin="$(node -p 'require(process.argv[1]).colmap.integritySha256' "$workspace/engines/manifest.linux.json")"
-node "$workspace/scripts/colmap-runtime.mjs" "$workspace/engines/linux/colmap" linux "$pin"
+node "$workspace/scripts/colmap-runtime.mjs" "$workspace/engines/linux/colmap" linux "$pin" release
 feature_help="$("$colmap" feature_extractor -h 2>&1)"
 matching_help="$("$colmap" sequential_matcher -h 2>&1)"
 "$colmap" mapper -h >/dev/null 2>&1

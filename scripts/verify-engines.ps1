@@ -20,7 +20,7 @@ foreach ($item in $manifest.requiredFiles) {
   if ($actual -ne $item.sha256) { throw "Hash mismatch for $($item.path): $actual" }
 }
 $integrityPin = ($manifest.requiredFiles | Where-Object { $_.path -eq 'engines/colmap/SHA256SUMS' }).sha256
-& node (Join-Path $PSScriptRoot 'colmap-runtime.mjs') (Join-Path $workspace 'engines/colmap') windows $integrityPin
+& node (Join-Path $PSScriptRoot 'colmap-runtime.mjs') (Join-Path $workspace 'engines/colmap') windows $integrityPin release
 if ($LASTEXITCODE -ne 0) { throw 'COLMAP source, runtime hashes, CLI or Caspar verification failed.' }
 $colmap = Join-Path $workspace 'engines\colmap\bin\colmap.exe'
 $savedPreference = $ErrorActionPreference

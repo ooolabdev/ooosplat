@@ -96,8 +96,7 @@ const tauriWindows = JSON.parse(readText("src-tauri/tauri.windows.conf.json"));
 for (const resource of [
   "../engines/manifest.json",
   "../engines/ffmpeg/",
-  "../engines/colmap/bin/",
-  "../engines/colmap/licenses/",
+  "../engines/colmap/",
   "../engines/brush/",
 ]) {
   assert(Object.hasOwn(tauriWindows.bundle?.resources ?? {}, resource), `Windows Tauri resources are missing ${resource}.`);
@@ -112,7 +111,7 @@ for (const dependency of ["ffmpeg"]) {
   assert(tauriLinux.bundle?.linux?.deb?.depends?.includes(dependency), `Linux DEB dependencies are missing ${dependency}.`);
 }
 assert(!tauriLinux.bundle?.linux?.deb?.depends?.includes("colmap"), "Linux must not depend on unpinned system COLMAP.");
-for (const resource of ["../engines/linux/colmap/bin/", "../engines/linux/colmap/lib/", "../engines/linux/colmap/licenses/", "../engines/linux/colmap/SHA256SUMS", "../engines/linux/colmap/BUILD-INFO.json", "../engines/linux/colmap/BUNDLED-COMPONENTS.json"]) {
+for (const resource of ["../engines/linux/colmap/"]) {
   assert(Object.hasOwn(tauriLinux.bundle?.resources ?? {}, resource), `Missing Linux COLMAP resource ${resource}`);
 }
 const tauriMacos = JSON.parse(readText("src-tauri/tauri.macos.conf.json"));
@@ -125,6 +124,7 @@ for (const resource of [
   "../engines/macos/arm64/SHA256SUMS",
   "../engines/macos/arm64/BUILD-INFO.json",
   "../engines/macos/arm64/BUNDLED-COMPONENTS.json",
+  "../engines/macos/arm64/colmap/",
 ]) {
   assert(Object.hasOwn(tauriMacos.bundle?.resources ?? {}, resource), `macOS Tauri resources are missing ${resource}.`);
 }
@@ -135,6 +135,16 @@ const expectedEngines = new Map([
   ["Brush", { license: "Apache-2.0", file: "licenses/Brush-LICENSE.txt" }],
 ]);
 const manifest = JSON.parse(readText("engines/manifest.json"));
+const colmapRuntime = JSON.parse(readText("engines/colmap-runtime.json"));
+assert(colmapRuntime.repository === "ooolabdev/ooosplat-colmap", "COLMAP runtime repository is incorrect.");
+assert(colmapRuntime.releaseTag === "colmap-4.2.1-runtime.1", "COLMAP runtime release tag is incorrect.");
+assert(colmapRuntime.sourceCommit === "bd1fcf654d2dd8fefa1466999c190a246f83f4b9", "COLMAP source commit is incorrect.");
+for (const [platform, runtime] of Object.entries(colmapRuntime.platforms ?? {})) {
+  for (const [name, value] of Object.entries({ archive: runtime.archiveSha256, inventory: runtime.integritySha256, buildInfo: runtime.buildInfoSha256 })) {
+    assert(/^[a-f0-9]{64}$/i.test(value ?? ""), `${platform} COLMAP ${name} hash is not pinned.`);
+  }
+  assert(runtime.sourceUrl?.startsWith(`https://github.com/ooolabdev/ooosplat-colmap/releases/download/${colmapRuntime.releaseTag}/`), `${platform} COLMAP URL is not pinned to the fork Release.`);
+}
 assert(manifest.schemaVersion >= 2, "Engine manifest schemaVersion must include license mappings.");
 assert(manifest.engines?.length === 3, "License verification expects exactly the three direct native engines.");
 

@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const common = path.join(workspace, "scripts", "colmap-macos-common.sh");
 const bash = process.env.OOOSPLAT_TEST_BASH || "bash";
+const bashTest = spawnSync(bash, ["--version"], { windowsHide: true }).status === 0 ? test : test.skip;
 const portable = file => file.replaceAll("\\", "/");
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ooosplat-macos-notices-"));
@@ -54,7 +55,7 @@ function successful(result) {
   assert.equal(result.status, 0, result.error?.message || result.stderr);
 }
 
-test("COLMAP-only transitive Homebrew FFmpeg retains its real formula notices, not the mixed-build LGPL notice", t => {
+bashTest("COLMAP-only transitive Homebrew FFmpeg retains its real formula notices, not the mixed-build LGPL notice", t => {
   const f = fixture(t);
   fs.writeFileSync(f.origins, `libavcodec.63.dylib\t${portable(path.join(f.prefix, "lib", "libavcodec.63.dylib"))}\n`);
   successful(run(f, "collect_macos_runtime_component_notices"));
@@ -73,7 +74,7 @@ test("COLMAP-only transitive Homebrew FFmpeg retains its real formula notices, n
   assert.equal(formula.versions.stable, "8.0");
 });
 
-test("mixed build explicitly registered FFmpeg and Homebrew FFmpeg keep separate provenance and notices", t => {
+bashTest("mixed build explicitly registered FFmpeg and Homebrew FFmpeg keep separate provenance and notices", t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.stage, "licenses", "FFmpeg-LGPL-2.1.txt"), "Mixed build LGPL notice\n");
   fs.writeFileSync(path.join(f.stage, "lib", "libavcodec.62.dylib"), "Mixed build library");
@@ -95,7 +96,7 @@ test("mixed build explicitly registered FFmpeg and Homebrew FFmpeg keep separate
   assert.deepEqual(bottled.files, ["lib/libavcodec.63.dylib"]);
 });
 
-test("an unregistered staged COLMAP dependency cannot be mislabeled as mixed FFmpeg", t => {
+bashTest("an unregistered staged COLMAP dependency cannot be mislabeled as mixed FFmpeg", t => {
   const f = fixture(t);
   const library = path.join(f.stage, "lib", "libavcodec.63.dylib");
   fs.writeFileSync(f.origins, `libavcodec.63.dylib\t${portable(library)}\n`);
@@ -106,7 +107,7 @@ test("an unregistered staged COLMAP dependency cannot be mislabeled as mixed FFm
   assert.equal(fs.existsSync(path.join(f.stage, "BUNDLED-COMPONENTS.json")), false);
 });
 
-test("explicit mixed FFmpeg provenance still requires the real mixed notice", t => {
+bashTest("explicit mixed FFmpeg provenance still requires the real mixed notice", t => {
   const f = fixture(t);
   fs.writeFileSync(f.origins, `libavcodec.63.dylib\t${portable(path.join(f.stage, "lib", "libavcodec.63.dylib"))}\tbuilt-ffmpeg\n`);
   const result = run(f, "collect_macos_runtime_component_notices");
@@ -114,7 +115,7 @@ test("explicit mixed FFmpeg provenance still requires the real mixed notice", t 
   assert.match(result.stderr, /Missing notice for explicitly registered mixed-build FFmpeg/);
 });
 
-test("Homebrew opt origins remain Homebrew even if given an unrelated built marker", t => {
+bashTest("Homebrew opt origins remain Homebrew even if given an unrelated built marker", t => {
   const f = fixture(t);
   successful(run(f, `classify_macos_component_origin "$brew_root/opt/ffmpeg/lib/libavcodec.63.dylib" built-ffmpeg
     [[ "$component" == ffmpeg && "$component_source" == homebrew ]]`));

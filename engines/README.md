@@ -22,13 +22,10 @@ embeds both; only FFmpeg/FFprobe remain system dependencies. COLMAP is never
 resolved from apt or PATH.
 Other Linux distributions remain outside the current delivery scope.
 
-The macOS Alpha restores a complete self-contained runtime under
-`engines/macos/arm64/`. Its FFmpeg/FFprobe and CPU CLI-only COLMAP builds are
-produced from pinned upstream sources; Brush uses its pinned OOOBrush arm64
-archive. The packaged app never writes into its resources and never falls back
-to Homebrew or system `PATH`. Maintainers install the pinned build formulae
-with `npm run setup:build-deps:macos` and rebuild the release archive with
-`npm run build:engines:macos` on an Apple Silicon Mac.
+The macOS Alpha keeps FFmpeg/FFprobe and Brush under `engines/macos/arm64/`,
+while COLMAP is isolated under `engines/macos/arm64/colmap/`. The normal app
+workflow builds only FFmpeg, prepares OOOBrush, and downloads the pinned
+COLMAP runtime described below; it does not compile COLMAP.
 
 ## COLMAP 4.2.1 source/build lock
 
@@ -42,8 +39,15 @@ The official GUI, OpenGL, MVS, ONNX, CGAL, LSD, download and test features are
 disabled. Runtime DLL/shared-library dependencies and image plugins are kept
 conservatively, including unresolved-use components; unclassified licenses
 block packaging rather than causing a library to be deleted. Headers, static
-development libraries, test executables, debug symbols and vocabulary/model
-resources are not shipped. NVIDIA runtime files are kept unmodified.
+development libraries, test executables and debug symbols are not shipped.
+The Release's hash-locked offline vocabulary and validation model are retained,
+but OOOSplat does not enable sequential loop detection in this change. NVIDIA
+runtime files are kept unmodified.
+
+Formal application builds consume the three platform assets from
+[ooolabdev/ooosplat-colmap colmap-4.2.1-runtime.1](https://github.com/ooolabdev/ooosplat-colmap/releases/tag/colmap-4.2.1-runtime.1).
+`colmap-runtime.json` locks the direct asset URL, archive, installed inventory,
+build metadata, source commit and build-script commit for every platform.
 
 ## Download COLMAP-only development builds
 
@@ -70,10 +74,9 @@ package OOOSplat, publish Releases, or modify engine manifests.
 | Ubuntu 24.04 x64 | `engines/linux/colmap/` | `engines/linux/colmap/bin/colmap` |
 | macOS 15+ arm64 | `engines/macos/arm64/colmap/` | `engines/macos/arm64/colmap/bin/colmap` |
 
-The inner directories are named `ooosplat-colmap-windows-x64`,
-`ooosplat-colmap-linux-x64`, and `ooosplat-colmap-macos-arm64`, respectively.
-macOS COLMAP is kept separate from the mixed FFmpeg/Brush libraries. Existing
-mixed-runtime COLMAP remains the fallback when no standalone executable exists.
+The published Release archives contain `bin`, `lib`, `licenses` and metadata
+directly at their root. Copy those contents into the destination without adding
+another wrapper directory. macOS COLMAP stays separate from FFmpeg and Brush.
 
 With your existing FFmpeg available, run:
 
@@ -84,10 +87,11 @@ npm run build:local
 
 These commands automatically prepare the pinned OOOBrush CLI, with verified
 download and offline cache reuse. They do not install/download COLMAP, verify
-its package hashes or version manifests, or edit formal manifests. FFmpeg is
-unchanged. The application's runtime health
-checks and GPU/BA probes still run normally. Missing resources fail directly
-during compilation/packaging or startup. `build:local` creates the normal host
+its package hashes, version or commit, or edit formal manifests. FFmpeg is
+unchanged. Local binaries use the internal `local-colmap` feature: SIFT,
+matching and mapper capabilities are still probed, while a capability-compatible
+developer build may have a different identity. Missing or incompatible resources
+fail during packaging or startup. `build:local` creates the normal host
 platform test bundles; extra Tauri arguments can follow `--`, for example
 `npm run build:local -- --no-bundle`. macOS local bundles use ad-hoc signing.
 In Windows PowerShell, use `npm.cmd` when forwarding extra arguments, for example
@@ -148,15 +152,9 @@ The fork emits an args-config merge warning for export paths containing spaces;
 its fallback retains the explicit CLI config. The Windows test confirmed the
 requested four iterations and successful Unicode/spaced-path export; OOOSplat
 does not rely on an upstream args.txt merge for its presets.
-Local Windows build reached the resource-copy stage after frontend compilation,
-then stopped because the existing manually placed COLMAP lacks
-`BUNDLED-COMPONENTS.json` (and other new development-package metadata).
-Place the complete new COLMAP development archive before testing application
-packaging; no placeholder metadata or relaxed formal verification is used.
-
-Formal COLMAP/mixed-runtime archive hashes are still pending their first reviewed
-build; preparing Brush does not bypass those normal release checks. No workflow
-triggers or Release publication mechanisms are changed by Brush preparation.
+Local COLMAP packages do not need the formal metadata files. The entire local
+directory is bundled so alternate versions can retain their dependency layout.
+Formal builds remain strict and require the reviewed Release metadata.
 
 Each Artifact contains the runtime archive, optional reference `.sha256`, and
 `.build-report.json`. Job Summary links the download and shows exact placement,
@@ -168,14 +166,14 @@ To stop using a development runtime, remove only the manually placed COLMAP
 directory (keep its tracked README if present), then restore normal pinned
 release inputs when available. No registration or uninstall command is needed.
 
-## Formal release promotion (separate from local development)
+## Formal runtime and manual rebuilds
 
-The new archive/integrity digests deliberately remain `null` until a real
-build is reviewed. Setup and packaging fail closed while these pins are
-missing; the old official Windows zip and apt COLMAP are not fallbacks. The
-explicit local commands above do not require these pins.
+Normal Windows, Ubuntu and macOS application Actions download the reviewed
+`colmap-4.2.1-runtime.1` asset for their platform and verify it before packing.
+The old official Windows zip, apt COLMAP and `PATH` are not fallbacks. Local
+development commands do not require the formal identity pins.
 
-1. Build with `.github/workflows/colmap-engines.yml` (manual dispatch), or
+1. To create a candidate successor, build with `.github/workflows/colmap-engines.yml` (manual dispatch), or
    `npm run build:engines:windows` / `npm run build:engines:linux` on a matching
    host with the locked compiler tools. macOS uses the existing engine workflow
    and `npm run build:engines:macos`. The standalone macOS development archive
@@ -184,15 +182,12 @@ explicit local commands above do not require these pins.
    `SHA256SUMS`, and `*.build-report.json`. The report includes compressed and
    installed bytes; Windows/Linux also include staging bytes before artifact
    trimming. It does not claim an unmeasured old-release size reduction.
-3. Run `node scripts/lock-engine-archive.mjs windows|linux|macos ARCHIVE` for
-   each reviewed artifact, then review/commit the manifest-only digest changes.
-   The tool re-extracts the archive and checks its source identity/inventory;
-   downloaded checksum sidecars never establish the installer's trust pin.
-4. Publish the identical artifacts under `engines-windows-x64-v0.1.0`,
-   `engines-linux-x64-v0.1.0`, and `engines-macos-arm64-v0.3.0`. Versioned asset
-   publication must not overwrite a previous release. The COLMAP-only workflow
-   does not publish these assets. Ubuntu app CI consumes the pinned archive;
-   the existing macOS app CI still builds its mixed engine runtime inline.
+3. Publish reviewed assets under a new immutable tag in
+   `ooolabdev/ooosplat-colmap`, then update `colmap-runtime.json` with direct
+   asset, archive, inventory and build-info hashes. Never overwrite an existing
+   tagged asset. The COLMAP-only workflow itself does not publish Releases.
+4. Ordinary app CI must consume that lock and must not invoke the manual COLMAP
+   builder. macOS may continue building its separate FFmpeg runtime.
 5. Run clean-host and real GPU acceptance before distributing the app. Standard
    CI validates CPU execution/CLI/package inputs, not GPU local/global BA.
 

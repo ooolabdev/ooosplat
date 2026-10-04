@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-for command_name in brew curl shasum tar cmake ninja make clang file otool install_name_tool vtool codesign node; do
+for command_name in brew curl shasum tar make clang file otool install_name_tool vtool codesign node; do
   command -v "$command_name" >/dev/null || { echo "Missing build command: $command_name" >&2; exit 1; }
 done
 
@@ -45,9 +45,7 @@ dependency_origins="$build/dependency-origins.tsv"
 : > "$dependency_origins"
 
 ffmpeg_archive="$sources/ffmpeg-8.1.2.tar.xz"
-colmap_archive="$sources/colmap-4.2.1.tar.gz"
 download_verified "$(engine_field 'FFmpeg / FFprobe' sourceUrl)" "$(engine_field 'FFmpeg / FFprobe' sourceSha256)" "$ffmpeg_archive"
-download_verified "$(engine_field COLMAP sourceUrl)" "$(engine_field COLMAP sourceSha256)" "$colmap_archive"
 
 mkdir -p "$build/ffmpeg-source"
 tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
@@ -82,27 +80,21 @@ for ffmpeg_library in "$stage/lib"/*; do
 done
 
 source "$workspace/scripts/colmap-macos-common.sh"
-build_macos_colmap
-collect_macos_colmap_notices
 install -m 0644 "$workspace/licenses/FFmpeg-LGPL-2.1.txt" "$stage/licenses/FFmpeg-LGPL-2.1.txt"
 install -m 0644 "$workspace/licenses/Brush-LICENSE.txt" "$stage/licenses/Brush-LICENSE.txt"
 node "$workspace/scripts/brush-runtime.mjs" prepare macos --destination "$stage" --cache "$sources/ooobrush"
 
-# Keep only the CLI deliverables. COLMAP may install auxiliary files that the
-# headless commands do not use; dynamic libraries are collected below.
-find "$stage/bin" -maxdepth 1 -type f ! -name ffmpeg ! -name ffprobe ! -name colmap ! -name brush_app -delete
+# The mixed runtime owns only FFmpeg/FFprobe and Brush. COLMAP is installed
+# separately from the locked ooosplat-colmap Release.
+find "$stage/bin" -maxdepth 1 -type f ! -name ffmpeg ! -name ffprobe ! -name brush_app -delete
 
 bundle_macos_runtime
-node "$workspace/scripts/smoke-colmap-image-io.mjs" "$stage/bin/colmap"
 
 node -e '
 const fs=require("fs");
 const path=require("path");
 const manifest=require(process.argv[1]);
-const lock=require(path.join(path.dirname(process.argv[1]),"colmap-build.json"));
-const colmapFeatures=Object.fromEntries(lock.disabledFeatures.map(feature=>[feature,false]));
-Object.assign(colmapFeatures,{CASPAR:false,CUDA:false,CERES:true,CASPAR_USE_DOUBLE:false});
-const output={schemaVersion:1,platform:"macos",architecture:"arm64",minimumSystemVersion:manifest.minimumSystemVersion,colmapFeatures,generatedAt:new Date().toISOString(),sources:manifest.engines.map(({name,version,commit,sourceUrl,sourceSha256,buildPolicy,license})=>({name,version,commit,sourceUrl,sourceSha256,buildPolicy,license}))};
+const output={schemaVersion:2,platform:"macos",architecture:"arm64",minimumSystemVersion:manifest.minimumSystemVersion,generatedAt:new Date().toISOString(),sources:manifest.engines.filter(engine=>engine.name!=="COLMAP").map(({name,version,commit,sourceUrl,sourceSha256,buildPolicy,license})=>({name,version,commit,sourceUrl,sourceSha256,buildPolicy,license}))};
 fs.writeFileSync(path.join(process.argv[2],"BUILD-INFO.json"),JSON.stringify(output,null,2)+"\n");
 ' "$manifest" "$stage"
 
@@ -122,5 +114,6 @@ tar -cJf "$archive" -C "$cache/stage" ooosplat-engines-macos-arm64
 )
 
 OOOSPLAT_ENGINE_BUILD_VERIFY=1 OOOSPLAT_MACOS_ENGINE_ARCHIVE="$archive" bash "$workspace/scripts/setup-engines-macos.sh"
+node "$workspace/scripts/smoke-colmap-image-io.mjs" "$workspace/engines/macos/arm64/colmap/bin/colmap"
 node "$workspace/scripts/engine-archive-info.mjs" macos "$archive" "$stage"
 echo "Created $archive"

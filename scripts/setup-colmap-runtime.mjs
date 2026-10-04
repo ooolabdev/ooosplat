@@ -1,51 +1,97 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { workspace, assertHashPin, fileHash, verifyColmap } from "./colmap-runtime.mjs";
+import { fileURLToPath } from "node:url";
+import { workspace, assertHashPin, fileHash, runtimeLock, verifyColmap } from "./colmap-runtime.mjs";
 
-const platform = process.argv[2];
-if (!["windows", "linux"].includes(platform)) throw new Error("Expected windows or linux");
-const manifest = JSON.parse(fs.readFileSync(path.join(workspace, `engines/manifest${platform === "linux" ? ".linux" : ""}.json`), "utf8"));
-const engine = platform === "linux" ? manifest.colmap : manifest.engines.find(e => e.name === "COLMAP");
-const integrityPin = platform === "linux" ? engine.integritySha256 : manifest.requiredFiles.find(f => f.path === "engines/colmap/SHA256SUMS")?.sha256;
-assertHashPin(engine.archiveSha256, "COLMAP archive");
-assertHashPin(integrityPin, "COLMAP SHA256SUMS");
-const destination = path.resolve(workspace, engine.install?.destination ?? engine.destination);
-if (!destination.startsWith(`${path.join(workspace, "engines")}${path.sep}`)) throw new Error("Unsafe runtime destination");
-try {
-  verifyColmap(destination, platform, integrityPin);
-  console.log("Ready: locked COLMAP runtime");
-  process.exit(0);
-} catch { /* Install the reviewed archive, never use the old binary or PATH. */ }
-const cache = path.join(workspace, ".cache", "engines", platform);
-fs.mkdirSync(cache, { recursive: true });
-const archive = path.join(cache, engine.install?.archiveName ?? engine.archiveName);
-const local = process.env.OOOSPLAT_COLMAP_ENGINE_ARCHIVE;
-if (local) fs.copyFileSync(local, archive);
-else if (!fs.existsSync(archive) || fileHash(archive).toLowerCase() !== engine.archiveSha256.toLowerCase()) {
-  const result = spawnSync(platform === "windows" ? "curl.exe" : "curl", ["--fail", "--location", "--retry", "3", engine.sourceUrl, "--output", archive], { stdio: "inherit", windowsHide: true });
-  if (result.error || result.status !== 0) throw new Error("COLMAP download failed");
+export function archiveEntriesSafe(listing) {
+  const entries = listing.split(/\r?\n/).filter(Boolean);
+  return entries.length > 0 && entries.every(entry => {
+    const normalized = entry.replace(/\\/g, "/").replace(/\/$/, "");
+    return normalized && !normalized.startsWith("/") && !/^[a-z]:/i.test(normalized)
+      && !normalized.split("/").some(part => !part || part === "." || part === "..");
+  });
 }
-if (fileHash(archive).toLowerCase() !== engine.archiveSha256.toLowerCase()) throw new Error("COLMAP archive SHA-256 mismatch");
-const listing = spawnSync("tar", ["-tf", archive], { encoding: "utf8", windowsHide: true });
-if (listing.error || listing.status !== 0 || listing.stdout.split(/\r?\n/).some(p => /(^[/\\]|(^|[/\\])\.\.([/\\]|$)|:)/.test(p))) throw new Error("Unsafe archive layout");
-const temporary = fs.mkdtempSync(path.join(cache, "install-"));
-try {
-  const extraction = spawnSync("tar", ["-xf", archive, "-C", temporary], { stdio: "inherit", windowsHide: true });
-  if (extraction.error || extraction.status !== 0) throw new Error("COLMAP extraction failed");
-  const staged = path.join(temporary, `ooosplat-colmap-${platform}-x64`);
-  verifyColmap(staged, platform, integrityPin);
-  if (fs.existsSync(path.join(destination, "README.md"))) fs.copyFileSync(path.join(destination, "README.md"), path.join(staged, "README.md"));
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, { windowsHide: true, ...options });
+  if (result.error || result.status !== 0) throw new Error(`${command} failed: ${result.error?.message ?? result.stderr ?? result.status}`);
+  return result;
+}
+
+function safeDestination(relative) {
+  const root = path.resolve(workspace, "engines");
+  const destination = path.resolve(workspace, relative);
+  if (!destination.startsWith(`${root}${path.sep}`)) throw new Error("Unsafe runtime destination");
+  return destination;
+}
+
+export function commitColmapRuntime(staged, destination, verify, rename = fs.renameSync) {
+  const temporary = path.dirname(staged);
   const backup = path.join(temporary, "previous-runtime");
-  if (fs.existsSync(destination)) fs.renameSync(destination, backup);
+  const failed = path.join(temporary, "failed-runtime");
+  let installed = false;
+  if (fs.existsSync(destination)) rename(destination, backup);
   try {
-    fs.renameSync(staged, destination);
-    verifyColmap(destination, platform, integrityPin);
+    rename(staged, destination);
+    installed = true;
+    verify(destination);
   } catch (error) {
-    if (fs.existsSync(destination)) fs.renameSync(destination, path.join(temporary, "failed-runtime"));
-    if (fs.existsSync(backup)) fs.renameSync(backup, destination);
+    if (installed && fs.existsSync(destination)) rename(destination, failed);
+    if (fs.existsSync(backup)) rename(backup, destination);
     throw error;
   }
-  console.log(`Installed verified COLMAP into ${destination}`);
-} finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+}
+
+export function installColmapRuntime(platform, { localArchive = process.env.OOOSPLAT_COLMAP_ENGINE_ARCHIVE } = {}) {
+  const expected = runtimeLock.platforms[platform];
+  if (!expected) throw new Error("Expected windows, linux or macos");
+  for (const [label, hash] of [["COLMAP archive", expected.archiveSha256], ["COLMAP SHA256SUMS", expected.integritySha256], ["COLMAP BUILD-INFO", expected.buildInfoSha256]]) assertHashPin(hash, label);
+  const destination = safeDestination(expected.destination);
+  try {
+    verifyColmap(destination, platform, expected.integritySha256, { requireRelease: true });
+    console.log(`Ready: locked COLMAP ${runtimeLock.releaseTag} runtime`);
+    return destination;
+  } catch { /* Install the reviewed archive; never use PATH or a stale runtime. */ }
+
+  const cache = path.join(workspace, ".cache", "engines", "colmap", platform);
+  fs.mkdirSync(cache, { recursive: true });
+  const archive = path.join(cache, expected.archiveName);
+  if (localArchive) {
+    const source = path.resolve(localArchive);
+    if (source !== path.resolve(archive)) fs.copyFileSync(source, archive);
+  } else if (!fs.existsSync(archive) || fileHash(archive).toLowerCase() !== expected.archiveSha256) {
+    const download = `${archive}.download`;
+    try {
+      run(process.platform === "win32" ? "curl.exe" : "curl", ["--fail", "--location", "--retry", "3", "--connect-timeout", "20", expected.sourceUrl, "--output", download], { stdio: "inherit", timeout: 20 * 60_000 });
+      if (fileHash(download).toLowerCase() !== expected.archiveSha256) throw new Error("COLMAP archive SHA-256 mismatch");
+      fs.rmSync(archive, { force: true });
+      fs.renameSync(download, archive);
+    } finally {
+      if (fs.existsSync(download)) fs.rmSync(download, { force: true });
+    }
+  }
+  if (fileHash(archive).toLowerCase() !== expected.archiveSha256) throw new Error("COLMAP archive SHA-256 mismatch");
+  const listing = run("tar", ["-tf", archive], { encoding: "utf8", timeout: 2 * 60_000 }).stdout;
+  if (!archiveEntriesSafe(listing)) throw new Error("Unsafe or empty COLMAP archive layout");
+
+  const temporary = fs.mkdtempSync(path.join(cache, "install-"));
+  const staged = path.join(temporary, "runtime");
+  try {
+    fs.mkdirSync(staged);
+    run("tar", ["-xf", archive, "-C", staged], { stdio: "inherit", timeout: 10 * 60_000 });
+    verifyColmap(staged, platform, expected.integritySha256, { requireRelease: true });
+    const readme = path.join(destination, "README.md");
+    if (fs.existsSync(readme)) fs.copyFileSync(readme, path.join(staged, "README.md"));
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    commitColmapRuntime(staged, destination, installedRoot => verifyColmap(installedRoot, platform, expected.integritySha256, { requireRelease: true }));
+    console.log(`Installed verified ${runtimeLock.releaseTag} into ${expected.destination}`);
+    return destination;
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  installColmapRuntime(process.argv[2]);
+}

@@ -61,6 +61,7 @@ jobs:
         run: |
           npm run setup:engines
           npm run verify:engines
+          node scripts/smoke-colmap-image-io.mjs engines/linux/colmap/bin/colmap
 
       - name: Rust formatting, tests, and clippy
         run: |
@@ -101,7 +102,9 @@ jobs:
           test -n "$(find "$extracted" -type f -path '*/engines/linux/brush/brush_app' -perm -111 -print -quit)"
           test -n "$(find "$extracted" -type f -path '*/engines/linux/colmap/bin/colmap' -perm -111 -print -quit)"
           test -n "$(find "$extracted" -type f -path '*/engines/manifest.linux.json' -print -quit)"
-          test -z "$(find "$extracted" -type f -name 'vocab_tree_faiss_flickr100K_words256K.bin' -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/linux/colmap/lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin' -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/linux/colmap/BUILD-INFO.json' -print -quit)"
+          test -n "$(find "$extracted" -type f -path '*/engines/linux/colmap/BUNDLED-COMPONENTS.json' -print -quit)"
           dpkg-deb --info "$package"
 
       - name: Package downloadable files

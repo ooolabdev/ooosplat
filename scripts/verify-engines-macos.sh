@@ -12,14 +12,15 @@ done
 
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime="$workspace/engines/macos/arm64"
+colmap_runtime="$runtime/colmap"
 manifest="$workspace/engines/manifest.macos.json"
 minimum_system_version="$(node -e 'process.stdout.write(require(process.argv[1]).minimumSystemVersion)' "$manifest")"
 
-for relative in bin/ffmpeg bin/ffprobe bin/colmap bin/brush_app SHA256SUMS BUILD-INFO.json BUNDLED-COMPONENTS.json; do
+for relative in bin/ffmpeg bin/ffprobe bin/brush_app SHA256SUMS BUILD-INFO.json BUNDLED-COMPONENTS.json; do
   [[ -f "$runtime/$relative" ]] || { echo "Missing macOS runtime file: $relative" >&2; exit 1; }
 done
 
-for binary in ffmpeg ffprobe colmap brush_app; do
+for binary in ffmpeg ffprobe brush_app; do
   [[ -x "$runtime/bin/$binary" ]] || { echo "$binary is not executable." >&2; exit 1; }
 done
 
@@ -28,7 +29,8 @@ integrity_pin="$(node -p 'require(process.argv[1]).distribution.integritySha256'
 if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" == "1" && -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
   integrity_pin="$(shasum -a 256 "$runtime/SHA256SUMS" | awk '{print $1}')"
 fi
-node "$workspace/scripts/colmap-runtime.mjs" "$runtime" macos "$integrity_pin"
+colmap_pin="$(node -p 'require(process.argv[1]).platforms.macos.integritySha256' "$workspace/engines/colmap-runtime.json")"
+node "$workspace/scripts/colmap-runtime.mjs" "$colmap_runtime" macos "$colmap_pin" release
 
 version_le() {
   local left_major="${1%%.*}" left_minor="${1#*.}" right_major="${2%%.*}" right_minor="${2#*.}"
@@ -58,16 +60,16 @@ while IFS= read -r file_path; do
     echo "$file_path requires macOS $minos (maximum allowed is $minimum_system_version)." >&2
     mach_o_validation_failed=1
   fi
-done < <(find "$runtime/bin" "$runtime/lib" -type f -print)
+done < <(find "$runtime/bin" "$runtime/lib" "$colmap_runtime/bin" "$colmap_runtime/lib" -type f \( -path '*/bin/*' -o -name '*.dylib' -o -name '*.so' \) -print)
 (( mach_o_validation_failed == 0 )) || exit 1
 
-for target in "$runtime/bin"/* "$runtime/lib"/*; do
+for target in "$runtime/bin"/* "$runtime/lib"/* "$colmap_runtime/bin"/* "$colmap_runtime/lib"/*; do
   [[ -f "$target" ]] || continue
   while IFS= read -r dependency; do
     case "$dependency" in
       @rpath/*)
         dylib="${dependency#@rpath/}"
-        [[ -f "$runtime/lib/$dylib" ]] || { echo "Missing bundled dependency $dylib for $target" >&2; exit 1; }
+        [[ -f "$runtime/lib/$dylib" || -f "$colmap_runtime/lib/$dylib" ]] || { echo "Missing bundled dependency $dylib for $target" >&2; exit 1; }
         ;;
       /System/Library/*|/usr/lib/*|@loader_path/*|@executable_path/*) ;;
       *) echo "Unsupported dependency path $dependency in $target" >&2; exit 1 ;;
@@ -79,9 +81,9 @@ restricted_path="/usr/bin:/bin:/usr/sbin:/sbin"
 PATH="$restricted_path" "$runtime/bin/ffmpeg" -version | grep -F 'ffmpeg version 8.1.2'
 PATH="$restricted_path" "$runtime/bin/ffprobe" -version | grep -F 'ffprobe version 8.1.2'
 
-feature_help="$(PATH="$restricted_path" "$runtime/bin/colmap" feature_extractor -h 2>&1)"
-matching_help="$(PATH="$restricted_path" "$runtime/bin/colmap" sequential_matcher -h 2>&1)"
-PATH="$restricted_path" "$runtime/bin/colmap" mapper -h >/dev/null 2>&1
+feature_help="$(PATH="$restricted_path" "$colmap_runtime/bin/colmap" feature_extractor -h 2>&1)"
+matching_help="$(PATH="$restricted_path" "$colmap_runtime/bin/colmap" sequential_matcher -h 2>&1)"
+PATH="$restricted_path" "$colmap_runtime/bin/colmap" mapper -h >/dev/null 2>&1
 if grep -q -- '--FeatureExtraction.use_gpu' <<<"$feature_help"; then
   grep -q -- '--FeatureMatching.use_gpu' <<<"$matching_help"
 elif grep -q -- '--SiftExtraction.use_gpu' <<<"$feature_help"; then
@@ -91,7 +93,7 @@ else
   exit 1
 fi
 
-if find "$runtime" -type f -print | grep -Ei 'cuda|cudnn|cudart|curand' >/dev/null; then
+if find "$colmap_runtime" -type f -print | grep -Ei 'cuda|cudnn|cudart|curand' >/dev/null; then
   echo "CUDA files are forbidden in the macOS COLMAP runtime." >&2
   exit 1
 fi
@@ -109,6 +111,5 @@ if (m.architecture!=="arm64" || m.minimumSystemVersion!=="15.0" || b.minimumSyst
 const covered=new Set(c.components.flatMap(component=>component.files));
 for (const file of fs.readdirSync(path.join(process.argv[4],"lib"))) if (!covered.has(`lib/${file}`)) throw new Error(`Missing license inventory for lib/${file}`);
 for (const license of c.sourceLicenseFiles||[]) if (!fs.existsSync(path.join(process.argv[4],"licenses",license))) throw new Error(`Missing source license ${license}`);
-if ((c.sourceLicenseFiles||[]).length < 6) throw new Error("Incomplete COLMAP source license inventory");
 ' "$manifest" "$runtime/BUILD-INFO.json" "$runtime/BUNDLED-COMPONENTS.json" "$runtime"
-echo "Verified bundled Apple Silicon FFmpeg/FFprobe, CPU COLMAP, and Brush without PATH fallback."
+echo "Verified bundled Apple Silicon FFmpeg/FFprobe and Brush plus the separate locked CPU COLMAP Release without PATH fallback."

@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "repository": "ooolabdev/ooosplat-colmap",
+  "releaseTag": "colmap-4.2.1-runtime.1",
+  "runtimeRevision": 1,
+  "colmapVersion": "4.2.1",
+  "sourceCommit": "bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
+  "scriptCommit": "4c9b2bf412a2af4225b4ec9f3ffb9f2392c66aa1",
+  "disabledFeatures": [
+    "GUI_ENABLED",
+    "OPENGL_ENABLED",
+    "MVS_ENABLED",
+    "ONNX_ENABLED",
+    "CGAL_ENABLED",
+    "LSD_ENABLED",
+    "DOWNLOAD_ENABLED",
+    "TESTS_ENABLED"
+  ],
+  "cudaRelease": "13.2.0",
+  "gpuArchitectures": [75, 80, 86, 89, 90, 100, 120],
+  "offlineVocabulary": {
+    "path": "lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin",
+    "sha256": "96ca8ec8ea60b1f73465aaf2c401fd3b3ca75cdba2d3c50d6a2f6f760f275ddc",
+    "bytes": 72412636
+  },
+  "platforms": {
+    "windows": {
+      "architecture": "x64",
+      "archiveName": "colmap-4.2.1-runtime.1-windows-x64-4c9b2bf4-run37156867846-attempt1.zip",
+      "sourceUrl": "https://github.com/ooolabdev/ooosplat-colmap/releases/download/colmap-4.2.1-runtime.1/colmap-4.2.1-runtime.1-windows-x64-4c9b2bf4-run37156867846-attempt1.zip",
+      "archiveSha256": "6ea29a37f5ace05cf4003dd97143a5fe9e9d01b315f52405d0e38b8970b95d00",
+      "integritySha256": "79eea38b9f9a4d55fe79c2fae8dcbebe4873d2dab8a20debb0dfe596301a8c87",
+      "buildInfoSha256": "7902452cb0edba1074c98eef49b3ed83f9b0966c75db0118dfd5dfe59a552cf3",
+      "destination": "engines/colmap",
+      "cuda": true,
+      "caspar": true
+    },
+    "linux": {
+      "architecture": "x64",
+      "archiveName": "colmap-4.2.1-runtime.1-linux-x64-4c9b2bf4-run37156867846-attempt1.tar.xz",
+      "sourceUrl": "https://github.com/ooolabdev/ooosplat-colmap/releases/download/colmap-4.2.1-runtime.1/colmap-4.2.1-runtime.1-linux-x64-4c9b2bf4-run37156867846-attempt1.tar.xz",
+      "archiveSha256": "99d3e586b554069ff8fc524430924886608505ba8337751783682fae9eadf88d",
+      "integritySha256": "4e67a4740e622f37652b2723430dea072bc78fd800e5de817908003454f16387",
+      "buildInfoSha256": "046b13788c8da5df58fde0012daa73b8611ab2a47e4d84d58e8aaf9d6801d36e",
+      "destination": "engines/linux/colmap",
+      "cuda": true,
+      "caspar": true
+    },
+    "macos": {
+      "architecture": "arm64",
+      "archiveName": "colmap-4.2.1-runtime.1-macos-arm64-4c9b2bf4-run37156867846-attempt1.tar.xz",
+      "sourceUrl": "https://github.com/ooolabdev/ooosplat-colmap/releases/download/colmap-4.2.1-runtime.1/colmap-4.2.1-runtime.1-macos-arm64-4c9b2bf4-run37156867846-attempt1.tar.xz",
+      "archiveSha256": "fd7ac276a2b858e10f2bddd7febfac139c0d6f18b07d84c869c0363eb814530e",
+      "integritySha256": "c8558574235f4afff57ec02ee2223d16ffa3c2c8501640c4850386354a310ff7",
+      "buildInfoSha256": "1b058a9731cb98496c43fadf476ac6a66f7378ef90a8eb0de161d3bc98aced91",
+      "destination": "engines/macos/arm64/colmap",
+      "cuda": false,
+      "caspar": false
+    }
+  }
+}

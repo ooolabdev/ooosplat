@@ -97,7 +97,7 @@ foreach ($resource in "../LICENSE", "../NOTICE", "../TRADEMARK_POLICY.md", "../G
 
 $tauriWindows = (Read-Utf8Text "src-tauri/tauri.windows.conf.json") | ConvertFrom-Json
 $windowsResources = @($tauriWindows.bundle.resources.PSObject.Properties.Name)
-foreach ($resource in "../engines/manifest.json", "../engines/ffmpeg/", "../engines/colmap/bin/", "../engines/colmap/licenses/", "../engines/brush/") {
+foreach ($resource in "../engines/manifest.json", "../engines/ffmpeg/", "../engines/colmap/", "../engines/brush/") {
     Assert-True ($windowsResources -contains $resource) "Windows Tauri resources are missing $resource."
 }
 $tauriLinux = (Read-Utf8Text "src-tauri/tauri.linux.conf.json") | ConvertFrom-Json
@@ -114,7 +114,7 @@ Assert-True (-not (@($tauriLinux.bundle.linux.deb.depends) -contains 'colmap')) 
 $tauriMacos = (Read-Utf8Text "src-tauri/tauri.macos.conf.json") | ConvertFrom-Json
 Assert-True ($tauriMacos.bundle.macOS.minimumSystemVersion -eq "15.0") "macOS bundle must target macOS 15.0."
 $macosResources = @($tauriMacos.bundle.resources.PSObject.Properties.Name)
-foreach ($resource in "../engines/manifest.macos.json", "../engines/macos/arm64/bin/", "../engines/macos/arm64/lib/", "../engines/macos/arm64/licenses/", "../engines/macos/arm64/SHA256SUMS", "../engines/macos/arm64/BUILD-INFO.json", "../engines/macos/arm64/BUNDLED-COMPONENTS.json") {
+foreach ($resource in "../engines/manifest.macos.json", "../engines/macos/arm64/bin/", "../engines/macos/arm64/lib/", "../engines/macos/arm64/licenses/", "../engines/macos/arm64/SHA256SUMS", "../engines/macos/arm64/BUILD-INFO.json", "../engines/macos/arm64/BUNDLED-COMPONENTS.json", "../engines/macos/arm64/colmap/") {
     Assert-True ($macosResources -contains $resource) "macOS Tauri resources are missing $resource."
 }
 

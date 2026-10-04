@@ -1,0 +1,99 @@
+name: Windows x64
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend, runtime policy, and license checks
+        shell: pwsh
+        run: |
+          npm run verify:telemetry:release
+          npm test
+          npm run test:engine-scripts
+          npm run verify:colmap-lock
+          npm run build
+          npm run verify:bundle-resources
+          npm run verify:licenses
+
+      - name: Install and verify pinned engines
+        shell: pwsh
+        run: |
+          npm run setup:engines
+          npm run verify:engines
+          node scripts/smoke-colmap-image-io.mjs engines/colmap/bin/colmap.exe
+
+      - name: Rust formatting, tests, and clippy
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build Windows NSIS installer
+        shell: pwsh
+        run: npm run package:windows
+
+      - name: Verify packaged COLMAP resources and installer
+        shell: pwsh
+        run: |
+          $runtime = 'engines/colmap'
+          foreach ($relative in @(
+            'bin/colmap.exe',
+            'lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin',
+            'BUILD-INFO.json',
+            'BUNDLED-COMPONENTS.json',
+            'SHA256SUMS'
+          )) {
+            $target = Join-Path $runtime $relative
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Missing packaged input: $target" }
+          }
+          $installer = Get-ChildItem -LiteralPath dist-artifacts -Filter '*.exe' -File | Select-Object -First 1
+          if (-not $installer -or $installer.Length -eq 0) { throw 'Missing NSIS installer.' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'ooosplat-package-inspection'
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "NSIS silent install failed with $($process.ExitCode)" }
+          foreach ($relative in @(
+            'engines/colmap/bin/colmap.exe',
+            'engines/colmap/lib/colmap/vocab_tree_faiss_flickr100K_words256K.bin',
+            'engines/colmap/BUILD-INFO.json',
+            'engines/colmap/BUNDLED-COMPONENTS.json'
+          )) {
+            $target = Join-Path $installDir $relative
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Installed NSIS package is missing $relative" }
+          }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: OOOSplat-${{ github.run_number }}-x64-windows
+          path: dist-artifacts/
+          if-no-files-found: error
+          retention-days: 14

@@ -118,7 +118,7 @@ describe("App preview workspace", () => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
-      latestEvent: null, events: [], result: null, error: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null,
     });
     mocks.prepareGaussianPreview.mockReset();
     mocks.cancelPipeline.mockReset().mockResolvedValue(undefined);
@@ -523,34 +523,33 @@ describe("App preview workspace", () => {
     expect(container.querySelector('[title="本机历史任务校准"]')).not.toBeNull();
   });
 
-  it("labels Brush heartbeat progress as an estimate", async () => {
+  it("does not turn a Brush heartbeat into completed training steps", async () => {
     act(() => useAppStore.setState({
       phase: "running",
       progress: 79,
-      progressMessage: "Brush 训练中 · 估算进度 50%",
+      progressMessage: "Brush 训练进程仍在运行",
       latestEvent: {
         sequence: 7,
         timestamp: new Date().toISOString(),
         kind: "heartbeat",
         level: "info",
-        stage: "TrainingSplats",
+        stage: "trainingSplats",
         engine: "brush",
         progress: 79,
         stageProgress: 50,
         indeterminate: false,
-        message: "Brush 训练中 · 估算进度 50%",
+        message: "Brush 训练进程仍在运行",
         current: null,
         total: 15_000,
-        unit: "estimated_progress",
+        unit: null,
         elapsedMs: 120_000,
         acceleration: null,
       },
     }));
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("Brush 训练中 · 估算进度 50%");
-    expect(Array.from(container.querySelectorAll(".process-metrics b"), (node) => node.textContent)).not.toContain("估算 50%");
-    expect(container.textContent).not.toContain("15,000 / 15,000");
+    expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅…。此步骤可能耗时较长，请耐心等待");
+    expect(container.textContent).not.toContain("7,500/15,000");
   });
 
   it("shows only the task panes until a completed project is opened", async () => {

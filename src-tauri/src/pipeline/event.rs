@@ -13,6 +13,7 @@ pub enum EventKind {
     Log,
     Heartbeat,
     Capability,
+    Runtime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,8 @@ pub struct PipelineEvent {
     pub unit: Option<String>,
     pub elapsed_ms: u64,
     pub acceleration: Option<ColmapAccelerationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::runtime::RuntimeSnapshot>,
 }
 
 impl PipelineEvent {
@@ -72,6 +75,7 @@ impl PipelineEvent {
             unit: None,
             elapsed_ms: 0,
             acceleration: None,
+            runtime: None,
         }
     }
 }

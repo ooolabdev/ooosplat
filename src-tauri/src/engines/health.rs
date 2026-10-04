@@ -420,7 +420,10 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
     for args in [
         vec!["feature_extractor", "-h"],
         vec!["sequential_matcher", "-h"],
+        vec!["exhaustive_matcher", "-h"],
+        vec!["matches_importer", "-h"],
         vec!["mapper", "-h"],
+        vec!["bundle_adjuster", "-h"],
     ] {
         let command_name = args[0];
         match manager
@@ -434,8 +437,9 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
             .await
         {
             Ok(output) => {
-                successful &= output.success;
                 let command_help = format!("{}\n{}", output.stdout, output.stderr);
+                successful &= output.success
+                    && colmap_command_has_required_options(command_name, &command_help);
                 match command_name {
                     "feature_extractor" => feature_help = command_help.clone(),
                     "sequential_matcher" => matching_help = command_help.clone(),
@@ -466,7 +470,7 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
 
     let cli_family = detect_cli_family(&feature_help, &matching_help);
     let locked_build = super::colmap::is_locked_build(&feature_help);
-    successful &= locked_build;
+    successful &= colmap_identity_accepted(locked_build);
     successful &= cli_family.is_some();
     #[cfg(target_os = "macos")]
     let cpu_only = Some(true);
@@ -495,10 +499,17 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_owned());
+    let unavailable_reason = if cli_family.is_none() {
+        "COLMAP 缺少 OOOSplat 所需的 SIFT 提取或匹配参数".into()
+    } else if !colmap_identity_accepted(locked_build) {
+        "COLMAP 版本/commit 不匹配；请安装锁定的 COLMAP 4.2.1 引擎包".into()
+    } else {
+        "COLMAP 必需命令无法正常启动".into()
+    };
     let acceleration = if !successful {
         cpu_status(
             AccelerationReasonCode::ColmapUnavailable,
-            "COLMAP 必需命令不可用或版本/commit 不匹配；请安装锁定的 COLMAP 4.2.1 引擎包".into(),
+            unavailable_reason,
             None,
             requirements_or_default(engines_root),
         )
@@ -531,7 +542,12 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         None => format!("三个必需命令可启动；{family_label}；未明确报告 CUDA 构建状态"),
     };
     let ba = super::colmap_ba::select(path, acceleration.gpu_index()).await;
-    let detail = if !locked_build {
+    let detail = if !locked_build && cfg!(feature = "local-colmap") {
+        format!(
+            "{detail}；本地开发模式接受能力兼容的非锁定 COLMAP；{}",
+            ba.detail
+        )
+    } else if !locked_build {
         "COLMAP 版本/commit 不匹配；请安装锁定的 COLMAP 4.2.1 引擎包".into()
     } else {
         format!("{detail}；{}", ba.detail)
@@ -547,6 +563,37 @@ async fn check_colmap(path: &Path, engines_root: &Path) -> EngineStatus {
         colmap_cli_family: cli_family,
         detail,
     }
+}
+
+fn colmap_identity_accepted(locked_build: bool) -> bool {
+    locked_build || cfg!(feature = "local-colmap")
+}
+
+fn colmap_command_has_required_options(command: &str, help: &str) -> bool {
+    let required: &[&str] = match command {
+        "feature_extractor" => &[
+            "--database_path",
+            "--image_path",
+            "--image_list_path",
+            "--ImageReader.camera_model",
+            "--ImageReader.mask_path",
+            "--ImageReader.existing_camera_id",
+        ],
+        "sequential_matcher" => &["--database_path", "--SequentialMatching.overlap"],
+        "exhaustive_matcher" => &["--database_path"],
+        "matches_importer" => &["--database_path", "--match_list_path", "--match_type"],
+        "mapper" => &[
+            "--database_path",
+            "--image_path",
+            "--input_path",
+            "--output_path",
+            "--Mapper.image_list_path",
+            "--Mapper.fix_existing_frames",
+        ],
+        "bundle_adjuster" => &["--input_path", "--output_path"],
+        _ => return false,
+    };
+    required.iter().all(|option| help.contains(option))
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -885,7 +932,7 @@ fn parse_version(value: &str) -> Option<NumericVersion> {
     Some(NumericVersion(major, minor))
 }
 
-fn nvidia_smi_candidates() -> Vec<PathBuf> {
+pub(crate) fn nvidia_smi_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(windows)]
     match std::env::var_os("SystemRoot") {
@@ -1121,5 +1168,41 @@ mod tests {
         assert_eq!(macos_colmap_path(root), standalone);
         std::fs::remove_file(&standalone).unwrap();
         assert_eq!(macos_colmap_path(root), legacy);
+    }
+
+    #[test]
+    fn locked_colmap_identity_is_always_accepted() {
+        assert!(colmap_identity_accepted(true));
+    }
+
+    #[test]
+    fn local_colmap_capability_check_rejects_missing_options() {
+        let mapper = [
+            "--database_path",
+            "--image_path",
+            "--input_path",
+            "--output_path",
+            "--Mapper.image_list_path",
+            "--Mapper.fix_existing_frames",
+        ]
+        .join("\n");
+        assert!(colmap_command_has_required_options("mapper", &mapper));
+        assert!(!colmap_command_has_required_options(
+            "mapper",
+            &mapper.replace("--Mapper.fix_existing_frames", "")
+        ));
+        assert!(!colmap_command_has_required_options("unknown", &mapper));
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-colmap"))]
+    fn formal_build_rejects_an_unlocked_colmap_identity() {
+        assert!(!colmap_identity_accepted(false));
+    }
+
+    #[test]
+    #[cfg(feature = "local-colmap")]
+    fn local_build_accepts_an_unlocked_colmap_identity() {
+        assert!(colmap_identity_accepted(false));
     }
 }

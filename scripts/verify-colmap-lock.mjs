@@ -1,34 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
-import { workspace, buildLock, assertHashPin } from "./colmap-runtime.mjs";
+import { workspace, buildLock, runtimeLock, assertHashPin } from "./colmap-runtime.mjs";
+
 assertHashPin(buildLock.sourceSha256, "COLMAP source");
-if (buildLock.version !== "4.2.1" || buildLock.commit !== "bd1fcf654d2dd8fefa1466999c190a246f83f4b9") throw new Error("Unexpected COLMAP release");
-if (buildLock.cudaVersion !== "13.2.0") throw new Error("Unexpected CUDA release");
-const cudaIdentity = buildLock.cudaToolkitIdentity;
-for (const [name, version] of Object.entries({ cuda_nvcc: "13.2.51", cuda_cudart: "13.2.51", cuda_crt: "13.2.51", libcurand: "10.4.2.51" })) {
-  if (cudaIdentity?.components?.[name] !== version) throw new Error(`Unexpected CUDA component lock: ${name}`);
-}
-for (const [platform, metadataVersion] of Object.entries({ windows: "13.2.0", linux: "13.2.20260303" })) {
-  const identity = cudaIdentity?.platforms?.[platform];
-  if (identity?.metadataVersion !== metadataVersion) throw new Error(`Unexpected ${platform} CUDA metadata identity`);
-  assertHashPin(identity.metadataSha256, `${platform} CUDA metadata source`);
-  if (!identity.metadataUrl?.startsWith("https://developer.download.nvidia.com/compute/cuda/repos/") || !identity.metadataUrl.endsWith("/version_13.2.0.json")) throw new Error("Unexpected CUDA metadata source");
-}
+if (buildLock.version !== runtimeLock.colmapVersion || buildLock.commit !== runtimeLock.sourceCommit) throw new Error("Builder and published runtime source locks differ");
+if (buildLock.cudaVersion !== runtimeLock.cudaRelease || JSON.stringify(buildLock.cudaArchitectures) !== JSON.stringify(runtimeLock.gpuArchitectures)) throw new Error("Builder and published CUDA policies differ");
+if (runtimeLock.repository !== "ooolabdev/ooosplat-colmap" || runtimeLock.releaseTag !== "colmap-4.2.1-runtime.1" || runtimeLock.runtimeRevision !== 1) throw new Error("Unexpected COLMAP runtime Release");
+if (runtimeLock.scriptCommit !== "4c9b2bf412a2af4225b4ec9f3ffb9f2392c66aa1") throw new Error("Unexpected COLMAP runtime build-script commit");
+
 const manifests = ["manifest.json", "manifest.linux.json", "manifest.macos.json"].map(name => JSON.parse(fs.readFileSync(path.join(workspace, "engines", name), "utf8")));
-const entries = [manifests[0].engines.find(e => e.name === "COLMAP"), manifests[1].colmap, manifests[2].engines.find(e => e.name === "COLMAP")];
-for (const entry of entries) if (entry.version !== buildLock.version || entry.commit !== buildLock.commit) throw new Error("Platforms must use the same COLMAP source commit");
-if (entries[2].sourceSha256 !== buildLock.sourceSha256 || entries[2].sourceUrl !== buildLock.sourceUrl) throw new Error("macOS source lock differs");
+const entries = [manifests[0].engines.find(entry => entry.name === "COLMAP"), manifests[1].colmap, manifests[2].engines.find(entry => entry.name === "COLMAP")];
+for (const [index, platform] of ["windows", "linux", "macos"].entries()) {
+  const entry = entries[index], expected = runtimeLock.platforms[platform];
+  if (entry.version !== runtimeLock.colmapVersion || entry.commit !== runtimeLock.sourceCommit || entry.releaseTag !== runtimeLock.releaseTag) throw new Error(`${platform} manifest identity differs from the runtime lock`);
+  if (entry.sourceUrl !== expected.sourceUrl || entry.archiveSha256?.toLowerCase() !== expected.archiveSha256) {
+    // macOS retains sourceSha256 for compatibility with its mixed-engine license schema.
+    if (platform !== "macos" || entry.sourceUrl !== expected.sourceUrl || entry.sourceSha256?.toLowerCase() !== expected.archiveSha256) throw new Error(`${platform} manifest archive differs from the runtime lock`);
+  }
+}
 if (manifests[1].systemEngines.includes("colmap")) throw new Error("Linux system COLMAP is forbidden");
 for (const entry of entries.slice(0, 2)) {
   const cuda = entry.cudaCompatibility;
-  if (cuda.toolkitVersion !== buildLock.cudaVersion || cuda.architecturePolicy !== buildLock.cudaArchitectures.join(";") || cuda.minimumComputeCapability !== buildLock.minimumComputeCapability || (cuda.minimumDriver ?? cuda.minimumWindowsDriver) !== buildLock.minimumDriver) throw new Error("Platform CUDA lock differs");
-  if (!entry.sourceUrl.startsWith("https://github.com/ooolabdev/ooosplat/releases/download/")) throw new Error("Expected self-built versioned COLMAP release");
+  if (cuda.toolkitVersion !== runtimeLock.cudaRelease || cuda.architecturePolicy !== runtimeLock.gpuArchitectures.join(";")
+    || cuda.minimumComputeCapability !== buildLock.minimumComputeCapability
+    || (cuda.minimumDriver ?? cuda.minimumWindowsDriver) !== buildLock.minimumDriver) throw new Error("Platform CUDA lock differs");
 }
-if (process.argv.includes("--require-archives")) {
-  for (const entry of entries.slice(0, 2)) assertHashPin(entry.archiveSha256, "COLMAP runtime archive");
-  assertHashPin(manifests[0].requiredFiles.find(f => f.path === "engines/colmap/SHA256SUMS")?.sha256, "Windows integrity inventory");
-  assertHashPin(entries[1].integritySha256, "Linux integrity inventory");
-  assertHashPin(manifests[2].distribution.archiveSha256, "macOS runtime archive");
-  assertHashPin(manifests[2].distribution.integritySha256, "macOS integrity inventory");
+for (const [platform, expected] of Object.entries(runtimeLock.platforms)) {
+  assertHashPin(expected.archiveSha256, `${platform} COLMAP runtime archive`);
+  assertHashPin(expected.integritySha256, `${platform} COLMAP integrity inventory`);
+  assertHashPin(expected.buildInfoSha256, `${platform} COLMAP BUILD-INFO`);
+  if (!expected.sourceUrl.startsWith(`https://github.com/${runtimeLock.repository}/releases/download/${runtimeLock.releaseTag}/`)) throw new Error(`${platform} runtime URL is not pinned to the fork Release`);
 }
-console.log(`Verified three-platform COLMAP source/CUDA policy lock: ${buildLock.version} ${buildLock.commit}`);
+
+console.log(`Verified source builder plus three-platform ${runtimeLock.releaseTag} runtime lock.`);

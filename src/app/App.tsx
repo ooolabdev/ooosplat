@@ -9,6 +9,7 @@ import packageMetadata from "../../package.json";
 import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
+import { RuntimePanel } from "../components/RuntimePanel";
 import {
   cancelPipeline, checkEngines, confirmAndDeleteProject, confirmLargeImageSequence,
   estimateProjectRuntime, exportPly, getAppRuntimeStatus, getProjectOverview, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
@@ -37,11 +38,7 @@ const friendlyProgressKeyByStage: Record<string, TranslationKey> = {
 
 const countFromProgressEvent = (event: PipelineEvent, stage: string): { current: number; total: number } | null => {
   if (event.stage !== stage || event.total == null || event.total <= 0) return null;
-  const directCurrent = event.current;
-  const estimatedTrainingCurrent = stage === "trainingSplats" && event.stageProgress != null
-    ? Math.round(event.total * event.stageProgress / 100)
-    : null;
-  const current = directCurrent ?? estimatedTrainingCurrent;
+  const current = event.current;
   if (current == null || !Number.isFinite(current)) return null;
   return { current: Math.max(0, Math.min(event.total, current)), total: event.total };
 };
@@ -299,9 +296,11 @@ export function App() {
     ? friendlyProgressKeyByStage[progressEvent.stage]
     : undefined;
   const friendlyProgressCount = friendlyProgressKey && progressEvent
-    ? [progressEvent, ...store.events.slice().reverse()]
-      .map((event) => countFromProgressEvent(event, progressEvent.stage))
-      .find((count) => count != null) ?? null
+    ? progressEvent.stage === "trainingSplats" && store.latestRuntime?.training?.iteration != null && store.latestRuntime.training.total != null
+      ? { current: store.latestRuntime.training.iteration, total: store.latestRuntime.training.total }
+      : [progressEvent, ...store.events.slice().reverse()]
+        .map((event) => countFromProgressEvent(event, progressEvent.stage))
+        .find((count) => count != null) ?? null
     : null;
   const friendlyProgressMessage = friendlyProgressKey
     ? friendlyProgressCount
@@ -999,6 +998,7 @@ export function App() {
               return <li key={key} className={className}><span /><b>{t(label)}</b>{index === activeStageIndex && isRunning && <small>{progressEvent?.indeterminate ? t("progress.running") : `${(progressEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>;
             })}
           </ol>
+          {store.latestRuntime && <RuntimePanel snapshot={store.latestRuntime} running={isRunning} />}
           <div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: store.events.length })}</small></div>
           <div className="live-log" aria-live="polite" ref={liveLogRef} onScroll={updateLiveLogFollow}>
             {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString(locale, { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message)}</p></div>)}

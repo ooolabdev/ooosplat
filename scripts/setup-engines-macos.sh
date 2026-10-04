@@ -64,7 +64,7 @@ integrity_pin="$(read_manifest distribution.integritySha256)"
 if [[ "${OOOSPLAT_ENGINE_BUILD_VERIFY:-}" == "1" && -n "${OOOSPLAT_MACOS_ENGINE_ARCHIVE:-}" ]]; then
   integrity_pin="$(shasum -a 256 "$runtime_root/SHA256SUMS" | awk '{print $1}')"
 fi
-node "$workspace/scripts/colmap-runtime.mjs" "$runtime_root" macos "$integrity_pin"
+node "$workspace/scripts/colmap-runtime.mjs" "$runtime_root" macos "$integrity_pin" integrity
 
 staged="$temporary/runtime"
 mv "$runtime_root" "$staged"
@@ -75,7 +75,17 @@ mv "$runtime_root" "$staged"
 if [[ -f "$destination/README.md" ]]; then
   cp "$destination/README.md" "$staged/README.md"
 fi
+# The mixed runtime does not own standalone COLMAP. Preserve the previous
+# directory until the independent, atomic COLMAP installer has a verified
+# replacement ready; a download failure must not remove a working local copy.
+if [[ -d "$destination/colmap" ]]; then
+  cp -R "$destination/colmap" "$staged/colmap"
+fi
 rm -rf -- "$destination"
 mv "$staged" "$destination"
+
+# COLMAP is an independently versioned runtime and is never merged into the
+# FFmpeg/Brush directory, avoiding dylib and metadata collisions.
+node "$workspace/scripts/setup-colmap-runtime.mjs" macos
 
 "$workspace/scripts/verify-engines-macos.sh"

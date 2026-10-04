@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, VideoInfo } from "../types/pipeline";
+import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
 
 interface AppState {
   inputPath: string | null;
@@ -18,6 +18,8 @@ interface AppState {
   progress: number;
   progressMessage: string;
   latestEvent: PipelineEvent | null;
+  latestRuntime: RuntimeSnapshot | null;
+  lastEventSequence: number;
   events: PipelineEvent[];
   result: PipelineResult | null;
   error: string | null;
@@ -54,6 +56,8 @@ export const useAppStore = create<AppState>((set) => ({
   progress: 0,
   progressMessage: "",
   latestEvent: null,
+  latestRuntime: null,
+  lastEventSequence: 0,
   events: [],
   result: null,
   error: null,
@@ -68,6 +72,8 @@ export const useAppStore = create<AppState>((set) => ({
     progress: 0,
     progressMessage: "",
     latestEvent: null,
+    latestRuntime: null,
+    lastEventSequence: 0,
     events: [],
     result: null,
     error: null,
@@ -83,14 +89,19 @@ export const useAppStore = create<AppState>((set) => ({
   setEstimate: (estimate) => set({ estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
-  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, events: [], result: null, error: null }),
+  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null }),
   receiveEvent: (event) => set((state) => {
-    if (state.latestEvent && event.sequence > 0 && event.sequence <= state.latestEvent.sequence) return state;
+    if (event.sequence > 0 && event.sequence <= Math.max(state.lastEventSequence, state.latestEvent?.sequence ?? 0)) return state;
+    if (event.kind === "runtime") {
+      if (state.phase !== "running" || ["completed", "failed", "cancelled"].includes(state.latestEvent?.stage ?? "")) return state;
+      return { latestRuntime: event.runtime ?? state.latestRuntime, lastEventSequence: event.sequence };
+    }
     const events = [...state.events, event].slice(-500);
     const terminal = event.stage === "failed" || event.stage === "cancelled";
     return {
       events,
       latestEvent: event,
+      lastEventSequence: event.sequence,
       progress: terminal ? state.progress : Math.max(state.progress, Math.min(100, event.progress)),
       progressMessage: event.message,
       colmapAcceleration: event.acceleration ?? state.colmapAcceleration,

@@ -9,23 +9,9 @@
     "homebrewCoreCommit": "67A856E0A75FE0E5A822AE2D5A53538403AED8AE",
     "usePinnedHomebrewBottles": true,
     "buildTools": [
-      "cmake",
-      "ninja",
-      "pkg-config",
       "ccache"
     ],
-    "runtimeFormulae": [
-      "boost",
-      "eigen",
-      "freeimage",
-      "metis",
-      "glog",
-      "sqlite",
-      "suite-sparse",
-      "ceres-solver",
-      "openimageio",
-      "libomp"
-    ]
+    "runtimeFormulae": []
   },
   "distribution": {
     "tag": "engines-macos-arm64-v0.3.0",
@@ -52,9 +38,15 @@
       "name": "COLMAP",
       "version": "4.2.1",
       "commit": "bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
-      "sourceUrl": "https://codeload.github.com/colmap/colmap/tar.gz/bd1fcf654d2dd8fefa1466999c190a246f83f4b9",
-      "sourceSha256": "650B14EE60A365D63D4585ECF64DDEAC085AFE8B38E31FB860EDB66017932E36",
-      "buildPolicy": "Apple arm64 Ceres CPU CLI-only; CUDA, Caspar, GUI, OpenGL, MVS, ONNX, CGAL, LSD, downloads and tests disabled",
+      "releaseTag": "colmap-4.2.1-runtime.1",
+      "runtimeRevision": 1,
+      "buildScriptCommit": "4c9b2bf412a2af4225b4ec9f3ffb9f2392c66aa1",
+      "sourceUrl": "https://github.com/ooolabdev/ooosplat-colmap/releases/download/colmap-4.2.1-runtime.1/colmap-4.2.1-runtime.1-macos-arm64-4c9b2bf4-run37156867846-attempt1.tar.xz",
+      "sourceSha256": "FD7AC276A2B858E10F2BDDD7FEBFAC139C0D6F18B07D84C869C0363EB814530E",
+      "integritySha256": "C8558574235F4AFFF57EC02EE2223D16FFA3C2C8501640C4850386354A310FF7",
+      "buildInfoSha256": "1B058A9731CB98496C43FADF476AC6A66F7378EF90A8EB0DE161D3BC98ACED91",
+      "destination": "engines/macos/arm64/colmap",
+      "buildPolicy": "Pinned ooolabdev/ooosplat-colmap Apple arm64 Ceres CPU CLI-only Release; kept separate from FFmpeg and Brush",
       "license": "BSD-3-Clause",
       "licenseFiles": ["licenses/COLMAP-LICENSE.txt"]
     },
@@ -78,7 +70,6 @@
   "requiredFiles": [
     "bin/ffmpeg",
     "bin/ffprobe",
-    "bin/colmap",
     "bin/brush_app",
     "SHA256SUMS",
     "BUILD-INFO.json",

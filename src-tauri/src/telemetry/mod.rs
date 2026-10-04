@@ -336,6 +336,7 @@ mod tests {
             unit: None,
             elapsed_ms: 0,
             acceleration: None,
+            runtime: None,
         }
     }
 

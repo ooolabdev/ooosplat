@@ -95,7 +95,7 @@ export interface ReshootInputInfo {
 export interface PipelineEvent {
   sequence: number;
   timestamp: string;
-  kind: "stage" | "progress" | "log" | "heartbeat" | "capability";
+  kind: "stage" | "progress" | "log" | "heartbeat" | "capability" | "runtime";
   level: "info" | "warning" | "error";
   stage: string;
   engine: "system" | "ffmpeg" | "colmap" | "brush" | null;
@@ -108,6 +108,42 @@ export interface PipelineEvent {
   unit: string | null;
   elapsedMs: number;
   acceleration: ColmapAccelerationStatus | null;
+  runtime?: RuntimeSnapshot | null;
+}
+
+export interface RuntimeSnapshot {
+  processId: number;
+  phase: string;
+  updatedAt: string;
+  lastOutputAgeMs: number;
+  training: {
+    iteration: number | null;
+    total: number | null;
+    startIter: number;
+    lod: number;
+    stepsPerSecond: number | null;
+    remainingSeconds: number | null;
+    splatCount: number | null;
+    psnr: number | null;
+    ssim: number | null;
+  } | null;
+  device: string | null;
+  backend: string | null;
+  config: Record<string, string>;
+  resources: {
+    processId: number;
+    sampledAt: string;
+    cpuPercent: number | null;
+    memoryBytes: number | null;
+    gpuStatus: "available" | "unavailable" | "unsupported";
+    gpus: Array<{
+      uuid: string;
+      name: string;
+      utilizationPercent: number | null;
+      memoryUsedMib: number | null;
+      memoryTotalMib: number | null;
+    }>;
+  } | null;
 }
 
 export interface PipelineResult {
