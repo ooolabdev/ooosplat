@@ -73,7 +73,7 @@ tar -xJf "$ffmpeg_archive" -C "$build/ffmpeg-source" --strip-components=1
   make -j"$jobs"
   make install
 )
-rm -rf -- "$stage/include" "$stage/share"
+rm -rf -- "$stage/include" "$stage/share" "$stage/lib/pkgconfig"
 for ffmpeg_library in "$stage/lib"/*; do
   [[ -f "$ffmpeg_library" ]] || continue
   printf '%s\t%s\tbuilt-ffmpeg\n' "$(basename "$ffmpeg_library")" "$ffmpeg_library" >> "$dependency_origins"

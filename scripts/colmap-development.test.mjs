@@ -138,6 +138,7 @@ test("platform build scripts fail early and prepare macOS license destinations",
   }
   const macos = read("scripts/build-engines-macos.sh");
   assert.match(macos, /mkdir -p[^\n]*"\$stage\/licenses"/);
+  assert.match(macos, /rm -rf[^\n]*"\$stage\/lib\/pkgconfig"/);
   const packageJson = JSON.parse(read("package.json"));
   assert.match(packageJson.scripts["build:bundle"], /clean:tauri-engine-resources/);
 });
