@@ -15,6 +15,14 @@ function partialResponse(bytes: Uint8Array, start: number, total: number) {
   });
 }
 
+function bytesEqual(left: Uint8Array, right: Uint8Array) {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 describe("large PLY range loading", () => {
   it("only enables ranges above 256 MiB", () => {
     expect(shouldUseSplatRange(SPLAT_RANGE_THRESHOLD_BYTES)).toBe(false);
@@ -62,7 +70,11 @@ describe("large PLY range loading", () => {
       progress.push(received / total);
     }
 
-    expect(loaded).toEqual(sourceBytes);
+    // Vitest's recursive equality and diff preparation are disproportionately
+    // expensive for multi-megabyte typed arrays on Windows and macOS runners.
+    // A direct byte comparison preserves the full-content assertion without
+    // making this range-stream test depend on runner speed.
+    expect(bytesEqual(loaded, sourceBytes)).toBe(true);
     expect(ranges).toEqual([
       `bytes=0-${SPLAT_RANGE_CHUNK_BYTES - 1}`,
       `bytes=${SPLAT_RANGE_CHUNK_BYTES}-${SPLAT_RANGE_CHUNK_BYTES * 2 - 1}`,
@@ -78,7 +90,7 @@ describe("large PLY range loading", () => {
       expect(init?.cache).toBe("no-store");
       expect(new Headers(init?.headers).has("range")).toBe(true);
     }
-  });
+  }, 15_000);
 
   it("aborts an in-flight range request idempotently", async () => {
     let capturedSignal: AbortSignal | undefined;
