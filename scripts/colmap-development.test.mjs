@@ -131,6 +131,11 @@ test("source and legacy engine builders are manual-only while application workfl
 test("platform build scripts fail early and prepare macOS license destinations", () => {
   const windows = read(".github/workflows/windows.yml");
   assert.match(windows, /\$PSNativeCommandUseErrorActionPreference = \$true/);
+  for (const script of ["setup-engines.ps1", "verify-engines.ps1"]) {
+    const powershell = read(`scripts/${script}`);
+    assert.match(powershell, /System\.Security\.Cryptography\.SHA256/);
+    assert.doesNotMatch(powershell, /Get-FileHash/);
+  }
   const macos = read("scripts/build-engines-macos.sh");
   assert.match(macos, /mkdir -p[^\n]*"\$stage\/licenses"/);
   const packageJson = JSON.parse(read("package.json"));

@@ -3,6 +3,21 @@ $workspace = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $workspace 'engines\manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Missing engine manifest: $manifestPath" }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+
+function Get-Sha256([string]$Path) {
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    } finally {
+      $sha256.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 $colmapManifest = $manifest.engines | Where-Object { $_.name -eq 'COLMAP' } | Select-Object -First 1
 if (-not $colmapManifest) { throw 'Engine manifest is missing the COLMAP entry.' }
 $integrityPin = ($manifest.requiredFiles | Where-Object { $_.path -eq 'engines/colmap/SHA256SUMS' }).sha256
@@ -16,7 +31,7 @@ if ($cudaCompatibility.minimumComputeCapability -notmatch '^\d+\.\d+$') { throw 
 foreach ($item in $manifest.requiredFiles) {
   $path = Join-Path $workspace $item.path
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing engine file: $($item.path). Run 'npm run setup:engines' first." }
-  $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+  $actual = Get-Sha256 $path
   if ($actual -ne $item.sha256) { throw "Hash mismatch for $($item.path): $actual" }
 }
 $integrityPin = ($manifest.requiredFiles | Where-Object { $_.path -eq 'engines/colmap/SHA256SUMS' }).sha256

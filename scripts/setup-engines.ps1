@@ -16,6 +16,21 @@ $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 # the other engines or silently accept the previously downloaded official zip.
 & node (Join-Path $PSScriptRoot 'setup-colmap-runtime.mjs') windows
 if ($LASTEXITCODE -ne 0) { throw 'Locked COLMAP runtime installation failed.' }
+
+function Get-Sha256([string]$Path) {
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    } finally {
+      $sha256.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 if (-not $CacheDirectory) {
   $CacheDirectory = Join-Path $workspace '.cache\engines'
 }
@@ -38,7 +53,7 @@ function Test-RequiredFiles($Engine, [string]$Destination) {
   foreach ($item in $required) {
     $path = Join-Path $workspace $item.path
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $item.sha256) { return $false }
+    if ((Get-Sha256 $path) -ne $item.sha256) { return $false }
   }
   return $true
 }
@@ -58,7 +73,7 @@ foreach ($engine in $manifest.engines) {
   $archivePath = Join-Path $CacheDirectory $install.archiveName
   $download = $true
   if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
-    $download = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash -ne $engine.archiveSha256
+    $download = (Get-Sha256 $archivePath) -ne $engine.archiveSha256
     if ($download) {
       Write-Warning "Cached archive hash changed; downloading a clean copy for $($engine.name)."
       Remove-Item -LiteralPath $archivePath -Force
@@ -72,7 +87,7 @@ foreach ($engine in $manifest.engines) {
     Write-Host "Using cached archive: $($install.archiveName)"
   }
 
-  $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+  $archiveHash = Get-Sha256 $archivePath
   if ($archiveHash -ne $engine.archiveSha256) {
     throw "Archive hash mismatch for $($engine.name). Expected $($engine.archiveSha256), got $archiveHash. The upstream asset may have changed; update manifest.json only after reviewing the new release."
   }
