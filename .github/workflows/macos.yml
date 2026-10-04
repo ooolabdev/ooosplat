@@ -69,7 +69,15 @@ jobs:
         run: bash scripts/setup-macos-build-deps.sh
 
       - name: Build FFmpeg/Brush and install the pinned COLMAP Release
-        run: npm run build:engines:macos
+        run: |
+          npm run build:engines:macos
+          archive_name="$(node -p "require('./engines/manifest.macos.json').distribution.archiveName")"
+          archive="$GITHUB_WORKSPACE/dist-engines/$archive_name"
+          test -f "$archive"
+          {
+            echo "OOOSPLAT_ENGINE_BUILD_VERIFY=1"
+            echo "OOOSPLAT_MACOS_ENGINE_ARCHIVE=$archive"
+          } >> "$GITHUB_ENV"
 
       - name: Rust formatting, tests, and clippy
         run: |

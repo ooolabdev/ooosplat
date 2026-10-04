@@ -221,6 +221,10 @@ test("macOS mixed runtime no longer compiles COLMAP while the manual COLMAP-only
   assert.doesNotMatch(mixed, /^build_macos_colmap$|^collect_macos_colmap_notices$|colmap_archive=/m);
   for (const functionName of ["build_macos_colmap", "collect_macos_colmap_notices", "bundle_macos_runtime"]) assert.match(only, new RegExp(`^${functionName}$`, "m"));
   assert.match(read("scripts/setup-engines-macos.sh"), /setup-colmap-runtime\.mjs" macos/);
+  const applicationWorkflow = read(".github/workflows/macos.yml");
+  assert.match(applicationWorkflow, /OOOSPLAT_ENGINE_BUILD_VERIFY=1/);
+  assert.match(applicationWorkflow, /OOOSPLAT_MACOS_ENGINE_ARCHIVE=\$archive/);
+  assert.match(applicationWorkflow, />> "\$GITHUB_ENV"/);
   assert.doesNotMatch(only, /brush_archive|ffmpeg_archive|engine_field (?:Brush|'FFmpeg)|setup-engines-macos/);
   assert.match(only, /package-colmap-macos-runtime\.mjs/);
   const common = read("scripts/colmap-macos-common.sh");
