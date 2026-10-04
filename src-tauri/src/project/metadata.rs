@@ -171,6 +171,10 @@ pub struct ProjectMetadata {
     #[serde(default)]
     pub app_id: String,
     pub id: Uuid,
+    /// Stable frontend draft identity used to reconcile a running task with
+    /// the project created by the pipeline. Older projects do not have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_task_id: Option<Uuid>,
     #[serde(default)]
     pub name: String,
     pub created_at: DateTime<Utc>,
@@ -239,7 +243,7 @@ pub struct ReshootProvenance {
 }
 
 pub const fn schema_version() -> u32 {
-    6
+    7
 }
 
 fn default_model() -> String {
@@ -476,6 +480,7 @@ mod tests {
         assert_eq!(metadata.transform, GaussianTransform::default());
         assert_eq!(metadata.editing, GaussianEditing::default());
         assert_eq!(metadata.input_type, ProjectInputType::Video);
+        assert_eq!(metadata.workspace_task_id, None);
         assert_eq!(metadata.schema_version, 2);
     }
 

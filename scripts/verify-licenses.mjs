@@ -259,6 +259,16 @@ for (const marker of [
 }
 assertContains(readText("src-tauri/Cargo.toml"), 'image = { version = "0.25"', "Cargo.toml");
 
+for (const marker of [
+  "Tauri single-instance plugin",
+  "2.4.5",
+  "Apache License 2.0 OR MIT License",
+  "https://crates.io/crates/tauri-plugin-single-instance/2.4.5",
+]) {
+  assertContains(thirdParty, marker, "THIRD_PARTY_NOTICES.txt");
+}
+assertContains(readText("src-tauri/Cargo.toml"), 'tauri-plugin-single-instance = "2"', "Cargo.toml");
+
 const ffmpegLicense = readText("licenses/FFmpeg-LGPL-2.1.txt");
 assertContains(ffmpegLicense, "GNU LESSER GENERAL PUBLIC LICENSE", "FFmpeg license");
 assertContains(ffmpegLicense, "Version 2.1, February 1999", "FFmpeg license");

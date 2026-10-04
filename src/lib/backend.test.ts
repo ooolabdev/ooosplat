@@ -12,7 +12,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(), open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
-import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
 
 describe("backend browser guards", () => {
   it("submits only opaque diagnostic tokens, never frontend paths or report payloads", async () => {
@@ -39,13 +39,19 @@ describe("backend browser guards", () => {
 
   it("uses validated backend commands for runtime state and project folders", async () => {
     (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-    mocks.invoke.mockResolvedValueOnce({ pipelineRunning: false, previewProjectId: null });
-    await expect(getAppRuntimeStatus()).resolves.toEqual({ pipelineRunning: false, previewProjectId: null });
+    mocks.invoke.mockResolvedValueOnce({ pipelineRunning: false, previewProjectId: null, taskAcceleration: null });
+    await expect(getAppRuntimeStatus()).resolves.toEqual({ pipelineRunning: false, previewProjectId: null, taskAcceleration: null });
     await revealProject({ id: "project-id" } as Parameters<typeof revealProject>[0]);
     await revealProjectLogs("project-id");
 
     expect(mocks.invoke).toHaveBeenNthCalledWith(1, "get_app_runtime_status");
     expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_project_location", { projectId: "project-id", location: "project" });
     expect(mocks.invoke).toHaveBeenNthCalledWith(3, "open_project_location", { projectId: "project-id", location: "logs" });
+  });
+
+  it("classifies a native drop through the dedicated path-only command", async () => {
+    mocks.invoke.mockResolvedValueOnce({ inputType: "video" });
+    await expect(classifyDroppedInput("E:\\素材\\clip.mov")).resolves.toEqual({ inputType: "video" });
+    expect(mocks.invoke).toHaveBeenCalledWith("classify_dropped_input", { path: "E:\\素材\\clip.mov" });
   });
 });

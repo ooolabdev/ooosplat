@@ -7,5 +7,5 @@ pub mod health;
 
 pub use health::{
     AccelerationReasonCode, AccelerationRequirements, ColmapAccelerationStatus, ColmapBackend,
-    EngineKind, EnginePaths, EngineStatus, GpuDeviceInfo,
+    EngineKind, EnginePaths, EngineStatus, GpuDetectionState, GpuDeviceInfo,
 };

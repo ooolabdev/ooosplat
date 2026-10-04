@@ -132,6 +132,15 @@ License text: licenses/Mediabunny-MPL-2.0.txt
 Upstream source: https://github.com/Vanilagy/mediabunny/tree/v1.52.3
 Distributed source package: https://www.npmjs.com/package/mediabunny/v/1.52.3
 
+Tauri single-instance plugin
+----------------------------
+Version: 2.4.5
+Use: Prevent a second desktop application process and focus the existing window.
+License: Apache License 2.0 OR MIT License
+Selected distribution license: Apache-2.0
+License text: LICENSE
+Upstream source: https://crates.io/crates/tauri-plugin-single-instance/2.4.5
+
 image crate
 -----------
 Version: 0.25.10

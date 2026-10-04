@@ -53,7 +53,9 @@ use crate::{
         ProjectPaths, ProjectStatus, ReshootProvenance, ReshootState,
     },
     reconstruction::{
-        colmap_model::{read_registered_images, read_single_camera, required_model_files},
+        colmap_model::{
+            read_registered_images, read_single_camera, reusable_model_files, ColmapCamera,
+        },
         ply::inspect_gaussian_ply,
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
@@ -105,6 +107,7 @@ pub struct ReshootSourceInfo {
     pub project_id: String,
     pub project_name: String,
     pub quality: Quality,
+    pub planner_enabled: bool,
     pub camera_id: u32,
     pub camera_model: String,
     pub width: u64,
@@ -318,6 +321,7 @@ pub struct PipelineFailureContext {
 #[derive(Debug, Clone)]
 struct ActiveProjectContext {
     project_id: uuid::Uuid,
+    workspace_task_id: Option<uuid::Uuid>,
     project_path: PathBuf,
     logs_directory: PathBuf,
 }
@@ -327,8 +331,19 @@ pub struct PipelineRunner {
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
+    current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
+    workspace_task_id: Option<uuid::Uuid>,
     planner_enabled: bool,
     effectiveness: Option<PlannerEffectivenessTracker>,
+}
+
+fn inherit_reshoot_planner_settings(source: &PipelineStateFile, target: &mut PipelineStateFile) {
+    target.planner_enabled = source.planner_enabled;
+    target.resolution_policy_version = source.resolution_policy_version;
+}
+
+fn reshoot_project_name(source_name: &str) -> String {
+    format!("{source_name}_补拍")
 }
 
 impl PipelineRunner {
@@ -353,6 +368,8 @@ impl PipelineRunner {
                 started: Instant::now(),
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
+            current_acceleration: Arc::new(std::sync::Mutex::new(None)),
+            workspace_task_id: None,
             planner_enabled,
             effectiveness: None,
         }
@@ -361,6 +378,19 @@ impl PipelineRunner {
     pub fn with_effectiveness_tracker(mut self, tracker: PlannerEffectivenessTracker) -> Self {
         self.effectiveness = Some(tracker);
         self
+    }
+
+    pub fn with_workspace_task_id(mut self, workspace_task_id: Option<uuid::Uuid>) -> Self {
+        self.workspace_task_id = workspace_task_id;
+        self
+    }
+
+    pub fn current_project_identity(&self) -> Option<(uuid::Uuid, Option<uuid::Uuid>)> {
+        self.active_project
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|project| (project.project_id, project.workspace_task_id))
     }
 
     pub fn cancel(&self) {
@@ -390,10 +420,17 @@ impl PipelineRunner {
         }
     }
 
+    pub fn current_acceleration(&self) -> Option<crate::engines::ColmapAccelerationStatus> {
+        self.current_acceleration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn verify_pipeline_engines(
         &self,
     ) -> Result<crate::engines::ColmapAccelerationStatus> {
-        let statuses = self.engines.check_all().await;
+        let statuses = self.engines.check_all_for_task().await;
         for required in [
             EngineKind::Ffmpeg,
             EngineKind::Ffprobe,
@@ -416,11 +453,16 @@ impl PipelineRunner {
         }
         colmap::require_verified_cli(&self.engines.colmap)?;
         brush::require_verified_cli(&self.engines.brush)?;
-        statuses
+        let acceleration = statuses
             .into_iter()
             .find(|status| status.kind == EngineKind::Colmap)
             .and_then(|status| status.acceleration)
-            .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))
+            .ok_or_else(|| SplatError::UnsupportedEngine("无法确定 COLMAP 自动加速状态".into()))?;
+        *self
+            .current_acceleration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(acceleration.clone());
+        Ok(acceleration)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -755,6 +797,10 @@ impl PipelineRunner {
         } else {
             project_manager.create(input, quality).await?
         };
+        metadata.workspace_task_id = self.workspace_task_id;
+        project_manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
         state.planner_enabled = self.planner_enabled;
         state.resolution_policy_version = self
@@ -778,6 +824,7 @@ impl PipelineRunner {
             project_id: project_id.to_string(),
             project_name: metadata.name.clone(),
             quality: metadata.quality,
+            planner_enabled: false,
             camera_id: 0,
             camera_model: String::new(),
             width: 0,
@@ -790,6 +837,9 @@ impl PipelineRunner {
             info.reason = Some("只有已完成且结果完整的项目可以进行高清补拍".into());
             return Ok(info);
         }
+        let source_state: PipelineStateFile =
+            serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
+        info.planner_enabled = source_state.planner_enabled;
         let frames = project.join("work/frames");
         let database = project.join("work/colmap/database.db");
         if !database.is_file()
@@ -798,21 +848,29 @@ impl PipelineRunner {
             info.reason = Some("原项目缺少相机重建数据库，无法进行增量补拍".into());
             return Ok(info);
         }
-        let sparse = project.join("work/colmap/sparse");
-        let (model, _) = match best_sparse_model(&frames, &sparse).await {
-            Ok(value) => value,
-            Err(error) => {
-                info.reason = Some(format!("原项目的相机重建结果不可用：{error}"));
-                return Ok(info);
-            }
-        };
+        let reconstruction =
+            match reusable_reconstruction(&project, &frames, metadata.output.as_ref()).await {
+                Ok(value) => value,
+                Err(error) => {
+                    info.reason = Some(format!("原项目的相机重建结果不可用：{error}"));
+                    return Ok(info);
+                }
+            };
+        let expected_registered_images = reconstruction.report.registered_images;
+        let model = reconstruction.model;
+        let database_for_validation = database.clone();
         let parsed = tokio::task::spawn_blocking(move || {
             let camera = read_single_camera(&model)?;
             let images = read_registered_images(&model)?;
+            validate_database_camera(&database_for_validation, &camera)?;
             Ok::<_, SplatError>((camera, images))
         })
         .await
         .map_err(|error| SplatError::Process(format!("读取原项目相机信息失败：{error}")))??;
+        if parsed.1.len() as u64 != expected_registered_images {
+            info.reason = Some("原项目的注册图片记录与稀疏模型统计不一致".into());
+            return Ok(info);
+        }
         if parsed.1.iter().any(|image| image.camera_id != parsed.0.id) {
             info.reason = Some("原项目包含多个相机，暂时不能进行同相机增量补拍".into());
             return Ok(info);
@@ -972,6 +1030,8 @@ impl PipelineRunner {
         self.events.acceleration(acceleration.clone());
         let (source_root, source_metadata) =
             catalog::load_registered_project(source_project_id).await?;
+        let source_state: PipelineStateFile =
+            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
         let project_manager = ProjectManager::with_root(projects_root.to_path_buf());
         let (paths, mut metadata) = if input_type == ReshootInputType::Images {
             let events = self.events.clone();
@@ -1011,7 +1071,8 @@ impl PipelineRunner {
                 .await?
         };
         let stored_source = metadata.source_path.clone();
-        metadata.name = format!("{}_高清补拍", source_metadata.name);
+        metadata.name = reshoot_project_name(&source_metadata.name);
+        metadata.workspace_task_id = self.workspace_task_id;
         metadata.transform = source_metadata.transform;
         metadata.editing = Default::default();
         metadata.reshoot = Some(ReshootProvenance {
@@ -1033,6 +1094,7 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
+        inherit_reshoot_planner_settings(&source_state, &mut state);
         state.reshoot = Some(ReshootState {
             source_image_count: source.source_image_count,
             reshoot_frame_count: input.estimated_frames,
@@ -1089,6 +1151,7 @@ impl PipelineRunner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveProjectContext {
             project_id: paths.id,
+            workspace_task_id: metadata.workspace_task_id,
             project_path: paths.project.clone(),
             logs_directory: paths.logs.clone(),
         });
@@ -1154,10 +1217,30 @@ impl PipelineRunner {
             .clone()
             .ok_or_else(|| SplatError::Process("补拍项目缺少来源信息".into()))?;
         let mut checkpoint = state.reshoot.clone().unwrap_or_default();
-        let source_frames = provenance.source_project_path.join("work/frames");
-        let source_database = provenance
-            .source_project_path
-            .join("work/colmap/database.db");
+        let source_root = &provenance.source_project_path;
+        let source_frames = source_root.join("work/frames");
+        let source_database = source_root.join("work/colmap/database.db");
+        let source_metadata: ProjectMetadata =
+            serde_json::from_slice(&tokio::fs::read(source_root.join("project.json")).await?)?;
+        let source_reconstruction =
+            reusable_reconstruction(source_root, &source_frames, source_metadata.output.as_ref())
+                .await?;
+        if !source_database.is_file()
+            || std::fs::metadata(&source_database).map_or(true, |value| value.len() == 0)
+        {
+            return Err(SplatError::Process(
+                "原项目缺少可复用的 COLMAP 数据库".into(),
+            ));
+        }
+        let source_model_for_validation = source_reconstruction.model.clone();
+        let source_database_for_validation = source_database.clone();
+        tokio::task::spawn_blocking(move || {
+            let camera = read_single_camera(&source_model_for_validation)?;
+            validate_database_camera(&source_database_for_validation, &camera)
+        })
+        .await
+        .map_err(|error| SplatError::Process(format!("校验补拍基线模型失败：{error}")))??;
+        let source_model_files = reusable_model_files(&source_reconstruction.model)?;
         let base_model = paths.colmap.join("base-model");
         let database = paths.colmap.join("database.db");
         let base_database = paths.colmap.join("base-database.db");
@@ -1178,12 +1261,8 @@ impl PipelineRunner {
             || !snapshot_frames_valid
             || !snapshot_database_valid
             || !base_database_valid
-            || required_model_files(&base_model)
-                .iter()
-                .any(|path| !path.is_file())
+            || !model_snapshot_matches(&source_model_files, &base_model)
         {
-            let source_sparse = provenance.source_project_path.join("work/colmap/sparse");
-            let (source_model, _) = best_sparse_model(&source_frames, &source_sparse).await?;
             self.events.stage(
                 PipelineStage::ExtractingFrames,
                 0.0,
@@ -1196,7 +1275,7 @@ impl PipelineRunner {
             tokio::fs::copy(&source_database, &base_database).await?;
             tokio::fs::copy(&base_database, &database).await?;
             tokio::fs::create_dir_all(&base_model).await?;
-            for source in required_model_files(&source_model) {
+            for source in &source_model_files {
                 let name = source.file_name().expect("model file has name");
                 tokio::fs::copy(&source, base_model.join(name)).await?;
             }
@@ -3684,6 +3763,250 @@ async fn reset_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct ReusableReconstruction {
+    model: PathBuf,
+    report: ReconstructionReport,
+}
+
+#[derive(Debug)]
+struct ReusableModelCandidate {
+    model: PathBuf,
+    report: ReconstructionReport,
+    candidate_id: Option<String>,
+}
+
+async fn reusable_reconstruction(
+    project: &Path,
+    frames: &Path,
+    output: Option<&ProjectOutput>,
+) -> Result<ReusableReconstruction> {
+    let project = project.to_path_buf();
+    let frames = frames.to_path_buf();
+    let output = output.cloned();
+    tokio::task::spawn_blocking(move || {
+        reusable_reconstruction_blocking(&project, &frames, output.as_ref())
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("读取可复用重建模型失败：{error}")))?
+}
+
+fn reusable_reconstruction_blocking(
+    project: &Path,
+    frames: &Path,
+    output: Option<&ProjectOutput>,
+) -> Result<ReusableReconstruction> {
+    let colmap = project.join("work/colmap");
+    let selected_candidate = selected_reconstruction_candidate(project)?;
+    let mut models = Vec::new();
+
+    collect_reusable_models(frames, &colmap.join("sparse"), None, &mut models)?;
+    let candidates = colmap.join("candidates");
+    if candidates.is_dir()
+        && !std::fs::symlink_metadata(&candidates)?
+            .file_type()
+            .is_symlink()
+    {
+        for entry in std::fs::read_dir(&candidates)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !safe_candidate_id(&id) {
+                continue;
+            }
+            collect_reusable_models(frames, &entry.path(), Some(id), &mut models)?;
+        }
+    }
+
+    if models.is_empty() {
+        return Err(SplatError::Process(
+            "原项目缺少可复用的 COLMAP 稀疏重建模型（已检查 sparse 与 candidates）".into(),
+        ));
+    }
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+
+    let selected_models = selected_candidate.as_deref().map(|selected| {
+        models
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.candidate_id.as_deref() == Some(selected))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    });
+    let pool = selected_models
+        .as_ref()
+        .filter(|indices| !indices.is_empty())
+        .cloned()
+        .unwrap_or_else(|| (0..models.len()).collect());
+    let exact = output.map(|output| {
+        pool.iter()
+            .copied()
+            .filter(|index| {
+                let report = &models[*index].report;
+                report.registered_images == output.registered_images
+                    && report.points_3d == output.points_3d
+            })
+            .collect::<Vec<_>>()
+    });
+    let pool = exact
+        .as_ref()
+        .filter(|indices| !indices.is_empty())
+        .unwrap_or(&pool);
+    let best = pool
+        .iter()
+        .copied()
+        .max_by(|left, right| compare_reusable_models(&models[*left], &models[*right]))
+        .expect("a non-empty model pool");
+    let selected = models.swap_remove(best);
+    Ok(ReusableReconstruction {
+        model: selected.model,
+        report: selected.report,
+    })
+}
+
+fn compare_reusable_models(
+    left: &ReusableModelCandidate,
+    right: &ReusableModelCandidate,
+) -> std::cmp::Ordering {
+    left.report
+        .registered_images
+        .cmp(&right.report.registered_images)
+        .then_with(|| left.report.points_3d.cmp(&right.report.points_3d))
+        .then_with(|| right.model.cmp(&left.model))
+}
+
+fn collect_reusable_models(
+    frames: &Path,
+    root: &Path,
+    candidate_id: Option<String>,
+    output: &mut Vec<ReusableModelCandidate>,
+) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Ok(());
+    }
+    if let Some(report) = validate_reusable_model(frames, root) {
+        output.push(ReusableModelCandidate {
+            model: root.to_path_buf(),
+            report,
+            candidate_id: candidate_id.clone(),
+        });
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(report) = validate_reusable_model(frames, &path) {
+            output.push(ReusableModelCandidate {
+                model: path,
+                report,
+                candidate_id: candidate_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_reusable_model(frames: &Path, model: &Path) -> Option<ReconstructionReport> {
+    reusable_model_files(model).ok()?;
+    ReconstructionValidator::validate(frames, model).ok()
+}
+
+fn selected_reconstruction_candidate(project: &Path) -> Result<Option<String>> {
+    for path in [
+        project.join("state.json"),
+        project.join("logs/planner.json"),
+    ] {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let selected = value
+            .pointer("/planner/bestReconstructionId")
+            .or_else(|| value.pointer("/bestReconstructionId"))
+            .and_then(serde_json::Value::as_str);
+        let Some(selected) = selected else {
+            continue;
+        };
+        if !safe_candidate_id(selected) {
+            return Err(SplatError::Process(
+                "项目记录的 COLMAP 候选模型标识不安全，已拒绝访问".into(),
+            ));
+        }
+        return Ok(Some(selected.to_owned()));
+    }
+    Ok(None)
+}
+
+fn safe_candidate_id(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\', ':'])
+}
+
+fn validate_database_camera(database: &Path, camera: &ColmapCamera) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| SplatError::Process(format!("无法读取原项目 COLMAP 数据库：{error}")))?;
+    let stored = connection
+        .query_row(
+            "SELECT model, width, height FROM cameras WHERE camera_id = ?1",
+            [camera.id],
+            |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| SplatError::Process(format!("校验原项目相机数据库失败：{error}")))?;
+    let Some((model, width, height)) = stored else {
+        return Err(SplatError::Process(format!(
+            "原项目 COLMAP 数据库缺少相机 ID {}",
+            camera.id
+        )));
+    };
+    if model != camera.model_id || width != camera.width as i64 || height != camera.height as i64 {
+        return Err(SplatError::Process(
+            "原项目 COLMAP 数据库与最终稀疏模型的相机信息不一致".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn model_snapshot_matches(source_files: &[PathBuf], snapshot: &Path) -> bool {
+    source_files.iter().all(|source| {
+        let Some(name) = source.file_name() else {
+            return false;
+        };
+        let destination = snapshot.join(name);
+        match (std::fs::metadata(source), std::fs::metadata(destination)) {
+            (Ok(source), Ok(destination)) => {
+                source.is_file() && destination.is_file() && source.len() == destination.len()
+            }
+            _ => false,
+        }
+    })
+}
+
 async fn best_sparse_model(
     frames: &Path,
     sparse: &Path,
@@ -3839,6 +4162,31 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reshoot_project_name_uses_the_short_suffix() {
+        assert_eq!(reshoot_project_name("示例项目"), "示例项目_补拍");
+    }
+
+    #[test]
+    fn reshoot_inherits_source_planner_settings() {
+        for planner_enabled in [false, true] {
+            let mut source = PipelineStateFile::created(Quality::Balanced);
+            source.planner_enabled = planner_enabled;
+            source.resolution_policy_version = planner_enabled.then_some(7);
+            let mut target = PipelineStateFile::created(Quality::Balanced);
+            target.planner_enabled = !planner_enabled;
+            target.resolution_policy_version = (!planner_enabled).then_some(3);
+
+            inherit_reshoot_planner_settings(&source, &mut target);
+
+            assert_eq!(target.planner_enabled, planner_enabled);
+            assert_eq!(
+                target.resolution_policy_version,
+                source.resolution_policy_version
+            );
+        }
+    }
+
     #[tokio::test]
     async fn image_preparation_emits_monotonic_phase_progress() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3933,6 +4281,156 @@ mod tests {
 
         assert_eq!(model, sparse.join("0"));
         assert_eq!(report.registered_images, 1);
+    }
+
+    #[test]
+    fn reusable_reconstruction_prefers_the_planner_selected_candidate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path();
+        let frames = project.join("work/frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        for index in 0..3 {
+            std::fs::write(frames.join(format!("frame_{index}.jpg")), b"frame").unwrap();
+        }
+        let selected = project.join("work/colmap/candidates/selected/1");
+        let other = project.join("work/colmap/candidates/other/0");
+        write_validator_model(&selected, 2, 20);
+        write_validator_model(&other, 3, 30);
+        std::fs::write(
+            project.join("state.json"),
+            br#"{"planner":{"bestReconstructionId":"selected"}}"#,
+        )
+        .unwrap();
+        let output = ProjectOutput {
+            registered_images: 3,
+            points_3d: 30,
+            ..Default::default()
+        };
+
+        let resolved = reusable_reconstruction_blocking(project, &frames, Some(&output)).unwrap();
+
+        assert_eq!(resolved.model, selected);
+        assert_eq!(resolved.report.registered_images, 2);
+    }
+
+    #[test]
+    fn reusable_reconstruction_uses_output_metrics_without_a_planner_record() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path();
+        let frames = project.join("work/frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        for index in 0..3 {
+            std::fs::write(frames.join(format!("frame_{index}.jpg")), b"frame").unwrap();
+        }
+        let expected = project.join("work/colmap/candidates/expected/0");
+        let larger = project.join("work/colmap/candidates/larger/0");
+        write_validator_model(&expected, 2, 25);
+        write_validator_model(&larger, 3, 40);
+        let output = ProjectOutput {
+            registered_images: 2,
+            points_3d: 25,
+            ..Default::default()
+        };
+
+        let resolved = reusable_reconstruction_blocking(project, &frames, Some(&output)).unwrap();
+
+        assert_eq!(resolved.model, expected);
+    }
+
+    #[test]
+    fn reusable_reconstruction_rejects_an_unsafe_candidate_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path();
+        let frames = project.join("work/frames");
+        let sparse = project.join("work/colmap/sparse/0");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(frames.join("frame.jpg"), b"frame").unwrap();
+        write_validator_model(&sparse, 1, 10);
+        std::fs::write(
+            project.join("state.json"),
+            br#"{"planner":{"bestReconstructionId":"../outside"}}"#,
+        )
+        .unwrap();
+
+        let error = reusable_reconstruction_blocking(project, &frames, None).unwrap_err();
+
+        assert!(error.to_string().contains("不安全"));
+    }
+
+    #[test]
+    fn reusable_reconstruction_reports_missing_models_without_an_io_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("work/frames");
+        std::fs::create_dir_all(&frames).unwrap();
+
+        let error = reusable_reconstruction_blocking(temporary.path(), &frames, None).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("缺少可复用"));
+        assert!(!message.contains("os error"));
+    }
+
+    #[test]
+    fn reshoot_database_camera_must_match_the_selected_model() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("database.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE cameras (camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cameras(camera_id, model, width, height) VALUES (1, 2, 1920, 1080)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let camera = ColmapCamera {
+            id: 1,
+            model_id: 2,
+            model: "SIMPLE_RADIAL".into(),
+            width: 1920,
+            height: 1080,
+        };
+
+        validate_database_camera(&database, &camera).unwrap();
+        assert!(validate_database_camera(
+            &database,
+            &ColmapCamera {
+                width: 1080,
+                ..camera
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn model_snapshot_requires_every_source_model_file_at_the_same_size() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let snapshot = temporary.path().join("snapshot");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let source_files = [
+            "cameras.bin",
+            "images.bin",
+            "points3D.bin",
+            "rigs.bin",
+            "frames.bin",
+        ]
+        .map(|name| {
+            let path = source.join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            std::fs::write(snapshot.join(name), name.as_bytes()).unwrap();
+            path
+        });
+        assert!(model_snapshot_matches(&source_files, &snapshot));
+
+        std::fs::write(snapshot.join("frames.bin"), b"truncated").unwrap();
+        assert!(!model_snapshot_matches(&source_files, &snapshot));
     }
 
     #[tokio::test]

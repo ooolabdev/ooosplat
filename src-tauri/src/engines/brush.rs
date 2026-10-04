@@ -278,7 +278,10 @@ fn is_device_lost_detail(detail: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        engines::{AccelerationReasonCode, AccelerationRequirements, ColmapBackend, GpuDeviceInfo},
+        engines::{
+            AccelerationReasonCode, AccelerationRequirements, ColmapBackend, GpuDetectionState,
+            GpuDeviceInfo,
+        },
         presets::{resolve_brush_training_preset, Quality},
     };
 
@@ -295,6 +298,11 @@ mod tests {
     ) -> ColmapAccelerationStatus {
         ColmapAccelerationStatus {
             backend,
+            detection_state: if backend == ColmapBackend::Gpu {
+                GpuDetectionState::Ready
+            } else {
+                GpuDetectionState::Unavailable
+            },
             reason_code: if backend == ColmapBackend::Gpu {
                 AccelerationReasonCode::GpuReady
             } else {

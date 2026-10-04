@@ -9,6 +9,7 @@ interface AppState {
   projects: ProjectSummary[];
   quality: Quality;
   colmapAcceleration: ColmapAccelerationStatus | null;
+  taskColmapAcceleration: ColmapAccelerationStatus | null;
   video: VideoInfo | null;
   imageSequence: ImageSequenceInfo | null;
   plan: FramePlan | null;
@@ -23,12 +24,14 @@ interface AppState {
   events: PipelineEvent[];
   result: PipelineResult | null;
   error: string | null;
+  errorAt: number | null;
   setInputPath: (path: string | null, inputType: InputType) => void;
   setProjectsRoot: (path: string) => void;
   setPlannerEnabled: (enabled: boolean) => void;
   setProjects: (projects: ProjectSummary[]) => void;
   setQuality: (quality: Quality) => void;
   setColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
+  setTaskColmapAcceleration: (acceleration: ColmapAccelerationStatus | null) => void;
   setAnalysis: (inputType: InputType, video: VideoInfo | null, imageSequence: ImageSequenceInfo | null, plan: FramePlan, estimate: RuntimeEstimate) => void;
   setEstimate: (estimate: RuntimeEstimate | null) => void;
   setEngines: (engines: EngineStatus[]) => void;
@@ -47,6 +50,7 @@ export const useAppStore = create<AppState>((set) => ({
   projects: [],
   quality: "balanced",
   colmapAcceleration: null,
+  taskColmapAcceleration: null,
   video: null,
   imageSequence: null,
   plan: null,
@@ -61,6 +65,7 @@ export const useAppStore = create<AppState>((set) => ({
   events: [],
   result: null,
   error: null,
+  errorAt: null,
   setInputPath: (inputPath, inputType) => set({
     inputPath,
     inputType,
@@ -77,19 +82,21 @@ export const useAppStore = create<AppState>((set) => ({
     events: [],
     result: null,
     error: null,
+    errorAt: null,
   }),
   setProjectsRoot: (projectsRoot) => set({ projectsRoot }),
   setPlannerEnabled: (plannerEnabled) => set((state) => state.plannerEnabled === plannerEnabled
     ? state
-    : { plannerEnabled, plan: null, estimate: null, result: null, error: null }),
+    : { plannerEnabled, plan: null, estimate: null, result: null, error: null, errorAt: null }),
   setProjects: (projects) => set({ projects }),
-  setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null }),
+  setQuality: (quality) => set({ quality, plan: null, estimate: null, result: null, error: null, errorAt: null }),
   setColmapAcceleration: (colmapAcceleration) => set({ colmapAcceleration }),
+  setTaskColmapAcceleration: (taskColmapAcceleration) => set({ taskColmapAcceleration }),
   setAnalysis: (inputType, video, imageSequence, plan, estimate) => set({ inputType, video, imageSequence, plan, estimate }),
   setEstimate: (estimate) => set({ estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
-  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null }),
+  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null, taskColmapAcceleration: null }),
   receiveEvent: (event) => set((state) => {
     if (event.sequence > 0 && event.sequence <= Math.max(state.lastEventSequence, state.latestEvent?.sequence ?? 0)) return state;
     if (event.kind === "runtime") {
@@ -104,9 +111,9 @@ export const useAppStore = create<AppState>((set) => ({
       lastEventSequence: event.sequence,
       progress: terminal ? state.progress : Math.max(state.progress, Math.min(100, event.progress)),
       progressMessage: event.message,
-      colmapAcceleration: event.acceleration ?? state.colmapAcceleration,
+      taskColmapAcceleration: event.acceleration ?? state.taskColmapAcceleration,
     };
   }),
   setResult: (result) => set({ result }),
-  setError: (error) => set({ error }),
+  setError: (error) => set({ error, errorAt: error ? Date.now() : null }),
 }));

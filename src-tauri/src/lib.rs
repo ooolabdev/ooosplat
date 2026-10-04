@@ -13,6 +13,16 @@ pub mod video;
 
 pub fn run_app() {
     tauri::Builder::default()
+        // Keep this first so a second process exits before other plugins initialize.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(commands::PipelineController::default())
@@ -22,6 +32,7 @@ pub fn run_app() {
             commands::check_engines,
             commands::check_colmap_acceleration,
             commands::probe_and_plan,
+            commands::classify_dropped_input,
             commands::estimate_project_runtime,
             commands::start_pipeline,
             commands::inspect_reshoot_source,
@@ -33,6 +44,7 @@ pub fn run_app() {
             commands::open_project_location,
             commands::export_ply,
             commands::get_project_overview,
+            commands::get_project_task_detail,
             commands::set_projects_root,
             commands::set_planner_enabled,
             commands::delete_project,

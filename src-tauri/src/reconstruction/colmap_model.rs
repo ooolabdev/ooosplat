@@ -137,6 +137,49 @@ pub fn required_model_files(model: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// Returns the files that must be copied to preserve a COLMAP model for reuse.
+///
+/// COLMAP 3.x models contain the three core files. COLMAP 4.x additionally
+/// writes rig and frame metadata; keep those files together when they exist so
+/// an incremental mapper sees the same reconstruction that was validated.
+pub fn reusable_model_files(model: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = required_model_files(model).into_iter().collect::<Vec<_>>();
+    for path in &files {
+        if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            return Err(SplatError::Process(format!(
+                "可复用 COLMAP 模型缺少文件：{}",
+                path.display()
+            )));
+        }
+    }
+
+    let rigs = model.join("rigs.bin");
+    let frames = model.join("frames.bin");
+    let rigs_metadata = std::fs::symlink_metadata(&rigs).ok();
+    let frames_metadata = std::fs::symlink_metadata(&frames).ok();
+    if rigs_metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_file())
+        || frames_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_file())
+    {
+        return Err(SplatError::Process(
+            "可复用 COLMAP 4.x 模型包含不安全的 rigs.bin 或 frames.bin".into(),
+        ));
+    }
+    match (rigs_metadata.is_some(), frames_metadata.is_some()) {
+        (true, true) => files.extend([rigs, frames]),
+        (false, false) => {}
+        _ => {
+            return Err(SplatError::Process(
+                "可复用 COLMAP 4.x 模型的 rigs.bin 与 frames.bin 不完整".into(),
+            ));
+        }
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +211,19 @@ mod tests {
             read_registered_images(root.path()).unwrap()[0].name,
             "frame_000001.jpg"
         );
+    }
+
+    #[test]
+    fn reusable_model_files_supports_legacy_and_colmap_four_models() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            std::fs::write(root.path().join(name), b"model").unwrap();
+        }
+        assert_eq!(reusable_model_files(root.path()).unwrap().len(), 3);
+
+        std::fs::write(root.path().join("rigs.bin"), b"rigs").unwrap();
+        assert!(reusable_model_files(root.path()).is_err());
+        std::fs::write(root.path().join("frames.bin"), b"frames").unwrap();
+        assert_eq!(reusable_model_files(root.path()).unwrap().len(), 5);
     }
 }

@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/backend", () => ({
   cancelPipeline: vi.fn(),
   checkEngines: vi.fn().mockResolvedValue([]),
+  checkColmapAcceleration: vi.fn().mockResolvedValue(null),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: vi.fn().mockResolvedValue(true),
   estimateProjectRuntime: vi.fn(),
@@ -23,6 +24,8 @@ vi.mock("../lib/backend", () => ({
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
   initializeTelemetry: mocks.initializeTelemetry,
+  classifyDroppedInput: vi.fn(),
+  onInputDragDrop: vi.fn().mockResolvedValue(() => undefined),
   onPipelineEvent: vi.fn().mockResolvedValue(() => undefined),
   prepareGaussianPreview: vi.fn(),
   probeAndPlan: vi.fn(),
@@ -87,12 +90,12 @@ describe("App live log", () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     useAppStore.setState({
-      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null,
+      inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
-      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
-    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null });
+    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null, taskAcceleration: null });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({
       analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured",
     });
@@ -106,6 +109,7 @@ describe("App live log", () => {
   afterEach(async () => {
     await act(async () => { root.unmount(); });
     container.remove();
+    window.localStorage.clear();
   });
 
   const mockLogViewport = () => {
@@ -276,6 +280,9 @@ describe("App live log", () => {
     });
     await flush();
     expect(container.querySelector(".current-message")?.textContent).toBe("正在生成高斯泼溅（12,345/30,000）。此步骤可能耗时较长，请耐心等待");
+    expect(container.querySelector(".runtime-panel")).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>(".settings-action:not(.language-action)")?.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".settings-switch")?.click());
     expect(container.querySelector(".runtime-panel")?.textContent).toContain("12,345 / 30,000");
   });
 

@@ -214,6 +214,11 @@ foreach ($term in "image crate", "0.25.10", "MIT OR Apache-2.0", "https://github
 $cargoToml = Read-Utf8Text "src-tauri/Cargo.toml"
 Assert-Contains $cargoToml 'image = { version = "0.25"' "Cargo.toml"
 
+foreach ($term in "Tauri single-instance plugin", "2.4.5", "Apache License 2.0 OR MIT License", "https://crates.io/crates/tauri-plugin-single-instance/2.4.5") {
+    Assert-Contains $thirdParty $term "THIRD_PARTY_NOTICES.txt"
+}
+Assert-Contains $cargoToml 'tauri-plugin-single-instance = "2"' "Cargo.toml"
+
 $ffmpegLicense = Read-Utf8Text "licenses/FFmpeg-LGPL-2.1.txt"
 Assert-Contains $ffmpegLicense "GNU LESSER GENERAL PUBLIC LICENSE" "FFmpeg license"
 Assert-Contains $ffmpegLicense "Version 2.1, February 1999" "FFmpeg license"

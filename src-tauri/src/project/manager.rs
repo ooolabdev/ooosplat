@@ -215,6 +215,7 @@ impl ProjectManager {
             schema_version: crate::project::metadata::schema_version(),
             app_id: PROJECT_APP_ID.into(),
             id,
+            workspace_task_id: None,
             name: base,
             created_at: now,
             started_at: Some(now),
