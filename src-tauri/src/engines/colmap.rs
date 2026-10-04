@@ -155,6 +155,110 @@ async fn run_colmap(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn run_mapper_with_ceres_fallback(
+    executable: &Path,
+    caspar_args: Vec<OsString>,
+    mut ceres_args: Vec<OsString>,
+    output: &Path,
+    working_directory: &Path,
+    log_path: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    selection: &super::colmap_ba::BaSelection,
+) -> Result<()> {
+    let result = run_colmap(
+        executable,
+        caspar_args,
+        working_directory,
+        log_path.clone(),
+        manager,
+        observer.clone(),
+    )
+    .await;
+    let Some(index) = selection.gpu_index else {
+        return result;
+    };
+    let caspar_error = match result {
+        Ok(()) => return Ok(()),
+        Err(error) if should_retry_mapper_with_ceres(selection, &error) => error,
+        Err(error) => return Err(error),
+    };
+
+    super::colmap_ba::disable_after_runtime_failure(
+        executable,
+        index,
+        "Caspar mapper process failed; Ceres fallback activated",
+    )
+    .await;
+    append_log(
+        &log_path,
+        &format!(
+            "[OOOSplat] Global Caspar mapper failed; resetting mapper output and retrying once with local/global Ceres: {caspar_error}\n"
+        ),
+    )
+    .await?;
+    tracing::warn!(
+        "Global Caspar mapper failed on GPU {}; retrying once with Ceres: {}",
+        index,
+        caspar_error
+    );
+    reset_mapper_output(output).await?;
+    super::colmap_ba::append_explicit_ceres_options(&mut ceres_args);
+    match run_colmap(
+        executable,
+        ceres_args,
+        working_directory,
+        log_path.clone(),
+        manager,
+        observer,
+    )
+    .await
+    {
+        Ok(()) => {
+            append_log(
+                &log_path,
+                "[OOOSplat] Ceres fallback completed successfully; Caspar is disabled for this engine/GPU for the remainder of the application process.\n",
+            )
+            .await?;
+            Ok(())
+        }
+        Err(ceres_error) => Err(SplatError::Process(format!(
+            "Caspar mapper failed and the automatic Ceres retry also failed.\nCaspar: {caspar_error}\nCeres: {ceres_error}"
+        ))),
+    }
+}
+
+async fn reset_mapper_output(output: &Path) -> Result<()> {
+    if output.exists() {
+        tokio::fs::remove_dir_all(output).await?;
+    }
+    tokio::fs::create_dir_all(output).await?;
+    Ok(())
+}
+
+fn should_retry_mapper_with_ceres(
+    selection: &super::colmap_ba::BaSelection,
+    error: &SplatError,
+) -> bool {
+    selection.gpu_index.is_some() && matches!(error, SplatError::Process(_))
+}
+
+async fn append_log(path: &Path, message: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?
+        .write_all(message.as_bytes())
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_features(
     executable: &Path,
     database: &Path,
@@ -474,26 +578,33 @@ pub async fn map(
     images: &Path,
     output: &Path,
     allow_two_view_tracks: bool,
+    automatic_optimization: bool,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    let args = with_ba(
+    let ceres_args = mapper_args(database, images, None, output, allow_two_view_tracks);
+    let (args, selection) = with_ba(
         executable,
-        mapper_args(database, images, None, output, allow_two_view_tracks),
+        database,
+        ceres_args.clone(),
         gpu_index,
+        automatic_optimization,
         &log,
     )
     .await?;
-    run_colmap(
+    run_mapper_with_ceres_fallback(
         executable,
         args,
+        ceres_args,
+        output,
         database.parent().unwrap_or(output),
         log,
         manager,
         observer,
+        &selection,
     )
     .await
 }
@@ -508,26 +619,33 @@ pub async fn map_from_existing(
     images: &Path,
     input_model: &Path,
     output: &Path,
+    automatic_optimization: bool,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    let args = with_ba(
+    let ceres_args = mapper_args(database, images, Some(input_model), output, false);
+    let (args, selection) = with_ba(
         executable,
-        mapper_args(database, images, Some(input_model), output, false),
+        database,
+        ceres_args.clone(),
         gpu_index,
+        automatic_optimization,
         &log,
     )
     .await?;
-    run_colmap(
+    run_mapper_with_ceres_fallback(
         executable,
         args,
+        ceres_args,
+        output,
         database.parent().unwrap_or(output),
         log,
         manager,
         observer,
+        &selection,
     )
     .await
 }
@@ -569,51 +687,56 @@ pub async fn map_incremental(
     input: &Path,
     output: &Path,
     image_list: &Path,
+    automatic_optimization: bool,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     gpu_index: Option<u32>,
 ) -> Result<()> {
     tokio::fs::create_dir_all(output).await?;
-    let args = with_ba(
+    let ceres_args = incremental_mapper_args(database, images, input, output, image_list);
+    let (args, selection) = with_ba(
         executable,
-        incremental_mapper_args(database, images, input, output, image_list),
+        database,
+        ceres_args.clone(),
         gpu_index,
+        automatic_optimization,
         &log,
     )
     .await?;
-    run_colmap(
+    run_mapper_with_ceres_fallback(
         executable,
         args,
+        ceres_args,
+        output,
         database.parent().unwrap_or(output),
         log,
         manager,
         observer,
+        &selection,
     )
     .await
 }
 
 async fn with_ba(
     executable: &Path,
+    database: &Path,
     mut args: Vec<OsString>,
     gpu_index: Option<u32>,
+    automatic_optimization: bool,
     log: &Path,
-) -> Result<Vec<OsString>> {
-    use tokio::io::AsyncWriteExt;
-    let selection = super::colmap_ba::select(executable, gpu_index).await;
+) -> Result<(Vec<OsString>, super::colmap_ba::BaSelection)> {
+    let selection = super::colmap_ba::select_for_mapper(
+        executable,
+        database,
+        gpu_index,
+        automatic_optimization,
+    )
+    .await;
     super::colmap_ba::append_mapper_options(&mut args, &selection);
-    if let Some(parent) = log.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .await?;
-    file.write_all(format!("[OOOSplat] {}\n", selection.detail).as_bytes())
-        .await?;
+    append_log(log, &format!("[OOOSplat] {}\n", selection.detail)).await?;
     tracing::info!("{}", selection.detail);
-    Ok(args)
+    Ok((args, selection))
 }
 
 fn incremental_mapper_args(
@@ -919,5 +1042,42 @@ mod tests {
         ] {
             assert!(args.windows(2).any(|window| window == pair));
         }
+    }
+
+    #[test]
+    fn only_a_failed_caspar_mapper_process_triggers_the_ceres_retry() {
+        let caspar = super::super::colmap_ba::BaSelection {
+            gpu_index: Some(0),
+            detail: String::new(),
+        };
+        let ceres = super::super::colmap_ba::BaSelection {
+            gpu_index: None,
+            detail: String::new(),
+        };
+        assert!(should_retry_mapper_with_ceres(
+            &caspar,
+            &SplatError::Process("Caspar solver failed".into())
+        ));
+        assert!(!should_retry_mapper_with_ceres(
+            &ceres,
+            &SplatError::Process("Ceres solver failed".into())
+        ));
+        assert!(!should_retry_mapper_with_ceres(
+            &caspar,
+            &SplatError::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn ceres_retry_discards_partial_mapper_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("sparse");
+        tokio::fs::create_dir_all(output.join("0")).await.unwrap();
+        tokio::fs::write(output.join("0/partial.bin"), b"partial")
+            .await
+            .unwrap();
+        reset_mapper_output(&output).await.unwrap();
+        assert!(output.is_dir());
+        assert!(!output.join("0/partial.bin").exists());
     }
 }

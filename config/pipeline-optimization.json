@@ -1,0 +1,237 @@
+{
+  "_comment": {
+    "zh-CN": "OOOSplat 自动优化运行参数。保持 schemaVersion 为 1；修改后需重启应用。",
+    "en": "OOOSplat automatic-optimization runtime parameters. Keep schemaVersion at 1 and restart the app after changes."
+  },
+  "schemaVersion": 1,
+  "shared": {
+    "_comment": {
+      "zh-CN": "所有质量档位共用的帧数、注册率和 Brush refine 间隔。比例取值范围为 0 到 1。",
+      "en": "Frame-count, registration-ratio, and Brush refine settings shared by all quality tiers. Ratios must be between 0 and 1."
+    },
+    "minimumSelectedFrames": 30,
+    "bridgeTriggerRatio": 0.8,
+    "goodRegistrationRatio": 0.8,
+    "brushRefineEvery": 200
+  },
+  "caspar": {
+    "_comment": {
+      "zh-CN": "只有关键点总数和几何验证匹配总数同时达到阈值，且真实 GPU 探测通过时，才会使用全局 Caspar BA。",
+      "en": "Global Caspar BA is used only when both dataset totals reach these thresholds and the real GPU probe succeeds."
+    },
+    "minimumKeypoints": 2000000,
+    "minimumVerifiedMatches": 2000000
+  },
+  "highVram": {
+    "_comment": {
+      "zh-CN": "High 档按可用 GPU 显存（MiB）选择 Low、Standard 或 Large Profile；无法读取显存时使用 Low。",
+      "en": "High quality selects the Low, Standard, or Large profile from available GPU memory in MiB; unknown memory uses Low."
+    },
+    "standardMinimumMiB": 8192,
+    "largeMinimumMiB": 12288
+  },
+  "qualities": {
+    "_comment": {
+      "zh-CN": "每个质量档分别定义自动优化关闭时的旧版参数，以及开启时的规划参数。",
+      "en": "Each quality tier defines legacy parameters for automatic optimization off and planned parameters for it on."
+    },
+    "fast": {
+      "_comment": {
+        "zh-CN": "Fast：优先速度和较小数据量。",
+        "en": "Fast: prioritizes speed and a smaller dataset."
+      },
+      "automaticOptimizationOff": {
+        "_comment": {
+          "zh-CN": "关闭自动优化：视频按固定比例抽帧；SFM 限制仅用于增量补拍；Brush 不设置增密和 Splat 上限。",
+          "en": "Optimization off: sample video by a fixed ratio; SFM limits apply to incremental reshoots; Brush adds no densification or splat cap."
+        },
+        "frameRetentionRatio": 0.3,
+        "incrementalSfmMaxImageSize": 1600,
+        "incrementalSfmMaxFeatures": 4096,
+        "brush": {
+          "totalSteps": 8000,
+          "maxResolution": 1200
+        }
+      },
+      "automaticOptimizationOn": {
+        "_comment": {
+          "zh-CN": "开启自动优化：initialFps 用于首轮抽帧，rescueMaxFps 定义 Bridge 候选池上限。",
+          "en": "Optimization on: initialFps drives the first pass and rescueMaxFps caps the Bridge candidate pool."
+        },
+        "initialFps": 6.0,
+        "rescueMaxFps": 9.0,
+        "sfmMaxFeatures": 4096,
+        "allowTwoViewTracks": false,
+        "initialBrushProfile": "fast"
+      }
+    },
+    "balanced": {
+      "_comment": {
+        "zh-CN": "Balanced：默认档位，在速度、覆盖率和训练质量之间平衡。",
+        "en": "Balanced: the default tier, balancing speed, coverage, and training quality."
+      },
+      "automaticOptimizationOff": {
+        "_comment": {
+          "zh-CN": "关闭自动优化：视频按固定比例抽帧并使用旧版 Brush 参数。",
+          "en": "Optimization off: sample video by a fixed ratio and use the legacy Brush settings."
+        },
+        "frameRetentionRatio": 0.5,
+        "incrementalSfmMaxImageSize": 1920,
+        "incrementalSfmMaxFeatures": 8192,
+        "brush": {
+          "totalSteps": 15000,
+          "maxResolution": 1600
+        }
+      },
+      "automaticOptimizationOn": {
+        "_comment": {
+          "zh-CN": "开启自动优化：使用 Balanced Profile，并保留额外候选帧供 Bridge 使用。",
+          "en": "Optimization on: use the Balanced profile and retain extra candidate frames for Bridge."
+        },
+        "initialFps": 8.0,
+        "rescueMaxFps": 12.0,
+        "sfmMaxFeatures": 8192,
+        "allowTwoViewTracks": false,
+        "initialBrushProfile": "balanced"
+      }
+    },
+    "high": {
+      "_comment": {
+        "zh-CN": "High：优先质量；开启自动优化时会继续根据 highVram 阈值选择具体 Profile。",
+        "en": "High: prioritizes quality; with optimization on, highVram thresholds select the concrete profile."
+      },
+      "automaticOptimizationOff": {
+        "_comment": {
+          "zh-CN": "关闭自动优化：保留全部视频帧，使用固定 2000 Brush 分辨率，不启用自动 OOM 降级。",
+          "en": "Optimization off: retain all video frames, use a fixed Brush resolution of 2000, and disable automatic OOM downgrade."
+        },
+        "frameRetentionRatio": 1.0,
+        "incrementalSfmMaxImageSize": 3200,
+        "incrementalSfmMaxFeatures": 16384,
+        "brush": {
+          "totalSteps": 30000,
+          "maxResolution": 2000
+        }
+      },
+      "automaticOptimizationOn": {
+        "_comment": {
+          "zh-CN": "开启自动优化：允许 two-view tracks；initialBrushProfile 是显存未知或不足时的保守起点。",
+          "en": "Optimization on: allow two-view tracks; initialBrushProfile is the conservative starting point when VRAM is unknown or low."
+        },
+        "initialFps": 12.0,
+        "rescueMaxFps": 15.0,
+        "sfmMaxFeatures": 16384,
+        "allowTwoViewTracks": true,
+        "initialBrushProfile": "highLow"
+      }
+    }
+  },
+  "brushProfiles": {
+    "_comment": {
+      "zh-CN": "自动优化开启时使用的 Brush 与分辨率 Profile。字符串 source 表示使用源素材长边；High 的 OOM 回退必须有界且不能循环。",
+      "en": "Brush and resolution profiles used when optimization is on. The string source means the source long edge; High OOM fallbacks must be bounded and acyclic."
+    },
+    "fast": {
+      "_comment": {
+        "zh-CN": "Fast 自动优化 Profile。",
+        "en": "Fast automatic-optimization profile."
+      },
+      "workingMaxLongEdge": 1600,
+      "sfmMaxImageSize": 1200,
+      "totalSteps": 8000,
+      "maxResolution": 1600,
+      "maxSplats": null,
+      "densification": {
+        "growthGradThreshold": 0.00004,
+        "growthSelectFraction": 0.15,
+        "growthStopIter": 6000
+      },
+      "oomFallback": null
+    },
+    "balanced": {
+      "_comment": {
+        "zh-CN": "Balanced 自动优化 Profile。",
+        "en": "Balanced automatic-optimization profile."
+      },
+      "workingMaxLongEdge": 1920,
+      "sfmMaxImageSize": 1600,
+      "totalSteps": 15000,
+      "maxResolution": 1920,
+      "maxSplats": null,
+      "densification": {
+        "growthGradThreshold": 0.00003,
+        "growthSelectFraction": 0.2,
+        "growthStopIter": 12000
+      },
+      "oomFallback": null
+    },
+    "highLow": {
+      "_comment": {
+        "zh-CN": "High 保守 Profile：显存未知或低于 Standard 阈值时使用；OOM 后降到 Emergency。",
+        "en": "Conservative High profile for unknown VRAM or memory below the Standard threshold; OOM falls back to Emergency."
+      },
+      "workingMaxLongEdge": 3200,
+      "sfmMaxImageSize": 3200,
+      "totalSteps": 30000,
+      "maxResolution": 3200,
+      "maxSplats": 200000,
+      "densification": {
+        "growthGradThreshold": 0.00002,
+        "growthSelectFraction": 0.25,
+        "growthStopIter": 23000
+      },
+      "oomFallback": "highEmergency"
+    },
+    "highStandard": {
+      "_comment": {
+        "zh-CN": "High 中等显存 Profile；OOM 后降到 High Low。",
+        "en": "High profile for mid-range VRAM; OOM falls back to High Low."
+      },
+      "workingMaxLongEdge": 3840,
+      "sfmMaxImageSize": 3200,
+      "totalSteps": 30000,
+      "maxResolution": 3840,
+      "maxSplats": 1500000,
+      "densification": {
+        "growthGradThreshold": 0.00002,
+        "growthSelectFraction": 0.3,
+        "growthStopIter": 25000
+      },
+      "oomFallback": "highLow"
+    },
+    "highLarge": {
+      "_comment": {
+        "zh-CN": "High 大显存 Profile：工作与训练分辨率使用源素材长边；OOM 后降到 High Standard。",
+        "en": "High profile for large VRAM: working and training resolutions use the source long edge; OOM falls back to High Standard."
+      },
+      "workingMaxLongEdge": "source",
+      "sfmMaxImageSize": 3200,
+      "totalSteps": 30000,
+      "maxResolution": "source",
+      "maxSplats": 4000000,
+      "densification": {
+        "growthGradThreshold": 0.00002,
+        "growthSelectFraction": 0.3,
+        "growthStopIter": 25000
+      },
+      "oomFallback": "highStandard"
+    },
+    "highEmergency": {
+      "_comment": {
+        "zh-CN": "High 的最终应急 Profile，不再继续自动降级。",
+        "en": "Final emergency High profile with no further automatic downgrade."
+      },
+      "workingMaxLongEdge": 2000,
+      "sfmMaxImageSize": 2000,
+      "totalSteps": 30000,
+      "maxResolution": 2000,
+      "maxSplats": 200000,
+      "densification": {
+        "growthGradThreshold": 0.00004,
+        "growthSelectFraction": 0.2,
+        "growthStopIter": 20000
+      },
+      "oomFallback": null
+    }
+  }
+}

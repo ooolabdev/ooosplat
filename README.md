@@ -175,6 +175,8 @@ sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
 
 “自动优化（实验性）”默认开启。视频会在抽帧时一次性缩放到对应工作分辨率，并保持原始宽高比且不会放大低分辨率素材；实际采样不会超过源视频 FPS 或总帧数。图片序列始终保留全部有效图片和原始输入分辨率，但 COLMAP 与 Brush 仍使用对应档位的处理上限。
 
+自动优化开启/关闭时各档位的完整参数、Bridge/Caspar/OOM 处理逻辑，以及开发环境外部配置覆盖方法见[自动优化参数配置](docs/pipeline-optimization-config.zh-CN.md)。默认参数集中维护在 `config/pipeline-optimization.json`。
+
 | 档位 | 视频初始 / 桥接上限 | 视频工作长边 | COLMAP 长边 / 最大特征数 | Brush 训练 |
 | --- | ---: | ---: | ---: | --- |
 | 快速 | 6 / 9 FPS | 最大 1,600 | 1,200 / 4,096 | 8,000 iterations，最大分辨率 1,600 |

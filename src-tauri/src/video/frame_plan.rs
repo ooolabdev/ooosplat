@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{presets::QualityPreset, video::VideoInfo};
+use crate::{
+    presets::{pipeline_optimization_config, QualityPreset},
+    video::VideoInfo,
+};
 
-pub const MINIMUM_SELECTED_FRAMES: u64 = 30;
+pub fn minimum_selected_frames() -> u64 {
+    pipeline_optimization_config()
+        .shared
+        .minimum_selected_frames
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,7 +133,7 @@ impl FrameSelectionStrategy for QualityV2FrameSelection {
         if video.total_frames == 0 || video.fps <= 0.0 || video.duration <= 0.0 {
             return FramePlan::default();
         }
-        let minimum_required_fps = MINIMUM_SELECTED_FRAMES as f64 / video.duration;
+        let minimum_required_fps = minimum_selected_frames() as f64 / video.duration;
         let initial_fps = preset
             .initial_fps
             .map(|fps| fps.max(minimum_required_fps).min(video.fps))

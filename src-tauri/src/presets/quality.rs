@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
+use super::pipeline_config::pipeline_optimization_config;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
@@ -91,15 +93,13 @@ impl PlannerResolutionPlan {
 
 impl ResolvedBrushTrainingPreset {
     pub fn downgrade_after_oom(self, initial_sfm_points: u64) -> Option<Self> {
-        let profile = match self.profile {
-            BrushTrainingProfile::HighLarge => BrushTrainingProfile::HighStandard,
-            BrushTrainingProfile::HighStandard => BrushTrainingProfile::HighLow,
-            BrushTrainingProfile::HighLow => BrushTrainingProfile::HighEmergency,
-            BrushTrainingProfile::Legacy
-            | BrushTrainingProfile::Fast
-            | BrushTrainingProfile::Balanced
-            | BrushTrainingProfile::HighEmergency => return None,
-        };
+        if self.profile == BrushTrainingProfile::Legacy {
+            return None;
+        }
+        let profile = pipeline_optimization_config()
+            .brush_profiles
+            .get(self.profile)
+            .oom_fallback?;
         Some(resolve_high_profile(
             profile,
             self.detected_total_memory_mb,
@@ -123,50 +123,22 @@ pub struct QualityPreset {
 }
 
 impl Quality {
-    pub const fn preset(self) -> QualityPreset {
-        match self {
-            Self::Fast => QualityPreset {
-                frame_retention_ratio: 0.30,
-                initial_fps: Some(6.0),
-                rescue_max_fps: Some(9.0),
-                sfm_max_image_size: 1_600,
-                sfm_max_features: 4_096,
-                sfm_allow_two_view_tracks: false,
-                brush_iterations: 8_000,
-                brush_max_resolution: 1_200,
-                brush_densification: Some(BrushDensificationPreset {
-                    growth_grad_threshold: 0.00004,
-                    growth_select_fraction: 0.15,
-                    growth_stop_iter: 6_000,
-                }),
-            },
-            Self::Balanced => QualityPreset {
-                frame_retention_ratio: 0.50,
-                initial_fps: Some(8.0),
-                rescue_max_fps: Some(12.0),
-                sfm_max_image_size: 1_920,
-                sfm_max_features: 8_192,
-                sfm_allow_two_view_tracks: false,
-                brush_iterations: 15_000,
-                brush_max_resolution: 1_600,
-                brush_densification: Some(BrushDensificationPreset {
-                    growth_grad_threshold: 0.00003,
-                    growth_select_fraction: 0.2,
-                    growth_stop_iter: 12_000,
-                }),
-            },
-            Self::High => QualityPreset {
-                frame_retention_ratio: 1.00,
-                initial_fps: Some(12.0),
-                rescue_max_fps: Some(15.0),
-                sfm_max_image_size: 3_200,
-                sfm_max_features: 16_384,
-                sfm_allow_two_view_tracks: true,
-                brush_iterations: 30_000,
-                // Planner-enabled High resolves this from VRAM. Legacy keeps 2K.
-                brush_max_resolution: 2_000,
-                brush_densification: None,
-            },
+    pub fn preset(self) -> QualityPreset {
+        let config = pipeline_optimization_config();
+        let quality = config.qualities.get(self);
+        let legacy = &quality.automatic_optimization_off;
+        let automatic = &quality.automatic_optimization_on;
+        let automatic_brush = config.brush_profiles.get(automatic.initial_brush_profile);
+        QualityPreset {
+            frame_retention_ratio: legacy.frame_retention_ratio,
+            initial_fps: Some(automatic.initial_fps),
+            rescue_max_fps: Some(automatic.rescue_max_fps),
+            sfm_max_image_size: legacy.incremental_sfm_max_image_size,
+            sfm_max_features: automatic.sfm_max_features,
+            sfm_allow_two_view_tracks: automatic.allow_two_view_tracks,
+            brush_iterations: legacy.brush.total_steps,
+            brush_max_resolution: legacy.brush.max_resolution,
+            brush_densification: automatic_brush.densification,
         }
     }
 }
@@ -180,6 +152,7 @@ pub fn resolve_brush_training_preset(
 ) -> ResolvedBrushTrainingPreset {
     let base = quality.preset();
     if !planner_enabled {
+        let config = pipeline_optimization_config();
         return ResolvedBrushTrainingPreset {
             profile: BrushTrainingProfile::Legacy,
             detected_total_memory_mb,
@@ -187,7 +160,7 @@ pub fn resolve_brush_training_preset(
             preset: BrushTrainingPreset {
                 total_steps: base.brush_iterations,
                 max_resolution: base.brush_max_resolution,
-                refine_every: 200,
+                refine_every: config.shared.brush_refine_every,
                 max_splats: None,
                 densification: None,
             },
@@ -195,13 +168,14 @@ pub fn resolve_brush_training_preset(
     }
 
     match quality {
-        Quality::Fast => {
-            resolved_quality_profile(BrushTrainingProfile::Fast, detected_total_memory_mb, base)
-        }
-        Quality::Balanced => resolved_quality_profile(
-            BrushTrainingProfile::Balanced,
+        Quality::Fast | Quality::Balanced => resolved_quality_profile(
+            pipeline_optimization_config()
+                .qualities
+                .get(quality)
+                .automatic_optimization_on
+                .initial_brush_profile,
             detected_total_memory_mb,
-            base,
+            base.brush_max_resolution,
         ),
         Quality::High => {
             let profile = high_profile_for_memory(detected_total_memory_mb);
@@ -223,23 +197,22 @@ pub fn resolve_planner_resolution_plan(
     video_input: bool,
 ) -> PlannerResolutionPlan {
     let source_long_edge = source_width.max(source_height).max(1);
-    let (working_limit, sfm_max_image_size, brush_initial_max_resolution, profile) = match quality {
-        Quality::Fast => (1_600, 1_200, 1_600, BrushTrainingProfile::Fast),
-        Quality::Balanced => (1_920, 1_600, 1_920, BrushTrainingProfile::Balanced),
-        Quality::High => match high_profile_for_memory(detected_total_memory_mb) {
-            BrushTrainingProfile::HighLow => (3_200, 3_200, 3_200, BrushTrainingProfile::HighLow),
-            BrushTrainingProfile::HighStandard => {
-                (3_840, 3_200, 3_840, BrushTrainingProfile::HighStandard)
-            }
-            BrushTrainingProfile::HighLarge => (
-                source_long_edge,
-                3_200,
-                source_long_edge,
-                BrushTrainingProfile::HighLarge,
-            ),
-            _ => unreachable!("VRAM classification only returns initial High profiles"),
-        },
+    let profile = match quality {
+        Quality::High => high_profile_for_memory(detected_total_memory_mb),
+        Quality::Fast | Quality::Balanced => {
+            pipeline_optimization_config()
+                .qualities
+                .get(quality)
+                .automatic_optimization_on
+                .initial_brush_profile
+        }
     };
+    let profile_config = pipeline_optimization_config().brush_profiles.get(profile);
+    let working_limit = profile_config
+        .working_max_long_edge
+        .resolve(source_long_edge);
+    let sfm_max_image_size = profile_config.sfm_max_image_size;
+    let brush_initial_max_resolution = profile_config.max_resolution.resolve(source_long_edge);
     let (working_width, working_height) = if video_input {
         scaled_dimensions(source_width, source_height, working_limit)
     } else {
@@ -283,9 +256,12 @@ pub fn resolve_brush_training_preset_for_plan(
 }
 
 fn high_profile_for_memory(detected_total_memory_mb: Option<u64>) -> BrushTrainingProfile {
+    let thresholds = &pipeline_optimization_config().high_vram;
     match detected_total_memory_mb {
-        Some(memory) if memory >= 12_288 => BrushTrainingProfile::HighLarge,
-        Some(memory) if memory >= 8_192 => BrushTrainingProfile::HighStandard,
+        Some(memory) if memory >= thresholds.large_minimum_mi_b => BrushTrainingProfile::HighLarge,
+        Some(memory) if memory >= thresholds.standard_minimum_mi_b => {
+            BrushTrainingProfile::HighStandard
+        }
         _ => BrushTrainingProfile::HighLow,
     }
 }
@@ -307,18 +283,20 @@ fn scaled_dimensions(width: u32, height: u32, max_long_edge: u32) -> (u32, u32) 
 fn resolved_quality_profile(
     profile: BrushTrainingProfile,
     detected_total_memory_mb: Option<u64>,
-    base: QualityPreset,
+    initial_max_resolution: u32,
 ) -> ResolvedBrushTrainingPreset {
+    let config = pipeline_optimization_config();
+    let profile_config = config.brush_profiles.get(profile);
     ResolvedBrushTrainingPreset {
         profile,
         detected_total_memory_mb,
-        configured_max_splats: None,
+        configured_max_splats: profile_config.max_splats,
         preset: BrushTrainingPreset {
-            total_steps: base.brush_iterations,
-            max_resolution: base.brush_max_resolution,
-            refine_every: 200,
-            max_splats: None,
-            densification: base.brush_densification,
+            total_steps: profile_config.total_steps,
+            max_resolution: initial_max_resolution.max(1),
+            refine_every: config.shared.brush_refine_every,
+            max_splats: profile_config.max_splats,
+            densification: profile_config.densification,
         },
     }
 }
@@ -329,31 +307,22 @@ fn resolve_high_profile(
     source_long_edge: u32,
     initial_sfm_points: u64,
 ) -> ResolvedBrushTrainingPreset {
-    let (max_resolution, growth_grad_threshold, growth_select_fraction, growth_stop_iter, cap) =
-        match profile {
-            BrushTrainingProfile::HighLow => (3_200, 0.00002, 0.25, 23_000, 200_000),
-            BrushTrainingProfile::HighStandard => (3_840, 0.00002, 0.3, 25_000, 1_500_000),
-            BrushTrainingProfile::HighLarge => {
-                (source_long_edge.max(1), 0.00002, 0.3, 25_000, 4_000_000)
-            }
-            BrushTrainingProfile::HighEmergency => (2_000, 0.00004, 0.2, 20_000, 200_000),
-            _ => unreachable!("only High profiles are resolved here"),
-        };
+    let config = pipeline_optimization_config();
+    let profile_config = config.brush_profiles.get(profile);
+    let cap = profile_config
+        .max_splats
+        .expect("High profiles must define maxSplats");
     let initial_sfm_points = initial_sfm_points.min(u32::MAX as u64) as u32;
     ResolvedBrushTrainingPreset {
         profile,
         detected_total_memory_mb,
         configured_max_splats: Some(cap),
         preset: BrushTrainingPreset {
-            total_steps: 30_000,
-            max_resolution,
-            refine_every: 200,
+            total_steps: profile_config.total_steps,
+            max_resolution: profile_config.max_resolution.resolve(source_long_edge),
+            refine_every: config.shared.brush_refine_every,
             max_splats: Some(cap.max(initial_sfm_points)),
-            densification: Some(BrushDensificationPreset {
-                growth_grad_threshold,
-                growth_select_fraction,
-                growth_stop_iter,
-            }),
+            densification: profile_config.densification,
         },
     }
 }

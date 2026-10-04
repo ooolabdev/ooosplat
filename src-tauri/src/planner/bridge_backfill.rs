@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Result, SplatError},
+    presets::pipeline_optimization_config,
     video::{FramePlan, PlannedFrame},
 };
 
-pub const BRIDGE_TRIGGER_RATIO: f64 = 0.80;
 const LOCAL_NEIGHBORS_PER_SIDE: usize = 10;
+
+pub fn bridge_trigger_ratio() -> f64 {
+    pipeline_optimization_config().shared.bridge_trigger_ratio
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,7 +115,7 @@ pub fn plan_bridge_backfill(
         available_budget,
         ..BridgeBackfillPlan::default()
     };
-    if initial_registration_ratio >= BRIDGE_TRIGGER_RATIO || available_budget == 0 {
+    if initial_registration_ratio >= bridge_trigger_ratio() || available_budget == 0 {
         return output;
     }
 

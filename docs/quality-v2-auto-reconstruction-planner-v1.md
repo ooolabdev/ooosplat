@@ -1,5 +1,7 @@
 # Quality v2 与 Auto Reconstruction Planner v1
 
+> 本文保留最初的 Planner v1 设计记录，部分数值已经过后续迭代，不应作为当前运行参数。当前唯一参数基线及配置方法见[自动优化参数配置](pipeline-optimization-config.zh-CN.md)和 `config/pipeline-optimization.json`。
+
 ## 目标
 
 第一版采用确定性的帧预算和一次性成功率补救，不识别 Walkthrough / Object Orbit，不运行 Geometry Probe，也不在运行时选择 Mapper。所有视频始终使用 Sequential Matching 与 Incremental Mapper；Loop Closure 和 Global Mapper 不进入生产决策。

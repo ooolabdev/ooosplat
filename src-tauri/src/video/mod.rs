@@ -4,8 +4,8 @@ pub mod image_sequence;
 pub mod probe;
 
 pub use frame_plan::{
-    FramePlan, FrameSelectionStrategy, PlannedFrame, QualityV2FrameSelection,
-    UniformRatioFrameSelection, MINIMUM_SELECTED_FRAMES,
+    minimum_selected_frames, FramePlan, FrameSelectionStrategy, PlannedFrame,
+    QualityV2FrameSelection, UniformRatioFrameSelection,
 };
 pub use image_sequence::{
     analyze_image_sequence, create_plan as create_image_plan, is_image_file, list_images,

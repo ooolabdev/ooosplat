@@ -2,9 +2,16 @@ use std::{io::Read, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SplatError};
+use crate::{
+    error::{Result, SplatError},
+    presets::pipeline_optimization_config,
+};
 
-pub const GOOD_REGISTERED_RATIO: f64 = 0.80;
+pub fn good_registered_ratio() -> f64 {
+    pipeline_optimization_config()
+        .shared
+        .good_registration_ratio
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,7 +60,7 @@ impl ReconstructionValidator {
             ));
         }
         let registered_ratio = registered_images as f64 / input_images as f64;
-        let quality = if registered_ratio >= GOOD_REGISTERED_RATIO {
+        let quality = if registered_ratio >= good_registered_ratio() {
             ReconstructionQuality::Good
         } else {
             ReconstructionQuality::Warning
@@ -113,7 +120,7 @@ mod tests {
     }
 
     fn classify(ratio: f64) -> ReconstructionQuality {
-        if ratio >= GOOD_REGISTERED_RATIO {
+        if ratio >= good_registered_ratio() {
             ReconstructionQuality::Good
         } else {
             ReconstructionQuality::Warning

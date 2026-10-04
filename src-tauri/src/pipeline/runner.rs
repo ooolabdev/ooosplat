@@ -38,8 +38,8 @@ use crate::{
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
-        plan_bridge_backfill, read_registered_source_indices, write_bridge_pair_list,
-        BridgeBackfillStatus, BRIDGE_TRIGGER_RATIO,
+        bridge_trigger_ratio, plan_bridge_backfill, read_registered_source_indices,
+        write_bridge_pair_list, BridgeBackfillStatus,
     },
     presets::{
         resolve_brush_training_preset, resolve_brush_training_preset_for_plan,
@@ -1495,6 +1495,7 @@ impl PipelineRunner {
                 Path::new("base-model"),
                 &sparse,
                 Path::new("mapper-images.txt"),
+                state.planner_enabled,
                 paths.logs.join("colmap.log"),
                 &self.process_manager,
                 Some(self.process_observer(
@@ -1603,7 +1604,7 @@ impl PipelineRunner {
                 .unwrap_or(0),
         );
         let reshoot_ratio = registered_reshoot_count as f64 / prepared.image_count.max(1) as f64;
-        let warning = (reshoot_ratio < 0.8).then(|| format!(
+        let warning = (reshoot_ratio < crate::reconstruction::good_registered_ratio()).then(|| format!(
             "补拍画面成功加入 {registered_reshoot_count}/{}，结果已生成，但部分补拍画面未能找到与原项目的联系。",
             prepared.image_count
         ));
@@ -1804,7 +1805,7 @@ impl PipelineRunner {
                 minimum_frame_override_applied: is_planned_video
                     && prepared.plan.minimum_frame_override_applied,
                 minimum_frame_target_unreachable: is_planned_video
-                    && source_item_count < crate::video::MINIMUM_SELECTED_FRAMES,
+                    && source_item_count < crate::video::minimum_selected_frames(),
             });
         }
 
@@ -2001,6 +2002,7 @@ impl PipelineRunner {
                 colmap_images,
                 &sparse,
                 allow_two_view_tracks,
+                state.planner_enabled,
                 colmap_log.clone(),
                 &self.process_manager,
                 Some(self.process_observer(
@@ -2075,7 +2077,7 @@ impl PipelineRunner {
                 } else {
                     PlannerBridgeStatus::NotApplicable
                 },
-                trigger_ratio: BRIDGE_TRIGGER_RATIO,
+                trigger_ratio: bridge_trigger_ratio(),
                 available_budget: plan.map(|value| value.available_budget).unwrap_or(0),
                 requested_frames: plan
                     .map(|value| value.selected_frame_indices.len() as u64)
@@ -2103,8 +2105,9 @@ impl PipelineRunner {
         }
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
-                "注册率 {:.1}%：低于 80%，将继续训练，但结果质量可能受影响",
-                report.registered_ratio * 100.0
+                "注册率 {:.1}%：低于 {:.1}%，将继续训练，但结果质量可能受影响",
+                report.registered_ratio * 100.0,
+                crate::reconstruction::good_registered_ratio() * 100.0
             )
         });
         self.events.stage(
@@ -2516,17 +2519,18 @@ impl PipelineRunner {
             BridgeBackfillStatus::NotEvaluated | BridgeBackfillStatus::Running => {}
         }
 
-        if initial_report.registered_ratio >= BRIDGE_TRIGGER_RATIO {
+        if initial_report.registered_ratio >= bridge_trigger_ratio() {
             state.bridge_backfill.status = BridgeBackfillStatus::NotNeeded;
             project_manager.write_state(&paths.state, state).await?;
             self.events.stage(
                 PipelineStage::ValidatingReconstruction,
                 1.0,
                 format!(
-                    "初始注册 {}/{} 张（{:.1}%）达到 80% 阈值，无需 Bridge Backfill",
+                    "初始注册 {}/{} 张（{:.1}%）达到 {:.1}% 阈值，无需 Bridge Backfill",
                     initial_report.registered_images,
                     initial_report.input_images,
-                    initial_report.registered_ratio * 100.0
+                    initial_report.registered_ratio * 100.0,
+                    bridge_trigger_ratio() * 100.0
                 ),
             );
             return Ok((initial_model, initial_report));
@@ -2575,10 +2579,11 @@ impl PipelineRunner {
                     Some(1.0),
                     false,
                     format!(
-                        "初始注册 {}/{} 张（{:.1}%）低于 80%，但 Bridge Backfill 没有可用补帧预算",
+                        "初始注册 {}/{} 张（{:.1}%）低于 {:.1}%，但 Bridge Backfill 没有可用补帧预算",
                         initial_report.registered_images,
                         initial_report.input_images,
-                        initial_report.registered_ratio * 100.0
+                        initial_report.registered_ratio * 100.0,
+                        bridge_trigger_ratio() * 100.0
                     ),
                     None,
                     None,
@@ -2927,6 +2932,7 @@ impl PipelineRunner {
             colmap_images,
             input_model,
             &bridge_sparse,
+            state.planner_enabled,
             colmap_log.with_file_name("colmap-bridge-mapper.log"),
             &self.process_manager,
             Some(self.process_observer(
