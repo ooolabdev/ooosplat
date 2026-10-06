@@ -91,7 +91,10 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           if [[ "$status" -ne 0 ]]; then
-            summary="$(tail -n 100 rust-test.log)"
+            summary="$(awk '/^failures:/{capture=1} capture' rust-test.log | tail -n 80)"
+            if [[ -z "$summary" ]]; then
+              summary="$(tail -n 80 rust-test.log)"
+            fi
             summary="${summary//'%'/'%25'}"
             summary="${summary//$'\r'/'%0D'}"
             summary="${summary//$'\n'/'%0A'}"
