@@ -2,17 +2,17 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), confirm: vi.fn() }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: vi.fn(),
   invoke: mocks.invoke,
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(), open: vi.fn(), save: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm, open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
-import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
+import { prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
 
 describe("backend browser guards", () => {
   it("submits only opaque diagnostic tokens, never frontend paths or report payloads", async () => {
@@ -30,6 +30,7 @@ describe("backend browser guards", () => {
   beforeEach(() => {
     delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     mocks.invoke.mockReset();
+    mocks.confirm.mockReset();
   });
 
   it("does not invoke the acceleration command outside Tauri", async () => {
@@ -53,5 +54,16 @@ describe("backend browser guards", () => {
     mocks.invoke.mockResolvedValueOnce({ inputType: "video" });
     await expect(classifyDroppedInput("E:\\素材\\clip.mov")).resolves.toEqual({ inputType: "video" });
     expect(mocks.invoke).toHaveBeenCalledWith("classify_dropped_input", { path: "E:\\素材\\clip.mov" });
+  });
+
+  it("shows localized capture advice and explicit continue/cancel labels for small image sets", async () => {
+    localStorage.setItem("ooo-splat-language", "zh-CN");
+    mocks.confirm.mockResolvedValueOnce(false);
+    await expect(confirmSmallImageSequence(29)).resolves.toBe(false);
+    expect(mocks.confirm).toHaveBeenCalledWith(
+      expect.stringContaining("AI 生成图片"),
+      expect.objectContaining({ title: "图片数量较少", kind: "warning", okLabel: "继续生成", cancelLabel: "取消生成" }),
+    );
+    expect(mocks.confirm.mock.calls[0][0]).toContain("60%–80%");
   });
 });

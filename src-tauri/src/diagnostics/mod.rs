@@ -1,6 +1,6 @@
 //! Explicit, one-shot diagnostic consent. Never uses the anonymous telemetry service.
 mod hardware;
-mod redact;
+pub(crate) mod redact;
 
 use crate::{
     commands::PipelineController,

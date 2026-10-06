@@ -4,8 +4,10 @@ import { useI18n } from "../i18n";
 import type { TelemetryPreferences } from "../types/telemetry";
 import { PrivacySettingsPanel } from "./TelemetryPreferences";
 
-type SettingsSection = "interface" | "privacy";
-const sections: SettingsSection[] = ["interface", "privacy"];
+import { McpSettingsPanel } from "./McpSettingsPanel";
+
+type SettingsSection = "interface" | "privacy" | "mcp";
+const sections: SettingsSection[] = ["interface", "privacy", "mcp"];
 
 export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, onTelemetryChange, onRuntimePanelChange, onClose }: {
   preferences: TelemetryPreferences | null;
@@ -60,7 +62,7 @@ export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, o
             tabIndex={section === item ? 0 : -1}
             onClick={() => setSection(item)}
             onKeyDown={(event) => selectFromKeyboard(event, index)}
-          >{item === "interface" ? <Monitor size={15} /> : <ShieldCheck size={15} />}<span>{t(item === "interface" ? "settings.interface" : "settings.privacy")}</span></button>)}
+          >{item === "interface" ? <Monitor size={15} /> : <ShieldCheck size={15} />}<span>{item === "mcp" ? "MCP" : t(item === "interface" ? "settings.interface" : "settings.privacy")}</span></button>)}
         </nav>
         <div className="settings-content">
           {section === "interface" && <section id="settings-panel-interface" role="tabpanel" aria-labelledby="settings-tab-interface">
@@ -70,6 +72,7 @@ export function SettingsDialog({ preferences, telemetryBusy, showRuntimePanel, o
               <button type="button" role="switch" aria-checked={showRuntimePanel} aria-label={t("settings.runtimePanel")} className={showRuntimePanel ? "settings-switch enabled" : "settings-switch"} onClick={() => onRuntimePanelChange(!showRuntimePanel)}><span /></button>
             </div>
           </section>}
+          {section === "mcp" && <section id="settings-panel-mcp" role="tabpanel" aria-labelledby="settings-tab-mcp"><McpSettingsPanel /></section>}
           {section === "privacy" && <section id="settings-panel-privacy" role="tabpanel" aria-labelledby="settings-tab-privacy">
             <div className="settings-section-heading"><h3>{t("settings.privacy")}</h3><p>{t("settings.privacyHint")}</p></div>
             {preferences

@@ -32,8 +32,8 @@
   },
   "qualities": {
     "_comment": {
-      "zh-CN": "每个质量档分别定义自动优化关闭时的旧版参数，以及开启时的规划参数。",
-      "en": "Each quality tier defines legacy parameters for automatic optimization off and planned parameters for it on."
+      "zh-CN": "每个质量档分别定义自动优化关闭时的固定参数与新版 Brush 兼容密化设置，以及开启时的规划参数。",
+      "en": "Each quality tier defines fixed parameters and compatible densification for the new Brush with optimization off, and planned parameters with it on."
     },
     "fast": {
       "_comment": {
@@ -42,15 +42,20 @@
       },
       "automaticOptimizationOff": {
         "_comment": {
-          "zh-CN": "关闭自动优化：视频按固定比例抽帧；SFM 限制仅用于增量补拍；Brush 不设置增密和 Splat 上限。",
-          "en": "Optimization off: sample video by a fixed ratio; SFM limits apply to incremental reshoots; Brush adds no densification or splat cap."
+          "zh-CN": "关闭自动优化：视频按固定比例抽帧；首次重建和增量补拍使用相同的 SFM 限制；Brush 显式使用新版梯度阈值 0.0025、旧版选择比例 0.10 和增密截止 15000，不额外限制 Splat 数。快速档训练在 8000 步结束，因此不会到达增密截止。",
+          "en": "Optimization off: sample video by a fixed ratio and share SFM limits between initial reconstruction and reshoots. Brush explicitly uses the new gradient threshold 0.0025, legacy selection fraction 0.10, and growth stop 15000 without an extra splat cap. Fast training ends at 8000 before reaching the growth stop."
         },
         "frameRetentionRatio": 0.3,
-        "incrementalSfmMaxImageSize": 1600,
-        "incrementalSfmMaxFeatures": 4096,
+        "sfmMaxImageSize": 1200,
+        "sfmMaxFeatures": 8192,
         "brush": {
           "totalSteps": 8000,
-          "maxResolution": 1200
+          "maxResolution": 1200,
+          "densification": {
+            "growthGradThreshold": 0.0025,
+            "growthSelectFraction": 0.1,
+            "growthStopIter": 15000
+          }
         }
       },
       "automaticOptimizationOn": {
@@ -72,15 +77,20 @@
       },
       "automaticOptimizationOff": {
         "_comment": {
-          "zh-CN": "关闭自动优化：视频按固定比例抽帧并使用旧版 Brush 参数。",
-          "en": "Optimization off: sample video by a fixed ratio and use the legacy Brush settings."
+          "zh-CN": "关闭自动优化：视频按固定比例抽帧，SFM 长边上限为 1600；Brush 显式使用梯度阈值 0.0025、选择比例 0.10 和增密截止 15000，不额外限制 Splat 数。",
+          "en": "Optimization off: sample video by a fixed ratio and cap the SFM long edge at 1600. Brush explicitly uses gradient threshold 0.0025, selection fraction 0.10, and growth stop 15000 without an extra splat cap."
         },
         "frameRetentionRatio": 0.5,
-        "incrementalSfmMaxImageSize": 1920,
-        "incrementalSfmMaxFeatures": 8192,
+        "sfmMaxImageSize": 1600,
+        "sfmMaxFeatures": 8192,
         "brush": {
           "totalSteps": 15000,
-          "maxResolution": 1600
+          "maxResolution": 1600,
+          "densification": {
+            "growthGradThreshold": 0.0025,
+            "growthSelectFraction": 0.1,
+            "growthStopIter": 15000
+          }
         }
       },
       "automaticOptimizationOn": {
@@ -102,15 +112,20 @@
       },
       "automaticOptimizationOff": {
         "_comment": {
-          "zh-CN": "关闭自动优化：保留全部视频帧，使用固定 2000 Brush 分辨率，不启用自动 OOM 降级。",
-          "en": "Optimization off: retain all video frames, use a fixed Brush resolution of 2000, and disable automatic OOM downgrade."
+          "zh-CN": "关闭自动优化：保留全部视频帧，SFM 长边和 Brush 分辨率上限为 2000；使用梯度阈值 0.0025、选择比例 0.10 和增密截止 15000，剩余训练继续优化；不额外限制 Splat 数或启用自动 OOM 降级。",
+          "en": "Optimization off: retain all video frames and cap SFM and Brush resolution at 2000. Use gradient threshold 0.0025, selection fraction 0.10, and growth stop 15000; remaining iterations continue optimization. Add no extra splat cap or automatic OOM downgrade."
         },
         "frameRetentionRatio": 1.0,
-        "incrementalSfmMaxImageSize": 3200,
-        "incrementalSfmMaxFeatures": 16384,
+        "sfmMaxImageSize": 2000,
+        "sfmMaxFeatures": 8192,
         "brush": {
           "totalSteps": 30000,
-          "maxResolution": 2000
+          "maxResolution": 2000,
+          "densification": {
+            "growthGradThreshold": 0.0025,
+            "growthSelectFraction": 0.1,
+            "growthStopIter": 15000
+          }
         }
       },
       "automaticOptimizationOn": {
@@ -133,14 +148,14 @@
     },
     "fast": {
       "_comment": {
-        "zh-CN": "Fast 自动优化 Profile。",
-        "en": "Fast automatic-optimization profile."
+        "zh-CN": "Fast 自动优化 Profile；Splat 配置上限为 500,000，运行时不会低于初始 SFM 三维点数。",
+        "en": "Fast automatic-optimization profile with a configured 500,000 splat cap; the runtime value never falls below the initial SFM point count."
       },
       "workingMaxLongEdge": 1600,
       "sfmMaxImageSize": 1200,
       "totalSteps": 8000,
       "maxResolution": 1600,
-      "maxSplats": null,
+      "maxSplats": 500000,
       "densification": {
         "growthGradThreshold": 0.00004,
         "growthSelectFraction": 0.15,
@@ -150,14 +165,14 @@
     },
     "balanced": {
       "_comment": {
-        "zh-CN": "Balanced 自动优化 Profile。",
-        "en": "Balanced automatic-optimization profile."
+        "zh-CN": "Balanced 自动优化 Profile；Splat 配置上限为 1,000,000，运行时不会低于初始 SFM 三维点数。",
+        "en": "Balanced automatic-optimization profile with a configured 1,000,000 splat cap; the runtime value never falls below the initial SFM point count."
       },
       "workingMaxLongEdge": 1920,
       "sfmMaxImageSize": 1600,
       "totalSteps": 15000,
       "maxResolution": 1920,
-      "maxSplats": null,
+      "maxSplats": 1000000,
       "densification": {
         "growthGradThreshold": 0.00003,
         "growthSelectFraction": 0.2,
@@ -174,7 +189,7 @@
       "sfmMaxImageSize": 3200,
       "totalSteps": 30000,
       "maxResolution": 3200,
-      "maxSplats": 200000,
+      "maxSplats": 1200000,
       "densification": {
         "growthGradThreshold": 0.00002,
         "growthSelectFraction": 0.25,

@@ -60,6 +60,7 @@ describe("runtime panel", () => {
     expect(container.textContent).toContain("整卡占用，包含其他程序");
     expect(container.textContent).toContain("100 MiB");
     expect(container.querySelector("progress")?.value).toBe(50);
+    expect(container.querySelector(".runtime-metrics > div:nth-child(2) small")).toBeNull();
     await act(async () => container.querySelector("button")!.click());
     expect(container.textContent).toContain("Actual training steps");
     expect(container.textContent).toContain("Whole-card use, including other programs");

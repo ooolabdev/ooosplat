@@ -115,7 +115,9 @@ pub struct QualityPreset {
     pub initial_fps: Option<f64>,
     pub rescue_max_fps: Option<f64>,
     pub sfm_max_image_size: u32,
+    pub planned_sfm_max_image_size: u32,
     pub sfm_max_features: u32,
+    pub planned_sfm_max_features: u32,
     pub sfm_allow_two_view_tracks: bool,
     pub brush_iterations: usize,
     pub brush_max_resolution: u32,
@@ -133,8 +135,10 @@ impl Quality {
             frame_retention_ratio: legacy.frame_retention_ratio,
             initial_fps: Some(automatic.initial_fps),
             rescue_max_fps: Some(automatic.rescue_max_fps),
-            sfm_max_image_size: legacy.incremental_sfm_max_image_size,
-            sfm_max_features: automatic.sfm_max_features,
+            sfm_max_image_size: legacy.sfm_max_image_size,
+            planned_sfm_max_image_size: automatic_brush.sfm_max_image_size,
+            sfm_max_features: legacy.sfm_max_features,
+            planned_sfm_max_features: automatic.sfm_max_features,
             sfm_allow_two_view_tracks: automatic.allow_two_view_tracks,
             brush_iterations: legacy.brush.total_steps,
             brush_max_resolution: legacy.brush.max_resolution,
@@ -162,7 +166,12 @@ pub fn resolve_brush_training_preset(
                 max_resolution: base.brush_max_resolution,
                 refine_every: config.shared.brush_refine_every,
                 max_splats: None,
-                densification: None,
+                densification: config
+                    .qualities
+                    .get(quality)
+                    .automatic_optimization_off
+                    .brush
+                    .densification,
             },
         };
     }
@@ -176,6 +185,7 @@ pub fn resolve_brush_training_preset(
                 .initial_brush_profile,
             detected_total_memory_mb,
             base.brush_max_resolution,
+            initial_sfm_points,
         ),
         Quality::High => {
             let profile = high_profile_for_memory(detected_total_memory_mb);
@@ -207,7 +217,8 @@ pub fn resolve_planner_resolution_plan(
                 .initial_brush_profile
         }
     };
-    let profile_config = pipeline_optimization_config().brush_profiles.get(profile);
+    let config = pipeline_optimization_config();
+    let profile_config = config.brush_profiles.get(profile);
     let working_limit = profile_config
         .working_max_long_edge
         .resolve(source_long_edge);
@@ -256,7 +267,8 @@ pub fn resolve_brush_training_preset_for_plan(
 }
 
 fn high_profile_for_memory(detected_total_memory_mb: Option<u64>) -> BrushTrainingProfile {
-    let thresholds = &pipeline_optimization_config().high_vram;
+    let config = pipeline_optimization_config();
+    let thresholds = &config.high_vram;
     match detected_total_memory_mb {
         Some(memory) if memory >= thresholds.large_minimum_mi_b => BrushTrainingProfile::HighLarge,
         Some(memory) if memory >= thresholds.standard_minimum_mi_b => {
@@ -284,9 +296,11 @@ fn resolved_quality_profile(
     profile: BrushTrainingProfile,
     detected_total_memory_mb: Option<u64>,
     initial_max_resolution: u32,
+    initial_sfm_points: u64,
 ) -> ResolvedBrushTrainingPreset {
     let config = pipeline_optimization_config();
     let profile_config = config.brush_profiles.get(profile);
+    let initial_sfm_points = initial_sfm_points.min(u32::MAX as u64) as u32;
     ResolvedBrushTrainingPreset {
         profile,
         detected_total_memory_mb,
@@ -295,7 +309,9 @@ fn resolved_quality_profile(
             total_steps: profile_config.total_steps,
             max_resolution: initial_max_resolution.max(1),
             refine_every: config.shared.brush_refine_every,
-            max_splats: profile_config.max_splats,
+            max_splats: profile_config
+                .max_splats
+                .map(|cap| cap.max(initial_sfm_points)),
             densification: profile_config.densification,
         },
     }
@@ -371,6 +387,18 @@ mod tests {
             (high.initial_fps, high.rescue_max_fps),
             (Some(12.0), Some(15.0))
         );
+        assert_eq!(fast.sfm_max_image_size, 1_200);
+        assert_eq!(balanced.sfm_max_image_size, 1_600);
+        assert_eq!(high.sfm_max_image_size, 2_000);
+        assert_eq!(fast.planned_sfm_max_image_size, 1_200);
+        assert_eq!(balanced.planned_sfm_max_image_size, 1_600);
+        assert_eq!(high.planned_sfm_max_image_size, 3_200);
+        assert_eq!(fast.sfm_max_features, 8_192);
+        assert_eq!(balanced.sfm_max_features, 8_192);
+        assert_eq!(high.sfm_max_features, 8_192);
+        assert_eq!(fast.planned_sfm_max_features, 4_096);
+        assert_eq!(balanced.planned_sfm_max_features, 8_192);
+        assert_eq!(high.planned_sfm_max_features, 16_384);
         assert_eq!(fast.brush_densification.unwrap().growth_stop_iter, 6_000);
         assert_eq!(
             balanced.brush_densification.unwrap().growth_grad_threshold,
@@ -465,8 +493,33 @@ mod tests {
     fn high_splat_cap_never_falls_below_initial_geometry() {
         let resolved =
             resolve_brush_training_preset(Quality::High, true, Some(4_096), 3_840, 350_000);
-        assert_eq!(resolved.configured_max_splats, Some(200_000));
-        assert_eq!(resolved.preset.max_splats, Some(350_000));
+        let cap = pipeline_optimization_config()
+            .brush_profiles
+            .get(resolved.profile)
+            .max_splats
+            .unwrap();
+        assert_eq!(resolved.configured_max_splats, Some(cap));
+        assert_eq!(resolved.preset.max_splats, Some(cap.max(350_000)));
+    }
+
+    #[test]
+    fn fast_and_balanced_splat_caps_never_fall_below_initial_geometry() {
+        let fast_below_cap =
+            resolve_brush_training_preset(Quality::Fast, true, Some(4_096), 1_600, 250_000);
+        assert_eq!(fast_below_cap.configured_max_splats, Some(500_000));
+        assert_eq!(fast_below_cap.preset.max_splats, Some(500_000));
+        assert!(fast_below_cap.downgrade_after_oom(250_000).is_none());
+
+        let fast_above_cap =
+            resolve_brush_training_preset(Quality::Fast, true, Some(4_096), 1_600, 600_000);
+        assert_eq!(fast_above_cap.configured_max_splats, Some(500_000));
+        assert_eq!(fast_above_cap.preset.max_splats, Some(600_000));
+
+        let balanced =
+            resolve_brush_training_preset(Quality::Balanced, true, Some(8_192), 1_920, 1_100_000);
+        assert_eq!(balanced.configured_max_splats, Some(1_000_000));
+        assert_eq!(balanced.preset.max_splats, Some(1_100_000));
+        assert!(balanced.downgrade_after_oom(1_100_000).is_none());
     }
 
     #[test]
@@ -483,13 +536,29 @@ mod tests {
     }
 
     #[test]
-    fn planner_disabled_keeps_legacy_brush_behavior() {
-        let resolved =
-            resolve_brush_training_preset(Quality::High, false, Some(24_576), 7_680, 50_000);
-        assert_eq!(resolved.profile, BrushTrainingProfile::Legacy);
-        assert_eq!(resolved.preset.max_resolution, 2_000);
-        assert!(resolved.preset.densification.is_none());
-        assert!(resolved.preset.max_splats.is_none());
+    fn planner_disabled_uses_compatible_densification_with_fixed_training_settings() {
+        for (quality, total_steps, max_resolution) in [
+            (Quality::Fast, 8_000, 1_200),
+            (Quality::Balanced, 15_000, 1_600),
+            (Quality::High, 30_000, 2_000),
+        ] {
+            let resolved =
+                resolve_brush_training_preset(quality, false, Some(24_576), 7_680, 50_000);
+            assert_eq!(resolved.profile, BrushTrainingProfile::Legacy);
+            assert_eq!(resolved.preset.total_steps, total_steps);
+            assert_eq!(resolved.preset.max_resolution, max_resolution);
+            assert_eq!(resolved.preset.refine_every, 200);
+            assert_eq!(
+                resolved.preset.densification,
+                Some(BrushDensificationPreset {
+                    growth_grad_threshold: 0.0025,
+                    growth_select_fraction: 0.1,
+                    growth_stop_iter: 15_000,
+                })
+            );
+            assert!(resolved.preset.max_splats.is_none());
+            assert!(resolved.downgrade_after_oom(50_000).is_none());
+        }
     }
 
     #[test]

@@ -174,9 +174,24 @@ pub enum ProcessStream {
 
 #[derive(Debug, Clone)]
 pub enum ProcessUpdate {
-    Started { process_id: u32 },
-    Line { stream: ProcessStream, line: String },
-    Heartbeat { elapsed_ms: u64 },
+    LogOpened {
+        path: PathBuf,
+        offset: u64,
+    },
+    Exited {
+        executable: PathBuf,
+        exit_code: Option<i32>,
+    },
+    Started {
+        process_id: u32,
+    },
+    Line {
+        stream: ProcessStream,
+        line: String,
+    },
+    Heartbeat {
+        elapsed_ms: u64,
+    },
     Resources(resources::ProcessResources),
 }
 
@@ -215,8 +230,9 @@ impl ProcessOutput {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ProcessManager {
+    lifecycle: Option<ProcessObserver>,
     cancellation: CancellationToken,
 }
 
@@ -224,7 +240,13 @@ impl ProcessManager {
     pub fn new() -> Self {
         Self {
             cancellation: CancellationToken::new(),
+            lifecycle: None,
         }
+    }
+
+    pub fn with_lifecycle(mut self, observer: ProcessObserver) -> Self {
+        self.lifecycle = Some(observer);
+        self
     }
 
     pub fn cancel(&self) {
@@ -321,6 +343,12 @@ impl ProcessManager {
                 .append(true)
                 .open(path)
                 .await?;
+            if let Some(observer) = &self.lifecycle {
+                observer(ProcessUpdate::LogOpened {
+                    path: path.clone(),
+                    offset: file.metadata().await?.len(),
+                });
+            }
             let args = spec
                 .args
                 .iter()
@@ -420,6 +448,12 @@ impl ProcessManager {
         let stderr = stderr_task
             .await
             .map_err(|error| SplatError::Process(error.to_string()))??;
+        if let Some(observer) = &self.lifecycle {
+            observer(ProcessUpdate::Exited {
+                executable: spec.executable.clone(),
+                exit_code: status.code(),
+            });
+        }
         let output = ProcessOutput {
             success: status.success(),
             exit_code: status.code(),

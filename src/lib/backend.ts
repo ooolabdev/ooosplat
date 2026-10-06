@@ -10,6 +10,9 @@ import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics"
 import { getCurrentLocale, translate } from "../i18n";
 import { previewAssetUrl } from "./previewAssetUrl";
 
+import type { SharedTask, TaskUpdate, StartReceipt, McpConnection, McpSettings } from "../types/tasks";
+import { taskIsActive } from "../types/tasks";
+
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
 export async function selectVideo(): Promise<string | null> {
@@ -36,6 +39,27 @@ export async function confirmLargeImageSequence(imageCount: number): Promise<boo
       kind: "warning",
       okLabel: translate(locale, "dialog.continue"),
       cancelLabel: translate(locale, "common.cancel"),
+    },
+  );
+}
+
+export async function confirmSmallImageSequence(imageCount: number): Promise<boolean> {
+  const locale = getCurrentLocale();
+  const advice = [
+    translate(locale, "captureAdvice.title"),
+    `• ${translate(locale, "captureAdvice.coverage")}`,
+    `• ${translate(locale, "captureAdvice.overlap")}`,
+    `• ${translate(locale, "captureAdvice.consistency")}`,
+    "",
+    translate(locale, "captureAdvice.aiWarning"),
+  ].join("\n");
+  return confirm(
+    `${translate(locale, "dialog.smallSequence", { count: imageCount.toLocaleString(locale) })}\n\n${advice}`,
+    {
+      title: translate(locale, "dialog.smallSequenceTitle"),
+      kind: "warning",
+      okLabel: translate(locale, "dialog.continueGeneration"),
+      cancelLabel: translate(locale, "dialog.cancelGeneration"),
     },
   );
 }
@@ -80,12 +104,20 @@ export async function onInputDragDrop(handler: (event: NativeInputDragEvent) => 
     });
   });
 }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string): Promise<PipelineResult> { return invoke("start_pipeline", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId }); }
-export async function resumePipeline(projectId: string): Promise<PipelineResult> { return invoke("resume_pipeline", { projectId }); }
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string): Promise<PipelineResult> {
+  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId });
+  await startGuiTask(task.task_id);
+  return waitForSharedTask(task.task_id);
+}
+export async function resumePipeline(projectId: string): Promise<PipelineResult> {
+  const receipt = await invoke<StartReceipt>("resume_gui_task", { projectId });
+  return waitForSharedTask(receipt.task_id);
+}
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId }); }
 export async function probeReshootInput(projectId: string, path: string, inputType: InputType): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType }); }
 export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string }): Promise<PipelineResult> {
-  return invoke("start_incremental_reshoot_pipeline", { request });
+  const receipt = await invoke<StartReceipt>("start_gui_reshoot", { request });
+  return waitForSharedTask(receipt.task_id);
 }
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }
 export async function prepareErrorReport(failureId: string): Promise<ErrorReportDraft> { return invoke("prepare_error_report", { failureId }); }
@@ -176,3 +208,40 @@ export async function exportPly(result: PipelineResult): Promise<string | null> 
   await invoke("export_ply", { sourcePath: result.finalPly, destinationPath: destination });
   return destination;
 }
+
+
+export async function getSharedTasks(): Promise<SharedTask[]> { return inTauri() ? invoke("get_shared_tasks") : []; }
+export async function getSharedTask(taskId: string): Promise<SharedTask> { return invoke("get_shared_task", { taskId }); }
+export async function startGuiTask(taskId: string): Promise<StartReceipt> { return invoke("start_gui_task", { taskId }); }
+export async function cancelSharedTask(taskId: string, runId: string): Promise<SharedTask> { return invoke("cancel_shared_task", { taskId, runId }); }
+export async function onTaskUpdate(handler: (update: TaskUpdate) => void): Promise<UnlistenFn> { return inTauri() ? listen<TaskUpdate>("task-update", ({ payload }) => handler(payload)) : () => undefined; }
+export async function getMcpSettings(): Promise<McpConnection> { return inTauri() ? invoke("get_mcp_settings") : { settings: { enabled: false, port: 39877, inputRoots: [] }, listening: false, address: null, token: null, error: null }; }
+export async function setMcpSettings(settings: McpSettings): Promise<McpConnection> { return invoke("set_mcp_settings", { settings }); }
+export async function selectMcpInputRoot(): Promise<string | null> { if (!inTauri()) return null; const path = await open({ directory: true, multiple: false }); return typeof path === 'string' ? path : null; }
+
+/** Local completion waiter; the only native requests are short queries/admissions. */
+async function waitForSharedTask(taskId: string): Promise<PipelineResult> {
+  let unsubscribe: UnlistenFn | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    return await new Promise<PipelineResult>((resolve, reject) => {
+      let revision = -1;
+      const apply = (task: SharedTask) => {
+        if (task.task_id !== taskId || task.revision <= revision) return;
+        revision = task.revision;
+        if (taskIsActive(task)) return;
+        if (task.status === 'completed' && task.result) resolve(task.result);
+        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, failureId: task.error?.failure_id, projectId: task.project_id });
+      };
+      void (async () => {
+        unsubscribe = await onTaskUpdate(update => apply(update.task));
+        const snapshot = await getSharedTask(taskId);
+        apply(snapshot);
+        if (taskIsActive(snapshot)) timer = setInterval(() => { void getSharedTask(taskId).then(apply).catch(reject); }, 15000);
+      })().catch(reject);
+    });
+  } finally { unsubscribe?.(); if (timer) clearInterval(timer); }
+}
+
+export interface TaskLogPage { entries: Array<{ source: string; text: string; partial_line: boolean }>; next_cursor: string | null; has_more: boolean; cursor_reset: boolean; reset_reason: string | null }
+export async function readSharedTaskLogs(taskId: string, runId: string | null, cursor?: string): Promise<TaskLogPage> { return invoke("read_shared_task_logs", { request: { task_id: taskId, run_id: runId, cursor, max_bytes: 32768 } }); }

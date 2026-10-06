@@ -43,6 +43,7 @@ pub async fn extract_uniform_frames(
     executable: &Path,
     input: &Path,
     output_directory: &Path,
+    colmap_directory: &Path,
     mask_directory: &Path,
     plan: &FramePlan,
     has_alpha: bool,
@@ -54,8 +55,9 @@ pub async fn extract_uniform_frames(
     if !input.is_file() {
         return Err(SplatError::InvalidPath(input.to_path_buf()));
     }
-    ensure_clean_output(output_directory, mask_directory).await?;
+    ensure_clean_output(output_directory, colmap_directory, mask_directory).await?;
     tokio::fs::create_dir_all(output_directory).await?;
+    tokio::fs::create_dir_all(colmap_directory).await?;
     if has_alpha {
         tokio::fs::create_dir_all(mask_directory).await?;
     }
@@ -63,6 +65,7 @@ pub async fn extract_uniform_frames(
     let args = frame_extraction_args(
         input,
         output_directory,
+        colmap_directory,
         mask_directory,
         plan.sampling_fps,
         has_alpha,
@@ -89,7 +92,17 @@ pub async fn extract_uniform_frames(
         )));
     }
 
-    validate_extraction(output_directory, mask_directory, has_alpha).await
+    if !has_alpha {
+        mirror_images(output_directory, colmap_directory).await?;
+    }
+
+    validate_extraction(
+        output_directory,
+        colmap_directory,
+        mask_directory,
+        has_alpha,
+    )
+    .await
 }
 
 /// Extracts the exact source-frame indices selected by Quality v2 and names
@@ -100,6 +113,7 @@ pub async fn extract_selected_frames(
     executable: &Path,
     input: &Path,
     output_directory: &Path,
+    colmap_directory: &Path,
     mask_directory: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
@@ -116,8 +130,9 @@ pub async fn extract_selected_frames(
             "Quality v2 did not select any source frames".into(),
         ));
     }
-    ensure_clean_output(output_directory, mask_directory).await?;
+    ensure_clean_output(output_directory, colmap_directory, mask_directory).await?;
     tokio::fs::create_dir_all(output_directory).await?;
+    tokio::fs::create_dir_all(colmap_directory).await?;
     if has_alpha {
         tokio::fs::create_dir_all(mask_directory).await?;
     }
@@ -131,6 +146,7 @@ pub async fn extract_selected_frames(
     let args = selected_frame_extraction_args(
         input,
         output_directory,
+        colmap_directory,
         mask_directory,
         &script_path,
         has_alpha,
@@ -158,8 +174,24 @@ pub async fn extract_selected_frames(
             }
         )));
     }
-    rename_selected_outputs(output_directory, mask_directory, selected_frames, has_alpha).await?;
-    validate_extraction(output_directory, mask_directory, has_alpha).await
+    rename_selected_outputs(
+        output_directory,
+        colmap_directory,
+        mask_directory,
+        selected_frames,
+        has_alpha,
+    )
+    .await?;
+    if !has_alpha {
+        mirror_images(output_directory, colmap_directory).await?;
+    }
+    validate_extraction(
+        output_directory,
+        colmap_directory,
+        mask_directory,
+        has_alpha,
+    )
+    .await
 }
 
 /// Extracts only Bridge Backfill frames into a temporary directory, then
@@ -169,6 +201,7 @@ pub async fn extract_additional_frames(
     executable: &Path,
     input: &Path,
     output_directory: &Path,
+    colmap_directory: &Path,
     mask_directory: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
@@ -177,15 +210,24 @@ pub async fn extract_additional_frames(
     process_manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<FrameExtractionResult> {
-    remove_selected_outputs(output_directory, mask_directory, selected_frames, has_alpha).await?;
+    remove_selected_outputs(
+        output_directory,
+        colmap_directory,
+        mask_directory,
+        selected_frames,
+        has_alpha,
+    )
+    .await?;
     let parent = output_directory.parent().unwrap_or(output_directory);
     let temporary = parent.join(format!(".bridge-backfill-{}", uuid::Uuid::new_v4()));
     let temporary_frames = temporary.join("frames");
+    let temporary_colmap_frames = temporary.join("colmap_frames");
     let temporary_masks = temporary.join("masks");
     let extraction = extract_selected_frames(
         executable,
         input,
         &temporary_frames,
+        &temporary_colmap_frames,
         &temporary_masks,
         selected_frames,
         has_alpha,
@@ -200,17 +242,32 @@ pub async fn extract_additional_frames(
         return Err(error);
     }
     tokio::fs::create_dir_all(output_directory).await?;
-    move_images(&temporary_frames, output_directory).await?;
+    tokio::fs::create_dir_all(colmap_directory).await?;
+    let mut image_sets = vec![
+        (temporary_frames.as_path(), output_directory),
+        (temporary_colmap_frames.as_path(), colmap_directory),
+    ];
     if has_alpha {
         tokio::fs::create_dir_all(mask_directory).await?;
-        move_images(&temporary_masks, mask_directory).await?;
+        image_sets.push((temporary_masks.as_path(), mask_directory));
+    }
+    if let Err(error) = move_image_sets(&image_sets).await {
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        return Err(error);
     }
     let _ = tokio::fs::remove_dir_all(&temporary).await;
-    validate_extraction(output_directory, mask_directory, has_alpha).await
+    validate_extraction(
+        output_directory,
+        colmap_directory,
+        mask_directory,
+        has_alpha,
+    )
+    .await
 }
 
 async fn remove_selected_outputs(
     frames: &Path,
+    colmap_frames: &Path,
     masks: &Path,
     selected: &[PlannedFrame],
     has_alpha: bool,
@@ -219,6 +276,11 @@ async fn remove_selected_outputs(
     for frame in selected {
         let name = format!("frame_{:010}.{extension}", frame.source_frame_index);
         match tokio::fs::remove_file(frames.join(&name)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match tokio::fs::remove_file(colmap_frames.join(&name)).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -236,6 +298,7 @@ async fn remove_selected_outputs(
 
 async fn rename_selected_outputs(
     frames: &Path,
+    colmap_frames: &Path,
     masks: &Path,
     selected_frames: &[PlannedFrame],
     has_alpha: bool,
@@ -263,6 +326,23 @@ async fn rename_selected_outputs(
         .await?;
     }
     if has_alpha {
+        let mut colmap_paths = image_paths(colmap_frames, "png").await?;
+        colmap_paths.sort();
+        if colmap_paths.len() != selected.len() {
+            return Err(SplatError::Process(
+                "Quality v2 COLMAP image count mismatch".into(),
+            ));
+        }
+        for (source, frame) in colmap_paths.into_iter().zip(&selected) {
+            tokio::fs::rename(
+                source,
+                colmap_frames.join(format!(
+                    "frame_{:010}.{extension}",
+                    frame.source_frame_index
+                )),
+            )
+            .await?;
+        }
         let mut mask_paths = image_paths(masks, "png").await?;
         mask_paths.sort();
         if mask_paths.len() != selected.len() {
@@ -281,18 +361,50 @@ async fn rename_selected_outputs(
     Ok(())
 }
 
-async fn move_images(source: &Path, destination: &Path) -> Result<()> {
+async fn move_image_sets(sets: &[(&Path, &Path)]) -> Result<()> {
+    let mut pending = Vec::new();
+    for (source, destination) in sets {
+        let mut entries = tokio::fs::read_dir(source).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().is_file() && is_pipeline_image(&entry.path()) {
+                let target = destination.join(entry.file_name());
+                if target.exists() {
+                    return Err(SplatError::Process(format!(
+                        "Bridge Backfill would overwrite {}",
+                        target.display()
+                    )));
+                }
+                pending.push((entry.path(), target));
+            }
+        }
+    }
+    let mut moved = Vec::new();
+    for (source, target) in pending {
+        if let Err(error) = tokio::fs::rename(&source, &target).await {
+            for (original, destination) in moved.into_iter().rev() {
+                let _ = tokio::fs::rename(destination, original).await;
+            }
+            return Err(error.into());
+        }
+        moved.push((source, target));
+    }
+    Ok(())
+}
+
+async fn mirror_images(source: &Path, destination: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(destination).await?;
     let mut entries = tokio::fs::read_dir(source).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.path().is_file() && is_pipeline_image(&entry.path()) {
-            let target = destination.join(entry.file_name());
-            if target.exists() {
-                return Err(SplatError::Process(format!(
-                    "Bridge Backfill would overwrite {}",
-                    target.display()
-                )));
-            }
-            tokio::fs::rename(entry.path(), target).await?;
+        let path = entry.path();
+        if !path.is_file() || !is_pipeline_image(&path) {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if target.exists() {
+            tokio::fs::remove_file(&target).await?;
+        }
+        if tokio::fs::hard_link(&path, &target).await.is_err() {
+            tokio::fs::copy(&path, &target).await?;
         }
     }
     Ok(())
@@ -333,7 +445,11 @@ fn selected_filter_script(
         .map(|(width, height)| format!(",scale={width}:{height}:flags=lanczos"))
         .unwrap_or_default();
     if has_alpha {
-        format!("[0:v]select='{expression}'{scale},format=rgba,split=2[rgba][masksrc];[masksrc]alphaextract[mask]")
+        format!(
+            "[0:v]select='{expression}'{scale},format=rgba,split=3[rgba][masksrc][colmapsrc];\
+             [masksrc]alphaextract[mask];\
+             [colmapsrc]format=gbrap,geq=r='round(r(X,Y)*alpha(X,Y)/255)':g='round(g(X,Y)*alpha(X,Y)/255)':b='round(b(X,Y)*alpha(X,Y)/255)':a='alpha(X,Y)',format=rgb24[colmap]"
+        )
     } else {
         format!("select='{expression}'{scale}")
     }
@@ -356,6 +472,7 @@ fn balanced_selection_expression(indices: &[u64]) -> String {
 fn selected_frame_extraction_args(
     input: &Path,
     output_directory: &Path,
+    colmap_directory: &Path,
     mask_directory: &Path,
     script_path: &Path,
     has_alpha: bool,
@@ -394,6 +511,17 @@ fn selected_frame_extraction_args(
             "-start_number".into(),
             "1".into(),
             mask_directory.join("frame_%06d.png.png").into_os_string(),
+            "-map".into(),
+            "[colmap]".into(),
+            "-c:v".into(),
+            "png".into(),
+            "-pix_fmt".into(),
+            "rgb24".into(),
+            "-vsync".into(),
+            "vfr".into(),
+            "-start_number".into(),
+            "1".into(),
+            colmap_directory.join("frame_%06d.png").into_os_string(),
         ]);
     } else {
         args.extend([
@@ -415,6 +543,7 @@ fn selected_frame_extraction_args(
 fn frame_extraction_args(
     input: &Path,
     output_directory: &Path,
+    colmap_directory: &Path,
     mask_directory: &Path,
     sampling_fps: f64,
     has_alpha: bool,
@@ -434,7 +563,9 @@ fn frame_extraction_args(
     );
     if has_alpha {
         let filter = format!(
-            "[0:v]fps={sampling_fps:.8},{scale},format=rgba,split=2[rgba][masksrc];[masksrc]alphaextract[mask]"
+            "[0:v]fps={sampling_fps:.8},{scale},format=rgba,split=3[rgba][masksrc][colmapsrc];\
+             [masksrc]alphaextract[mask];\
+             [colmapsrc]format=gbrap,geq=r='round(r(X,Y)*alpha(X,Y)/255)':g='round(g(X,Y)*alpha(X,Y)/255)':b='round(b(X,Y)*alpha(X,Y)/255)':a='alpha(X,Y)',format=rgb24[colmap]"
         );
         args.extend([
             "-filter_complex".into(),
@@ -457,6 +588,15 @@ fn frame_extraction_args(
             "-start_number".into(),
             "1".into(),
             mask_directory.join("frame_%06d.png.png").into_os_string(),
+            "-map".into(),
+            "[colmap]".into(),
+            "-c:v".into(),
+            "png".into(),
+            "-pix_fmt".into(),
+            "rgb24".into(),
+            "-start_number".into(),
+            "1".into(),
+            colmap_directory.join("frame_%06d.png").into_os_string(),
         ]);
     } else {
         let filter = format!("fps={sampling_fps:.8},{scale}");
@@ -474,8 +614,8 @@ fn frame_extraction_args(
     args
 }
 
-async fn ensure_clean_output(frames: &Path, masks: &Path) -> Result<()> {
-    for directory in [frames, masks] {
+async fn ensure_clean_output(frames: &Path, colmap_frames: &Path, masks: &Path) -> Result<()> {
+    for directory in [frames, colmap_frames, masks] {
         if !directory.exists() {
             continue;
         }
@@ -494,6 +634,7 @@ async fn ensure_clean_output(frames: &Path, masks: &Path) -> Result<()> {
 
 pub(crate) async fn validate_extraction(
     frames: &Path,
+    colmap_frames: &Path,
     masks: &Path,
     has_alpha: bool,
 ) -> Result<FrameExtractionResult> {
@@ -501,6 +642,15 @@ pub(crate) async fn validate_extraction(
     let frame_names = image_names(frames, expected_extension).await?;
     if frame_names.is_empty() {
         return Err(SplatError::Process("FFmpeg 未输出任何画面".into()));
+    }
+
+    let colmap_names = image_names(colmap_frames, expected_extension).await?;
+    if frame_names != colmap_names {
+        return Err(SplatError::Process(format!(
+            "COLMAP 专用图片不完整：原始帧 {} 张，COLMAP 图片 {} 张",
+            frame_names.len(),
+            colmap_names.len()
+        )));
     }
 
     let mask_count = if has_alpha {
@@ -521,31 +671,73 @@ pub(crate) async fn validate_extraction(
         0
     };
 
-    let first_frame = frame_names
+    let validation_entries = frame_names
         .iter()
-        .next()
-        .ok_or_else(|| SplatError::Process("FFmpeg did not output any frames".into()))?;
-    let first_path = frames.join(first_frame);
-    let first_mask_path = has_alpha.then(|| masks.join(format!("{first_frame}.png")));
+        .map(|name| {
+            (
+                frames.join(name),
+                colmap_frames.join(name),
+                has_alpha.then(|| masks.join(format!("{name}.png"))),
+            )
+        })
+        .collect::<Vec<_>>();
     let (width, height) = tokio::task::spawn_blocking(move || {
         use image::ImageDecoder;
-        let decoder = image::ImageReader::open(first_path)?
-            .with_guessed_format()?
-            .into_decoder()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let dimensions = decoder.dimensions();
-        if let Some(mask_path) = first_mask_path {
-            let mask_decoder = image::ImageReader::open(mask_path)?
+        let mut expected_dimensions = None;
+        for (frame_path, colmap_path, mask_path) in validation_entries {
+            for path in [&frame_path, &colmap_path] {
+                if std::fs::metadata(path)?.len() == 0 {
+                    return Err(std::io::Error::other(format!(
+                        "prepared image is empty: {}",
+                        path.display()
+                    )));
+                }
+            }
+            let decoder = image::ImageReader::open(&frame_path)?
                 .with_guessed_format()?
                 .into_decoder()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            if mask_decoder.dimensions() != dimensions {
+            let dimensions = decoder.dimensions();
+            if expected_dimensions.is_some_and(|expected| expected != dimensions) {
                 return Err(std::io::Error::other(
-                    "Alpha mask dimensions do not match the extracted frame",
+                    "extracted frame dimensions are inconsistent",
                 ));
             }
+            expected_dimensions = Some(dimensions);
+
+            let colmap_decoder = image::ImageReader::open(&colmap_path)?
+                .with_guessed_format()?
+                .into_decoder()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if colmap_decoder.dimensions() != dimensions {
+                return Err(std::io::Error::other(
+                    "COLMAP image dimensions do not match the extracted frame",
+                ));
+            }
+            if has_alpha && colmap_decoder.color_type().has_alpha() {
+                return Err(std::io::Error::other(
+                    "COLMAP image unexpectedly retains an alpha channel",
+                ));
+            }
+            if let Some(mask_path) = mask_path {
+                if std::fs::metadata(&mask_path)?.len() == 0 {
+                    return Err(std::io::Error::other(format!(
+                        "alpha mask is empty: {}",
+                        mask_path.display()
+                    )));
+                }
+                let mask_decoder = image::ImageReader::open(mask_path)?
+                    .with_guessed_format()?
+                    .into_decoder()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if mask_decoder.dimensions() != dimensions {
+                    return Err(std::io::Error::other(
+                        "Alpha mask dimensions do not match the extracted frame",
+                    ));
+                }
+            }
         }
-        Ok::<_, std::io::Error>(dimensions)
+        expected_dimensions.ok_or_else(|| std::io::Error::other("FFmpeg did not output any frames"))
     })
     .await
     .map_err(|error| SplatError::Process(format!("Frame dimension task failed: {error}")))??;
@@ -603,6 +795,7 @@ mod tests {
         let args = args_as_strings(frame_extraction_args(
             Path::new("input.mov"),
             Path::new("frames"),
+            Path::new("colmap_frames"),
             Path::new("masks"),
             15.0,
             false,
@@ -618,17 +811,31 @@ mod tests {
         let args = args_as_strings(frame_extraction_args(
             Path::new("input.mov"),
             Path::new("frames"),
+            Path::new("colmap_frames"),
             Path::new("masks"),
             15.0,
             true,
             None,
         ));
         assert!(args.iter().any(|value| value == "-filter_complex"));
+        assert_eq!(
+            args.iter().filter(|value| value.as_str() == "-i").count(),
+            1
+        );
         assert!(args.iter().any(|value| value.contains("alphaextract")));
+        assert!(args.iter().any(|value| value.contains("split=3")));
+        assert!(args
+            .iter()
+            .any(|value| value.contains("round(r(X,Y)*alpha(X,Y)/255)")));
+        assert!(!args.iter().any(|value| value.contains("premultiply")));
         assert!(args.iter().any(|value| value.ends_with("frame_%06d.png")));
         assert!(args
             .iter()
             .any(|value| value.ends_with("frame_%06d.png.png")));
+        assert!(args.iter().any(|value| {
+            value.ends_with("colmap_frames\\frame_%06d.png")
+                || value.ends_with("colmap_frames/frame_%06d.png")
+        }));
     }
 
     #[test]
@@ -649,6 +856,7 @@ mod tests {
         let args = args_as_strings(frame_extraction_args(
             Path::new("input.mov"),
             Path::new("frames"),
+            Path::new("colmap_frames"),
             Path::new("masks"),
             8.0,
             false,
@@ -665,40 +873,154 @@ mod tests {
         let opaque = selected_filter_script("eq(n\\,0)", false, Some((1600, 900)));
         assert!(opaque.contains("scale=1600:900:flags=lanczos"));
         let alpha = selected_filter_script("eq(n\\,0)", true, Some((1920, 1080)));
-        assert!(alpha.contains("scale=1920:1080:flags=lanczos,format=rgba,split=2"));
+        assert!(alpha.contains("scale=1920:1080:flags=lanczos,format=rgba,split=3"));
         assert!(alpha.contains("alphaextract[mask]"));
+        assert!(alpha.contains("round(r(X,Y)*alpha(X,Y)/255)"));
+        assert!(!alpha.contains("premultiply"));
     }
 
     #[tokio::test]
     async fn validates_matching_alpha_frame_and_mask_names() {
         let temporary = tempfile::tempdir().unwrap();
         let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
         let masks = temporary.path().join("masks");
         tokio::fs::create_dir_all(&frames).await.unwrap();
+        tokio::fs::create_dir_all(&colmap_frames).await.unwrap();
         tokio::fs::create_dir_all(&masks).await.unwrap();
         image::RgbaImage::new(2, 2)
             .save(frames.join("frame_000001.png"))
             .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(colmap_frames.join("frame_000001.png"))
+            .unwrap();
         image::GrayImage::new(2, 2)
             .save(masks.join("frame_000001.png.png"))
             .unwrap();
-        let result = validate_extraction(&frames, &masks, true).await.unwrap();
+        let result = validate_extraction(&frames, &colmap_frames, &masks, true)
+            .await
+            .unwrap();
         assert_eq!(result.frame_count, 1);
         assert_eq!(result.mask_count, 1);
         assert_eq!(result.image_format, FrameImageFormat::Png);
     }
 
     #[tokio::test]
+    async fn rejects_alpha_colmap_images_and_dimension_mismatches() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
+        let masks = temporary.path().join("masks");
+        for directory in [&frames, &colmap_frames, &masks] {
+            tokio::fs::create_dir_all(directory).await.unwrap();
+        }
+        image::RgbaImage::new(2, 2)
+            .save(frames.join("frame_000001.png"))
+            .unwrap();
+        image::RgbaImage::new(2, 2)
+            .save(colmap_frames.join("frame_000001.png"))
+            .unwrap();
+        image::GrayImage::new(2, 2)
+            .save(masks.join("frame_000001.png.png"))
+            .unwrap();
+        assert!(validate_extraction(&frames, &colmap_frames, &masks, true)
+            .await
+            .is_err());
+
+        image::RgbImage::new(3, 2)
+            .save(colmap_frames.join("frame_000001.png"))
+            .unwrap();
+        assert!(validate_extraction(&frames, &colmap_frames, &masks, true)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg and an external alpha video"]
+    async fn selected_and_bridge_alpha_integration() {
+        let executable = PathBuf::from(
+            std::env::var("OOOSPLAT_VALIDATION_FFMPEG")
+                .expect("OOOSPLAT_VALIDATION_FFMPEG is required"),
+        );
+        let input = PathBuf::from(
+            std::env::var("OOOSPLAT_VALIDATION_VIDEO")
+                .expect("OOOSPLAT_VALIDATION_VIDEO is required"),
+        );
+        let output_parent = PathBuf::from(
+            std::env::var("OOOSPLAT_VALIDATION_OUTPUT")
+                .expect("OOOSPLAT_VALIDATION_OUTPUT is required"),
+        );
+        let root = output_parent.join(format!("selected-bridge-{}", uuid::Uuid::new_v4()));
+        let frames = root.join("frames");
+        let colmap_frames = root.join("colmap_frames");
+        let masks = root.join("masks");
+        let process_manager = ProcessManager::new();
+        let initial = [
+            PlannedFrame {
+                source_frame_index: 0,
+                timestamp_seconds: 0.0,
+            },
+            PlannedFrame {
+                source_frame_index: 224,
+                timestamp_seconds: 224.0 / 30.0,
+            },
+        ];
+        let extracted = extract_selected_frames(
+            &executable,
+            &input,
+            &frames,
+            &colmap_frames,
+            &masks,
+            &initial,
+            true,
+            None,
+            None,
+            &process_manager,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(extracted.frame_count, 2);
+        let bridge = [PlannedFrame {
+            source_frame_index: 30,
+            timestamp_seconds: 1.0,
+        }];
+        let merged = extract_additional_frames(
+            &executable,
+            &input,
+            &frames,
+            &colmap_frames,
+            &masks,
+            &bridge,
+            true,
+            None,
+            None,
+            &process_manager,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.frame_count, 3);
+        assert_eq!(merged.mask_count, 3);
+        eprintln!("selected/Bridge validation output: {}", root.display());
+    }
+
+    #[tokio::test]
     async fn rejects_partial_alpha_output() {
         let temporary = tempfile::tempdir().unwrap();
         let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
         let masks = temporary.path().join("masks");
         tokio::fs::create_dir_all(&frames).await.unwrap();
+        tokio::fs::create_dir_all(&colmap_frames).await.unwrap();
         tokio::fs::create_dir_all(&masks).await.unwrap();
         image::RgbaImage::new(2, 2)
             .save(frames.join("frame_000001.png"))
             .unwrap();
-        let error = validate_extraction(&frames, &masks, true)
+        image::RgbImage::new(2, 2)
+            .save(colmap_frames.join("frame_000001.png"))
+            .unwrap();
+        let error = validate_extraction(&frames, &colmap_frames, &masks, true)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Alpha Mask 不完整"));

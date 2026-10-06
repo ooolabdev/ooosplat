@@ -98,7 +98,9 @@ export const useAppStore = create<AppState>((set) => ({
   setPhase: (phase) => set({ phase }),
   beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null, taskColmapAcceleration: null }),
   receiveEvent: (event) => set((state) => {
-    if (event.sequence > 0 && event.sequence <= Math.max(state.lastEventSequence, state.latestEvent?.sequence ?? 0)) return state;
+    if (event.taskId && state.latestEvent?.taskId === event.taskId && event.runId !== state.latestEvent.runId && (event.revision ?? 0) <= (state.latestEvent.revision ?? 0)) return state;
+    const sameRun = !event.runId || event.runId === state.latestEvent?.runId;
+    if (sameRun && event.sequence > 0 && event.sequence <= Math.max(state.lastEventSequence, state.latestEvent?.sequence ?? 0)) return state;
     if (event.kind === "runtime") {
       if (state.phase !== "running" || ["completed", "failed", "cancelled"].includes(state.latestEvent?.stage ?? "")) return state;
       return { latestRuntime: event.runtime ?? state.latestRuntime, lastEventSequence: event.sequence };

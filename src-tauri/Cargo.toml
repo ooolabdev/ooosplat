@@ -29,6 +29,11 @@ path = "src/bin/splatstudio.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+axum = { version = "=0.8.9", features = ["json"] }
+schemars = "1"
+getrandom = "0.3"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
@@ -65,3 +70,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false }

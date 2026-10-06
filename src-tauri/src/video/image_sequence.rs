@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use image::{DynamicImage, GrayImage, ImageDecoder, ImageReader, Luma};
+use image::{DynamicImage, GrayImage, ImageBuffer, ImageDecoder, ImageReader, Luma, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +97,14 @@ pub fn scan_image_sequence(
     dir: &Path,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ImageSequenceScan> {
+    scan_image_sequence_with_boundary(dir, cancellation, None)
+}
+
+pub fn scan_image_sequence_with_boundary(
+    dir: &Path,
+    cancellation: Option<&CancellationToken>,
+    boundary: Option<&Path>,
+) -> Result<ImageSequenceScan> {
     let files = list_images(dir)?;
     if files.len() < 2 {
         return Err(SplatError::InvalidVideo(
@@ -108,6 +116,10 @@ pub fn scan_image_sequence(
     let mut has_alpha = false;
     let mut images = Vec::with_capacity(files.len());
     for path in files {
+        if let Some(boundary) = boundary {
+            crate::tasks::authorize_input(&path, &[boundary.to_path_buf()])
+                .map_err(|e| SplatError::Process(e.to_string()))?;
+        }
         ensure_not_cancelled(cancellation)?;
         let (current, has_alpha_channel) = read_image_header(&path)?;
         if let Some(expected) = dimensions {
@@ -172,12 +184,14 @@ fn normalized_sequence_name(index: usize, source: &Path, prefix: &str) -> Result
 pub fn prepare_image_sequence(
     source_dir: &Path,
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
 ) -> Result<PreparedImageSequence> {
     let scan = scan_image_sequence(source_dir, None)?;
     prepare_scanned_image_sequence(
         scan,
         frames_dir,
+        colmap_frames_dir,
         masks_dir,
         ImageSequenceNaming::Primary,
         None,
@@ -188,12 +202,14 @@ pub fn prepare_image_sequence(
 pub fn prepare_reshoot_image_sequence(
     source_dir: &Path,
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
 ) -> Result<PreparedImageSequence> {
     let scan = scan_image_sequence(source_dir, None)?;
     prepare_scanned_image_sequence(
         scan,
         frames_dir,
+        colmap_frames_dir,
         masks_dir,
         ImageSequenceNaming::Reshoot,
         None,
@@ -204,6 +220,7 @@ pub fn prepare_reshoot_image_sequence(
 pub fn prepare_scanned_image_sequence(
     scan: ImageSequenceScan,
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
     naming: ImageSequenceNaming,
     observer: Option<ImagePreparationObserver>,
@@ -211,6 +228,7 @@ pub fn prepare_scanned_image_sequence(
 ) -> Result<PreparedImageSequence> {
     let info = &scan.info;
     std::fs::create_dir_all(frames_dir)?;
+    std::fs::create_dir_all(colmap_frames_dir)?;
     if info.has_alpha {
         std::fs::create_dir_all(masks_dir)?;
     }
@@ -233,6 +251,9 @@ pub fn prepare_scanned_image_sequence(
         ensure_not_cancelled(cancellation)?;
         let name = normalized_sequence_name(index, &image.path, prefix)?;
         link_or_copy(&image.path, &frames_dir.join(&name))?;
+        if !image.has_alpha_channel {
+            link_or_copy(&image.path, &colmap_frames_dir.join(&name))?;
+        }
         names.push(name);
         reporter.report(ImagePreparationProgress {
             phase: ImagePreparationPhase::LinkingFrames,
@@ -251,8 +272,13 @@ pub fn prepare_scanned_image_sequence(
             }
             ensure_not_cancelled(cancellation)?;
             let decoded = decode_image(&image.path)?;
-            let transparent =
-                write_alpha_mask(&decoded, &masks_dir.join(format!("{}.png", names[index])))?;
+            let transparent = has_native_transparency(&decoded);
+            write_alpha_mask(&decoded, &masks_dir.join(format!("{}.png", names[index])))?;
+            if transparent {
+                write_premultiplied_colmap_image(&decoded, &colmap_frames_dir.join(&names[index]))?;
+            } else {
+                link_or_copy(&image.path, &colmap_frames_dir.join(&names[index]))?;
+            }
             has_transparency |= transparent;
             completed += 1;
             reporter.report(ImagePreparationProgress {
@@ -309,6 +335,7 @@ pub fn prepare_scanned_image_sequence(
     });
     let prepared = validate_named_sequence_with_cancellation(
         frames_dir,
+        colmap_frames_dir,
         masks_dir,
         info.image_count,
         has_transparency,
@@ -326,12 +353,14 @@ pub fn prepare_scanned_image_sequence(
 
 pub fn validate_reshoot_image_sequence(
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
     expected_count: u64,
     has_alpha: bool,
 ) -> Result<PreparedImageSequence> {
     validate_named_sequence_with_cancellation(
         frames_dir,
+        colmap_frames_dir,
         masks_dir,
         expected_count,
         has_alpha,
@@ -342,12 +371,14 @@ pub fn validate_reshoot_image_sequence(
 
 pub fn validate_prepared_image_sequence(
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
     expected_count: u64,
     has_alpha: bool,
 ) -> Result<PreparedImageSequence> {
     validate_named_sequence_with_cancellation(
         frames_dir,
+        colmap_frames_dir,
         masks_dir,
         expected_count,
         has_alpha,
@@ -358,6 +389,7 @@ pub fn validate_prepared_image_sequence(
 
 fn validate_named_sequence_with_cancellation(
     frames_dir: &Path,
+    colmap_frames_dir: &Path,
     masks_dir: &Path,
     expected_count: u64,
     has_alpha: bool,
@@ -384,6 +416,39 @@ fn validate_named_sequence_with_cancellation(
         )));
     }
 
+    let colmap_frames = list_images(colmap_frames_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    if colmap_frames.len() != frames.len() {
+        return Err(SplatError::Process(format!(
+            "COLMAP 图片检查点不完整：预期 {} 张，实际 {} 张",
+            frames.len(),
+            colmap_frames.len()
+        )));
+    }
+    for (frame, colmap_frame) in frames.iter().zip(&colmap_frames) {
+        ensure_not_cancelled(cancellation)?;
+        if frame.file_name() != colmap_frame.file_name()
+            || std::fs::metadata(colmap_frame).map_or(true, |metadata| metadata.len() == 0)
+        {
+            return Err(SplatError::Process(format!(
+                "COLMAP 图片与原始准备帧不一致：{}",
+                colmap_frame.display()
+            )));
+        }
+        if read_image_header(frame)?.0 != read_image_header(colmap_frame)?.0 {
+            return Err(SplatError::Process(format!(
+                "COLMAP 图片尺寸与原始准备帧不一致：{}",
+                colmap_frame.display()
+            )));
+        }
+    }
+
     let mask_count = if has_alpha {
         for frame in &frames {
             ensure_not_cancelled(cancellation)?;
@@ -395,6 +460,12 @@ fn validate_named_sequence_with_cancellation(
             if !mask.is_file() || std::fs::metadata(&mask)?.len() == 0 {
                 return Err(SplatError::Process(format!(
                     "COLMAP Mask 缺失：{}",
+                    mask.display()
+                )));
+            }
+            if read_image_header(frame)?.0 != read_image_header(&mask)?.0 {
+                return Err(SplatError::Process(format!(
+                    "COLMAP Mask 尺寸与原始准备帧不一致：{}",
                     mask.display()
                 )));
             }
@@ -436,16 +507,77 @@ fn read_image_header(path: &Path) -> Result<((u32, u32), bool)> {
     Ok((decoder.dimensions(), decoder.color_type().has_alpha()))
 }
 
-fn write_alpha_mask(image: &DynamicImage, destination: &Path) -> Result<bool> {
+fn write_alpha_mask(image: &DynamicImage, destination: &Path) -> Result<()> {
     let rgba = image.to_rgba8();
     let mut mask = GrayImage::new(rgba.width(), rgba.height());
-    let mut has_transparency = false;
     for (x, y, pixel) in rgba.enumerate_pixels() {
-        has_transparency |= pixel[3] < 255;
         mask.put_pixel(x, y, Luma([pixel[3]]));
     }
     save_mask(&mask, destination)?;
-    Ok(has_transparency)
+    Ok(())
+}
+
+fn has_native_transparency(image: &DynamicImage) -> bool {
+    match image {
+        DynamicImage::ImageLumaA16(value) => value.pixels().any(|pixel| pixel[1] < u16::MAX),
+        DynamicImage::ImageRgba16(value) => value.pixels().any(|pixel| pixel[3] < u16::MAX),
+        DynamicImage::ImageLumaA8(value) => value.pixels().any(|pixel| pixel[1] < u8::MAX),
+        DynamicImage::ImageRgba8(value) => value.pixels().any(|pixel| pixel[3] < u8::MAX),
+        _ => false,
+    }
+}
+
+fn write_premultiplied_colmap_image(image: &DynamicImage, destination: &Path) -> Result<()> {
+    let result = match image {
+        DynamicImage::ImageLumaA16(_) | DynamicImage::ImageRgba16(_) => {
+            let rgba = image.to_rgba16();
+            let mut rgb = ImageBuffer::<Rgb<u16>, Vec<u16>>::new(rgba.width(), rgba.height());
+            for (x, y, pixel) in rgba.enumerate_pixels() {
+                let alpha = pixel[3];
+                rgb.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        premultiply_u16(pixel[0], alpha),
+                        premultiply_u16(pixel[1], alpha),
+                        premultiply_u16(pixel[2], alpha),
+                    ]),
+                );
+            }
+            DynamicImage::ImageRgb16(rgb).save(destination)
+        }
+        _ => {
+            let rgba = image.to_rgba8();
+            let mut rgb = RgbImage::new(rgba.width(), rgba.height());
+            for (x, y, pixel) in rgba.enumerate_pixels() {
+                let alpha = pixel[3];
+                rgb.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        premultiply_u8(pixel[0], alpha),
+                        premultiply_u8(pixel[1], alpha),
+                        premultiply_u8(pixel[2], alpha),
+                    ]),
+                );
+            }
+            DynamicImage::ImageRgb8(rgb).save(destination)
+        }
+    };
+    result.map_err(|error| {
+        SplatError::Process(format!(
+            "无法写入 COLMAP 专用图片 {}：{error}",
+            destination.display()
+        ))
+    })
+}
+
+fn premultiply_u8(channel: u8, alpha: u8) -> u8 {
+    ((u32::from(channel) * u32::from(alpha) + 127) / 255) as u8
+}
+
+fn premultiply_u16(channel: u16, alpha: u16) -> u16 {
+    ((u64::from(channel) * u64::from(alpha) + 32_767) / 65_535) as u16
 }
 
 fn save_mask(mask: &GrayImage, destination: &Path) -> Result<()> {
@@ -563,7 +695,7 @@ fn natural_cmp(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Rgba, RgbaImage};
+    use image::{ColorType, Rgba, RgbaImage};
 
     fn write_rgba(path: &Path, alpha: u8) {
         RgbaImage::from_pixel(2, 2, Rgba([10, 20, 30, alpha]))
@@ -616,10 +748,16 @@ mod tests {
 
         assert_eq!(info.image_count, 2);
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
-        let error = prepare_image_sequence(dir.path(), frames.path(), masks.path())
-            .unwrap_err()
-            .to_string();
+        let error = prepare_image_sequence(
+            dir.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("2.png"));
     }
 
@@ -627,6 +765,7 @@ mod tests {
     fn opaque_images_are_linked_without_decoding_pixel_payloads() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         image::RgbImage::new(2, 2)
             .save(source.path().join("1.png"))
@@ -646,6 +785,7 @@ mod tests {
         let prepared = prepare_scanned_image_sequence(
             scan,
             frames.path(),
+            colmap_frames.path(),
             masks.path(),
             ImageSequenceNaming::Primary,
             None,
@@ -662,10 +802,17 @@ mod tests {
     fn transparent_sequences_generate_matching_masks() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         write_rgba(&source.path().join("1.png"), 0);
         write_rgba(&source.path().join("2.png"), 255);
-        let prepared = prepare_image_sequence(source.path(), frames.path(), masks.path()).unwrap();
+        let prepared = prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
         assert_eq!(prepared.image_count, 2);
         assert_eq!(prepared.mask_count, 2);
         assert_eq!(
@@ -682,12 +829,212 @@ mod tests {
                 .get_pixel(0, 0)[0],
             255
         );
+        assert_eq!(
+            image::open(colmap_frames.path().join("frame_000001.png"))
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0,
+            [0, 0, 0]
+        );
+        assert_eq!(
+            image::open(colmap_frames.path().join("frame_000002.png"))
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0,
+            [10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn rgba8_colmap_images_use_exact_encoded_space_premultiplication() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        let pixels = [
+            Rgba([255, 128, 1, 0]),
+            Rgba([255, 128, 1, 128]),
+            Rgba([255, 128, 1, 255]),
+        ];
+        for name in ["1.png", "2.png"] {
+            let image = RgbaImage::from_fn(3, 1, |x, _| pixels[x as usize]);
+            image.save(source.path().join(name)).unwrap();
+        }
+        let original = std::fs::read(source.path().join("1.png")).unwrap();
+
+        let prepared = prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
+
+        assert!(prepared.has_alpha);
+        assert_eq!(
+            std::fs::read(frames.path().join("frame_000001.png")).unwrap(),
+            original
+        );
+        let output = image::open(colmap_frames.path().join("frame_000001.png"))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(output.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(output.get_pixel(1, 0).0, [128, 64, 1]);
+        assert_eq!(output.get_pixel(2, 0).0, [255, 128, 1]);
+        assert_eq!(
+            image::open(masks.path().join("frame_000001.png.png"))
+                .unwrap()
+                .to_luma8()
+                .into_raw(),
+            [0, 128, 255]
+        );
+    }
+
+    #[test]
+    fn rgba16_colmap_images_preserve_depth_and_round_exactly() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        let pixels = [
+            Rgba([65_535_u16, 32_768, 1, 0]),
+            Rgba([65_535, 32_768, 1, 32_768]),
+            Rgba([65_535, 32_768, 1, 65_535]),
+        ];
+        for name in ["1.png", "2.png"] {
+            let image =
+                ImageBuffer::<Rgba<u16>, Vec<u16>>::from_fn(3, 1, |x, _| pixels[x as usize]);
+            image.save(source.path().join(name)).unwrap();
+        }
+        let original = std::fs::read(source.path().join("1.png")).unwrap();
+
+        prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(frames.path().join("frame_000001.png")).unwrap(),
+            original
+        );
+        let output_path = colmap_frames.path().join("frame_000001.png");
+        let decoder = ImageReader::open(&output_path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(decoder.color_type(), ColorType::Rgb16);
+        let output = image::open(output_path).unwrap().to_rgb16();
+        assert_eq!(output.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(output.get_pixel(1, 0).0, [32_768, 16_384, 1]);
+        assert_eq!(output.get_pixel(2, 0).0, [65_535, 32_768, 1]);
+        assert_eq!(
+            image::open(masks.path().join("frame_000001.png.png"))
+                .unwrap()
+                .to_luma8()
+                .into_raw(),
+            [0, 128, 255]
+        );
+    }
+
+    #[test]
+    fn opaque_inputs_are_byte_identical_in_frames_and_colmap_frames() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([11, 22, 33]))
+            .save(source.path().join("1.jpg"))
+            .unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([44, 55, 66]))
+            .save(source.path().join("2.png"))
+            .unwrap();
+
+        let prepared = prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
+
+        assert!(!prepared.has_alpha);
+        for (source_name, prepared_name) in
+            [("1.jpg", "frame_000001.jpg"), ("2.png", "frame_000002.png")]
+        {
+            let expected = std::fs::read(source.path().join(source_name)).unwrap();
+            assert_eq!(
+                std::fs::read(frames.path().join(prepared_name)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read(colmap_frames.path().join(prepared_name)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_validation_rejects_missing_misnamed_or_mismatched_colmap_images() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        write_rgba(&source.path().join("1.png"), 64);
+        write_rgba(&source.path().join("2.png"), 128);
+        prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
+
+        let second = colmap_frames.path().join("frame_000002.png");
+        std::fs::remove_file(&second).unwrap();
+        assert!(validate_prepared_image_sequence(
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            2,
+            true,
+        )
+        .is_err());
+
+        image::RgbImage::new(2, 2).save(&second).unwrap();
+        std::fs::rename(&second, colmap_frames.path().join("wrong.png")).unwrap();
+        assert!(validate_prepared_image_sequence(
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            2,
+            true,
+        )
+        .is_err());
+
+        std::fs::remove_file(colmap_frames.path().join("wrong.png")).unwrap();
+        image::RgbImage::new(3, 2).save(&second).unwrap();
+        assert!(validate_prepared_image_sequence(
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            2,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
     fn opaque_rgba_sequences_discard_candidate_masks() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         write_rgba(&source.path().join("1.png"), 255);
         write_rgba(&source.path().join("2.png"), 255);
@@ -697,6 +1044,7 @@ mod tests {
         let prepared = prepare_scanned_image_sequence(
             scan,
             frames.path(),
+            colmap_frames.path(),
             masks.path(),
             ImageSequenceNaming::Primary,
             None,
@@ -713,13 +1061,20 @@ mod tests {
     fn mixed_sequences_generate_white_masks_for_opaque_images() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         image::RgbImage::new(2, 2)
             .save(source.path().join("1.jpg"))
             .unwrap();
         write_rgba(&source.path().join("2.png"), 0);
 
-        let prepared = prepare_image_sequence(source.path(), frames.path(), masks.path()).unwrap();
+        let prepared = prepare_image_sequence(
+            source.path(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+        )
+        .unwrap();
 
         assert!(prepared.has_alpha);
         assert_eq!(prepared.mask_count, 2);
@@ -743,6 +1098,7 @@ mod tests {
     fn reshoot_sequences_use_a_collision_free_prefix() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         write_rgba(&source.path().join("1.png"), 0);
         write_rgba(&source.path().join("2.png"), 255);
@@ -750,6 +1106,7 @@ mod tests {
         let prepared = prepare_scanned_image_sequence(
             scan,
             frames.path(),
+            colmap_frames.path(),
             masks.path(),
             ImageSequenceNaming::Reshoot,
             None,
@@ -765,6 +1122,7 @@ mod tests {
     fn preparation_progress_is_monotonic_and_cancellation_is_honored() {
         let source = tempfile::tempdir().unwrap();
         let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
         let masks = tempfile::tempdir().unwrap();
         write_rgba(&source.path().join("1.png"), 0);
         write_rgba(&source.path().join("2.png"), 255);
@@ -778,6 +1136,7 @@ mod tests {
         prepare_scanned_image_sequence(
             scan,
             frames.path(),
+            colmap_frames.path(),
             masks.path(),
             ImageSequenceNaming::Primary,
             Some(observer),
@@ -797,6 +1156,7 @@ mod tests {
         ));
 
         let cancelled_frames = tempfile::tempdir().unwrap();
+        let cancelled_colmap_frames = tempfile::tempdir().unwrap();
         let cancelled_masks = tempfile::tempdir().unwrap();
         let cancellation = CancellationToken::new();
         let cancellation_from_observer = cancellation.clone();
@@ -810,6 +1170,7 @@ mod tests {
             prepare_scanned_image_sequence(
                 scan,
                 cancelled_frames.path(),
+                cancelled_colmap_frames.path(),
                 cancelled_masks.path(),
                 ImageSequenceNaming::Primary,
                 Some(observer),

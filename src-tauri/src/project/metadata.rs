@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub const PROJECT_APP_ID: &str = "studio.ooo.splat";
+pub const COLMAP_INPUT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +264,8 @@ pub struct FrameState {
     pub mask_count: Option<u64>,
     #[serde(default)]
     pub has_alpha: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colmap_input_version: Option<u32>,
     #[serde(default)]
     pub initial_extracted_frames: u64,
     #[serde(default)]
@@ -296,6 +299,7 @@ impl From<&FramePlan> for FrameState {
             image_format: None,
             mask_count: None,
             has_alpha: false,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             initial_extracted_frames: plan.estimated_frames,
             selected_frames: plan.selected_frames.clone(),
             candidate_frames: plan.candidate_frames.clone(),
@@ -308,6 +312,8 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    #[serde(default)]
+    pub configuration: Option<crate::presets::PipelineOptimizationConfig>,
     pub stage: PipelineStage,
     pub preset: Quality,
     pub video: Option<VideoInfo>,
@@ -355,6 +361,8 @@ pub struct ReshootState {
     pub mask_count: u64,
     #[serde(default)]
     pub has_alpha: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colmap_input_version: Option<u32>,
     #[serde(default)]
     pub registered_reshoot_count: u64,
 }
@@ -366,6 +374,7 @@ impl PipelineStateFile {
 
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
+            configuration: None,
             stage: PipelineStage::Created,
             preset,
             video: None,
@@ -420,6 +429,7 @@ mod tests {
         assert_eq!(frames.image_format, None);
         assert_eq!(frames.mask_count, None);
         assert!(!frames.has_alpha);
+        assert_eq!(frames.colmap_input_version, None);
         assert!(!state.planner_enabled);
         assert!(state.resolution_policy_version.is_none());
         assert!(state.resolution_plan.is_none());
@@ -429,6 +439,27 @@ mod tests {
         );
         assert!(state.brush_training.resolved.is_none());
         assert!(!state.brush_training.oom_retry_used);
+    }
+
+    #[test]
+    fn old_reshoot_state_defaults_colmap_input_version() {
+        let json = r#"{
+          "stage":"extractingFrames","preset":"balanced","video":null,
+          "inputType":"images","frames":null,
+          "featuresComplete":false,"matchingComplete":false,
+          "reconstructionComplete":false,"brushComplete":false,
+          "reshoot":{"sourceSnapshotComplete":true,"supplementalFramesComplete":true,
+            "supplementalFeaturesComplete":false,"incrementalMatchingComplete":false,
+            "incrementalReconstructionComplete":false}
+        }"#;
+
+        let state: PipelineStateFile = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            state.reshoot.unwrap().colmap_input_version,
+            None,
+            "legacy reshoot checkpoints must not silently opt into the new image semantics"
+        );
     }
 
     #[test]

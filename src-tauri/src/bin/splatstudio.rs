@@ -105,8 +105,12 @@ async fn execute(cli: Cli) -> Result<()> {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("masks");
+            let colmap_frames = output
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("colmap_frames");
             if input.is_dir() {
-                let extraction = prepare_image_sequence(&input, &output, &masks)?;
+                let extraction = prepare_image_sequence(&input, &output, &colmap_frames, &masks)?;
                 println!(
                     "prepared {} images in {} and {} masks in {}",
                     extraction.image_count,
@@ -124,6 +128,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 &engines.ffmpeg,
                 &input,
                 &output,
+                &colmap_frames,
                 &masks,
                 &plan,
                 video.has_alpha,

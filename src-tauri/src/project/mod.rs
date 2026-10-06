@@ -6,5 +6,5 @@ pub use manager::{ProjectImportObserver, ProjectImportProgress, ProjectManager, 
 pub use metadata::{
     FrameState, GaussianCrop, GaussianEditing, GaussianTransform, PipelineStateFile,
     ProjectInputType, ProjectMetadata, ProjectOutput, ProjectStatus, ReshootProvenance,
-    ReshootState, PROJECT_APP_ID,
+    ReshootState, COLMAP_INPUT_VERSION, PROJECT_APP_ID,
 };

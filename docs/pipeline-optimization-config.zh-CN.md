@@ -15,15 +15,21 @@ npm run dev:local
 
 ## 自动优化关闭
 
-关闭后保留旧版流程：视频按固定比例均匀抽帧，初次特征提取使用 COLMAP 默认 SIFT 限制，不执行候选帧池、Bridge Backfill、分档分辨率规划、Caspar BA 或 High 的 OOM 自动重试。图片输入仍保留全部有效图片并使用 Exhaustive Matching。
+关闭后保留旧版流程：视频按固定比例均匀抽帧，初次特征提取和增量补拍使用相同的档位 SFM 限制，不执行候选帧池、Bridge Backfill、分档分辨率规划、Caspar BA 或 High 的 OOM 自动重试。图片输入仍保留全部有效图片并使用 Exhaustive Matching。
 
-| 档位 | 视频保留比例 | 增量补拍 SFM 最大边 / 特征数 | Brush 迭代 | Brush 最大分辨率 | Densification / Splat 上限 |
+| 档位 | 视频保留比例 | SFM 最大边 / 每张最大特征数 | Brush 迭代 | Brush 最大分辨率 | 梯度阈值 / 选择比例 / 增密截止 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Fast | 30% | 1600 / 4096 | 8,000 | 1200 | 不额外设置 |
-| Balanced | 50% | 1920 / 8192 | 15,000 | 1600 | 不额外设置 |
-| High | 100% | 3200 / 16384 | 30,000 | 2000 | 不额外设置 |
+| Fast | 30% | 1200 / 8192 | 8,000 | 1200 | 0.0025 / 0.10 / 15,000 |
+| Balanced | 50% | 1600 / 8192 | 15,000 | 1600 | 0.0025 / 0.10 / 15,000 |
+| High | 100% | 2000 / 8192 | 30,000 | 2000 | 0.0025 / 0.10 / 15,000 |
 
-`incrementalSfmMaxImageSize` 和 `incrementalSfmMaxFeatures` 用于增量补拍；旧版首次特征提取继续使用 COLMAP 自身默认值，避免配置化工作改变关闭自动优化时的历史行为。所有档位的 Brush `refineEvery` 默认都是 200。
+`sfmMaxImageSize` 和 `sfmMaxFeatures` 同时用于首次重建和增量补拍，确保补拍沿用原任务的 SFM 限制。长边限制只影响 COLMAP 特征提取时的工作分辨率，不会缩放或改写源图片。旧版外部配置中的 `incrementalSfmMaxImageSize` 和 `incrementalSfmMaxFeatures` 仍作为兼容别名接受。所有档位的 Brush `refineEvery` 默认都是 200。
+
+三档的兼容密化配置位于各自的 `automaticOptimizationOff.brush.densification`，实际执行时会显式传入 `--growth-grad-threshold 0.0025`、`--growth-select-fraction 0.1` 和 `--growth-stop-iter 15000`。快速档在 8,000 步结束；均衡档在 15,000 步结束；精细档在第 15,000 步停止基于梯度的密化，后续继续优化。截止参数不关闭新版 Brush 的其他 refine 行为，例如过大屏幕尺寸分裂。应用不额外传入 `--max-splats`，固定 OOOBrush 1.0.0 运行时仍采用自身的 10,000,000 上限，也不额外修改屏幕尺寸分裂或尺度过滤参数。
+
+这组设置保留新版梯度阈值，恢复旧版的 0.10 选择比例。新旧版梯度统计方式不同，不能把旧阈值 0.00004 直接套到新版。2026-10-06 的 RTX 3060 Ti 快速档 toy 对照固定了同一份 COLMAP 模型、8,000 步和 1,200 训练长边，保留 19 个评估视角；比例从 0.25 降至 0.10 后，点数由 533,775 降为 316,951，耗时减少约 28.27%，渲染与旧版略更接近，相对原照片的前景指标小幅下降。该实测只覆盖快速档的一个场景，均衡和精细档采用同一兼容策略，但尚未完成同等实机画质验收。
+
+旧版外部 JSON 没有 `densification` 字段或将其设为 `null` 时仍可加载，并沿用“不显式覆盖引擎密化默认值”的原有行为。新建任务读取当前配置；已保存的任务恢复时继续使用自身已记录的训练快照，不重写历史任务参数。
 
 ## 自动优化开启
 
@@ -43,14 +49,14 @@ Brush 配置如下：
 
 | Profile | 梯度阈值 | 选择比例 | 停止增密迭代 | Splat 上限 | OOM 后一次降级 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Fast | 0.00004 | 0.15 | 6,000 | 无 | 无 |
-| Balanced | 0.00003 | 0.20 | 12,000 | 无 | 无 |
+| Fast | 0.00004 | 0.15 | 6,000 | 500,000 | 无 |
+| Balanced | 0.00003 | 0.20 | 12,000 | 1,000,000 | 无 |
 | High Low | 0.00002 | 0.25 | 23,000 | 200,000 | High Emergency |
 | High Standard | 0.00002 | 0.30 | 25,000 | 1,500,000 | High Low |
 | High Large | 0.00002 | 0.30 | 25,000 | 4,000,000 | High Standard |
 | High Emergency | 0.00004 | 0.20 | 20,000 | 200,000 | 无 |
 
-实际 `maxSplats` 不会低于初始 SfM 三维点数。High 只有在错误明确分类为显存不足时才按当前 Profile 的 `oomFallback` 降低一级，并且整次任务最多自动重试一次；`DeviceLost` 或普通进程错误不会触发该降级。
+实际 `maxSplats` 不会低于初始 SfM 三维点数。Fast 和 Balanced 不增加 OOM 降级链；High 只有在错误明确分类为显存不足时才按当前 Profile 的 `oomFallback` 降低一级，并且整次任务最多自动重试一次；`DeviceLost` 或普通进程错误不会触发该降级。
 
 ## Bridge 与 Caspar
 
@@ -59,6 +65,15 @@ Brush 配置如下：
 - Caspar 仅在自动优化开启、设备与驱动兼容、真实 GPU 探测成功，并且数据库关键点总数和几何验证匹配总数分别达到配置阈值（默认均为 2,000,000）时使用。此时局部 BA 为 Ceres、全局 BA 为 Caspar；其他情况全部使用 Ceres。
 - Caspar Mapper 进程失败时会清理该次 Mapper 输出，显式改为局部/全局 Ceres 重试一次，并在当前应用进程内禁用该引擎与 GPU 组合的 Caspar。
 - macOS 始终使用 Ceres CPU。
+
+### Caspar 策略依据
+
+当前“较小数据集全 Ceres；达到数据量阈值后局部 Ceres、全局 Caspar”的策略基于以下两组 2026-10-04 实机对照：
+
+- [Toy dataset: Ceres/Caspar mapper comparison](caspar-toy-benchmark-report-20261004.md)：251 帧数据在 RTX 3060 Ti 上重复两轮后，所有 Caspar 组合都慢于全 Ceres；其中全 Caspar 最慢。这支持对小数据集保留全 Ceres，并用关键点数和几何验证匹配数设置启用门槛。
+- [001 局部 Caspar 收益调查](caspar-001-local-report-20261004.md)：在全局 Caspar 固定的对照中，局部 Caspar 虽缩短局部处理阶段，但增加了后续全局调用和迭代工作量，使 Mapper 总耗时增加约 19%–31%。这支持启用 Caspar 时保持局部 Ceres、只将全局 BA 交给 Caspar。
+
+两份报告都只覆盖 COLMAP 4.2.1、RTX 3060 Ti、当前求解器默认参数和各自数据集，且没有评估最终 Brush 渲染质量。因此它们是当前保守策略的工程依据，不是对所有 GPU、数据规模和场景的普遍性能结论。`2,000,000` 的双阈值仍应通过更多真实数据集持续校准；在新证据充分前，不因单次更快结果放宽真实 GPU 探测、失败回退或局部 Ceres 约束。
 
 ## 配置边界
 

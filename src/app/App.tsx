@@ -1,6 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  Blend, ChevronDown, ChevronRight, CircleAlert, Clapperboard, Cpu, Eye,
+  Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu, Eye,
   Film, FolderOpen, GripVertical, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
   Send, Square, Trash2, Upload, X, Zap, Lock,
 } from "lucide-react";
@@ -12,18 +12,19 @@ import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import { RuntimePanel } from "../components/RuntimePanel";
 import {
-  cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence,
+  cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
   estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
-  setPlannerEnabled, setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
+  setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, inspectReshootSource, onInputDragDrop, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
+import { formatClockDuration, liveTrainingRemainingSeconds } from "../lib/runtimeEstimate";
 import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type PipelineFailureKind } from "../lib/pipelineError";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, PipelineEvent, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
+import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
 import { displayStatusForDraft, draftIsRunnable, moveDraft, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
@@ -35,6 +36,7 @@ const PREVIEW_CLOSE_TIMEOUT_MS = 8_000;
 const NATIVE_ACTION_TIMEOUT_MS = 8_000;
 const DRAFT_DRAG_START_DISTANCE = 4;
 const DRAFT_DRAG_HOLD_MS = 200;
+const MIN_RECOMMENDED_IMAGE_COUNT = 30;
 const TASK_GROUPS_STORAGE_KEY = "ooo-splat-task-groups-v1";
 type TaskGroupKey = "new" | "completed" | "unfinished";
 type TaskGroupVisibility = Record<TaskGroupKey, boolean>;
@@ -43,6 +45,25 @@ type DetailErrorSource = "action" | "detail" | "draft" | "persisted" | "global";
 type DetailErrorRecord = { message: string; occurredAt: number; source: DetailErrorSource; contextKey: string };
 type DraftDragHold = { pointerId: number; draftId: string; startX: number; startY: number; target: HTMLElement; timer: number; active: boolean };
 const ERROR_SOURCE_PRIORITY: Record<DetailErrorSource, number> = { action: 4, draft: 4, detail: 3, persisted: 2, global: 1 };
+
+function CaptureAdviceHelp() {
+  const { t } = useI18n();
+  const tooltipId = useId();
+  return <span className="capture-help">
+    <button className="capture-help-trigger" type="button" aria-label={t("captureAdvice.title")} aria-describedby={tooltipId}>
+      <CircleHelp size={16} aria-hidden="true" />
+    </button>
+    <span className="capture-help-tooltip" id={tooltipId} role="tooltip">
+      <strong>{t("captureAdvice.title")}</strong>
+      <ul>
+        <li>{t("captureAdvice.coverage")}</li>
+        <li>{t("captureAdvice.overlap")}</li>
+        <li>{t("captureAdvice.consistency")}</li>
+      </ul>
+      <small>{t("captureAdvice.aiWarning")}</small>
+    </span>
+  </span>;
+}
 
 const timestampOf = (value: string | null | undefined): number => {
   const parsed = value ? Date.parse(value) : Number.NaN;
@@ -189,6 +210,26 @@ const stages = [
 
 const rawMessageOf = pipelineErrorMessage;
 const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
+const completedProjectSummary = (result: PipelineResult, draft: TaskDraft): ProjectSummary => ({
+  id: result.projectId,
+  workspaceTaskId: draft.id,
+  taskKind: draft.kind,
+  name: basename(result.projectPath),
+  status: "completed",
+  projectPath: result.projectPath,
+  finalPly: result.finalPly,
+  fileSize: result.fileSize,
+  splatCount: result.splatCount,
+  createdAt: result.completedAt,
+  completedAt: result.completedAt,
+  durationMs: result.durationMs,
+  quality: draft.quality,
+  sourceName: basename(draft.inputPath ?? result.projectPath),
+  registeredRatio: result.registeredRatio,
+  points3d: result.points3d,
+  failureMessage: null,
+});
+const parentPath = (path: string) => path.replace(/[\\/][^\\/]+[\\/]?$/, "") || path;
 const formatBytes = (bytes: number | null, locale: string) => {
   if (bytes == null) return "—";
   const [value, unit, digits] = bytes >= 1024 ** 3
@@ -297,9 +338,14 @@ function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDe
   </article>;
 }
 
+import { useSharedTasks } from "./useSharedTasks";
+import { SharedTaskDetail } from "../components/SharedTaskDetail";
+import { taskIsActive } from "../types/tasks";
+
 export function App() {
   const { locale, t, toggleLocale, formatNumber, formatDuration } = useI18n();
   const store = useAppStore();
+  const { tasks: sharedTasks, syncError: taskSyncError } = useSharedTasks();
   const loadGaussian = useGaussianTransformStore((state) => state.load);
   const closeGaussian = useGaussianTransformStore((state) => state.close);
   const isRunning = store.phase === "running";
@@ -322,12 +368,14 @@ export function App() {
   const autoRunNextRef = useRef(false);
   const queueRevisionRef = useRef(0);
   const inputAnalysisPromises = useRef(new Map<string, Promise<boolean>>());
+  const inputAnalysisRevisions = useRef(new Map<string, number>());
   const runStartedAt = useRef<number | null>(null);
   const runElapsedOffset = useRef(0);
   const cancellationOverlayTimer = useRef<number | null>(null);
   const pipelineRunningRef = useRef(isRunning);
   const accelerationRequestRevision = useRef(0);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
+  const [elapsedAnchorRevision, setElapsedAnchorRevision] = useState(0);
   const [isCancellationRequested, setIsCancellationRequested] = useState(false);
   const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
   const [leftPanePercent, setLeftPanePercent] = useState(() => Math.min(68, Math.max(32, readSavedNumber("ooo-splat-left-pane", 44))));
@@ -362,6 +410,7 @@ export function App() {
   const [activeDraftId, setActiveDraftId] = useState<string | null>(() => taskWorkspace.drafts.find((draft) => draft.running)?.id ?? null);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [projectDetail, setProjectDetail] = useState<ProjectTaskDetail | null>(null);
+  const [projectEstimate, setProjectEstimate] = useState<{ projectId: string; value: Awaited<ReturnType<typeof estimateProjectRuntime>> } | null>(null);
   const [projectDetailLoading, setProjectDetailLoading] = useState(false);
   const [projectDetailError, setProjectDetailError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
   const [projectActionError, setProjectActionError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
@@ -373,11 +422,15 @@ export function App() {
   const drafts = taskWorkspace.drafts;
   const selectedTask = taskWorkspace.selected;
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
-  const selectedProject = selectedTask.kind === "project" ? store.projects.find((project) => project.id === selectedTask.id) ?? projectDetail?.project ?? null : null;
+  const selectedProject = selectedTask.kind === "project"
+    ? store.projects.find((project) => project.id === selectedTask.id)
+      ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
+    : null;
   const detailContextKey = selectedDraft ? `draft:${selectedDraft.id}` : selectedProject ? `project:${selectedProject.id}` : "global";
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
-  const completed = useMemo(() => store.projects.filter((project) => project.status === "completed"), [store.projects]);
-  const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects]);
+  const sharedProjectIds = new Set(Object.values(sharedTasks).map(task => task.project_id));
+  const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
+  const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
   const progressEvent = useMemo(() => {
     if (!store.latestEvent || !["failed", "cancelled"].includes(store.latestEvent.stage)) return store.latestEvent;
     return [...store.events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage)) ?? null;
@@ -419,6 +472,11 @@ export function App() {
     [activeDraftId, autoRunNext, drafts, missingEngines.length, store.projectsRoot],
   );
   const runBusy = isRunning || runGateBusy;
+  useEffect(() => {
+    setTaskWorkspace(workspace => workspace.selected.kind === "draft" && sharedTasks[workspace.selected.id]
+      ? { ...workspace, selected: { kind: "task", id: workspace.selected.id } }
+      : workspace);
+  }, [sharedTasks]);
   const currentStageLabel = useCallback((stage: string | undefined, index: number) => {
     if (stage === "completed") return t("stage.completed");
     if (stage === "failed") return t("stage.failed");
@@ -521,6 +579,7 @@ export function App() {
   const selectDraft = useCallback((id: string) => {
     mutateTaskWorkspace((workspace) => ({ ...workspace, selected: { kind: "draft", id } }));
     setProjectDetail(null);
+    setProjectEstimate(null);
     setProjectDetailError(null);
     setProjectActionError(null);
   }, [mutateTaskWorkspace]);
@@ -528,8 +587,29 @@ export function App() {
   const selectProject = useCallback((project: ProjectSummary) => {
     mutateTaskWorkspace((workspace) => ({ ...workspace, selected: { kind: "project", id: project.id } }));
     setProjectDetail(null);
+    setProjectEstimate(null);
     setProjectDetailError(null);
     setProjectActionError((error) => error?.projectId === project.id ? error : null);
+  }, [mutateTaskWorkspace]);
+
+  const promoteCompletedDraft = useCallback((draft: TaskDraft, result: PipelineResult) => {
+    const project = completedProjectSummary(result, draft);
+    const currentProjects = useAppStore.getState().projects;
+    useAppStore.getState().setProjects([
+      project,
+      ...currentProjects.filter((item) => item.id !== project.id),
+    ]);
+    const nextIndex = Math.max(0, taskWorkspaceRef.current.drafts.findIndex((item) => item.id === draft.id));
+    mutateTaskWorkspace((workspace) => ({
+      ...workspace,
+      drafts: workspace.drafts.filter((item) => item.id !== draft.id),
+      selected: { kind: "project", id: project.id },
+    }));
+    setProjectDetail(null);
+    setProjectEstimate(null);
+    setProjectDetailError(null);
+    setProjectActionError(null);
+    return { project, nextIndex };
   }, [mutateTaskWorkspace]);
 
   const addGenerationDraft = useCallback(() => {
@@ -537,7 +617,7 @@ export function App() {
     setExpandedGroups((groups) => ({ ...groups, new: true }));
     mutateTaskWorkspace((workspace) => {
       const ordinal = nextGenerationOrdinal(workspace.drafts);
-      const draft = createGenerationDraft(ordinal);
+      const draft = createGenerationDraft(ordinal, useAppStore.getState().plannerEnabled);
       return { drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: Math.max(workspace.nextOrdinal, ordinal + 1) };
     });
   }, [mutateTaskWorkspace]);
@@ -555,7 +635,7 @@ export function App() {
       let nextOrdinal = workspace.nextOrdinal;
       if (!drafts.some((draft) => draft.kind === "generation" && !draft.running)) {
         const ordinal = nextGenerationOrdinal(drafts);
-        drafts = [...drafts, createGenerationDraft(ordinal)];
+        drafts = [...drafts, createGenerationDraft(ordinal, useAppStore.getState().plannerEnabled)];
         nextOrdinal = Math.max(nextOrdinal, ordinal + 1);
       }
       const selected = workspace.selected.kind === "draft" && workspace.selected.id === id
@@ -676,10 +756,37 @@ export function App() {
 
   const refreshProjects = async () => {
     const overview = await getProjectOverview();
+    const plannerDefault = overview.plannerEnabled ?? true;
     store.setProjectsRoot(overview.projectsRoot);
-    store.setPlannerEnabled(overview.plannerEnabled ?? true);
+    store.setPlannerEnabled(plannerDefault);
     store.setProjects(overview.projects);
+    setTaskWorkspace((workspace) => ({
+      ...workspace,
+      drafts: workspace.drafts.map((draft) => draft.plannerDefaultPending
+        ? { ...draft, plannerEnabled: plannerDefault, plannerDefaultPending: false }
+        : draft),
+    }));
     return overview;
+  };
+
+  const refreshCompletedProject = async (project: ProjectSummary) => {
+    try {
+      const overview = await refreshProjects();
+      if (!overview.projects.some((item) => item.id === project.id)) {
+        throw new Error(t("project.syncMissing"));
+      }
+      setProjectActionError(null);
+    } catch (error) {
+      const currentProjects = useAppStore.getState().projects;
+      if (!currentProjects.some((item) => item.id === project.id)) {
+        useAppStore.getState().setProjects([project, ...currentProjects]);
+      }
+      setProjectActionError({
+        projectId: project.id,
+        message: t("project.syncFailed", { detail: messageOf(error) }),
+        occurredAt: Date.now(),
+      });
+    }
   };
 
   const reconcileRuntimeState = useCallback(async () => {
@@ -687,6 +794,12 @@ export function App() {
     const appState = useAppStore.getState();
     appState.setTaskColmapAcceleration(runtime.taskAcceleration ?? null);
     if (runtime.pipelineRunning) {
+      runElapsedOffset.current = runtime.pipelineElapsedOffsetMs ?? 0;
+      const runElapsed = runtime.pipelineRunElapsedMs ?? 0;
+      runStartedAt.current = Date.now() - runElapsed;
+      setLiveElapsedMs(runElapsedOffset.current + runElapsed);
+      setElapsedAnchorRevision((revision) => revision + 1);
+      if (appState.phase !== "running") appState.setPhase("running");
       setTaskWorkspace((workspace) => {
         const persistedId = runtime.pipelineWorkspaceTaskId;
         const fallbackId = workspace.selected.kind === "draft"
@@ -710,6 +823,7 @@ export function App() {
     }
     setActiveProjectId(runtime.pipelineProjectId ?? null);
     if (!runtime.pipelineRunning && !pipelineCommandPending.current) {
+      runStartedAt.current = null;
       if (appState.phase === "running") appState.setPhase("idle");
       clearCancellationFeedback();
       setActiveDraftId(null);
@@ -739,13 +853,18 @@ export function App() {
   useEffect(() => {
     void getProjectOverview()
       .then((overview) => {
+        const plannerDefault = overview.plannerEnabled ?? true;
         store.setError(null);
         store.setProjectsRoot(overview.projectsRoot);
-        store.setPlannerEnabled(overview.plannerEnabled ?? true);
+        store.setPlannerEnabled(plannerDefault);
         store.setProjects(overview.projects);
         setTaskWorkspace((workspace) => {
           const linked = new Set(overview.projects.map((project) => project.workspaceTaskId).filter(Boolean));
-          const drafts = workspace.drafts.filter((draft) => !linked.has(draft.id));
+          const drafts = workspace.drafts
+            .filter((draft) => !linked.has(draft.id))
+            .map((draft) => draft.plannerDefaultPending
+              ? { ...draft, plannerEnabled: plannerDefault, plannerDefaultPending: false }
+              : draft);
           const promotedProject = workspace.selected.kind === "draft"
             ? overview.projects.find((project) => project.workspaceTaskId === workspace.selected.id)
             : null;
@@ -807,7 +926,12 @@ export function App() {
     let unlisten: undefined | (() => void);
     void onPipelineEvent((event) => {
       store.receiveEvent(event);
+      if (!["completed", "failed", "cancelled"].includes(event.stage)) {
+        runStartedAt.current = Date.now() - event.elapsedMs;
+        setLiveElapsedMs(runElapsedOffset.current + event.elapsedMs);
+      }
       if (["completed", "failed", "cancelled"].includes(event.stage)) {
+        runStartedAt.current = null;
         setLiveElapsedMs(runElapsedOffset.current + event.elapsedMs);
       }
     }).then((fn) => { unlisten = fn; });
@@ -833,11 +957,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!isRunning || runStartedAt.current == null) return;
-    return startElapsedTicker(runStartedAt.current, (elapsed) => {
+    if (!isRunning) return;
+    const startedAt = runStartedAt.current;
+    if (startedAt == null) return;
+    return startElapsedTicker(startedAt, (elapsed) => {
       setLiveElapsedMs(runElapsedOffset.current + elapsed);
     });
-  }, [isRunning]);
+  }, [elapsedAnchorRevision, isRunning]);
 
   useEffect(() => {
     if (!isRunning) clearCancellationFeedback();
@@ -861,8 +987,8 @@ export function App() {
   }, [expandedGroups]);
 
   useEffect(() => {
-    saveTaskWorkspace(taskWorkspace.drafts, taskWorkspace.selected, taskWorkspace.nextOrdinal);
-  }, [taskWorkspace]);
+    saveTaskWorkspace(taskWorkspace.drafts.filter(draft => !sharedTasks[draft.id]), taskWorkspace.selected, taskWorkspace.nextOrdinal);
+  }, [taskWorkspace, sharedTasks]);
 
   useEffect(() => { setInputDropActive(false); }, [selectedTask.kind, selectedTask.id]);
 
@@ -870,12 +996,14 @@ export function App() {
     if (selectedTask.kind !== "project") return;
     if (isRunning && selectedTask.id === activeProjectId) {
       setProjectDetail(null);
+      setProjectEstimate(null);
       setProjectDetailLoading(false);
       return;
     }
     let cancelled = false;
     setProjectDetailLoading(true);
     setProjectDetailError(null);
+    setProjectEstimate(null);
     void getProjectTaskDetail(selectedTask.id)
       .then((detail) => {
         if (!cancelled) {
@@ -887,6 +1015,12 @@ export function App() {
         if (!cancelled) setProjectDetailError({ projectId: selectedTask.id, message: messageOf(error), occurredAt: Date.now() });
       })
       .finally(() => { if (!cancelled) setProjectDetailLoading(false); });
+    const selected = useAppStore.getState().projects.find((project) => project.id === selectedTask.id);
+    if (selected?.status !== "completed") {
+      void estimateProjectRuntime(selectedTask.id)
+        .then((value) => { if (!cancelled) setProjectEstimate({ projectId: selectedTask.id, value }); })
+        .catch(() => undefined);
+    }
     return () => { cancelled = true; };
   }, [selectedTask.kind, selectedTask.id, activeProjectId, isRunning, messageOf]);
 
@@ -927,14 +1061,18 @@ export function App() {
     }
   };
 
-  const analyze = (draftId: string, path: string, quality: Quality, plannerEnabled = store.plannerEnabled) => {
+  const analyze = (draftId: string, path: string, quality: Quality, plannerEnabled: boolean) => {
+    const revision = (inputAnalysisRevisions.current.get(draftId) ?? 0) + 1;
+    inputAnalysisRevisions.current.set(draftId, revision);
     updateDraft(draftId, { error: null, needsValidation: false, inputChecking: true });
     const analysis = (async () => {
       try {
         const result = await probeAndPlan(path, quality, plannerEnabled);
+        if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
         updateDraft(draftId, { inputType: result.inputType, video: result.video, imageSequence: result.imageSequence, plan: result.plan, estimate: result.estimate, error: null, inputChecking: false });
         return true;
       } catch (error) {
+        if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
         updateDraft(draftId, { video: null, imageSequence: null, plan: null, estimate: null, error: messageOf(error), inputChecking: false });
         return false;
       }
@@ -947,20 +1085,25 @@ export function App() {
   };
 
   const analyzeReshoot = (draftId: string, sourceProjectId: string, path: string, inputType: InputType) => {
+    const revision = (inputAnalysisRevisions.current.get(draftId) ?? 0) + 1;
+    inputAnalysisRevisions.current.set(draftId, revision);
     updateDraft(draftId, { error: null, needsValidation: false, inputChecking: true, reshootPlan: null });
     setReshootBusy(true);
     const analysis = (async () => {
       try {
         const source = await inspectReshootSource(sourceProjectId);
-        updateDraft(draftId, { reshootSource: source });
+        if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
+        updateDraft(draftId, { reshootSource: source, plannerEnabled: source.plannerEnabled });
         if (!source.eligible) {
           updateDraft(draftId, { error: source.reason ?? t("reshoot.ineligible"), inputChecking: false });
           return false;
         }
         const plan = await probeReshootInput(sourceProjectId, path, inputType);
+        if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
         updateDraft(draftId, { reshootPlan: plan, estimate: plan.estimate, error: plan.compatible ? null : plan.incompatibilityReason ?? t("reshoot.ineligible"), inputChecking: false });
         return plan.compatible;
       } catch (error) {
+        if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
         updateDraft(draftId, { error: messageOf(error), inputChecking: false });
         return false;
       } finally {
@@ -987,7 +1130,7 @@ export function App() {
         store.setInputPath(path, inputType);
         setActiveDraftId(null);
       }
-      return analyze(draftId, path, draft.quality);
+      return analyze(draftId, path, draft.quality, draft.plannerEnabled);
     }
     if (!draft.sourceProjectId) return false;
     return analyzeReshoot(draftId, draft.sourceProjectId, path, inputType);
@@ -1006,6 +1149,7 @@ export function App() {
   const chooseInputType = (inputType: InputType) => {
     setInputMenuOpen(false);
     if (selectedDraft && inputType !== selectedDraft.inputType) {
+      inputAnalysisRevisions.current.set(selectedDraft.id, (inputAnalysisRevisions.current.get(selectedDraft.id) ?? 0) + 1);
       queueRevisionRef.current += 1;
       updateDraft(selectedDraft.id, {
         inputPath: null,
@@ -1066,20 +1210,15 @@ export function App() {
     if (!selectedDraft || selectedDraft.kind !== "generation") return;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
-    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality);
+    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled);
   };
 
   const changePlannerEnabled = async () => {
-    if (isRunning) return;
-    const enabled = !store.plannerEnabled;
-    try {
-      const settings = await setPlannerEnabled(enabled);
-      store.setPlannerEnabled(settings.plannerEnabled);
-      if (selectedDraft?.kind === "generation" && selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, settings.plannerEnabled);
-      store.setError(null);
-    } catch (error) {
-      store.setError(messageOf(error));
-    }
+    if (!selectedDraft || selectedDraft.kind !== "generation" || selectedDraft.running) return;
+    const enabled = !selectedDraft.plannerEnabled;
+    queueRevisionRef.current += 1;
+    updateDraft(selectedDraft.id, { plannerEnabled: enabled, plannerDefaultPending: false, plan: null, estimate: null, error: null });
+    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled);
   };
 
   const requestCancellation = async () => {
@@ -1100,13 +1239,16 @@ export function App() {
     }
   };
 
-  const generate = async (draftId = selectedDraft?.id) => {
+  const generate = async (draftId = selectedDraft?.id, source: "manual" | "queue" = "manual") => {
     const draft = taskWorkspaceRef.current.drafts.find((item) => item.id === draftId);
     if (!draft || draft.kind !== "generation" || !draft.inputPath || !draft.plan || !store.projectsRoot) return;
     if (!claimRunGate()) return;
     let largeSequenceAccepted = true;
     try {
-      if (draft.inputType === "images" && draft.imageSequence?.requiresLargeSequenceConfirmation) {
+      if (source === "manual" && draft.inputType === "images" && draft.imageSequence && draft.imageSequence.imageCount < MIN_RECOMMENDED_IMAGE_COUNT) {
+        largeSequenceAccepted = await confirmSmallImageSequence(draft.imageSequence.imageCount);
+      }
+      if (largeSequenceAccepted && draft.inputType === "images" && draft.imageSequence?.requiresLargeSequenceConfirmation) {
         largeSequenceAccepted = await confirmLargeImageSequence(draft.imageSequence.imageCount);
       }
     } catch (error) {
@@ -1130,7 +1272,7 @@ export function App() {
       let nextOrdinal = workspace.nextOrdinal;
       if (!drafts.some((item) => item.kind === "generation" && !item.running)) {
         const ordinal = nextGenerationOrdinal(drafts);
-        drafts = [...drafts, createGenerationDraft(ordinal)];
+        drafts = [...drafts, createGenerationDraft(ordinal, useAppStore.getState().plannerEnabled)];
         nextOrdinal = Math.max(nextOrdinal, ordinal + 1);
       }
       return { ...workspace, drafts, nextOrdinal };
@@ -1140,11 +1282,15 @@ export function App() {
     let promoted = false;
     let nextIndex = 0;
     try {
-      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, store.plannerEnabled, draft.id);
+      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, draft.plannerEnabled, draft.id);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
       succeeded = true;
+      const promotion = promoteCompletedDraft(draft, result);
+      promoted = true;
+      nextIndex = promotion.nextIndex;
+      await refreshCompletedProject(promotion.project);
     } catch (error) {
       if (runStartedAt.current != null) {
         const backendElapsed = useAppStore.getState().latestEvent?.elapsedMs ?? 0;
@@ -1160,17 +1306,19 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
     } finally {
-      try {
-        const overview = await refreshProjects();
-        const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
-        nextIndex = Math.max(0, taskWorkspaceRef.current.drafts.findIndex((item) => item.id === draft.id));
-        if (project) {
-          promoted = true;
-          mutateTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
-        } else {
-          updateDraft(draft.id, { running: false });
-        }
-      } catch { updateDraft(draft.id, { running: false }); }
+      if (!succeeded) {
+        try {
+          const overview = await refreshProjects();
+          const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
+          nextIndex = Math.max(0, taskWorkspaceRef.current.drafts.findIndex((item) => item.id === draft.id));
+          if (project) {
+            promoted = true;
+            mutateTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
+          } else {
+            updateDraft(draft.id, { running: false });
+          }
+        } catch { updateDraft(draft.id, { running: false }); }
+      }
       setActiveDraftId(null);
       releaseRunGate();
     }
@@ -1329,7 +1477,7 @@ export function App() {
   const openReshoot = (project: ProjectSummary) => {
     if (reshootBusy) return;
     queueRevisionRef.current += 1;
-    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality);
+    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality, useAppStore.getState().plannerEnabled);
     setExpandedGroups((groups) => ({ ...groups, new: true }));
     setProjectActionError(null);
     setTaskWorkspace((workspace) => ({ drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: workspace.nextOrdinal + 1 }));
@@ -1351,7 +1499,7 @@ export function App() {
     try {
       const source = await inspectReshootSource(draft.sourceProjectId);
       if (!source.eligible) {
-        updateDraft(draft.id, { reshootSource: source, error: source.reason ?? t("reshoot.ineligible") });
+        updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.reason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
@@ -1392,6 +1540,10 @@ export function App() {
       store.setResult(result);
       store.setPhase("completed");
       succeeded = true;
+      const promotion = promoteCompletedDraft(draft, result);
+      promoted = true;
+      nextIndex = promotion.nextIndex;
+      await refreshCompletedProject(promotion.project);
     } catch (error) {
       const message = messageOf(error);
       updateDraft(draft.id, { error: message });
@@ -1403,16 +1555,18 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
     } finally {
-      try {
-        const overview = await refreshProjects();
-        const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
-        nextIndex = Math.max(0, taskWorkspaceRef.current.drafts.findIndex((item) => item.id === draft.id));
-        if (project) {
-          promoted = true;
-          mutateTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
-        }
-        else updateDraft(draft.id, { running: false });
-      } catch { updateDraft(draft.id, { running: false }); }
+      if (!succeeded) {
+        try {
+          const overview = await refreshProjects();
+          const project = overview.projects.find((item) => item.workspaceTaskId === draft.id);
+          nextIndex = Math.max(0, taskWorkspaceRef.current.drafts.findIndex((item) => item.id === draft.id));
+          if (project) {
+            promoted = true;
+            mutateTaskWorkspace((workspace) => ({ ...workspace, drafts: workspace.drafts.filter((item) => item.id !== draft.id), selected: { kind: "project", id: project.id } }));
+          }
+          else updateDraft(draft.id, { running: false });
+        } catch { updateDraft(draft.id, { running: false }); }
+      }
       setActiveDraftId(null);
       releaseRunGate();
     }
@@ -1435,7 +1589,7 @@ export function App() {
       const pending = inputAnalysisPromises.current.get(candidate.id);
       if (pending) await pending;
       else if (candidate.needsValidation) {
-        if (candidate.kind === "generation") await analyze(candidate.id, candidate.inputPath, candidate.quality);
+        if (candidate.kind === "generation") await analyze(candidate.id, candidate.inputPath, candidate.quality, candidate.plannerEnabled);
         else if (candidate.sourceProjectId) await analyzeReshoot(candidate.id, candidate.sourceProjectId, candidate.inputPath, candidate.inputType);
       }
       if (!autoRunNextRef.current) return;
@@ -1446,7 +1600,7 @@ export function App() {
         setAutoQueueEnabled(false);
         return;
       }
-      if (candidate.kind === "generation") await generate(candidate.id);
+      if (candidate.kind === "generation") await generate(candidate.id, "queue");
       else await runReshoot(candidate.id);
       return;
     }
@@ -1456,7 +1610,7 @@ export function App() {
     const draft = selectedDraft;
     if (!draft?.needsValidation || draft.running) return;
     if (draft.kind === "generation") {
-      if (draft.inputPath) void analyze(draft.id, draft.inputPath, draft.quality);
+      if (draft.inputPath) void analyze(draft.id, draft.inputPath, draft.quality, draft.plannerEnabled);
       return;
     }
     if (!draft.sourceProjectId) return;
@@ -1464,7 +1618,7 @@ export function App() {
     else {
       updateDraft(draft.id, { inputChecking: true, needsValidation: false });
       void inspectReshootSource(draft.sourceProjectId)
-        .then((source) => updateDraft(draft.id, { reshootSource: source, error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
+        .then((source) => updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
         .catch((error) => updateDraft(draft.id, { error: messageOf(error), inputChecking: false }));
     }
   // Validation is intentionally lazy and keyed only by selection.
@@ -1532,10 +1686,54 @@ export function App() {
     (selectedTask.kind === "draft" && selectedTask.id === activeDraftId)
     || (selectedTask.kind === "project" && selectedTask.id === activeProjectId)
   );
+  const trainingRemainingSeconds = selectedShowsLiveRun
+    ? liveTrainingRemainingSeconds(store.latestRuntime, isRunning, Date.now())
+    : null;
+  const activeStageProgress = store.latestEvent == null
+    ? null
+    : [...store.events].reverse().find((event) => event.stage === store.latestEvent?.stage && event.stageProgress != null)?.stageProgress ?? null;
   const detailStageIndex = stagePosition(projectDetail?.stage);
   const detailErrorDismissible = !selectedProject || selectedProject.status === "completed";
   const detailErrorBanner = visibleDetailError
     ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
+    : null;
+  const projectConfigurationDetails = selectedProject && projectDetail
+    ? <div className="project-configuration-detail">
+      <div className="form-section">
+        <label className="field-label">{t("input.label")}</label>
+        <div className="path-picker readonly" title={projectDetail.sourcePath ?? selectedProject.sourceName}>
+          {projectDetail.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
+          <span><strong>{basename(projectDetail.sourcePath ?? selectedProject.sourceName)}</strong><small>{projectDetail.sourcePath ?? selectedProject.sourceName}</small></span>
+        </div>
+      </div>
+      <div className="form-section">
+        <label className="field-label">{t("project.root")}</label>
+        <div className="path-picker compact readonly" title={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)}>
+          <FolderOpen size={18} /><span><strong>{basename(projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath))}</strong><small>{projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)}</small></span>
+        </div>
+      </div>
+      <div className="form-section">
+        <div className="field-label-row"><label className="field-label">{t("quality.label")}</label>{selectedProject.status !== "completed" && <span className="locked-setting"><Lock size={12} />{t("project.inheritedReadonly")}</span>}</div>
+        <div className="quality-settings locked-quality-settings">
+          <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>{qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled aria-checked={selectedProject.quality === quality.value} className={selectedProject.quality === quality.value ? "quality-option selected" : "quality-option"}><span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span></button>)}</div>
+          <button className="planner-switch" type="button" role="switch" aria-checked={projectDetail.plannerEnabled} disabled><span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span><i aria-hidden="true"><span /></i></button>
+        </div>
+      </div>
+      <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.backend === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
+        <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
+        <span><strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t(selectedProject.status === "completed" ? "gpu.enabledCompleted" : "gpu.enabled") : t("gpu.cpu")}</strong><small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? t("gpu.temporaryHint") : localizePipelineMessage(locale, systemAcceleration.reason)}</small></span>
+      </div>
+      {(projectDetail.video || projectDetail.imageSequence) && <div className="source-metrics project-source-metrics">
+        <span><small>{projectDetail.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{projectDetail.imageSequence ? t("common.images", { count: formatNumber(projectDetail.imageSequence.imageCount) }) : formatVideoDuration(projectDetail.video?.duration ?? 0)}</b></span>
+        <span><small>{t("metrics.resolution")}</small><b>{projectDetail.imageSequence?.width ?? projectDetail.video?.width} × {projectDetail.imageSequence?.height ?? projectDetail.video?.height}</b></span>
+        {selectedProject.status !== "completed" && <span><small>{t("metrics.estimatedFrames")}</small><b>{projectDetail.estimatedFrames == null ? "-" : t("metrics.approx", { value: formatNumber(projectDetail.estimatedFrames) })}</b></span>}
+        {selectedProject.status !== "completed" && <span><small>{t("metrics.estimate")}</small><b>{projectEstimate?.projectId === selectedProject.id ? t("metrics.approx", { value: formatDuration(projectEstimate.value.estimatedMs) }) : t("metrics.analyzing")}</b></span>}
+      </div>}
+      {(projectDetail.video?.hasAlpha || projectDetail.imageSequence?.hasAlpha) && <div className="alpha-source-status" role="status"><Blend size={17} /><span><strong>{projectDetail.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{projectDetail.inputType === "images" ? t(selectedProject.status === "completed" ? "alpha.imagesCompletedHint" : "alpha.imagesHint") : t(selectedProject.status === "completed" ? "alpha.videoCompletedHint" : "alpha.videoHint", { format: projectDetail.video?.pixelFormat || "Alpha" })}</small></span></div>}
+    </div>
+    : null;
+  const historicalTaskProgress = selectedProject && projectDetail
+    ? <section className="live-process historical"><div className="live-heading"><div><strong>{t("progress.title")}</strong></div><span className="mono">{projectDetail.progress.toFixed(1)}%</span></div><ol className="stage-timeline">{stages.map(([key, label], index) => <li key={key} className={index < detailStageIndex || selectedProject.status === "completed" ? "done" : index === detailStageIndex ? selectedProject.status === "failed" ? "failed" : selectedProject.status === "cancelled" ? "cancelled" : "active" : ""}><span /><b>{t(label)}</b></li>)}</ol><div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: projectDetail.logs.length })}</small></div><div className="live-log">{projectDetail.logs.map((line, index) => <div className="log-line historical" key={`${line.source}-${index}`}><time /><span>{line.source}</span><p>{line.message}</p></div>)}</div></section>
     : null;
 
   if (viewMode === "preview") {
@@ -1561,8 +1759,9 @@ export function App() {
       <section className="control-pane" ref={controlPaneRef} aria-label={t("task.console")}>
         <div className="pane-header"><h1>{selectedProject?.name ?? (selectedDraft?.kind === "reshoot" ? draftDisplayName(selectedDraft, t("workspace.newTask"), t("project.reshoot")) : t("task.create"))}</h1><span className={selectedShowsLiveRun ? "run-state active" : "run-state"}>{selectedProject ? t(statusKey[selectedProject.status]) : selectedShowsLiveRun ? t("task.running") : t("task.idle")}</span></div>
 
+        {selectedTask.kind === "task" && sharedTasks[selectedTask.id] && <SharedTaskDetail task={sharedTasks[selectedTask.id]} onPreview={id => { void refreshProjects().then(overview => { const project = overview.projects.find(item => item.id === id); if (project) void previewProject(project); }).catch(error => store.setError(messageOf(error))); }} />}
         {selectedDraft?.kind === "generation" && <><div className="form-section">
-          <label className="field-label">{t("input.label")}</label>
+          <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
           <div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
             <div className="input-type-picker">
               <button className="input-picker-toggle" type="button" disabled={selectedDraft.running} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
@@ -1602,7 +1801,7 @@ export function App() {
                 <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
               </button>)}
             </div>
-            <button className="planner-switch" type="button" role="switch" aria-checked={store.plannerEnabled} disabled={isRunning} onClick={() => void changePlannerEnabled()}>
+            <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedDraft.running} onClick={() => void changePlannerEnabled()}>
               <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
               <i aria-hidden="true"><span /></i>
             </button>
@@ -1614,7 +1813,7 @@ export function App() {
           <span>
             <strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t("gpu.enabled") : t("gpu.cpu")}</strong>
             <small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? `${t("gpu.temporaryHint")}${systemAcceleration.device ? ` · ${systemAcceleration.device.name}` : ""}` : systemAcceleration.backend === "gpu" && systemAcceleration.device ? `${systemAcceleration.device.name}${systemAcceleration.device.totalMemoryMb ? ` · ${t("gpu.memory", { value: (systemAcceleration.device.totalMemoryMb / 1024).toFixed(1) })}` : ""} · ${t("gpu.driver", { value: systemAcceleration.device.driverVersion })} · Compute Capability ${systemAcceleration.device.computeCapability}` : systemAcceleration.reasonCode === "macOsCpuOnly" ? localizePipelineMessage(locale, systemAcceleration.reason) : `${localizePipelineMessage(locale, systemAcceleration.reason)} · ${t("gpu.requirements", { driver: systemAcceleration.requirements.minimumDriverVersion, capability: systemAcceleration.requirements.minimumComputeCapability })}`}</small>
-            {isRunning && store.taskColmapAcceleration && <small>{t("gpu.currentTask")} · {store.taskColmapAcceleration.backend === "gpu" ? t("gpu.taskGpu", { device: store.taskColmapAcceleration.device?.name ?? "NVIDIA GPU" }) : t("gpu.taskCpu")}</small>}
+            {selectedShowsLiveRun && store.taskColmapAcceleration && <small>{t("gpu.currentTask")} · {store.taskColmapAcceleration.backend === "gpu" ? t("gpu.taskGpu", { device: store.taskColmapAcceleration.device?.name ?? "NVIDIA GPU" }) : t("gpu.taskCpu")}</small>}
           </span>
         </div>
 
@@ -1641,7 +1840,7 @@ export function App() {
           <ul className="reshoot-capture-tips"><li>{t("reshoot.sameDevice")}</li><li>{t("reshoot.sameFraming")}</li><li>{t("reshoot.keepOverlap")}</li></ul>
 
           <div className="form-section">
-            <label className="field-label">{t("input.label")}</label>
+            <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
             <div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
               <div className="input-type-picker">
                 <button className="input-picker-toggle" type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
@@ -1710,18 +1909,24 @@ export function App() {
         </section>}
 
         {selectedProject && <section className="project-detail-page">
-          {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : <>
-            <p className="project-path" title={selectedProject.projectPath}>{selectedProject.projectPath}</p>
+          {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : selectedProject.status === "completed" ? <>
             <dl className="project-detail-stats"><div><dt>{t("result.splats")}</dt><dd>{selectedProject.splatCount == null ? "-" : formatNumber(selectedProject.splatCount)}</dd></div><div><dt>{t("result.fileSize")}</dt><dd>{formatBytes(selectedProject.fileSize, locale)}</dd></div><div><dt>{t("result.registered")}</dt><dd>{projectDetail?.registeredImages == null ? "-" : `${formatNumber(projectDetail.registeredImages)} / ${formatNumber(projectDetail.inputImages ?? 0)}`}</dd></div><div><dt>{t("result.points")}</dt><dd>{selectedProject.points3d == null ? "-" : formatNumber(selectedProject.points3d)}</dd></div><div><dt>{t("project.elapsed")}</dt><dd>{formatDuration(selectedProject.durationMs)}</dd></div><div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[selectedProject.quality])}</dd></div><div><dt>{t("progress.stage")}</dt><dd>{currentStageLabel(projectDetail?.stage, detailStageIndex)}</dd></div></dl>
+            {projectConfigurationDetails}
             {selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
             {detailErrorBanner}
-            {projectDetail && <section className="live-process historical"><div className="live-heading"><div><strong>{t("progress.title")}</strong></div><span className="mono">{projectDetail.progress.toFixed(1)}%</span></div><ol className="stage-timeline">{stages.map(([key, label], index) => <li key={key} className={index < detailStageIndex || selectedProject.status === "completed" ? "done" : index === detailStageIndex ? selectedProject.status === "failed" ? "failed" : selectedProject.status === "cancelled" ? "cancelled" : "active" : ""}><span /><b>{t(label)}</b></li>)}</ol><div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: projectDetail.logs.length })}</small></div><div className="live-log">{projectDetail.logs.map((line, index) => <div className="log-line historical" key={`${line.source}-${index}`}><time /><span>{line.source}</span><p>{line.message}</p></div>)}</div></section>}
-          </>}
+            {historicalTaskProgress}
+          </> : projectDetail ? <div className="unfinished-task-detail">
+            {projectConfigurationDetails}
+            {detailErrorBanner}
+            <button className="primary-action" type="button" disabled={runBusy || missingEngines.length > 0 || selectedProject.status === "running"} onClick={() => void resume(selectedProject)}><Play size={16} fill="currentColor" />{t("project.continue")}</button>
+            {historicalTaskProgress}
+          </div> : detailErrorBanner}
         </section>}
 
         {selectedShowsLiveRun && <section className="live-process">
           <div className="live-heading"><div><span className="live-dot" /><strong>{t("progress.title")}</strong></div><span className="mono">{store.progress.toFixed(1)}%</span></div>
           <p className="current-message">{currentMessage}</p>
+          {trainingRemainingSeconds != null && <p className="training-remaining">{t("runtime.remaining")} {formatClockDuration(trainingRemainingSeconds)}</p>}
           <div className="process-metrics">
             <span><small>{t("progress.stage")}</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
             <span><small>{t("progress.elapsed")}</small><b>{formatDuration(liveElapsedMs)}</b></span>
@@ -1732,7 +1937,7 @@ export function App() {
               const className = index < activeStageIndex || store.phase === "completed"
                 ? "done"
                 : terminalClass || (index === activeStageIndex && isRunning ? "active" : "");
-              return <li key={key} className={className}><span /><b>{t(label)}</b>{index === activeStageIndex && isRunning && <small>{progressEvent?.indeterminate ? t("progress.running") : `${(progressEvent?.stageProgress ?? 0).toFixed(0)}%`}</small>}</li>;
+              return <li key={key} className={className}><span /><b>{t(label)}</b>{index === activeStageIndex && isRunning && activeStageProgress != null && <small>{Math.min(100, Math.max(0, activeStageProgress)).toFixed(1)}%</small>}</li>;
             })}
           </ol>
           {uiPreferences.showRuntimePanel && store.latestRuntime && <RuntimePanel snapshot={store.latestRuntime} running={isRunning} />}
@@ -1783,7 +1988,15 @@ export function App() {
             <button className="queue-toggle" type="button" role="switch" aria-checked={autoRunNext} onClick={() => setAutoQueueEnabled(!autoRunNext)}><i aria-hidden="true"><span /></i><span>{t("workspace.autoRunNext")}</span></button>
             <small className="group-count">{t("history.projects", { count: drafts.length })}</small>
           </div>
-          <div id="new-task-group-content" className="project-group-content" hidden={!expandedGroups.new}>{drafts.map((draft, index) => <DraftRow key={draft.id} draft={draft} status={displayStatusForDraft(draft, queuedDrafts)} insertion={draftDrag?.insertionIndex === index ? "before" : draftDrag?.insertionIndex === drafts.length && index === drafts.length - 1 ? "after" : null} dragging={draftDrag?.id === draft.id} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => {
+          {taskSyncError && <p role="status">{taskSyncError}</p>}
+          <div className="shared-task-list">{Object.values(sharedTasks).sort((a, b) => b.created_at.localeCompare(a.created_at)).map(task => <article key={task.task_id} className={`project-card ${selectedTask.id === task.task_id ? "selected" : ""}`}>
+            <button className="shared-task-select" type="button" onClick={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))}>
+              <span className={`project-status ${taskIsActive(task) ? "running" : task.status}`} /><strong>{basename(task.input_path)}</strong><span>{task.status}</span>
+              <small>{task.source === "mcp" ? (locale === "zh-CN" ? "由 AI Agent 创建" : "Created by AI Agent") : t("history.title")}</small>
+            </button>
+            {task.project_id && !taskIsActive(task) && <button type="button" onClick={() => { void refreshProjects().then(overview => { const project = overview.projects.find(item => item.id === task.project_id); if (project) selectProject(project); }); }}>{locale === "zh-CN" ? "项目操作" : "Project actions"}</button>}
+          </article>)}</div>
+          <div id="new-task-group-content" className="project-group-content" hidden={!expandedGroups.new}>{drafts.filter(draft => !sharedTasks[draft.id]).map((draft, index) => <DraftRow key={draft.id} draft={draft} status={displayStatusForDraft(draft, queuedDrafts)} insertion={draftDrag?.insertionIndex === index ? "before" : draftDrag?.insertionIndex === drafts.length && index === drafts.length - 1 ? "after" : null} dragging={draftDrag?.id === draft.id} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => {
             if (suppressDraftSelectionRef.current !== draft.id) selectDraft(draft.id);
           }} onDelete={() => removeDraft(draft.id)} onPointerDown={(event) => beginDraftDrag(event, draft.id)} onPointerMove={updateDraftDrag} onPointerEnd={endDraftDrag} onKeyboardMove={(offset) => moveDraftWithKeyboard(draft.id, offset)} />)}</div>
           <span className="visually-hidden" aria-live="polite">{reorderAnnouncement}</span>

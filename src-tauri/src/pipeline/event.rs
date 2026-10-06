@@ -36,6 +36,12 @@ pub enum PipelineEngine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineEvent {
+    #[serde(default)]
+    pub task_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub run_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub revision: u64,
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     pub kind: EventKind,
@@ -60,6 +66,9 @@ impl PipelineEvent {
         let bounded = stage_progress.clamp(0.0, 1.0);
         let (start, end) = stage_progress_range(stage);
         Self {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: 0,
             timestamp: Utc::now(),
             kind: EventKind::Stage,

@@ -321,6 +321,9 @@ mod tests {
 
     fn stage_event(stage: PipelineStage, stage_progress: f32) -> PipelineEvent {
         PipelineEvent {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: 1,
             timestamp: chrono::Utc::now(),
             kind: EventKind::Stage,

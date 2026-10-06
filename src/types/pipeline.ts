@@ -96,6 +96,7 @@ export interface ReshootInputInfo {
 }
 
 export interface PipelineEvent {
+  taskId?: string | null; runId?: string | null; revision?: number;
   sequence: number;
   timestamp: string;
   kind: "stage" | "progress" | "log" | "heartbeat" | "capability" | "runtime";
@@ -191,6 +192,8 @@ export interface AppRuntimeStatus {
   pipelineRunning: boolean;
   pipelineProjectId?: string | null;
   pipelineWorkspaceTaskId?: string | null;
+  pipelineRunElapsedMs: number;
+  pipelineElapsedOffsetMs: number;
   previewProjectId: string | null;
   taskAcceleration: ColmapAccelerationStatus | null;
 }
@@ -199,6 +202,10 @@ export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
   project: ProjectSummary;
   inputType: InputType;
+  sourcePath: string;
+  projectsRoot: string;
+  plannerEnabled: boolean;
+  estimatedFrames: number | null;
   stage: string;
   progress: number;
   inputImages: number | null;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { RuntimeEstimate } from "../types/pipeline";
-import { projectRuntime } from "./runtimeEstimate";
+import type { RuntimeEstimate, RuntimeSnapshot } from "../types/pipeline";
+import { formatClockDuration, liveTrainingRemainingSeconds, projectRuntime } from "./runtimeEstimate";
 
 const estimate: RuntimeEstimate = {
   estimatedMs: 100_000,
@@ -29,5 +29,41 @@ describe("runtime projection", () => {
 
   it("returns null when no estimate exists", () => {
     expect(projectRuntime(null, 50, 30_000, true)).toBeNull();
+  });
+});
+
+const snapshot = (overrides: Partial<RuntimeSnapshot> = {}): RuntimeSnapshot => ({
+  processId: 42,
+  phase: "training",
+  updatedAt: "2026-10-05T10:00:00.000Z",
+  lastOutputAgeMs: 500,
+  training: {
+    iteration: 800,
+    total: 8_000,
+    startIter: 0,
+    lod: 0,
+    stepsPerSecond: 10,
+    remainingSeconds: 90,
+    splatCount: null,
+    psnr: null,
+    ssim: null,
+  },
+  device: null,
+  backend: null,
+  config: {},
+  resources: null,
+  ...overrides,
+});
+
+describe("live training estimate", () => {
+  it("counts down between runtime snapshots", () => {
+    expect(liveTrainingRemainingSeconds(snapshot(), true, Date.parse("2026-10-05T10:00:04.000Z"))).toBe(86);
+    expect(formatClockDuration(86)).toBe("1:26");
+  });
+
+  it("hides estimates outside training or after output becomes stale", () => {
+    expect(liveTrainingRemainingSeconds(snapshot({ phase: "exporting" }), true, Date.parse("2026-10-05T10:00:01.000Z"))).toBeNull();
+    expect(liveTrainingRemainingSeconds(snapshot(), true, Date.parse("2026-10-05T10:00:10.000Z"))).toBeNull();
+    expect(liveTrainingRemainingSeconds(snapshot(), false, Date.parse("2026-10-05T10:00:01.000Z"))).toBeNull();
   });
 });

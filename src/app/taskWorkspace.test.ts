@@ -21,13 +21,25 @@ describe("task workspace persistence", () => {
   });
 
   it("persists source choices but discards stale analysis", () => {
-    const draft = { ...createGenerationDraft(1), inputPath: "C:/capture.mov", video: { duration: 1 } as never, error: "old error", errorAt: 123 };
+    const draft = { ...createGenerationDraft(1, false), inputPath: "C:/capture.mov", video: { duration: 1 } as never, error: "old error", errorAt: 123 };
     saveTaskWorkspace([draft], { kind: "draft", id: draft.id }, 2);
     const restored = loadTaskWorkspace().drafts[0];
     expect(restored.inputPath).toBe("C:/capture.mov");
     expect(restored.video).toBeNull();
     expect(restored.needsValidation).toBe(true);
+    expect(restored.plannerEnabled).toBe(false);
+    expect(restored.plannerDefaultPending).toBe(false);
     expect(restored).toMatchObject({ error: null, errorAt: null });
+  });
+
+  it("marks legacy drafts for one-time planner default hydration", () => {
+    localStorage.setItem(TASK_WORKSPACE_STORAGE_KEY, JSON.stringify({
+      schemaVersion: 1,
+      nextOrdinal: 2,
+      selected: { kind: "draft", id: "legacy" },
+      drafts: [{ id: "legacy", ordinal: 1, kind: "generation", inputType: "video", inputPath: null, quality: "balanced", sourceProjectId: null, sourceProjectName: null, linkedProjectId: null, running: false }],
+    }));
+    expect(loadTaskWorkspace().drafts[0].plannerDefaultPending).toBe(true);
   });
 
   it("recovers from damaged storage", () => {

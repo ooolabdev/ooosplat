@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useI18n, type TranslationKey } from "../i18n";
+import { formatClockDuration, liveTrainingRemainingSeconds, runtimeOutputAgeMs } from "../lib/runtimeEstimate";
 import type { RuntimeSnapshot } from "../types/pipeline";
 
 const phases: Record<string, TranslationKey> = {
@@ -44,17 +45,17 @@ export function RuntimePanel({ snapshot, running }: { snapshot: RuntimeSnapshot;
 
   const unavailable = t("runtime.unavailable");
   const number = (value: number) => value.toLocaleString(locale, { maximumFractionDigits: 1 });
-  const duration = (seconds: number) => `${Math.floor(seconds / 60)}:${Math.floor(seconds % 60).toString().padStart(2, "0")}`;
   const training = snapshot.training;
   const current = training?.iteration;
   const total = training?.total;
   const percent = current != null && total != null && total > 0
     ? Math.min(100, current / total * 100)
     : null;
-  const outputAge = snapshot.lastOutputAgeMs + (running ? Math.max(0, now - Date.parse(snapshot.updatedAt)) : 0);
+  const outputAge = runtimeOutputAgeMs(snapshot, running, now);
   const resources = snapshot.resources;
   const stale = resources != null && now - Date.parse(resources.sampledAt) > 6_000;
   const speedVisible = running && outputAge <= 10_000 && snapshot.phase === "training";
+  const remainingSeconds = liveTrainingRemainingSeconds(snapshot, running, now);
 
   return <div className="runtime-panel">
     <div className="runtime-heading">
@@ -70,7 +71,7 @@ export function RuntimePanel({ snapshot, running }: { snapshot: RuntimeSnapshot;
       <progress className="runtime-track" max={100} {...(percent == null ? {} : { value: percent })} aria-label={t("runtime.steps")} />
       <dl className="runtime-metrics">
         <div><dt>{t("runtime.speed")}</dt><dd>{speedVisible && training.stepsPerSecond != null ? t("runtime.stepRate", { value: number(training.stepsPerSecond) }) : "—"}</dd></div>
-        <div><dt>{t("runtime.remaining")}</dt><dd>{speedVisible && training.remainingSeconds != null ? duration(training.remainingSeconds) : "—"}</dd><small>{t("runtime.remainingHint")}</small></div>
+        <div><dt>{t("runtime.remaining")}</dt><dd>{remainingSeconds != null ? formatClockDuration(remainingSeconds) : "—"}</dd></div>
       </dl>
     </>}
     <p className={`runtime-output ${running && outputAge > 10_000 ? "quiet" : ""}`}>

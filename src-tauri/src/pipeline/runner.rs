@@ -50,7 +50,7 @@ use crate::{
     project::{
         catalog, manager::atomic_replace_file, FrameState, PipelineStateFile,
         ProjectImportObserver, ProjectInputType, ProjectManager, ProjectMetadata, ProjectOutput,
-        ProjectPaths, ProjectStatus, ReshootProvenance, ReshootState,
+        ProjectPaths, ProjectStatus, ReshootProvenance, ReshootState, COLMAP_INPUT_VERSION,
     },
     reconstruction::{
         colmap_model::{
@@ -63,8 +63,8 @@ use crate::{
         prepare_scanned_image_sequence, scaled_video_dimensions, scan_image_sequence,
         validate_prepared_image_sequence, validate_reshoot_image_sequence, video_can_scale_to,
         FramePlan, FrameSelectionStrategy, ImagePreparationObserver, ImagePreparationPhase,
-        ImageSequenceInfo, ImageSequenceNaming, PlannedFrame, QualityV2FrameSelection,
-        UniformRatioFrameSelection, VideoInfo,
+        ImageSequenceInfo, ImageSequenceNaming, PlannedFrame, PreparedImageSequence,
+        QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -81,7 +81,7 @@ pub struct PreparedFrames {
     pub working_height: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineResult {
     pub project_id: String,
@@ -187,6 +187,9 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
             timestamp: Utc::now(),
             kind,
@@ -227,6 +230,9 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
             timestamp: Utc::now(),
             kind: EventKind::Capability,
@@ -256,6 +262,9 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
             timestamp: Utc::now(),
             kind: EventKind::Runtime,
@@ -282,6 +291,9 @@ impl EventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (self.emit)(PipelineEvent {
+            task_id: None,
+            run_id: None,
+            revision: 0,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
             timestamp: Utc::now(),
             kind: EventKind::Stage,
@@ -326,12 +338,28 @@ struct ActiveProjectContext {
     logs_directory: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub enum RunnerUpdate {
+    Project(crate::project::ProjectMetadata),
+    LogOpened {
+        path: PathBuf,
+        offset: u64,
+    },
+    ProcessExited {
+        engine: PipelineEngine,
+        exit_code: Option<i32>,
+    },
+}
+
 pub struct PipelineRunner {
+    lifecycle: Option<Arc<dyn Fn(RunnerUpdate) + Send + Sync>>,
+    input_boundary: Option<PathBuf>,
     engines: EnginePaths,
     process_manager: ProcessManager,
     events: EventSink,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
+    elapsed_offset_ms: AtomicU64,
     workspace_task_id: Option<uuid::Uuid>,
     planner_enabled: bool,
     effectiveness: Option<PlannerEffectivenessTracker>,
@@ -358,6 +386,8 @@ impl PipelineRunner {
     ) -> Self {
         Self {
             engines,
+            lifecycle: None,
+            input_boundary: None,
             process_manager: ProcessManager::new(),
             events: EventSink {
                 emit: Arc::new(emit),
@@ -369,10 +399,48 @@ impl PipelineRunner {
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
             current_acceleration: Arc::new(std::sync::Mutex::new(None)),
+            elapsed_offset_ms: AtomicU64::new(0),
             workspace_task_id: None,
             planner_enabled,
             effectiveness: None,
         }
+    }
+
+    pub fn with_input_boundary(mut self, path: Option<PathBuf>) -> Self {
+        self.input_boundary = path;
+        self
+    }
+
+    pub fn with_lifecycle_observer(
+        mut self,
+        observer: impl Fn(RunnerUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        let observer: Arc<dyn Fn(RunnerUpdate) + Send + Sync> = Arc::new(observer);
+        let observe = observer.clone();
+        self.process_manager =
+            self.process_manager
+                .with_lifecycle(Arc::new(move |update| match update {
+                    ProcessUpdate::LogOpened { path, offset } => {
+                        observe(RunnerUpdate::LogOpened { path, offset })
+                    }
+                    ProcessUpdate::Exited {
+                        executable,
+                        exit_code,
+                    } => {
+                        let name = executable.file_stem().unwrap_or_default().to_string_lossy();
+                        let engine = if name.contains("brush") {
+                            PipelineEngine::Brush
+                        } else if name.contains("colmap") {
+                            PipelineEngine::Colmap
+                        } else {
+                            PipelineEngine::Ffmpeg
+                        };
+                        observe(RunnerUpdate::ProcessExited { engine, exit_code });
+                    }
+                    _ => {}
+                }));
+        self.lifecycle = Some(observer);
+        self
     }
 
     pub fn with_effectiveness_tracker(mut self, tracker: PlannerEffectivenessTracker) -> Self {
@@ -391,6 +459,14 @@ impl PipelineRunner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|project| (project.project_id, project.workspace_task_id))
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.events.started.elapsed().as_millis() as u64
+    }
+
+    pub fn elapsed_offset_ms(&self) -> u64 {
+        self.elapsed_offset_ms.load(Ordering::Relaxed)
     }
 
     pub fn cancel(&self) {
@@ -471,6 +547,7 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         output: &Path,
+        colmap_output: &Path,
         masks: &Path,
         logs: Option<&Path>,
         planner_enabled: bool,
@@ -544,6 +621,7 @@ impl PipelineRunner {
                 &self.engines.ffmpeg,
                 input,
                 output,
+                colmap_output,
                 masks,
                 &plan.selected_frames,
                 video.has_alpha,
@@ -558,6 +636,7 @@ impl PipelineRunner {
                 &self.engines.ffmpeg,
                 input,
                 output,
+                colmap_output,
                 masks,
                 &plan,
                 video.has_alpha,
@@ -607,6 +686,7 @@ impl PipelineRunner {
         input: &Path,
         quality: Quality,
         output: &Path,
+        colmap_output: &Path,
         masks: &Path,
         probe_already_complete: bool,
     ) -> Result<PreparedFrames> {
@@ -616,10 +696,11 @@ impl PipelineRunner {
         }
         let source = input.to_path_buf();
         let cancellation = self.process_manager.child_token();
-        let scan =
-            tokio::task::spawn_blocking(move || scan_image_sequence(&source, Some(&cancellation)))
-                .await
-                .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
+        let scan = crate::presets::spawn_pipeline_blocking(move || {
+            scan_image_sequence(&source, Some(&cancellation))
+        })
+        .await
+        .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??;
         let image_sequence = scan.info.clone();
         self.events.stage(
             PipelineStage::ProbingVideo,
@@ -652,6 +733,7 @@ impl PipelineRunner {
             },
         );
         let frames = output.to_path_buf();
+        let colmap_frames = colmap_output.to_path_buf();
         let mask_root = masks.to_path_buf();
         let events = self.events.clone();
         let observer: ImagePreparationObserver = Arc::new(move |progress| {
@@ -687,10 +769,11 @@ impl PipelineRunner {
             );
         });
         let cancellation = self.process_manager.child_token();
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared = crate::presets::spawn_pipeline_blocking(move || {
             prepare_scanned_image_sequence(
                 scan,
                 &frames,
+                &colmap_frames,
                 &mask_root,
                 ImageSequenceNaming::Primary,
                 Some(observer),
@@ -761,6 +844,7 @@ impl PipelineRunner {
         quality: Quality,
         project_manager: ProjectManager,
     ) -> Result<PipelineResult> {
+        let project_manager = project_manager.with_input_boundary(self.input_boundary.clone());
         let acceleration = self.verify_pipeline_engines().await?;
         self.events.acceleration(acceleration.clone());
         let (paths, mut metadata) = if input.is_dir() {
@@ -802,6 +886,7 @@ impl PipelineRunner {
             .write_metadata(&paths.metadata, &metadata)
             .await?;
         let mut state = project_manager.read_state(&paths.state).await?;
+        state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
         state.planner_enabled = self.planner_enabled;
         state.resolution_policy_version = self
             .planner_enabled
@@ -840,7 +925,30 @@ impl PipelineRunner {
         let source_state: PipelineStateFile =
             serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
         info.planner_enabled = source_state.planner_enabled;
+        if source_state
+            .frames
+            .as_ref()
+            .and_then(|frames| frames.colmap_input_version)
+            != Some(COLMAP_INPUT_VERSION)
+        {
+            info.reason = Some(
+                "原项目使用旧版或未知的 COLMAP 图片处理语义。为避免混用特征缓存，请先使用当前版本从原素材重新生成项目，再进行补拍。"
+                    .into(),
+            );
+            return Ok(info);
+        }
         let frames = project.join("work/frames");
+        let colmap_frames = project.join("work/colmap_frames");
+        if !colmap_frames.is_dir() {
+            info.reason = Some("原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。".into());
+            return Ok(info);
+        }
+        if let Err(error) = validate_current_colmap_input_snapshot(&project, &source_state).await {
+            info.reason = Some(format!(
+                "原项目的 COLMAP 专用图片不完整或与原始帧不一致，无法安全进行增量补拍：{error}"
+            ));
+            return Ok(info);
+        }
         let database = project.join("work/colmap/database.db");
         if !database.is_file()
             || std::fs::metadata(&database).map_or(true, |value| value.len() == 0)
@@ -859,7 +967,7 @@ impl PipelineRunner {
         let expected_registered_images = reconstruction.report.registered_images;
         let model = reconstruction.model;
         let database_for_validation = database.clone();
-        let parsed = tokio::task::spawn_blocking(move || {
+        let parsed = crate::presets::spawn_pipeline_blocking(move || {
             let camera = read_single_camera(&model)?;
             let images = read_registered_images(&model)?;
             validate_database_camera(&database_for_validation, &camera)?;
@@ -912,7 +1020,7 @@ impl PipelineRunner {
             match input_type {
                 ReshootInputType::Images => {
                     let path = input.to_path_buf();
-                    let images = tokio::task::spawn_blocking(move || {
+                    let images = crate::presets::spawn_pipeline_blocking(move || {
                         crate::video::analyze_image_sequence(&path)
                     })
                     .await
@@ -1146,6 +1254,12 @@ impl PipelineRunner {
         state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
+        if let Some(observer) = &self.lifecycle {
+            observer(RunnerUpdate::Project(metadata.clone()));
+        }
+        let previous_duration = metadata.duration_ms.unwrap_or(0);
+        self.elapsed_offset_ms
+            .store(previous_duration, Ordering::Relaxed);
         *self
             .active_project
             .lock()
@@ -1156,7 +1270,6 @@ impl PipelineRunner {
             logs_directory: paths.logs.clone(),
         });
         let started = Instant::now();
-        let previous_duration = metadata.duration_ms.unwrap_or(0);
         metadata.status = ProjectStatus::Running;
         metadata.started_at = Some(Utc::now());
         metadata.completed_at = None;
@@ -1219,9 +1332,31 @@ impl PipelineRunner {
         let mut checkpoint = state.reshoot.clone().unwrap_or_default();
         let source_root = &provenance.source_project_path;
         let source_frames = source_root.join("work/frames");
+        let source_colmap_frames = source_root.join("work/colmap_frames");
         let source_database = source_root.join("work/colmap/database.db");
         let source_metadata: ProjectMetadata =
             serde_json::from_slice(&tokio::fs::read(source_root.join("project.json")).await?)?;
+        let source_state: PipelineStateFile =
+            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+        if source_state
+            .frames
+            .as_ref()
+            .and_then(|frames| frames.colmap_input_version)
+            != Some(COLMAP_INPUT_VERSION)
+        {
+            return Err(SplatError::Process(
+                "原项目使用旧版或未知的 COLMAP 图片处理语义，不能与新版补拍特征缓存混用。请先从原素材重新生成基线项目。"
+                    .into(),
+            ));
+        }
+        validate_current_colmap_input_snapshot(source_root, &source_state)
+            .await
+            .map_err(|error| {
+                SplatError::Process(format!(
+                    "原项目的 COLMAP 专用图片不完整或与原始帧不一致，不能作为补拍基线：{error}"
+                ))
+            })?;
+        archive_incompatible_colmap_input_cache(paths, &state).await?;
         let source_reconstruction =
             reusable_reconstruction(source_root, &source_frames, source_metadata.output.as_ref())
                 .await?;
@@ -1234,7 +1369,7 @@ impl PipelineRunner {
         }
         let source_model_for_validation = source_reconstruction.model.clone();
         let source_database_for_validation = source_database.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::presets::spawn_pipeline_blocking(move || {
             let camera = read_single_camera(&source_model_for_validation)?;
             validate_database_camera(&source_database_for_validation, &camera)
         })
@@ -1251,6 +1386,9 @@ impl PipelineRunner {
         let snapshot_frames_valid = count_image_files(&paths.frames)
             .await
             .is_ok_and(|count| count >= provenance.source_image_count);
+        let snapshot_colmap_frames_valid = count_image_files(&paths.colmap_frames)
+            .await
+            .is_ok_and(|count| count >= provenance.source_image_count);
         let snapshot_database_valid = tokio::fs::metadata(&database)
             .await
             .is_ok_and(|value| value.is_file() && value.len() > 0);
@@ -1258,7 +1396,9 @@ impl PipelineRunner {
             .await
             .is_ok_and(|value| value.is_file() && value.len() > 0);
         if !checkpoint.source_snapshot_complete
+            || checkpoint.colmap_input_version != Some(COLMAP_INPUT_VERSION)
             || !snapshot_frames_valid
+            || !snapshot_colmap_frames_valid
             || !snapshot_database_valid
             || !base_database_valid
             || !model_snapshot_matches(&source_model_files, &base_model)
@@ -1269,9 +1409,11 @@ impl PipelineRunner {
                 "正在复用原项目的相机与重建结果",
             );
             reset_directory(&paths.frames).await?;
+            reset_directory(&paths.colmap_frames).await?;
             reset_directory(&paths.colmap).await?;
             reset_directory(&reshoot_masks).await?;
             copy_image_files(&source_frames, &paths.frames).await?;
+            copy_image_files(&source_colmap_frames, &paths.colmap_frames).await?;
             tokio::fs::copy(&source_database, &base_database).await?;
             tokio::fs::copy(&base_database, &database).await?;
             tokio::fs::create_dir_all(&base_model).await?;
@@ -1285,6 +1427,7 @@ impl PipelineRunner {
                 reshoot_frame_count: provenance.reshoot_frame_count,
                 mask_count: provenance.mask_count,
                 has_alpha: provenance.has_alpha,
+                colmap_input_version: Some(COLMAP_INPUT_VERSION),
                 ..Default::default()
             };
             state.reshoot = Some(checkpoint.clone());
@@ -1292,13 +1435,15 @@ impl PipelineRunner {
         }
 
         if checkpoint.supplemental_frames_complete
-            && validate_reshoot_image_sequence(
-                &paths.frames,
-                &reshoot_masks,
-                checkpoint.reshoot_frame_count,
-                checkpoint.has_alpha,
-            )
-            .is_err()
+            && (checkpoint.colmap_input_version != Some(COLMAP_INPUT_VERSION)
+                || validate_reshoot_image_sequence(
+                    &paths.frames,
+                    &paths.colmap_frames,
+                    &reshoot_masks,
+                    checkpoint.reshoot_frame_count,
+                    checkpoint.has_alpha,
+                )
+                .is_err())
         {
             checkpoint.supplemental_frames_complete = false;
             checkpoint.supplemental_features_complete = false;
@@ -1309,12 +1454,14 @@ impl PipelineRunner {
         let prepared = if checkpoint.supplemental_frames_complete {
             validate_reshoot_image_sequence(
                 &paths.frames,
+                &paths.colmap_frames,
                 &reshoot_masks,
                 checkpoint.reshoot_frame_count,
                 checkpoint.has_alpha,
             )?
         } else {
             remove_reshoot_images(&paths.frames).await?;
+            remove_reshoot_images(&paths.colmap_frames).await?;
             reset_directory(&reshoot_masks).await?;
             self.events.stage(
                 PipelineStage::ExtractingFrames,
@@ -1325,16 +1472,18 @@ impl PipelineRunner {
                     "正在准备补拍画面"
                 },
             );
-            let prepared = match metadata.input_type {
+            let prepared_result: Result<PreparedImageSequence> = async {
+                Ok(match metadata.input_type {
                 ProjectInputType::Images => {
                     let source = metadata.source_path.clone();
                     let cancellation = self.process_manager.child_token();
-                    let scan = tokio::task::spawn_blocking(move || {
+                    let scan = crate::presets::spawn_pipeline_blocking(move || {
                         scan_image_sequence(&source, Some(&cancellation))
                     })
                     .await
                     .map_err(|error| SplatError::Process(format!("补拍图片扫描失败：{error}")))??;
                     let frames = paths.frames.clone();
+                    let colmap_frames = paths.colmap_frames.clone();
                     let masks = reshoot_masks.clone();
                     let events = self.events.clone();
                     let observer: ImagePreparationObserver = Arc::new(move |progress| {
@@ -1372,10 +1521,11 @@ impl PipelineRunner {
                         );
                     });
                     let cancellation = self.process_manager.child_token();
-                    tokio::task::spawn_blocking(move || {
+                    crate::presets::spawn_pipeline_blocking(move || {
                         prepare_scanned_image_sequence(
                             scan,
                             &frames,
+                            &colmap_frames,
                             &masks,
                             ImageSequenceNaming::Reshoot,
                             Some(observer),
@@ -1387,8 +1537,10 @@ impl PipelineRunner {
                 }
                 ProjectInputType::Video => {
                     let temporary = paths.work.join("reshoot-extract");
+                    let temporary_colmap = paths.work.join("reshoot-extract-colmap");
                     let temporary_masks = paths.work.join("reshoot-extract-masks");
                     reset_directory(&temporary).await?;
+                    reset_directory(&temporary_colmap).await?;
                     reset_directory(&temporary_masks).await?;
                     let supplemental_video = probe_video(
                         &self.engines.ffprobe,
@@ -1414,6 +1566,7 @@ impl PipelineRunner {
                             &metadata.source_path,
                             metadata.quality,
                             &temporary,
+                            &temporary_colmap,
                             &temporary_masks,
                             Some(&paths.logs),
                             state.planner_enabled,
@@ -1423,18 +1576,32 @@ impl PipelineRunner {
                         .await?;
                     move_extracted_reshoot(
                         &temporary,
+                        &temporary_colmap,
                         &temporary_masks,
                         &paths.frames,
+                        &paths.colmap_frames,
                         &reshoot_masks,
                         extracted.has_alpha,
                     )
                     .await?;
                     validate_reshoot_image_sequence(
                         &paths.frames,
+                        &paths.colmap_frames,
                         &reshoot_masks,
                         extracted.extracted_frames,
                         extracted.has_alpha,
                     )?
+                }
+                })
+            }
+            .await;
+            let prepared = match prepared_result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    remove_reshoot_images(&paths.frames).await?;
+                    remove_reshoot_images(&paths.colmap_frames).await?;
+                    reset_directory(&reshoot_masks).await?;
+                    return Err(error);
                 }
             };
             validate_image_dimensions(
@@ -1448,6 +1615,7 @@ impl PipelineRunner {
             checkpoint.reshoot_frame_count = prepared.image_count;
             checkpoint.mask_count = prepared.mask_count;
             checkpoint.has_alpha = prepared.has_alpha;
+            checkpoint.colmap_input_version = Some(COLMAP_INPUT_VERSION);
             if let Some(reshoot) = metadata.reshoot.as_mut() {
                 reshoot.reshoot_frame_count = prepared.image_count;
                 reshoot.mask_count = prepared.mask_count;
@@ -1473,10 +1641,11 @@ impl PipelineRunner {
             );
             prepared
         };
-        let reshoot_names = image_names_with_prefix(&paths.frames, "reshoot_").await?;
+        let reshoot_names = image_names_with_prefix(&paths.colmap_frames, "reshoot_").await?;
         write_image_list(&reshoot_list, &reshoot_names).await?;
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
+        let sfm_preset = metadata.quality.preset();
         if !checkpoint.supplemental_features_complete {
             tokio::fs::copy(&base_database, &database).await?;
             self.events.stage(
@@ -1487,10 +1656,16 @@ impl PipelineRunner {
             colmap::extract_incremental_features(
                 &self.engines.colmap,
                 &database,
-                Path::new("../frames"),
+                Path::new("../colmap_frames"),
                 Path::new("reshoot-images.txt"),
                 provenance.camera_id,
                 prepared.has_alpha.then_some(Path::new("../reshoot-masks")),
+                (!state.planner_enabled).then_some(sfm_preset.sfm_max_image_size),
+                Some(if state.planner_enabled {
+                    sfm_preset.planned_sfm_max_features
+                } else {
+                    sfm_preset.sfm_max_features
+                }),
                 paths.logs.join("colmap.log"),
                 &self.process_manager,
                 Some(self.process_observer(
@@ -1552,12 +1727,15 @@ impl PipelineRunner {
         }
         if !checkpoint.incremental_reconstruction_complete {
             let base = base_model.clone();
-            let original_names = tokio::task::spawn_blocking(move || read_registered_images(&base))
-                .await
-                .map_err(|error| SplatError::Process(format!("读取原项目画面列表失败：{error}")))??
-                .into_iter()
-                .map(|image| image.name)
-                .collect::<Vec<_>>();
+            let original_names =
+                crate::presets::spawn_pipeline_blocking(move || read_registered_images(&base))
+                    .await
+                    .map_err(|error| {
+                        SplatError::Process(format!("读取原项目画面列表失败：{error}"))
+                    })??
+                    .into_iter()
+                    .map(|image| image.name)
+                    .collect::<Vec<_>>();
             let mut mapper_names = original_names;
             mapper_names.extend(reshoot_names.iter().cloned());
             write_image_list(&mapper_list, &mapper_names).await?;
@@ -1570,7 +1748,7 @@ impl PipelineRunner {
             colmap::map_incremental(
                 &self.engines.colmap,
                 &database,
-                Path::new("../frames"),
+                Path::new("../colmap_frames"),
                 Path::new("base-model"),
                 &sparse,
                 Path::new("mapper-images.txt"),
@@ -1595,7 +1773,7 @@ impl PipelineRunner {
         let (model, report) = best_sparse_model(&paths.frames, &sparse).await?;
         let model_copy = model.clone();
         let registered_reshoot_count =
-            tokio::task::spawn_blocking(move || read_registered_images(&model_copy))
+            crate::presets::spawn_pipeline_blocking(move || read_registered_images(&model_copy))
                 .await
                 .map_err(|error| SplatError::Process(format!("读取补拍注册结果失败：{error}")))??
                 .into_iter()
@@ -1736,6 +1914,7 @@ impl PipelineRunner {
                 "项目输入类型与检查点不一致，无法安全继续".into(),
             ));
         }
+        archive_incompatible_colmap_input_cache(paths, &state).await?;
         recover_interrupted_publish(paths, &state).await?;
         normalize_checkpoints(paths, &mut state).await?;
         project_manager.write_state(&paths.state, &state).await?;
@@ -1779,6 +1958,7 @@ impl PipelineRunner {
                 prepared
             } else {
                 reset_directory(&paths.frames).await?;
+                reset_directory(&paths.colmap_frames).await?;
                 reset_directory(&paths.masks).await?;
                 reset_directory(&paths.colmap).await?;
                 reset_directory(&paths.brush).await?;
@@ -1788,6 +1968,7 @@ impl PipelineRunner {
                             &metadata.source_path,
                             quality,
                             &paths.frames,
+                            &paths.colmap_frames,
                             &paths.masks,
                             Some(&paths.logs),
                             state.planner_enabled,
@@ -1801,6 +1982,7 @@ impl PipelineRunner {
                             &metadata.source_path,
                             quality,
                             &paths.frames,
+                            &paths.colmap_frames,
                             &paths.masks,
                             state.image_sequence.is_some(),
                         )
@@ -1825,6 +2007,7 @@ impl PipelineRunner {
                 frames.image_format = Some(prepared.image_format.clone());
                 frames.mask_count = Some(prepared.mask_count);
                 frames.has_alpha = prepared.has_alpha;
+                frames.colmap_input_version = Some(COLMAP_INPUT_VERSION);
                 state.frames = Some(frames);
                 state.features_complete = false;
                 state.matching_complete = false;
@@ -1895,7 +2078,11 @@ impl PipelineRunner {
         let sfm_max_image_size = state
             .resolution_plan
             .map(|plan| plan.sfm_max_image_size)
-            .unwrap_or(preset.sfm_max_image_size);
+            .unwrap_or(if state.planner_enabled {
+                preset.planned_sfm_max_image_size
+            } else {
+                preset.sfm_max_image_size
+            });
         if let Some(resolution) = state.resolution_plan {
             self.events.send(
                 PipelineStage::ExtractingFeatures,
@@ -1934,7 +2121,7 @@ impl PipelineRunner {
         // paths on Windows. The process working directory is work/colmap, so this
         // ASCII-only relative path preserves Unicode/UNC project roots without
         // moving any project data outside the project directory.
-        let colmap_images = Path::new("../frames");
+        let colmap_images = Path::new("../colmap_frames");
         let colmap_masks = prepared.has_alpha.then_some(Path::new("../masks"));
 
         let backend_label = if acceleration.use_gpu() { "GPU" } else { "CPU" };
@@ -1966,7 +2153,7 @@ impl PipelineRunner {
                     colmap_masks,
                     None,
                     sfm_max_image_size,
-                    preset.sfm_max_features,
+                    preset.planned_sfm_max_features,
                     colmap_log.clone(),
                     &self.process_manager,
                     observer,
@@ -1979,6 +2166,8 @@ impl PipelineRunner {
                     &database,
                     colmap_images,
                     colmap_masks,
+                    Some(sfm_max_image_size),
+                    Some(preset.sfm_max_features),
                     colmap_log.clone(),
                     &self.process_manager,
                     observer,
@@ -2798,8 +2987,14 @@ impl PipelineRunner {
             }
             Err(error) => {
                 let bridge_duration_ms = bridge_started.elapsed().as_millis() as u64;
-                remove_bridge_outputs(&paths.frames, &paths.masks, &additional, prepared.has_alpha)
-                    .await;
+                remove_bridge_outputs(
+                    &paths.frames,
+                    &paths.colmap_frames,
+                    &paths.masks,
+                    &additional,
+                    prepared.has_alpha,
+                )
+                .await;
                 let added = additional
                     .iter()
                     .map(|frame| frame.source_frame_index)
@@ -2872,6 +3067,7 @@ impl PipelineRunner {
             &self.engines.ffmpeg,
             &metadata.source_path,
             &paths.frames,
+            &paths.colmap_frames,
             &paths.masks,
             additional,
             prepared.has_alpha,
@@ -2927,7 +3123,11 @@ impl PipelineRunner {
         let sfm_max_image_size = state
             .resolution_plan
             .map(|plan| plan.sfm_max_image_size)
-            .unwrap_or(preset.sfm_max_image_size);
+            .unwrap_or(if state.planner_enabled {
+                preset.planned_sfm_max_image_size
+            } else {
+                preset.sfm_max_image_size
+            });
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
             0.0,
@@ -2943,7 +3143,7 @@ impl PipelineRunner {
             colmap_masks,
             Some(&image_list),
             sfm_max_image_size,
-            preset.sfm_max_features,
+            preset.planned_sfm_max_features,
             paths.logs.join("colmap-bridge-features.log"),
             &self.process_manager,
             Some(self.process_observer(
@@ -3046,6 +3246,7 @@ impl PipelineRunner {
         let runtime = Arc::new(std::sync::Mutex::new(RuntimeTracker::new()));
         let matching_heartbeat_bucket = Arc::new(AtomicU64::new(0));
         Arc::new(move |update| match update {
+            ProcessUpdate::LogOpened { .. } | ProcessUpdate::Exited { .. } => {}
             ProcessUpdate::Started { process_id } => {
                 let mut tracker = runtime
                     .lock()
@@ -3326,7 +3527,7 @@ fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
 
 async fn count_image_files(directory: &Path) -> Result<u64> {
     let directory = directory.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::presets::spawn_pipeline_blocking(move || {
         Ok::<u64, SplatError>(crate::video::list_images(&directory)?.len() as u64)
     })
     .await
@@ -3382,7 +3583,7 @@ async fn image_sequences_share_content(left: &Path, right: &Path) -> Result<bool
     }
     let left = left.to_path_buf();
     let right = right.to_path_buf();
-    let (left, right) = tokio::task::spawn_blocking(move || {
+    let (left, right) = crate::presets::spawn_pipeline_blocking(move || {
         Ok::<_, SplatError>((
             crate::video::list_images(&left)?,
             crate::video::list_images(&right)?,
@@ -3486,15 +3687,19 @@ async fn remove_reshoot_images(directory: &Path) -> Result<()> {
 
 async fn move_extracted_reshoot(
     extracted_frames: &Path,
+    extracted_colmap_frames: &Path,
     extracted_masks: &Path,
     frames: &Path,
+    colmap_frames: &Path,
     masks: &Path,
     has_alpha: bool,
 ) -> Result<()> {
     tokio::fs::create_dir_all(frames).await?;
+    tokio::fs::create_dir_all(colmap_frames).await?;
     if has_alpha {
         tokio::fs::create_dir_all(masks).await?;
     }
+    let mut pending = Vec::new();
     for (index, source) in crate::video::list_images(extracted_frames)?
         .iter()
         .enumerate()
@@ -3508,14 +3713,36 @@ async fn move_extracted_reshoot(
             .and_then(|value| value.to_str())
             .ok_or_else(|| SplatError::InvalidPath(source.clone()))?;
         let new_name = format!("reshoot_{:06}.{extension}", index + 1);
-        tokio::fs::rename(source, frames.join(&new_name)).await?;
+        pending.push((source.clone(), frames.join(&new_name)));
+        pending.push((
+            extracted_colmap_frames.join(old_name),
+            colmap_frames.join(&new_name),
+        ));
         if has_alpha {
-            tokio::fs::rename(
+            pending.push((
                 extracted_masks.join(format!("{old_name}.png")),
                 masks.join(format!("{new_name}.png")),
-            )
-            .await?;
+            ));
         }
+    }
+    for (source, destination) in &pending {
+        if !source.is_file() || destination.exists() {
+            return Err(SplatError::Process(format!(
+                "补拍三路图片无法安全合并：{} -> {}",
+                source.display(),
+                destination.display()
+            )));
+        }
+    }
+    let mut moved = Vec::new();
+    for (source, destination) in pending {
+        if let Err(error) = tokio::fs::rename(&source, &destination).await {
+            for (original, target) in moved.into_iter().rev() {
+                let _ = tokio::fs::rename(target, original).await;
+            }
+            return Err(error.into());
+        }
+        moved.push((source, destination));
     }
     Ok(())
 }
@@ -3547,7 +3774,7 @@ async fn validate_image_dimensions(
 ) -> Result<()> {
     let directory = directory.to_path_buf();
     let prefix = prefix.to_owned();
-    tokio::task::spawn_blocking(move || {
+    crate::presets::spawn_pipeline_blocking(move || {
         use image::GenericImageView;
         for path in crate::video::list_images(&directory)? {
             let name = path
@@ -3583,6 +3810,88 @@ async fn validate_image_dimensions(
     })
     .await
     .map_err(|error| SplatError::Process(format!("补拍画面校验失败：{error}")))?
+}
+
+async fn archive_incompatible_colmap_input_cache(
+    paths: &ProjectPaths,
+    state: &PipelineStateFile,
+) -> Result<()> {
+    let frame_cache_incompatible = state.frames.as_ref().is_some_and(|frames| {
+        frames.extracted_frames.is_some()
+            && frames.colmap_input_version != Some(COLMAP_INPUT_VERSION)
+    });
+    let reshoot_cache_incompatible = state.reshoot.as_ref().is_some_and(|reshoot| {
+        (reshoot.source_snapshot_complete
+            || reshoot.supplemental_frames_complete
+            || reshoot.supplemental_features_complete
+            || reshoot.incremental_matching_complete
+            || reshoot.incremental_reconstruction_complete)
+            && reshoot.colmap_input_version != Some(COLMAP_INPUT_VERSION)
+    });
+    if !frame_cache_incompatible && !reshoot_cache_incompatible {
+        return Ok(());
+    }
+
+    let archive_root = paths
+        .work
+        .join("cache-archive")
+        .join(format!("colmap-input-vunknown-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&archive_root).await?;
+    let candidates = vec![
+        (paths.frames.clone(), "frames"),
+        (paths.colmap_frames.clone(), "colmap_frames"),
+        (paths.masks.clone(), "masks"),
+        (paths.colmap.clone(), "colmap"),
+        (paths.brush.clone(), "brush"),
+        (paths.work.join("reshoot-masks"), "reshoot-masks"),
+    ];
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (source, name) in candidates {
+        if !source.exists() {
+            continue;
+        }
+        let destination = archive_root.join(name);
+        if let Err(error) = tokio::fs::rename(&source, &destination).await {
+            for (original, archived) in moved.into_iter().rev() {
+                let _ = tokio::fs::rename(archived, original).await;
+            }
+            let _ = tokio::fs::remove_dir_all(&archive_root).await;
+            return Err(SplatError::Process(format!(
+                "无法保存旧版 COLMAP 缓存 {}：{error}",
+                source.display()
+            )));
+        }
+        moved.push((source, destination));
+    }
+    Ok(())
+}
+
+async fn validate_current_colmap_input_snapshot(
+    project: &Path,
+    state: &PipelineStateFile,
+) -> Result<PreparedImageSequence> {
+    let frame_state = state
+        .frames
+        .as_ref()
+        .ok_or_else(|| SplatError::Process("项目缺少已准备图片的检查点记录".into()))?;
+    if frame_state.colmap_input_version != Some(COLMAP_INPUT_VERSION) {
+        return Err(SplatError::Process(
+            "项目使用旧版或未知的 COLMAP 图片处理语义".into(),
+        ));
+    }
+    let expected_count = frame_state
+        .extracted_frames
+        .filter(|count| *count > 0)
+        .ok_or_else(|| SplatError::Process("项目缺少已准备图片数量".into()))?;
+    let frames = project.join("work/frames");
+    let colmap_frames = project.join("work/colmap_frames");
+    let masks = project.join("work/masks");
+    let has_alpha = frame_state.has_alpha;
+    crate::presets::spawn_pipeline_blocking(move || {
+        validate_prepared_image_sequence(&frames, &colmap_frames, &masks, expected_count, has_alpha)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("校验 COLMAP 图片快照失败：{error}")))?
 }
 
 async fn normalize_checkpoints(paths: &ProjectPaths, state: &mut PipelineStateFile) -> Result<()> {
@@ -3625,6 +3934,9 @@ async fn prepared_frames_from_checkpoint(
     let Some(frames) = state.frames.as_ref() else {
         return Ok(None);
     };
+    if frames.colmap_input_version != Some(COLMAP_INPUT_VERSION) {
+        return Ok(None);
+    }
     let Some(extracted_frames) = frames.extracted_frames.filter(|count| *count > 0) else {
         return Ok(None);
     };
@@ -3643,7 +3955,9 @@ async fn prepared_frames_from_checkpoint(
                 return Ok(None);
             };
             let has_alpha = frames.has_alpha || video.has_alpha;
-            let Ok(extraction) = validate_extraction(&paths.frames, &paths.masks, has_alpha).await
+            let Ok(extraction) =
+                validate_extraction(&paths.frames, &paths.colmap_frames, &paths.masks, has_alpha)
+                    .await
             else {
                 return Ok(None);
             };
@@ -3682,11 +3996,13 @@ async fn prepared_frames_from_checkpoint(
                 return Ok(None);
             };
             let frames_dir = paths.frames.clone();
+            let colmap_frames_dir = paths.colmap_frames.clone();
             let masks_dir = paths.masks.clone();
             let has_alpha = frames.has_alpha;
-            let Ok(prepared) = tokio::task::spawn_blocking(move || {
+            let Ok(prepared) = crate::presets::spawn_pipeline_blocking(move || {
                 validate_prepared_image_sequence(
                     &frames_dir,
+                    &colmap_frames_dir,
                     &masks_dir,
                     extracted_frames,
                     has_alpha,
@@ -3744,7 +4060,7 @@ async fn recover_interrupted_publish(
         return Ok(());
     }
     let inspect_path = orphan.clone();
-    if tokio::task::spawn_blocking(move || inspect_gaussian_ply(&inspect_path))
+    if crate::presets::spawn_pipeline_blocking(move || inspect_gaussian_ply(&inspect_path))
         .await
         .map_err(|error| SplatError::Process(format!("PLY 恢复校验任务失败：{error}")))?
         .is_err()
@@ -3784,7 +4100,7 @@ async fn reusable_reconstruction(
     let project = project.to_path_buf();
     let frames = frames.to_path_buf();
     let output = output.cloned();
-    tokio::task::spawn_blocking(move || {
+    crate::presets::spawn_pipeline_blocking(move || {
         reusable_reconstruction_blocking(&project, &frames, output.as_ref())
     })
     .await
@@ -4013,7 +4329,7 @@ async fn best_sparse_model(
 ) -> Result<(PathBuf, ReconstructionReport)> {
     let frames = frames.to_path_buf();
     let sparse = sparse.to_path_buf();
-    tokio::task::spawn_blocking(move || best_sparse_model_blocking(&frames, &sparse))
+    crate::presets::spawn_pipeline_blocking(move || best_sparse_model_blocking(&frames, &sparse))
         .await
         .map_err(|error| SplatError::Process(format!("稀疏模型校验任务失败：{error}")))?
 }
@@ -4023,7 +4339,7 @@ async fn best_sparse_model_with_input_count(
     input_images: u64,
 ) -> Result<(PathBuf, ReconstructionReport)> {
     let sparse = sparse.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::presets::spawn_pipeline_blocking(move || {
         best_sparse_model_with_input_count_blocking(&sparse, input_images)
     })
     .await
@@ -4102,6 +4418,7 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
         frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
+        frames.colmap_input_version = Some(COLMAP_INPUT_VERSION);
     }
 }
 
@@ -4115,6 +4432,7 @@ fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
 
 async fn remove_bridge_outputs(
     frames: &Path,
+    colmap_frames: &Path,
     masks: &Path,
     additional: &[PlannedFrame],
     has_alpha: bool,
@@ -4123,6 +4441,7 @@ async fn remove_bridge_outputs(
     for frame in additional {
         let name = format!("frame_{:010}.{extension}", frame.source_frame_index);
         let _ = tokio::fs::remove_file(frames.join(&name)).await;
+        let _ = tokio::fs::remove_file(colmap_frames.join(&name)).await;
         if has_alpha {
             let _ = tokio::fs::remove_file(masks.join(format!("{name}.png"))).await;
         }
@@ -4192,6 +4511,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
         let masks = temporary.path().join("masks");
         std::fs::create_dir_all(&source).unwrap();
         image::RgbImage::new(2, 2)
@@ -4207,7 +4527,14 @@ mod tests {
         });
 
         let prepared = runner
-            .prepare_images(&source, Quality::Balanced, &frames, &masks, false)
+            .prepare_images(
+                &source,
+                Quality::Balanced,
+                &frames,
+                &colmap_frames,
+                &masks,
+                false,
+            )
             .await
             .unwrap();
 
@@ -4574,11 +4901,20 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
         image::RgbImage::new(2, 2)
             .save(paths.frames.join("frame_000001.jpg"))
             .unwrap();
         image::RgbImage::new(2, 2)
             .save(paths.frames.join("frame_000002.jpg"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(paths.colmap_frames.join("frame_000001.jpg"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(paths.colmap_frames.join("frame_000002.jpg"))
             .unwrap();
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.video = Some(VideoInfo {
@@ -4600,6 +4936,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             ..FrameState::default()
         });
 
@@ -4634,17 +4971,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_colmap_input_cache_is_archived_without_touching_published_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.work).await.unwrap();
+        for directory in [
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+        ] {
+            tokio::fs::create_dir_all(directory).await.unwrap();
+            tokio::fs::write(directory.join("sentinel"), b"legacy")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(paths.project.join("final.ply"), b"published")
+            .await
+            .unwrap();
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.frames = Some(FrameState {
+            extracted_frames: Some(2),
+            colmap_input_version: None,
+            ..FrameState::default()
+        });
+
+        archive_incompatible_colmap_input_cache(&paths, &state)
+            .await
+            .unwrap();
+
+        for directory in [
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+        ] {
+            assert!(!directory.exists());
+        }
+        assert_eq!(
+            tokio::fs::read(paths.project.join("final.ply"))
+                .await
+                .unwrap(),
+            b"published"
+        );
+        let mut archives = tokio::fs::read_dir(paths.work.join("cache-archive"))
+            .await
+            .unwrap();
+        let archive = archives.next_entry().await.unwrap().unwrap().path();
+        assert!(archives.next_entry().await.unwrap().is_none());
+        for name in ["frames", "colmap_frames", "masks", "colmap", "brush"] {
+            assert_eq!(
+                tokio::fs::read(archive.join(name).join("sentinel"))
+                    .await
+                    .unwrap(),
+                b"legacy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reshoot_baseline_requires_a_complete_current_colmap_image_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
+        tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
+        for name in ["frame_000001.png", "frame_000002.png"] {
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                .save(paths.frames.join(name))
+                .unwrap();
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                .save(paths.colmap_frames.join(name))
+                .unwrap();
+        }
+        let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
+        state.frames = Some(FrameState {
+            extracted_frames: Some(2),
+            has_alpha: false,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
+            ..FrameState::default()
+        });
+
+        validate_current_colmap_input_snapshot(&paths.project, &state)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(paths.colmap_frames.join("frame_000002.png"))
+            .await
+            .unwrap();
+        assert!(
+            validate_current_colmap_input_snapshot(&paths.project, &state)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reshoot_three_way_merge_preflights_and_moves_every_image_set() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extracted_frames = temporary.path().join("extracted-frames");
+        let extracted_colmap = temporary.path().join("extracted-colmap");
+        let extracted_masks = temporary.path().join("extracted-masks");
+        let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap-frames");
+        let masks = temporary.path().join("masks");
+        for directory in [
+            &extracted_frames,
+            &extracted_colmap,
+            &extracted_masks,
+            &frames,
+            &colmap_frames,
+            &masks,
+        ] {
+            tokio::fs::create_dir_all(directory).await.unwrap();
+        }
+        for index in 1..=2 {
+            let name = format!("frame_{index:06}.png");
+            image::RgbaImage::new(2, 2)
+                .save(extracted_frames.join(&name))
+                .unwrap();
+            image::RgbImage::new(2, 2)
+                .save(extracted_colmap.join(&name))
+                .unwrap();
+            image::GrayImage::new(2, 2)
+                .save(extracted_masks.join(format!("{name}.png")))
+                .unwrap();
+        }
+        tokio::fs::write(frames.join("reshoot_000002.png"), b"collision")
+            .await
+            .unwrap();
+
+        assert!(move_extracted_reshoot(
+            &extracted_frames,
+            &extracted_colmap,
+            &extracted_masks,
+            &frames,
+            &colmap_frames,
+            &masks,
+            true,
+        )
+        .await
+        .is_err());
+        assert!(extracted_frames.join("frame_000001.png").is_file());
+        assert!(!frames.join("reshoot_000001.png").exists());
+
+        tokio::fs::remove_file(frames.join("reshoot_000002.png"))
+            .await
+            .unwrap();
+        move_extracted_reshoot(
+            &extracted_frames,
+            &extracted_colmap,
+            &extracted_masks,
+            &frames,
+            &colmap_frames,
+            &masks,
+            true,
+        )
+        .await
+        .unwrap();
+        for index in 1..=2 {
+            let name = format!("reshoot_{index:06}.png");
+            assert!(frames.join(&name).is_file());
+            assert!(colmap_frames.join(&name).is_file());
+            assert!(masks.join(format!("{name}.png")).is_file());
+        }
+    }
+
+    #[tokio::test]
     async fn image_sequence_checkpoint_requires_every_image_and_mask() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(&paths.masks).await.unwrap();
         for name in ["frame_000001.png", "frame_000002.jpg"] {
-            tokio::fs::write(paths.frames.join(name), b"image")
-                .await
+            if name.ends_with(".png") {
+                image::RgbaImage::new(2, 2)
+                    .save(paths.frames.join(name))
+                    .unwrap();
+            } else {
+                image::RgbImage::new(2, 2)
+                    .save(paths.frames.join(name))
+                    .unwrap();
+            }
+            image::RgbImage::new(2, 2)
+                .save(paths.colmap_frames.join(name))
                 .unwrap();
-            tokio::fs::write(paths.masks.join(format!("{name}.png")), b"mask")
-                .await
+            image::GrayImage::new(2, 2)
+                .save(paths.masks.join(format!("{name}.png")))
                 .unwrap();
         }
         let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
@@ -4663,6 +5181,7 @@ mod tests {
             image_format: Some("images".into()),
             mask_count: Some(2),
             has_alpha: true,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             ..FrameState::default()
         });
 
@@ -4684,9 +5203,15 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
         for name in ["frame_000001.png", "frame_000002.png"] {
-            tokio::fs::write(paths.frames.join(name), b"image")
-                .await
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                .save(paths.frames.join(name))
+                .unwrap();
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                .save(paths.colmap_frames.join(name))
                 .unwrap();
         }
         let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
@@ -4705,6 +5230,7 @@ mod tests {
             image_format: Some("images".into()),
             mask_count: Some(0),
             has_alpha: false,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             ..FrameState::default()
         });
 
@@ -4722,9 +5248,15 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(&paths.masks).await.unwrap();
         image::RgbaImage::new(2, 2)
             .save(paths.frames.join("frame_000001.png"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(paths.colmap_frames.join("frame_000001.png"))
             .unwrap();
         image::GrayImage::new(2, 2)
             .save(paths.masks.join("frame_000001.png.png"))
@@ -4749,6 +5281,7 @@ mod tests {
             image_format: Some("png".into()),
             mask_count: Some(1),
             has_alpha: true,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             ..FrameState::default()
         });
 
@@ -4773,9 +5306,15 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ProjectPaths::existing(uuid::Uuid::nil(), temporary.path().to_path_buf());
         tokio::fs::create_dir_all(&paths.frames).await.unwrap();
+        tokio::fs::create_dir_all(&paths.colmap_frames)
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(&paths.colmap).await.unwrap();
         image::RgbImage::new(2, 2)
             .save(paths.frames.join("frame_000001.jpg"))
+            .unwrap();
+        image::RgbImage::new(2, 2)
+            .save(paths.colmap_frames.join("frame_000001.jpg"))
             .unwrap();
         tokio::fs::write(paths.colmap.join("database.db"), b"")
             .await
@@ -4800,6 +5339,7 @@ mod tests {
             image_format: Some("jpeg".into()),
             mask_count: Some(0),
             has_alpha: false,
+            colmap_input_version: Some(COLMAP_INPUT_VERSION),
             ..FrameState::default()
         });
         state.features_complete = true;

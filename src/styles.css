@@ -93,6 +93,15 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .field-label { display: block; margin-bottom: 11px; color: #515b6d; font-size: 13px; font-weight: 700; }
 .field-label-row { min-height: 20px; margin-bottom: 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field-label-row .field-label { margin-bottom: 0; }
+.input-label-row { justify-content: flex-start; gap: 6px; }
+.capture-help { position: relative; display: inline-flex; align-items: center; }
+.capture-help-trigger { width: 20px; height: 20px; padding: 0; display: grid; place-items: center; color: #7f8999; background: transparent; border: 0; cursor: help; }
+.capture-help-trigger:hover, .capture-help-trigger:focus-visible { color: var(--blue); }
+.capture-help-tooltip { position: absolute; z-index: 80; top: calc(100% + 8px); left: 0; width: min(400px, calc(100vw - 64px)); padding: 13px 15px 14px; visibility: hidden; opacity: 0; transform: translateY(-3px); color: #3f495b; background: #fff; border: 1px solid var(--line-dark); box-shadow: 0 12px 30px rgba(24, 39, 67, .16); pointer-events: none; transition: opacity 120ms ease, transform 120ms ease, visibility 120ms; }
+.capture-help:hover .capture-help-tooltip, .capture-help:focus-within .capture-help-tooltip { visibility: visible; opacity: 1; transform: translateY(0); }
+.capture-help-tooltip strong { display: block; margin-bottom: 7px; color: var(--ink); font-size: 12px; }
+.capture-help-tooltip ul { margin: 0; padding-left: 17px; display: grid; gap: 5px; font-size: 11px; line-height: 1.55; }
+.capture-help-tooltip small { display: block; margin-top: 9px; padding-top: 9px; color: #667084; border-top: 1px solid var(--line); font-size: 10px; line-height: 1.55; }
 .locked-setting { display: inline-flex; align-items: center; gap: 5px; color: #6b7485; font-size: 10px; font-weight: 650; white-space: nowrap; }
 .path-picker { width: 100%; min-height: 66px; padding: 12px 14px; display: grid; grid-template-columns: 24px minmax(0,1fr) 18px; align-items: center; gap: 10px; color: var(--ink); text-align: left; background: transparent; border: 1px solid var(--line-dark); cursor: pointer; transition: border-color 150ms, background 150ms; }
 .path-picker:hover:not(:disabled) { border-color: var(--blue); background: #f1f4fb; }
@@ -102,6 +111,8 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .path-picker strong { font-size: 14px; }
 .path-picker small { color: var(--muted); font: 500 12px/1.35 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
 .path-picker.compact { min-height: 60px; }
+.path-picker.readonly { cursor: default; color: #7f8999; background: #f2f4f7; border-color: var(--line); }
+.path-picker.readonly > svg:first-child, .path-picker.readonly small { color: #7f8999; }
 .input-picker { position: relative; display: grid; grid-template-columns: 108px minmax(0, 1fr); }
 .input-picker.drop-active { outline: 2px solid var(--blue); outline-offset: 2px; background: #eef3ff; }
 .input-drop-overlay { position: absolute; z-index: 60; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; color: #315bbb; background: rgba(238, 243, 255, .94); border: 1px dashed #6688d8; pointer-events: none; font-size: 12px; font-weight: 700; }
@@ -202,6 +213,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
 .mono { font: 650 13px/1 "Cascadia Mono", monospace; }
 .current-message { min-height: 20px; margin: 14px 0 0; color: #455064; font-size: 12px; line-height: 1.55; }
+.training-remaining { margin: 3px 0 0; color: #5f6d82; font-size: 11px; font-weight: 400; line-height: 1.45; }
 .process-metrics { margin-top: 13px; display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .process-metrics span { min-width: 0; padding: 11px 10px; display: grid; gap: 5px; border-right: 1px solid var(--line); }
 .process-metrics span:first-child { padding-left: 0; }
@@ -337,8 +349,8 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .new-task-group .group-toggle { flex: 0 1 auto; }
 .group-count { margin-left: auto; }
 .project-group-content[hidden] { display: none; }
-.group-add-action { min-height: 28px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; color: var(--blue); background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 10px; font-weight: 700; }
-.group-add-action:hover { color: var(--blue-dark); }
+.group-add-action { min-height: 28px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; color: #69758a; background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 10px; font-weight: 700; }
+.group-add-action:hover { color: #3e4a60; }
 .queue-toggle { min-height: 28px; padding: 0 7px; display: inline-flex; align-items: center; gap: 6px; color: #69758a; background: transparent; border: 1px solid transparent; cursor: pointer; font-size: 10px; white-space: nowrap; }
 .queue-toggle:hover { color: #3e4a60; }
 .queue-toggle > i { position: relative; width: 26px; height: 14px; flex: 0 0 auto; border-radius: 8px; background: #b8c0cc; }
@@ -398,7 +410,11 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .reshoot-task-page { padding-top: 4px; }
 .reshoot-task-intro { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .project-detail-page { padding-top: 4px; }
-.project-detail-page > .project-path { margin-left: 0; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.unfinished-task-detail { display: grid; }
+.project-configuration-detail { display: grid; }
+.project-detail-stats + .project-configuration-detail { margin-top: 20px; }
+.project-source-metrics { margin-top: 20px; }
+.unfinished-task-detail > .primary-action { margin-top: 20px; }
 .project-detail-stats { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); border-bottom: 1px solid var(--line); }
 .project-detail-stats > div { min-width: 0; padding: 13px 10px; border-right: 1px solid var(--line); }
 .project-detail-stats > div:first-child { padding-left: 0; }
@@ -711,3 +727,10 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .sparse-preview-canvas { flex: 1; width: 100%; height: 100%; display: block; touch-action: none; }
 .sparse-preview-error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #f3b7b7; }
 .sparse-preview-hint { padding: 8px 16px; color: #91a4c4; font-size: 11px; }
+
+.shared-task-select { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:0; color:inherit; padding:12px; }
+.shared-task-select small { width:100%; color:var(--text-secondary); }
+.shared-task-detail { padding:20px; }
+.shared-task-detail .pipeline-log { max-height:360px; overflow:auto; overflow-wrap:anywhere; white-space:pre-wrap; font-family:monospace; font-size:12px; }
+.shared-task-detail progress { width:100%; }
+.mcp-configuration { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; user-select:text; }

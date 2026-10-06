@@ -10,6 +10,8 @@ import type { PipelineEvent } from "../types/pipeline";
 const mocks = vi.hoisted(() => ({
   initializeTelemetry: vi.fn(),
   getProjectOverview: vi.fn(),
+  getSharedTasks: vi.fn(async () => []),
+  onTaskUpdate: vi.fn(async () => () => undefined),
   getAppRuntimeStatus: vi.fn(),
 }));
 
@@ -19,8 +21,11 @@ vi.mock("../lib/backend", () => ({
   checkColmapAcceleration: vi.fn().mockResolvedValue(null),
   confirmAndDeleteProject: vi.fn().mockResolvedValue(false),
   confirmLargeImageSequence: vi.fn().mockResolvedValue(true),
+  confirmSmallImageSequence: vi.fn().mockResolvedValue(true),
   estimateProjectRuntime: vi.fn(),
   exportPly: vi.fn(),
+  getSharedTasks: vi.fn(async () => []),
+  onTaskUpdate: vi.fn(async () => () => undefined),
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
   initializeTelemetry: mocks.initializeTelemetry,
@@ -95,7 +100,7 @@ describe("App live log", () => {
       latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
     });
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
-    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, previewProjectId: null, taskAcceleration: null });
+    mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, pipelineRunElapsedMs: 5_000, pipelineElapsedOffsetMs: 10_000, previewProjectId: null, taskAcceleration: null });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({
       analyticsEnabled: true, consentDecided: true, deliveryStatus: "configured",
     });
@@ -136,6 +141,66 @@ describe("App live log", () => {
   it("shows only the current stage and total elapsed metrics", () => {
     const labels = Array.from(container.querySelectorAll(".process-metrics small"), (node) => node.textContent);
     expect(labels).toEqual(["当前阶段", "总耗时"]);
+  });
+
+  it("continues total elapsed time after reconnecting to an active run", async () => {
+    const elapsed = () => container.querySelectorAll(".process-metrics b")[1]?.textContent;
+    const before = elapsed();
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 1_100)));
+    expect(elapsed()).not.toBe(before);
+  });
+
+  it("shows the current stage percentage separately from overall progress", async () => {
+    await act(async () => useAppStore.getState().receiveEvent({
+      ...event(1),
+      stage: "reconstructing",
+      progress: 63.8,
+      stageProgress: 47.8,
+      indeterminate: false,
+      current: null,
+      total: null,
+    }));
+    expect(container.querySelector(".live-heading > .mono")?.textContent).toBe("63.8%");
+    expect(container.querySelector(".stage-timeline li.active small")?.textContent).toBe("47.8%");
+  });
+
+  it("does not substitute overall progress when the current stage percentage is unavailable", async () => {
+    await act(async () => useAppStore.getState().receiveEvent({
+      ...event(1),
+      stage: "reconstructing",
+      progress: 47.3,
+      stageProgress: null,
+      indeterminate: true,
+      current: null,
+      total: null,
+    }));
+    expect(container.querySelector(".stage-timeline li.active small")).toBeNull();
+  });
+
+  it("shows the live training estimate below the process message without enabling the runtime panel", async () => {
+    await act(async () => {
+      useAppStore.getState().receiveEvent(event(1));
+      useAppStore.getState().receiveEvent({
+        ...event(2),
+        kind: "runtime",
+        runtime: {
+          processId: 42,
+          phase: "training",
+          updatedAt: new Date().toISOString(),
+          lastOutputAgeMs: 0,
+          training: { iteration: 500, total: 8_000, startIter: 0, lod: 0, stepsPerSecond: 10, remainingSeconds: 90, splatCount: null, psnr: null, ssim: null },
+          device: null,
+          backend: null,
+          config: {},
+          resources: null,
+        },
+      });
+    });
+    expect(container.querySelector(".training-remaining")?.textContent).toContain("预计训练剩余时长");
+    expect(container.querySelector(".training-remaining strong")).toBeNull();
+    expect(container.querySelector(".training-remaining small")).toBeNull();
+    expect(container.querySelector(".training-remaining")?.textContent).not.toContain("不含后续导出耗时");
+    expect(container.querySelector(".runtime-panel")).toBeNull();
   });
 
   it("integrates automatic optimization into the quality card with matching typography copy", () => {

@@ -448,16 +448,34 @@ mod tests {
     }
 
     #[test]
-    fn default_training_does_not_override_densification() {
-        let args = args_as_strings(train_args(
-            Path::new("dataset"),
-            Path::new("output"),
-            resolve_brush_training_preset(Quality::Balanced, false, None, 1_600, 0).preset,
-        ));
-
-        assert!(!args.iter().any(|arg| arg == "--growth-select-fraction"));
-        assert!(!args.iter().any(|arg| arg == "--growth-stop-iter"));
-        assert!(!args.iter().any(|arg| arg == "--max-splats"));
+    fn optimization_off_passes_compatible_densification_for_all_qualities() {
+        for (quality, steps, resolution) in [
+            (Quality::Fast, "8000", "1200"),
+            (Quality::Balanced, "15000", "1600"),
+            (Quality::High, "30000", "2000"),
+        ] {
+            let args = args_as_strings(train_args(
+                Path::new("dataset"),
+                Path::new("output"),
+                resolve_brush_training_preset(quality, false, None, 3_840, 0).preset,
+            ));
+            for pair in [
+                ["--total-train-iters", steps],
+                ["--max-resolution", resolution],
+                ["--refine-every", "200"],
+                ["--growth-grad-threshold", "0.0025"],
+                ["--growth-select-fraction", "0.1"],
+                ["--growth-stop-iter", "15000"],
+            ] {
+                assert!(
+                    args.windows(2).any(|actual| actual == pair),
+                    "{quality}: {pair:?}"
+                );
+            }
+            assert!(!args.iter().any(|arg| arg == "--max-splats"));
+            assert!(!args.iter().any(|arg| arg == "--split-at-screen-size"));
+            assert!(!args.iter().any(|arg| arg == "--min-scale-factor"));
+        }
     }
 
     #[test]
@@ -500,6 +518,9 @@ mod tests {
         assert!(fast
             .windows(2)
             .any(|pair| pair == ["--growth-stop-iter", "6000"]));
+        assert!(fast
+            .windows(2)
+            .any(|pair| pair == ["--max-splats", "500000"]));
 
         let balanced = args_as_strings(train_args(
             Path::new("dataset"),
@@ -512,7 +533,9 @@ mod tests {
         assert!(balanced
             .windows(2)
             .any(|pair| pair == ["--growth-stop-iter", "12000"]));
-        assert!(!balanced.iter().any(|arg| arg == "--max-splats"));
+        assert!(balanced
+            .windows(2)
+            .any(|pair| pair == ["--max-splats", "1000000"]));
     }
 
     #[test]

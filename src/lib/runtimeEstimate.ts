@@ -1,4 +1,4 @@
-import type { RuntimeEstimate } from "../types/pipeline";
+import type { RuntimeEstimate, RuntimeSnapshot } from "../types/pipeline";
 
 export interface ProjectedRuntime {
   projectedTotalMs: number;
@@ -30,4 +30,24 @@ export function projectRuntime(
     projectedTotalMs,
     remainingMs: Math.max(0, projectedTotalMs - elapsedMs),
   };
+}
+
+export function runtimeOutputAgeMs(snapshot: RuntimeSnapshot, running: boolean, now: number): number {
+  const updatedAt = Date.parse(snapshot.updatedAt);
+  const sinceUpdate = running && Number.isFinite(updatedAt) ? Math.max(0, now - updatedAt) : 0;
+  return snapshot.lastOutputAgeMs + sinceUpdate;
+}
+
+export function liveTrainingRemainingSeconds(snapshot: RuntimeSnapshot | null, running: boolean, now: number): number | null {
+  if (!snapshot || !running || snapshot.phase !== "training" || snapshot.training?.remainingSeconds == null) return null;
+  if (runtimeOutputAgeMs(snapshot, running, now) > 10_000) return null;
+  const updatedAt = Date.parse(snapshot.updatedAt);
+  const elapsedSeconds = Number.isFinite(updatedAt) ? Math.max(0, now - updatedAt) / 1_000 : 0;
+  return Math.max(0, snapshot.training.remainingSeconds - elapsedSeconds);
+}
+
+export function formatClockDuration(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(wholeSeconds / 60);
+  return `${minutes}:${(wholeSeconds % 60).toString().padStart(2, "0")}`;
 }

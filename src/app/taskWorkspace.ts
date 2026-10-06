@@ -2,7 +2,7 @@ import type { FramePlan, ImageSequenceInfo, InputType, Quality, ReshootInputInfo
 
 export const TASK_WORKSPACE_STORAGE_KEY = "ooo-splat-task-workspace-v1";
 
-export type TaskSelection = { kind: "draft" | "project"; id: string };
+export type TaskSelection = { kind: "draft" | "project" | "task"; id: string };
 
 export interface TaskDraft {
   id: string;
@@ -11,6 +11,8 @@ export interface TaskDraft {
   inputType: InputType;
   inputPath: string | null;
   quality: Quality;
+  plannerEnabled: boolean;
+  plannerDefaultPending: boolean;
   sourceProjectId: string | null;
   sourceProjectName: string | null;
   linkedProjectId: string | null;
@@ -31,7 +33,7 @@ interface PersistedWorkspace {
   schemaVersion: 1;
   nextOrdinal: number;
   selected: TaskSelection;
-  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running">>;
+  drafts: Array<Pick<TaskDraft, "id" | "ordinal" | "kind" | "inputType" | "inputPath" | "quality" | "sourceProjectId" | "sourceProjectName" | "linkedProjectId" | "running"> & { plannerEnabled?: boolean }>;
 }
 
 const newId = () => {
@@ -45,19 +47,19 @@ const newId = () => {
   return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
 };
 
-export function createGenerationDraft(ordinal: number): TaskDraft {
+export function createGenerationDraft(ordinal: number, plannerEnabled = true, plannerDefaultPending = false): TaskDraft {
   return {
     id: newId(), ordinal, kind: "generation", inputType: "video", inputPath: null,
-    quality: "balanced", sourceProjectId: null, sourceProjectName: null,
+    quality: "balanced", plannerEnabled, plannerDefaultPending, sourceProjectId: null, sourceProjectName: null,
     linkedProjectId: null, running: false, inputChecking: false, needsValidation: false,
     video: null, imageSequence: null, plan: null, estimate: null,
     reshootSource: null, reshootPlan: null, error: null, errorAt: null,
   };
 }
 
-export function createReshootDraft(ordinal: number, sourceProjectId: string, sourceProjectName: string, quality: Quality): TaskDraft {
+export function createReshootDraft(ordinal: number, sourceProjectId: string, sourceProjectName: string, quality: Quality, plannerEnabled = true): TaskDraft {
   return {
-    ...createGenerationDraft(ordinal), kind: "reshoot", sourceProjectId, sourceProjectName,
+    ...createGenerationDraft(ordinal, plannerEnabled), kind: "reshoot", sourceProjectId, sourceProjectName,
     quality, needsValidation: true,
   };
 }
@@ -70,7 +72,7 @@ export function nextGenerationOrdinal(drafts: TaskDraft[]): number {
 }
 
 export function loadTaskWorkspace(): { drafts: TaskDraft[]; selected: TaskSelection; nextOrdinal: number } {
-  const fallback = createGenerationDraft(1);
+  const fallback = createGenerationDraft(1, true, true);
   try {
     const raw = window.localStorage.getItem(TASK_WORKSPACE_STORAGE_KEY);
     if (!raw) return { drafts: [fallback], selected: { kind: "draft", id: fallback.id }, nextOrdinal: 2 };
@@ -83,6 +85,8 @@ export function loadTaskWorkspace(): { drafts: TaskDraft[]; selected: TaskSelect
       return ({
       ...createGenerationDraft(Number(draft.ordinal) || 1),
       ...draft,
+      plannerEnabled: typeof draft.plannerEnabled === "boolean" ? draft.plannerEnabled : true,
+      plannerDefaultPending: typeof draft.plannerEnabled !== "boolean",
       running,
       inputChecking: false,
       needsValidation: Boolean(draft.inputPath || draft.kind === "reshoot"),
@@ -94,10 +98,10 @@ export function loadTaskWorkspace(): { drafts: TaskDraft[]; selected: TaskSelect
     let nextOrdinal = Math.max(Number(value.nextOrdinal) || 1, ...drafts.map((draft) => draft.ordinal + 1), 1);
     if (!normalStandby) {
       const ordinal = nextGenerationOrdinal(drafts);
-      drafts.push(createGenerationDraft(ordinal));
+      drafts.push(createGenerationDraft(ordinal, true, true));
       nextOrdinal = Math.max(nextOrdinal, ordinal + 1);
     }
-    let selected = value.selected && ["draft", "project"].includes(value.selected.kind ?? "")
+    let selected = value.selected && ["draft", "project", "task"].includes(value.selected.kind ?? "")
       ? value.selected as TaskSelection
       : { kind: "draft" as const, id: drafts[0].id };
     if (selected.kind === "draft" && !drafts.some((draft) => draft.id === selected.id)) {
@@ -114,9 +118,10 @@ export function saveTaskWorkspace(drafts: TaskDraft[], selected: TaskSelection, 
     schemaVersion: 1,
     nextOrdinal,
     selected,
-    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, sourceProjectId, sourceProjectName, linkedProjectId, running }) => ({
+    drafts: drafts.map(({ id, ordinal, kind, inputType, inputPath, quality, plannerEnabled, plannerDefaultPending, sourceProjectId, sourceProjectName, linkedProjectId, running }) => ({
       id, ordinal, kind, inputType, inputPath, quality, sourceProjectId, sourceProjectName,
       linkedProjectId, running,
+      ...(plannerDefaultPending ? {} : { plannerEnabled }),
     })),
   };
   try { window.localStorage.setItem(TASK_WORKSPACE_STORAGE_KEY, JSON.stringify(persisted)); } catch { /* optional local recovery */ }

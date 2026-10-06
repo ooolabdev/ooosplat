@@ -74,11 +74,13 @@ pub async fn select_for_mapper(
         return select(executable, compatible_gpu).await;
     }
     let database = database.to_path_buf();
-    let stats = match tokio::task::spawn_blocking(move || read_database_stats(&database)).await {
-        Ok(Ok(stats)) => stats,
-        Ok(Err(reason)) => return ceres(&format!("database statistics unavailable: {reason}")),
-        Err(reason) => return ceres(&format!("database statistics task failed: {reason}")),
-    };
+    let stats =
+        match crate::presets::spawn_pipeline_blocking(move || read_database_stats(&database)).await
+        {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(reason)) => return ceres(&format!("database statistics unavailable: {reason}")),
+            Err(reason) => return ceres(&format!("database statistics task failed: {reason}")),
+        };
     if !meets_caspar_threshold(stats) {
         let thresholds = &pipeline_optimization_config().caspar;
         return ceres(&format!(

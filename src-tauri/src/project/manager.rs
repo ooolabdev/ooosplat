@@ -25,6 +25,7 @@ pub struct ProjectPaths {
     pub output: PathBuf,
     pub work: PathBuf,
     pub frames: PathBuf,
+    pub colmap_frames: PathBuf,
     pub masks: PathBuf,
     pub colmap: PathBuf,
     pub brush: PathBuf,
@@ -49,6 +50,7 @@ impl ProjectPaths {
             metadata: project.join("project.json"),
             output: project.clone(),
             frames: work.join("frames"),
+            colmap_frames: work.join("colmap_frames"),
             masks: work.join("masks"),
             colmap: work.join("colmap"),
             brush: work.join("brush"),
@@ -64,12 +66,14 @@ impl ProjectPaths {
 #[derive(Debug, Clone)]
 pub struct ProjectManager {
     projects_root: PathBuf,
+    input_boundary: Option<PathBuf>,
     register_in_catalog: bool,
 }
 
 impl ProjectManager {
     pub fn system_default() -> Result<Self> {
         Ok(Self {
+            input_boundary: None,
             projects_root: catalog::default_projects_root()?,
             register_in_catalog: true,
         })
@@ -77,14 +81,21 @@ impl ProjectManager {
     pub fn with_root(projects_root: PathBuf) -> Self {
         Self {
             projects_root,
+            input_boundary: None,
             register_in_catalog: true,
         }
     }
     pub fn for_diagnostics(projects_root: PathBuf) -> Self {
         Self {
             projects_root,
+            input_boundary: None,
             register_in_catalog: false,
         }
+    }
+
+    pub fn with_input_boundary(mut self, boundary: Option<PathBuf>) -> Self {
+        self.input_boundary = boundary;
+        self
     }
 
     pub async fn validate_root(root: &Path) -> Result<()> {
@@ -120,9 +131,14 @@ impl ProjectManager {
         let image_scan = if input.is_dir() {
             let source = input.to_path_buf();
             let token = cancellation.clone();
+            let boundary = self.input_boundary.clone();
             Some(
-                tokio::task::spawn_blocking(move || {
-                    crate::video::scan_image_sequence(&source, token.as_ref())
+                crate::presets::spawn_pipeline_blocking(move || {
+                    crate::video::image_sequence::scan_image_sequence_with_boundary(
+                        &source,
+                        token.as_ref(),
+                        boundary.as_deref(),
+                    )
                 })
                 .await
                 .map_err(|error| SplatError::Process(format!("图片序列分析任务失败：{error}")))??,
@@ -158,11 +174,12 @@ impl ProjectManager {
         let source = project.join("source");
         let work = project.join("work");
         let frames = work.join("frames");
+        let colmap_frames = work.join("colmap_frames");
         let masks = work.join("masks");
         let colmap = work.join("colmap");
         let brush = work.join("brush");
         let logs = project.join("logs");
-        for directory in [&source, &frames, &colmap, &brush, &logs] {
+        for directory in [&source, &frames, &colmap_frames, &colmap, &brush, &logs] {
             tokio::fs::create_dir_all(directory).await?;
         }
         let stored_source = if input_type == ProjectInputType::Images {
@@ -183,6 +200,10 @@ impl ProjectManager {
                 {
                     let _ = tokio::fs::remove_dir_all(&project).await;
                     return Err(SplatError::Cancelled);
+                }
+                if let Some(boundary) = &self.input_boundary {
+                    crate::tasks::authorize_input(&image.path, std::slice::from_ref(boundary))
+                        .map_err(|e| SplatError::Process(e.to_string()))?;
                 }
                 let dest =
                     images_dir.join(crate::video::normalized_image_name(index, &image.path)?);
@@ -207,6 +228,11 @@ impl ProjectManager {
                 .unwrap_or("mp4")
                 .to_ascii_lowercase();
             let stored = source.join(format!("input.{extension}"));
+            if let Some(boundary) = &self.input_boundary {
+                if std::fs::canonicalize(input)? != std::fs::canonicalize(boundary)? {
+                    return Err(SplatError::InvalidPath(input.to_path_buf()));
+                }
+            }
             tokio::fs::copy(input, &stored).await?;
             stored
         };
@@ -252,6 +278,7 @@ impl ProjectManager {
                 output: project,
                 work,
                 frames,
+                colmap_frames,
                 masks,
                 colmap,
                 brush,
@@ -322,21 +349,31 @@ fn validate_video_path(path: &Path) -> Result<()> {
 }
 
 pub async fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
-    let temporary = path.with_extension("json.tmp");
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data.json");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)?;
-    let mut file = tokio::fs::File::create(&temporary).await?;
-    use tokio::io::AsyncWriteExt;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    atomic_replace(&temporary, path)?;
-    Ok(())
+    let result = async {
+        let mut file = tokio::fs::File::create(&temporary).await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        atomic_replace(&temporary, path)
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 pub(crate) async fn atomic_replace_file(source: &Path, destination: &Path) -> Result<()> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || atomic_replace(&source, &destination))
+    crate::presets::spawn_pipeline_blocking(move || atomic_replace(&source, &destination))
         .await
         .map_err(|error| SplatError::Process(format!("原子发布任务失败：{error}")))?
 }
@@ -460,6 +497,34 @@ mod tests {
         assert_eq!(value["value"], 2);
     }
 
+    #[tokio::test]
+    async fn concurrent_json_writes_use_independent_temporary_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("project-index.json");
+        let writes = (0..16).map(|value| {
+            let path = path.clone();
+            tokio::spawn(async move {
+                atomic_write_json(&path, &serde_json::json!({"value": value})).await
+            })
+        });
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(value["value"].as_u64().is_some_and(|value| value < 16));
+        let leftovers = std::fs::read_dir(temporary.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path() != path)
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "leftover temporary files: {leftovers:?}"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn copy_replacement_keeps_latest_data_and_cleans_temporary_files() {
@@ -489,6 +554,7 @@ mod tests {
         assert!(metadata.source_path.is_file());
         assert_eq!(paths.output, paths.project);
         assert!(paths.state.is_file());
+        assert!(paths.colmap_frames.is_dir());
     }
 
     #[tokio::test]

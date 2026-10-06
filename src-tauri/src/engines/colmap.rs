@@ -264,6 +264,8 @@ pub async fn extract_features(
     database: &Path,
     images: &Path,
     masks: Option<&Path>,
+    max_image_size: Option<u32>,
+    max_features: Option<u32>,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -279,7 +281,8 @@ pub async fn extract_features(
             gpu_index,
             use_gpu_option,
             gpu_index_option,
-            None,
+            max_image_size,
+            max_features,
             None,
         ),
         database.parent().unwrap_or(images),
@@ -314,7 +317,8 @@ pub async fn extract_features_quality_v2(
             gpu_index,
             use_gpu_option,
             gpu_index_option,
-            Some((max_image_size, max_features)),
+            Some(max_image_size),
+            Some(max_features),
             image_list,
         ),
         database.parent().unwrap_or(images),
@@ -333,6 +337,8 @@ pub async fn extract_incremental_features(
     image_list: &Path,
     existing_camera_id: u32,
     masks: Option<&Path>,
+    max_image_size: Option<u32>,
+    max_features: Option<u32>,
     log: PathBuf,
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
@@ -350,6 +356,8 @@ pub async fn extract_incremental_features(
             gpu_index,
             use_gpu_option,
             gpu_index_option,
+            max_image_size,
+            max_features,
         ),
         database.parent().unwrap_or(images),
         log,
@@ -451,7 +459,8 @@ fn feature_extraction_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
-    quality_limits: Option<(u32, u32)>,
+    max_image_size: Option<u32>,
+    max_features: Option<u32>,
     image_list: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = vec![
@@ -467,19 +476,7 @@ fn feature_extraction_args(
         use_gpu_option.into(),
         (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
-    if let Some((max_image_size, max_features)) = quality_limits {
-        let max_image_size_option = if use_gpu_option.starts_with("--FeatureExtraction") {
-            "--FeatureExtraction.max_image_size"
-        } else {
-            "--SiftExtraction.max_image_size"
-        };
-        args.extend([
-            max_image_size_option.into(),
-            max_image_size.to_string().into(),
-            "--SiftExtraction.max_num_features".into(),
-            max_features.to_string().into(),
-        ]);
-    }
+    append_feature_extraction_limits(&mut args, use_gpu_option, max_image_size, max_features);
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -495,6 +492,31 @@ fn feature_extraction_args(
     args
 }
 
+fn append_feature_extraction_limits(
+    args: &mut Vec<OsString>,
+    use_gpu_option: &str,
+    max_image_size: Option<u32>,
+    max_features: Option<u32>,
+) {
+    if let Some(max_image_size) = max_image_size {
+        let max_image_size_option = if use_gpu_option.starts_with("--FeatureExtraction") {
+            "--FeatureExtraction.max_image_size"
+        } else {
+            "--SiftExtraction.max_image_size"
+        };
+        args.extend([
+            max_image_size_option.into(),
+            max_image_size.to_string().into(),
+        ]);
+    }
+    if let Some(max_features) = max_features {
+        args.extend([
+            "--SiftExtraction.max_num_features".into(),
+            max_features.to_string().into(),
+        ]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental_feature_extraction_args(
     database: &Path,
@@ -505,6 +527,8 @@ fn incremental_feature_extraction_args(
     gpu_index: Option<u32>,
     use_gpu_option: &str,
     gpu_index_option: &str,
+    max_image_size: Option<u32>,
+    max_features: Option<u32>,
 ) -> Vec<OsString> {
     let mut args = vec![
         "feature_extractor".into(),
@@ -519,6 +543,7 @@ fn incremental_feature_extraction_args(
         use_gpu_option.into(),
         (if gpu_index.is_some() { "1" } else { "0" }).into(),
     ];
+    append_feature_extraction_limits(&mut args, use_gpu_option, max_image_size, max_features);
     if let Some(index) = gpu_index {
         args.push(gpu_index_option.into());
         args.push(index.to_string().into());
@@ -811,6 +836,7 @@ mod tests {
             "--FeatureExtraction.gpu_index",
             None,
             None,
+            None,
         ));
         assert!(extraction
             .windows(2)
@@ -842,6 +868,7 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            None,
             None,
             None,
         ));
@@ -911,6 +938,7 @@ mod tests {
             "--SiftExtraction.gpu_index",
             None,
             None,
+            None,
         ));
         assert!(extraction
             .windows(2)
@@ -924,17 +952,21 @@ mod tests {
     fn transparent_input_passes_the_colmap_mask_root() {
         let extraction = strings(feature_extraction_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             Some(Path::new("../masks")),
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
             None,
             None,
+            None,
         ));
         assert!(extraction
             .windows(2)
             .any(|pair| pair == ["--ImageReader.mask_path", "../masks"]));
+        assert!(extraction
+            .windows(2)
+            .any(|pair| pair == ["--image_path", "../colmap_frames"]));
     }
 
     #[test]
@@ -946,7 +978,8 @@ mod tests {
             None,
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
-            Some((1600, 4096)),
+            Some(1600),
+            Some(4096),
             Some(Path::new("bridge-images.txt")),
         ));
         assert!(extraction
@@ -961,10 +994,44 @@ mod tests {
     }
 
     #[test]
+    fn image_size_only_limit_preserves_default_feature_count_for_both_cli_families() {
+        for (use_gpu_option, gpu_index_option, expected_image_option) in [
+            (
+                "--FeatureExtraction.use_gpu",
+                "--FeatureExtraction.gpu_index",
+                "--FeatureExtraction.max_image_size",
+            ),
+            (
+                "--SiftExtraction.use_gpu",
+                "--SiftExtraction.gpu_index",
+                "--SiftExtraction.max_image_size",
+            ),
+        ] {
+            let extraction = strings(feature_extraction_args(
+                Path::new("database.db"),
+                Path::new("frames"),
+                None,
+                None,
+                use_gpu_option,
+                gpu_index_option,
+                Some(1200),
+                None,
+                None,
+            ));
+            assert!(extraction
+                .windows(2)
+                .any(|pair| pair == [expected_image_option, "1200"]));
+            assert!(!extraction
+                .iter()
+                .any(|arg| arg == "--SiftExtraction.max_num_features"));
+        }
+    }
+
+    #[test]
     fn incremental_mapper_arguments_include_the_baseline_model() {
         let args = strings(mapper_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             Some(Path::new("sparse/0")),
             Path::new("sparse-bridge"),
             false,
@@ -983,7 +1050,7 @@ mod tests {
     fn high_mapper_can_triangulate_two_view_tracks() {
         let args = strings(mapper_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             None,
             Path::new("sparse"),
             true,
@@ -994,7 +1061,7 @@ mod tests {
 
         let default_args = strings(mapper_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             None,
             Path::new("sparse"),
             false,
@@ -1008,13 +1075,15 @@ mod tests {
     fn incremental_features_reuse_the_existing_camera_and_only_new_images() {
         let args = strings(incremental_feature_extraction_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             Path::new("reshoot-images.txt"),
             7,
             Some(Path::new("../reshoot-masks")),
             Some(0),
             "--FeatureExtraction.use_gpu",
             "--FeatureExtraction.gpu_index",
+            Some(1600),
+            Some(8192),
         ));
         assert!(args
             .windows(2)
@@ -1022,14 +1091,42 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--ImageReader.existing_camera_id", "7"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--FeatureExtraction.max_image_size", "1600"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--SiftExtraction.max_num_features", "8192"]));
         assert!(!args.iter().any(|arg| arg == "--ImageReader.single_camera"));
+    }
+
+    #[test]
+    fn incremental_feature_limits_support_the_legacy_cli_family() {
+        let args = strings(incremental_feature_extraction_args(
+            Path::new("database.db"),
+            Path::new("../colmap_frames"),
+            Path::new("reshoot-images.txt"),
+            3,
+            None,
+            None,
+            "--SiftExtraction.use_gpu",
+            "--SiftExtraction.gpu_index",
+            Some(2000),
+            Some(16384),
+        ));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--SiftExtraction.max_image_size", "2000"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--SiftExtraction.max_num_features", "16384"]));
     }
 
     #[test]
     fn incremental_mapper_keeps_existing_frames_and_intrinsics_fixed() {
         let args = strings(incremental_mapper_args(
             Path::new("database.db"),
-            Path::new("../frames"),
+            Path::new("../colmap_frames"),
             Path::new("base-model"),
             Path::new("incremental-model"),
             Path::new("mapper-images.txt"),

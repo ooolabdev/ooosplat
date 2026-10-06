@@ -1,13 +1,16 @@
-use std::{env, fs, sync::OnceLock};
+use std::{
+    env, fs,
+    sync::{Arc, OnceLock},
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{BrushDensificationPreset, BrushTrainingProfile, Quality};
 
 pub const PIPELINE_CONFIG_ENV: &str = "OOOSPLAT_PIPELINE_CONFIG";
 const EMBEDDED_CONFIG: &str = include_str!("../../../config/pipeline-optimization.json");
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PipelineOptimizationConfig {
     #[serde(rename = "_comment", default)]
@@ -20,7 +23,7 @@ pub struct PipelineOptimizationConfig {
     pub brush_profiles: BrushProfileConfigs,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BilingualComment {
     #[serde(rename = "zh-CN")]
@@ -28,7 +31,7 @@ pub struct BilingualComment {
     pub en: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SharedConfig {
     #[serde(rename = "_comment", default)]
@@ -39,7 +42,7 @@ pub struct SharedConfig {
     pub brush_refine_every: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CasparConfig {
     #[serde(rename = "_comment", default)]
@@ -48,7 +51,7 @@ pub struct CasparConfig {
     pub minimum_verified_matches: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HighVramConfig {
     #[serde(rename = "_comment", default)]
@@ -57,7 +60,7 @@ pub struct HighVramConfig {
     pub large_minimum_mi_b: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QualityConfigs {
     #[serde(rename = "_comment", default)]
@@ -77,7 +80,7 @@ impl QualityConfigs {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QualityConfig {
     #[serde(rename = "_comment", default)]
@@ -86,25 +89,29 @@ pub struct QualityConfig {
     pub automatic_optimization_on: AutomaticQualityConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LegacyQualityConfig {
     #[serde(rename = "_comment", default)]
     pub comment: Option<BilingualComment>,
     pub frame_retention_ratio: f64,
-    pub incremental_sfm_max_image_size: u32,
-    pub incremental_sfm_max_features: u32,
+    #[serde(alias = "incrementalSfmMaxImageSize")]
+    pub sfm_max_image_size: u32,
+    #[serde(alias = "incrementalSfmMaxFeatures")]
+    pub sfm_max_features: u32,
     pub brush: LegacyBrushConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LegacyBrushConfig {
     pub total_steps: usize,
     pub max_resolution: u32,
+    #[serde(default)]
+    pub densification: Option<BrushDensificationPreset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomaticQualityConfig {
     #[serde(rename = "_comment", default)]
@@ -116,7 +123,7 @@ pub struct AutomaticQualityConfig {
     pub initial_brush_profile: BrushTrainingProfile,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrushProfileConfigs {
     #[serde(rename = "_comment", default)]
@@ -145,7 +152,7 @@ impl BrushProfileConfigs {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrushProfileConfig {
     #[serde(rename = "_comment", default)]
@@ -159,7 +166,7 @@ pub struct BrushProfileConfig {
     pub oom_fallback: Option<BrushTrainingProfile>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResolutionValue {
     Fixed(u32),
@@ -175,16 +182,51 @@ impl ResolutionValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceResolution {
     Source,
 }
 
-static CONFIG: OnceLock<PipelineOptimizationConfig> = OnceLock::new();
+static CONFIG: OnceLock<Arc<PipelineOptimizationConfig>> = OnceLock::new();
 
-pub fn pipeline_optimization_config() -> &'static PipelineOptimizationConfig {
-    CONFIG.get_or_init(|| match env::var_os(PIPELINE_CONFIG_ENV) {
+tokio::task_local! { static RUN_CONFIG: Arc<PipelineOptimizationConfig>; }
+std::thread_local! { static BLOCKING_CONFIG: std::cell::RefCell<Option<Arc<PipelineOptimizationConfig>>> = const { std::cell::RefCell::new(None) }; }
+
+pub fn spawn_pipeline_blocking<F, T>(work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let config = pipeline_optimization_config();
+    tokio::task::spawn_blocking(move || {
+        struct Restore(Option<Arc<PipelineOptimizationConfig>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BLOCKING_CONFIG.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let previous = BLOCKING_CONFIG.with(|slot| slot.replace(Some(config)));
+        let _restore = Restore(previous);
+        work()
+    })
+}
+
+pub async fn with_pipeline_config<F: std::future::Future>(
+    config: PipelineOptimizationConfig,
+    future: F,
+) -> F::Output {
+    RUN_CONFIG.scope(Arc::new(config), future).await
+}
+
+pub fn pipeline_optimization_config() -> Arc<PipelineOptimizationConfig> {
+    if let Some(config) = BLOCKING_CONFIG.with(|slot| slot.borrow().clone()) {
+        return config;
+    }
+    if let Ok(config) = RUN_CONFIG.try_with(Arc::clone) {
+        return config;
+    }
+    CONFIG.get_or_init(|| Arc::new(match env::var_os(PIPELINE_CONFIG_ENV) {
         Some(path) => match fs::read_to_string(&path)
             .map_err(|error| error.to_string())
             .and_then(|json| parse_and_validate(&json))
@@ -199,7 +241,7 @@ pub fn pipeline_optimization_config() -> &'static PipelineOptimizationConfig {
             }
         },
         None => embedded_config(),
-    })
+    })).clone()
 }
 
 fn embedded_config() -> PipelineOptimizationConfig {
@@ -327,14 +369,21 @@ impl QualityConfig {
                 "qualities.{name}.automaticOptimizationOff.frameRetentionRatio must be finite and between 0 and 1"
             ));
         }
-        if legacy.incremental_sfm_max_image_size == 0
-            || legacy.incremental_sfm_max_features == 0
+        if legacy.sfm_max_image_size == 0
+            || legacy.sfm_max_features == 0
             || legacy.brush.total_steps == 0
             || legacy.brush.max_resolution == 0
         {
             return Err(format!(
                 "qualities.{name}.automaticOptimizationOff numeric limits must be greater than zero"
             ));
+        }
+        if let Some(densification) = legacy.brush.densification {
+            // Brush clamps this cutoff to the training length; Fast intentionally
+            // shares the 15,000 cutoff while only training for 8,000 iterations.
+            densification.validate(&format!(
+                "qualities.{name}.automaticOptimizationOff.brush.densification"
+            ))?;
         }
         let automatic = &self.automatic_optimization_on;
         if !automatic.initial_fps.is_finite()
@@ -361,9 +410,9 @@ impl QualityConfig {
 
 impl BrushProfileConfig {
     fn validate(&self, name: &str) -> Result<(), String> {
-        if self.sfm_max_image_size == 0 || self.total_steps == 0 {
+        if self.sfm_max_image_size == 0 || self.total_steps == 0 || self.max_splats == Some(0) {
             return Err(format!(
-                "brushProfiles.{name} image and iteration limits must be greater than zero"
+                "brushProfiles.{name} image, iteration, and optional maxSplats limits must be greater than zero"
             ));
         }
         for (field, value) in [
@@ -377,17 +426,28 @@ impl BrushProfileConfig {
             }
         }
         if let Some(densification) = self.densification {
-            if !densification.growth_grad_threshold.is_finite()
-                || densification.growth_grad_threshold <= 0.0
-                || !densification.growth_select_fraction.is_finite()
-                || !(0.0..=1.0).contains(&densification.growth_select_fraction)
-                || densification.growth_stop_iter == 0
-                || densification.growth_stop_iter as usize > self.total_steps
-            {
+            densification.validate(&format!("brushProfiles.{name}.densification"))?;
+            if densification.growth_stop_iter as usize > self.total_steps {
                 return Err(format!(
-                    "brushProfiles.{name}.densification contains an invalid threshold, fraction, or stop iteration"
+                    "brushProfiles.{name}.densification.growthStopIter must not exceed totalSteps"
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl BrushDensificationPreset {
+    fn validate(&self, field: &str) -> Result<(), String> {
+        if !self.growth_grad_threshold.is_finite()
+            || self.growth_grad_threshold <= 0.0
+            || !self.growth_select_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.growth_select_fraction)
+            || self.growth_stop_iter == 0
+        {
+            return Err(format!(
+                "{field} contains an invalid threshold, fraction, or stop iteration"
+            ));
         }
         Ok(())
     }
@@ -403,9 +463,112 @@ mod tests {
         assert_eq!(config.schema_version, 1);
         assert_eq!(config.caspar.minimum_keypoints, 2_000_000);
         assert_eq!(
+            config
+                .qualities
+                .fast
+                .automatic_optimization_off
+                .sfm_max_image_size,
+            1_200
+        );
+        assert_eq!(
+            config
+                .qualities
+                .balanced
+                .automatic_optimization_off
+                .sfm_max_image_size,
+            1_600
+        );
+        assert_eq!(
+            config
+                .qualities
+                .high
+                .automatic_optimization_off
+                .sfm_max_image_size,
+            2_000
+        );
+        assert_eq!(config.brush_profiles.fast.max_splats, Some(500_000));
+        assert_eq!(config.brush_profiles.balanced.max_splats, Some(1_000_000));
+        assert_eq!(
             config.qualities.fast.automatic_optimization_on.initial_fps,
             6.0
         );
+    }
+
+    #[test]
+    fn legacy_incremental_image_size_field_remains_supported() {
+        let legacy: LegacyQualityConfig = serde_json::from_str(
+            r#"{
+                "frameRetentionRatio": 0.3,
+                "incrementalSfmMaxImageSize": 1440,
+                "incrementalSfmMaxFeatures": 4096,
+                "brush": { "totalSteps": 8000, "maxResolution": 1200 }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sfm_max_image_size, 1_440);
+        assert_eq!(legacy.sfm_max_features, 4_096);
+        assert!(legacy.brush.densification.is_none());
+    }
+
+    #[test]
+    fn optimization_off_densification_is_configurable_and_accepts_fast_cutoff() {
+        let config = parse_and_validate(EMBEDDED_CONFIG).unwrap();
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            assert_eq!(
+                config
+                    .qualities
+                    .get(quality)
+                    .automatic_optimization_off
+                    .brush
+                    .densification,
+                Some(BrushDensificationPreset {
+                    growth_grad_threshold: 0.0025,
+                    growth_select_fraction: 0.1,
+                    growth_stop_iter: 15_000,
+                })
+            );
+        }
+        let mut json: serde_json::Value = serde_json::from_str(EMBEDDED_CONFIG).unwrap();
+        json["qualities"]["fast"]["automaticOptimizationOff"]["brush"]["densification"] = serde_json::json!({
+            "growthGradThreshold": 0.0035,
+            "growthSelectFraction": 0.12,
+            "growthStopIter": 10000
+        });
+        let custom = parse_and_validate(&json.to_string()).unwrap();
+        assert_eq!(
+            custom
+                .qualities
+                .fast
+                .automatic_optimization_off
+                .brush
+                .densification,
+            Some(BrushDensificationPreset {
+                growth_grad_threshold: 0.0035,
+                growth_select_fraction: 0.12,
+                growth_stop_iter: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn optimization_off_invalid_densification_is_rejected() {
+        for quality in ["fast", "balanced", "high"] {
+            for (field, value) in [
+                ("growthGradThreshold", serde_json::json!(0)),
+                ("growthGradThreshold", serde_json::json!(-0.1)),
+                ("growthSelectFraction", serde_json::json!(-0.1)),
+                ("growthSelectFraction", serde_json::json!(1.1)),
+                ("growthStopIter", serde_json::json!(0)),
+            ] {
+                let mut json: serde_json::Value = serde_json::from_str(EMBEDDED_CONFIG).unwrap();
+                json["qualities"][quality]["automaticOptimizationOff"]["brush"]["densification"]
+                    [field] = value;
+                assert!(
+                    parse_and_validate(&json.to_string()).is_err(),
+                    "{quality}: {field}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -423,5 +586,9 @@ mod tests {
             1,
         );
         assert!(parse_and_validate(&invalid).is_err());
+
+        let zero_splat_cap =
+            EMBEDDED_CONFIG.replacen("\"maxSplats\": 500000", "\"maxSplats\": 0", 1);
+        assert!(parse_and_validate(&zero_splat_cap).is_err());
     }
 }

@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::InvokeBody, Emitter, Manager, State};
@@ -23,7 +20,6 @@ use crate::{
     },
     error::{Result, SplatError},
     pipeline::{
-        effectiveness::PlannerEffectivenessTracker,
         estimate::{
             estimate_runtime_for_images_with_brush_and_resolution,
             estimate_runtime_with_brush_and_resolution, RuntimeEstimate,
@@ -53,62 +49,34 @@ use crate::{
         ply::inspect_gaussian_ply,
         splat_transform::{export_transformed_ply_with_edits, GaussianExportEdits},
     },
-    telemetry::{
-        PipelineTelemetrySession, TelemetryInputType, TelemetryPreferences, TelemetryRunKind,
-        TelemetryService,
-    },
+    telemetry::{TelemetryPreferences, TelemetryService},
     video::{
         analyze_image_sequence, create_image_plan, FramePlan, FrameSelectionStrategy,
         ImageSequenceInfo, QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
-#[derive(Default)]
-pub struct PipelineController {
-    active: Mutex<Option<Arc<PipelineRunner>>>,
-    pub(crate) diagnostics: crate::diagnostics::DiagnosticService,
-}
-
-impl PipelineController {
-    async fn claim(&self, runner: Arc<PipelineRunner>) -> Result<()> {
-        let mut active = self.active.lock().await;
-        if active.is_some() {
-            return Err(SplatError::Process("已有任务正在运行".into()));
-        }
-        *active = Some(runner);
-        Ok(())
-    }
-
-    async fn release(&self, runner: &Arc<PipelineRunner>) {
-        let mut active = self.active.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, runner))
-        {
-            *active = None;
-        }
-    }
-}
+pub type PipelineController = crate::tasks::TaskService;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineCommandError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failed_stage: Option<PipelineStage>,
+    pub(crate) failed_stage: Option<PipelineStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    engine: Option<PipelineEngine>,
+    pub(crate) engine: Option<PipelineEngine>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failure_kind: Option<&'static str>,
+    pub(crate) failure_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    project_id: Option<String>,
+    pub(crate) project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    project_path: Option<Box<PathBuf>>,
+    pub(crate) project_path: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logs_directory: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failure_id: Option<Box<Uuid>>,
+    pub(crate) failure_id: Option<Box<Uuid>>,
 }
 
 impl From<SplatError> for PipelineCommandError {
@@ -132,7 +100,7 @@ impl From<SplatError> for PipelineCommandError {
 }
 
 impl PipelineCommandError {
-    fn from_runner(error: SplatError, runner: &PipelineRunner) -> Self {
+    pub(crate) fn from_runner(error: &SplatError, runner: &PipelineRunner) -> Self {
         let message = error.to_string();
         let cancelled = matches!(error, SplatError::Cancelled);
         let PipelineFailureContext {
@@ -166,40 +134,59 @@ fn classify_pipeline_failure(
 ) -> (Option<PipelineEngine>, Option<&'static str>) {
     let lower = message.to_ascii_lowercase();
     match stage {
-        Some(PipelineStage::Reconstructing) => {
+        Some(PipelineStage::Reconstructing | PipelineStage::ValidatingReconstruction) => {
             let source_error = [
+                "no initial image pair",
                 "no good initial image pair",
                 "could not find a good initial image pair",
                 "failed to find an initial image pair",
+                "failed to register",
+                "could not register",
+                "no images registered",
+                "registered 0 images",
                 "discarding reconstruction",
                 "failed to create any sparse model",
+                "did not produce a usable sparse model",
+                "未生成完整的稀疏模型",
+                "稀疏重建没有可用的注册图像或三维点",
+                "稀疏重建输出不完整",
             ]
             .iter()
             .any(|needle| lower.contains(needle));
-            let storage_error = [
-                "io error",
-                "i/o error",
-                "database is locked",
-                "database locked",
-                "unable to open database",
-                "failed to open database",
-                "cannot open database",
-                "unable to open database file",
-                "read-only database",
-                "readonly database",
-                "no space left",
-                "disk full",
-                "input/output error",
-                "no such file",
-                "file not found",
-                "being used by another process",
-                "used by another process",
-                "sharing violation",
-                "access denied",
-                "permission denied",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
+            let database_io_error = ["io error", "i/o error"]
+                .iter()
+                .any(|needle| lower.contains(needle))
+                && ["database", "sqlite", "filesystem", "project file"]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
+            let storage_error = database_io_error
+                || [
+                    "database is locked",
+                    "database locked",
+                    "unable to open database",
+                    "failed to open database",
+                    "cannot open database",
+                    "unable to open database file",
+                    "read-only database",
+                    "readonly database",
+                    "no space left",
+                    "disk full",
+                    "input/output error",
+                    "being used by another process",
+                    "used by another process",
+                    "sharing violation",
+                    "access denied",
+                    "permission denied",
+                    "数据库被锁定",
+                    "无法打开数据库",
+                    "磁盘空间不足",
+                    "磁盘已满",
+                    "另一个进程正在使用",
+                    "拒绝访问",
+                    "权限不足",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle));
             (
                 Some(PipelineEngine::Colmap),
                 Some(if source_error {
@@ -248,66 +235,11 @@ fn classify_pipeline_failure(
         Some(PipelineStage::ProbingVideo | PipelineStage::ExtractingFrames) => {
             (Some(PipelineEngine::Ffmpeg), None)
         }
-        Some(
-            PipelineStage::ExtractingFeatures
-            | PipelineStage::Matching
-            | PipelineStage::ValidatingReconstruction,
-        ) => (Some(PipelineEngine::Colmap), None),
+        Some(PipelineStage::ExtractingFeatures | PipelineStage::Matching) => {
+            (Some(PipelineEngine::Colmap), None)
+        }
         _ => (Some(PipelineEngine::System), None),
     }
-}
-
-async fn record_command_failure(
-    state: &PipelineController,
-    mut error: PipelineCommandError,
-    input_paths: &[PathBuf],
-) -> PipelineCommandError {
-    if error.code != "cancelled" {
-        let mut paths = error
-            .project_path
-            .as_deref()
-            .map(|path| vec![path.clone()])
-            .unwrap_or_default();
-        paths.extend_from_slice(input_paths);
-        let project_id = error
-            .project_id
-            .as_ref()
-            .and_then(|id| Uuid::parse_str(id).ok());
-        error.failure_id = Some(Box::new(
-            state
-                .diagnostics
-                .capture(
-                    error.failed_stage,
-                    error.engine,
-                    error.failure_kind,
-                    &error.message,
-                    project_id,
-                    &paths,
-                )
-                .await,
-        ));
-    }
-    error
-}
-
-async fn finish_pipeline(
-    state: &PipelineController,
-    result: Result<PipelineResult>,
-    runner: &Arc<PipelineRunner>,
-    input_paths: &[PathBuf],
-) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    // Capture logs before unlocking the task, so retries/deletion cannot change the snapshot.
-    let result = match result {
-        Ok(output) => Ok(output),
-        Err(error) => Err(record_command_failure(
-            state,
-            PipelineCommandError::from_runner(error, runner),
-            input_paths,
-        )
-        .await),
-    };
-    state.release(runner).await;
-    result
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,6 +302,8 @@ pub struct AppRuntimeStatus {
     pipeline_running: bool,
     pipeline_project_id: Option<String>,
     pipeline_workspace_task_id: Option<String>,
+    pipeline_run_elapsed_ms: u64,
+    pipeline_elapsed_offset_ms: u64,
     preview_project_id: Option<String>,
     task_acceleration: Option<ColmapAccelerationStatus>,
 }
@@ -386,6 +320,10 @@ pub struct ProjectTaskLogLine {
 pub struct ProjectTaskDetail {
     project: ProjectSummary,
     input_type: ProjectInputType,
+    source_path: PathBuf,
+    projects_root: PathBuf,
+    planner_enabled: bool,
+    estimated_frames: Option<u64>,
     stage: PipelineStage,
     progress: f64,
     input_images: Option<u64>,
@@ -522,7 +460,7 @@ pub struct ProbeAndPlan {
     estimate: RuntimeEstimate,
 }
 
-fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
+pub(crate) fn paths_for_app(app: &tauri::AppHandle) -> EnginePaths {
     EnginePaths::discover(app.path().resource_dir().ok().as_deref())
 }
 
@@ -843,6 +781,15 @@ pub async fn get_project_overview(
     state: State<'_, PipelineController>,
 ) -> std::result::Result<ProjectOverview, SplatError> {
     let mut overview = catalog::get_overview().await?;
+    let tasks = state
+        .all()
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))?;
+    for project in &mut overview.projects {
+        if let Some(task) = tasks.iter().find(|t| t.project_id == Some(project.id)) {
+            project.status = task.status.project_status();
+        }
+    }
     if state.active.lock().await.is_none() {
         for project in &mut overview.projects {
             if project.status == ProjectStatus::Running {
@@ -932,15 +879,22 @@ async fn read_project_log_tail(logs_directory: &Path) -> Result<Vec<ProjectTaskL
 }
 
 #[tauri::command]
-pub async fn get_project_task_detail(project_id: String) -> Result<ProjectTaskDetail> {
+pub async fn get_project_task_detail(
+    controller: State<'_, PipelineController>,
+    project_id: String,
+) -> Result<ProjectTaskDetail> {
     let id = parse_project_id(&project_id)?;
-    let (project_root, metadata) = catalog::load_registered_project(id).await?;
-    let overview = catalog::get_overview().await?;
-    let project = overview
-        .projects
+    let (project_root, metadata, mut project) =
+        catalog::load_registered_project_summary(id).await?;
+    if let Some(task) = controller
+        .all()
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))?
         .into_iter()
-        .find(|project| project.id == id)
-        .ok_or_else(|| SplatError::Process("项目不存在".into()))?;
+        .find(|t| t.project_id == Some(id))
+    {
+        project.status = task.status.project_status();
+    }
     let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
     let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
     let progress = if project.status == ProjectStatus::Completed {
@@ -958,6 +912,13 @@ pub async fn get_project_task_detail(project_id: String) -> Result<ProjectTaskDe
     Ok(ProjectTaskDetail {
         project,
         input_type: metadata.input_type,
+        source_path: metadata.source_path,
+        projects_root: project_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+        planner_enabled: state.planner_enabled,
+        estimated_frames: state.frames.as_ref().map(|frames| frames.estimated_frames),
         stage,
         progress,
         input_images,
@@ -999,6 +960,143 @@ pub async fn set_telemetry_consent(
     telemetry.set_consent(enabled).await
 }
 
+#[cfg(test)]
+async fn record_command_failure(
+    state: &PipelineController,
+    error: PipelineCommandError,
+    paths: &[PathBuf],
+) -> PipelineCommandError {
+    state.capture_failure(error, paths).await
+}
+
+fn service_command_error(error: crate::tasks::ServiceError) -> PipelineCommandError {
+    let mut command = PipelineCommandError::from(SplatError::Process(error.to_string()));
+    if error.code == "TASK_BUSY" {
+        command.code = "TASK_BUSY";
+    }
+    command
+}
+
+async fn wait_task_result(
+    state: &PipelineController,
+    id: Uuid,
+) -> std::result::Result<PipelineResult, PipelineCommandError> {
+    let task = state.wait(id).await.map_err(service_command_error)?;
+    if let Some(result) = task.result {
+        return serde_json::from_value(result)
+            .map_err(|e| PipelineCommandError::from(SplatError::Json(e)));
+    }
+    if let Some(error) = task.error {
+        return Err(PipelineCommandError {
+            code: if task.status == crate::tasks::TaskStatus::Cancelled {
+                "cancelled"
+            } else {
+                "pipeline_failed"
+            },
+            message: error.message,
+            failed_stage: error.failed_stage,
+            engine: error.engine,
+            failure_kind: None,
+            project_id: task.project_id.map(|v| v.to_string()),
+            project_path: task.project_path.map(Box::new),
+            logs_directory: None,
+            failure_id: error.failure_id.map(Box::new),
+        });
+    }
+    Err(PipelineCommandError::from(SplatError::Process(
+        "任务未产生结果".into(),
+    )))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_gui_task(
+    state: State<'_, PipelineController>,
+    path: String,
+    quality: Quality,
+    projects_root: String,
+    planner_enabled: Option<bool>,
+    workspace_task_id: Option<String>,
+) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
+    let id = workspace_task_id
+        .map(|v| Uuid::parse_str(&v))
+        .transpose()
+        .map_err(|_| crate::tasks::ServiceError::new("INVALID_ARGUMENT", "工作区任务 ID 无效"))?;
+    state
+        .create(
+            id,
+            path.into(),
+            quality,
+            projects_root.into(),
+            planner_enabled.unwrap_or(true),
+            "gui",
+            None,
+            None,
+        )
+        .await
+}
+#[tauri::command]
+pub async fn start_gui_task(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    task_id: Uuid,
+) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    state
+        .start(
+            task_id,
+            paths_for_app(&app),
+            Some(telemetry.inner().clone()),
+        )
+        .await
+}
+#[tauri::command]
+pub async fn get_shared_tasks(
+    state: State<'_, PipelineController>,
+) -> std::result::Result<Vec<crate::tasks::TaskRecord>, crate::tasks::ServiceError> {
+    state.all().await
+}
+#[tauri::command]
+pub async fn read_shared_task_logs(
+    state: State<'_, PipelineController>,
+    request: crate::tasks::logs::LogRequest,
+) -> std::result::Result<crate::tasks::logs::LogPage, crate::tasks::ServiceError> {
+    let task = state.get(request.task_id).await?;
+    tokio::task::spawn_blocking(move || crate::tasks::logs::read(&task, &request))
+        .await
+        .map_err(|_| crate::tasks::ServiceError::new("LOG_READ_FAILED", "日志读取异常"))?
+}
+#[tauri::command]
+pub async fn get_shared_task(
+    state: State<'_, PipelineController>,
+    task_id: Uuid,
+) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
+    state.get(task_id).await
+}
+#[tauri::command]
+pub async fn cancel_shared_task(
+    state: State<'_, PipelineController>,
+    task_id: Uuid,
+    run_id: Uuid,
+) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
+    state.cancel(task_id, run_id).await
+}
+#[tauri::command]
+pub async fn resume_gui_task(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    project_id: Uuid,
+) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    state
+        .resume(
+            project_id,
+            paths_for_app(&app),
+            Some(telemetry.inner().clone()),
+        )
+        .await
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_pipeline(
@@ -1011,62 +1109,35 @@ pub async fn start_pipeline(
     planner_enabled: Option<bool>,
     workspace_task_id: Option<String>,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let emitter = app.clone();
-    let planner_enabled = planner_enabled.unwrap_or(true);
-    let effectiveness = PlannerEffectivenessTracker::default();
-    let telemetry_session = Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
-        telemetry.inner().clone(),
-        quality,
-        if Path::new(&path).is_dir() {
-            TelemetryInputType::Images
-        } else {
-            TelemetryInputType::Video
-        },
-        TelemetryRunKind::New,
-        planner_enabled,
-        effectiveness.clone(),
-    ));
-    let event_telemetry = telemetry_session.clone();
-    let workspace_task_id = workspace_task_id
-        .as_deref()
-        .map(Uuid::parse_str)
+    let id = workspace_task_id
+        .map(|v| Uuid::parse_str(&v))
         .transpose()
         .map_err(|_| {
             PipelineCommandError::from(SplatError::Process("工作区任务 ID 无效".into()))
         })?;
-    let runner = Arc::new(
-        PipelineRunner::new_with_planner(paths_for_app(&app), planner_enabled, move |event| {
-            event_telemetry.observe(&event);
-            let _ = emitter.emit("pipeline-event", event);
-        })
-        .with_effectiveness_tracker(effectiveness)
-        .with_workspace_task_id(workspace_task_id),
-    );
-    state.claim(runner.clone()).await?;
-    telemetry_session.generation_started();
-    let result = runner
-        .generate(Path::new(&path), quality, Path::new(&projects_root))
-        .await;
-    match &result {
-        Ok(output) => telemetry_session.generation_completed(
-            output.duration_ms,
-            output.input_images,
-            output.source_duration_seconds,
-        ),
-        Err(error) => telemetry_session.generation_failed(error),
-    }
-    if let Err(error) = &result {
-        runner.emit_terminal(error);
-    }
-    finish_pipeline(
-        state.inner(),
-        result,
-        &runner,
-        &[PathBuf::from(path), PathBuf::from(projects_root)],
-    )
-    .await
+    let task = state
+        .create(
+            id,
+            path.into(),
+            quality,
+            projects_root.into(),
+            planner_enabled.unwrap_or(true),
+            "gui",
+            None,
+            None,
+        )
+        .await
+        .map_err(service_command_error)?;
+    state
+        .start(
+            task.task_id,
+            paths_for_app(&app),
+            Some(telemetry.inner().clone()),
+        )
+        .await
+        .map_err(service_command_error)?;
+    wait_task_result(state.inner(), task.task_id).await
 }
-
 #[tauri::command]
 pub async fn resume_pipeline(
     app: tauri::AppHandle,
@@ -1074,64 +1145,26 @@ pub async fn resume_pipeline(
     telemetry: State<'_, TelemetryService>,
     project_id: String,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let preflight = async {
-        let project_id = parse_project_id(&project_id)?;
-        let (project_root, metadata) = catalog::load_registered_project(project_id).await?;
-        let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
-        let pipeline_state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
-        Ok::<_, SplatError>((project_id, metadata, pipeline_state))
-    }
-    .await;
-    let (project_id, metadata, pipeline_state) = match preflight {
-        Ok(value) => value,
-        Err(error) => return Err(record_command_failure(state.inner(), error.into(), &[]).await),
-    };
-    let emitter = app.clone();
-    let effectiveness = PlannerEffectivenessTracker::default();
-    let telemetry_session = Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
-        telemetry.inner().clone(),
-        metadata.quality,
-        match metadata.input_type {
-            ProjectInputType::Video => TelemetryInputType::Video,
-            ProjectInputType::Images => TelemetryInputType::Images,
-        },
-        TelemetryRunKind::Resume,
-        pipeline_state.planner_enabled,
-        effectiveness.clone(),
-    ));
-    let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(
-        PipelineRunner::new_with_planner(
-            paths_for_app(&app),
-            pipeline_state.planner_enabled,
-            move |event| {
-                event_telemetry.observe(&event);
-                let _ = emitter.emit("pipeline-event", event);
-            },
-        )
-        .with_effectiveness_tracker(effectiveness),
-    );
-    state.claim(runner.clone()).await?;
-    telemetry_session.generation_started();
-    let result = runner.resume(project_id).await;
-    match &result {
-        Ok(output) => telemetry_session.generation_completed(
-            output.duration_ms,
-            output.input_images,
-            output.source_duration_seconds,
-        ),
-        Err(error) => telemetry_session.generation_failed(error),
-    }
-    if let Err(error) = &result {
-        runner.emit_terminal(error);
-    }
-    finish_pipeline(state.inner(), result, &runner, &[metadata.source_path]).await
+    let id = parse_project_id(&project_id)?;
+    let receipt = state
+        .resume(id, paths_for_app(&app), Some(telemetry.inner().clone()))
+        .await
+        .map_err(service_command_error)?;
+    wait_task_result(state.inner(), receipt.task_id).await
 }
-
 #[tauri::command]
 pub async fn cancel_pipeline(state: State<'_, PipelineController>) -> Result<()> {
-    if let Some(runner) = state.active.lock().await.as_ref() {
-        runner.cancel();
+    if let Some(task) = state
+        .running()
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))?
+    {
+        if let Some(run) = task.run_id {
+            state
+                .cancel(task.task_id, run)
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -1146,10 +1179,22 @@ pub async fn get_app_runtime_status(
     let pipeline_identity = active_pipeline
         .as_ref()
         .and_then(|runner| runner.current_project_identity());
+    let pipeline_run_elapsed_ms = active_pipeline
+        .as_ref()
+        .map(|runner| runner.elapsed_ms())
+        .unwrap_or(0);
+    let pipeline_elapsed_offset_ms = active_pipeline
+        .as_ref()
+        .map(|runner| runner.elapsed_offset_ms())
+        .unwrap_or(0);
     let task_acceleration = active_pipeline
         .as_ref()
         .and_then(|runner| runner.current_acceleration());
     drop(active_pipeline);
+    let active_task = pipeline
+        .running()
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))?;
     let preview_project_id = preview
         .active
         .lock()
@@ -1159,9 +1204,9 @@ pub async fn get_app_runtime_status(
     Ok(AppRuntimeStatus {
         pipeline_running,
         pipeline_project_id: pipeline_identity.map(|value| value.0.to_string()),
-        pipeline_workspace_task_id: pipeline_identity
-            .and_then(|value| value.1)
-            .map(|value| value.to_string()),
+        pipeline_workspace_task_id: active_task.map(|task| task.task_id.to_string()),
+        pipeline_run_elapsed_ms,
+        pipeline_elapsed_offset_ms,
         preview_project_id,
         task_acceleration,
     })
@@ -1894,11 +1939,10 @@ mod tests {
         classify_dropped_input_path, classify_pipeline_failure, contains_mp4_ftyp,
         create_preview_asset, next_gaussian_video_path, persisted_task_stage, preview_client_path,
         read_project_log_tail, write_gaussian_video, GaussianVideoExportSession,
-        PipelineCommandError, PipelineController, VideoOrientation,
+        PipelineCommandError, VideoOrientation,
     };
-    use crate::engines::EnginePaths;
     use crate::error::SplatError;
-    use crate::pipeline::{runner::PipelineRunner, PipelineEngine, PipelineStage};
+    use crate::pipeline::{PipelineEngine, PipelineStage};
     use crate::presets::Quality;
     use crate::project::{PipelineStateFile, ProjectStatus};
     use std::{fs, path::Path};
@@ -1941,26 +1985,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn pipeline_controller_has_one_owner_and_only_its_owner_can_release_it() {
-        let root = tempdir().unwrap();
-        let controller = PipelineController::default();
-        let first = std::sync::Arc::new(PipelineRunner::new(
-            EnginePaths::from_root(root.path()),
-            |_| {},
-        ));
-        let second = std::sync::Arc::new(PipelineRunner::new(
-            EnginePaths::from_root(root.path()),
-            |_| {},
-        ));
-        controller.claim(first.clone()).await.unwrap();
-        assert!(controller.claim(second.clone()).await.is_err());
-        controller.release(&second).await;
-        assert!(controller.claim(second.clone()).await.is_err());
-        controller.release(&first).await;
-        controller.claim(second).await.unwrap();
     }
 
     #[test]
@@ -2091,6 +2115,34 @@ mod tests {
             classify_pipeline_failure(
                 Some(PipelineStage::Reconstructing),
                 "SQLite error: database is locked",
+            ),
+            (Some(PipelineEngine::Colmap), Some("mapper_storage")),
+        );
+        assert_eq!(
+            classify_pipeline_failure(
+                Some(PipelineStage::Reconstructing),
+                "COLMAP did not produce a usable sparse model: file not found",
+            ),
+            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+        );
+        assert_eq!(
+            classify_pipeline_failure(
+                Some(PipelineStage::ValidatingReconstruction),
+                "稀疏重建没有可用的注册图像或三维点",
+            ),
+            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+        );
+        assert_eq!(
+            classify_pipeline_failure(
+                Some(PipelineStage::Reconstructing),
+                "I/O error while reading feature descriptors",
+            ),
+            (Some(PipelineEngine::Colmap), Some("mapper_source")),
+        );
+        assert_eq!(
+            classify_pipeline_failure(
+                Some(PipelineStage::Reconstructing),
+                "I/O error while opening SQLite database",
             ),
             (Some(PipelineEngine::Colmap), Some("mapper_storage")),
         );
@@ -2314,94 +2366,59 @@ pub async fn probe_reshoot_input(
 }
 
 #[tauri::command]
+pub async fn start_gui_reshoot(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    request: IncrementalReshootRequest,
+) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    let source = Uuid::parse_str(&request.source_project_id)
+        .map_err(|_| crate::tasks::ServiceError::new("INVALID_ARGUMENT", "原项目 ID 无效"))?;
+    let (project, metadata) = catalog::load_registered_project(source).await?;
+    if (request.input_type == ReshootInputType::Images) != Path::new(&request.reshoot_path).is_dir()
+    {
+        return Err(crate::tasks::ServiceError::new(
+            "INVALID_INPUT",
+            "补拍输入类型与路径不一致",
+        ));
+    }
+    let checkpoint: PipelineStateFile =
+        serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
+    let id = request
+        .workspace_task_id
+        .map(|v| Uuid::parse_str(&v))
+        .transpose()
+        .map_err(|_| crate::tasks::ServiceError::new("INVALID_ARGUMENT", "工作区任务 ID 无效"))?;
+    let task = state
+        .create(
+            id,
+            request.reshoot_path.into(),
+            metadata.quality,
+            request.projects_root.into(),
+            checkpoint.planner_enabled,
+            "gui",
+            None,
+            None,
+        )
+        .await?;
+    state.mark_reshoot(task.task_id, source).await?;
+    state
+        .start(
+            task.task_id,
+            paths_for_app(&app),
+            Some(telemetry.inner().clone()),
+        )
+        .await
+}
+#[tauri::command]
 pub async fn start_incremental_reshoot_pipeline(
     app: tauri::AppHandle,
     state: State<'_, PipelineController>,
     telemetry: State<'_, TelemetryService>,
     request: IncrementalReshootRequest,
 ) -> std::result::Result<PipelineResult, PipelineCommandError> {
-    let preflight = async {
-        let id = Uuid::parse_str(&request.source_project_id)
-            .map_err(|_| SplatError::Process("原项目 ID 无效".into()))?;
-        let (project, metadata) = catalog::load_registered_project(id).await?;
-        let state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
-        Ok::<_, SplatError>((id, metadata, state.planner_enabled))
-    }
-    .await;
-    let (source_project_id, source_metadata, source_planner_enabled) = match preflight {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(record_command_failure(
-                state.inner(),
-                error.into(),
-                &[
-                    PathBuf::from(&request.reshoot_path),
-                    PathBuf::from(&request.projects_root),
-                ],
-            )
-            .await)
-        }
-    };
-    let emitter = app.clone();
-    let telemetry_session = Arc::new(PipelineTelemetrySession::new(
-        telemetry.inner().clone(),
-        source_metadata.quality,
-        match request.input_type {
-            ReshootInputType::Video => TelemetryInputType::Video,
-            ReshootInputType::Images => TelemetryInputType::Images,
-        },
-    ));
-    let event_telemetry = telemetry_session.clone();
-    let runner = Arc::new(
-        PipelineRunner::new_with_planner(
-            paths_for_app(&app),
-            source_planner_enabled,
-            move |event| {
-                event_telemetry.observe(&event);
-                let _ = emitter.emit("pipeline-event", event);
-            },
-        )
-        .with_workspace_task_id(
-            request
-                .workspace_task_id
-                .as_deref()
-                .map(Uuid::parse_str)
-                .transpose()
-                .map_err(|_| {
-                    PipelineCommandError::from(SplatError::Process("工作区任务 ID 无效".into()))
-                })?,
-        ),
-    );
-    state.claim(runner.clone()).await?;
-    telemetry_session.generation_started();
-    let result = runner
-        .generate_incremental_reshoot(
-            source_project_id,
-            Path::new(&request.reshoot_path),
-            request.input_type,
-            Path::new(&request.projects_root),
-        )
-        .await;
-    match &result {
-        Ok(output) => telemetry_session.generation_completed(
-            output.duration_ms,
-            output.input_images,
-            output.source_duration_seconds,
-        ),
-        Err(error) => telemetry_session.generation_failed(error),
-    }
-    if let Err(error) = &result {
-        runner.emit_terminal(error);
-    }
-    finish_pipeline(
-        state.inner(),
-        result,
-        &runner,
-        &[
-            PathBuf::from(request.reshoot_path),
-            PathBuf::from(request.projects_root),
-        ],
-    )
-    .await
+    let receipt = start_gui_reshoot(app, state.clone(), telemetry, request)
+        .await
+        .map_err(service_command_error)?;
+    wait_task_result(state.inner(), receipt.task_id).await
 }
