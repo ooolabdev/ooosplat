@@ -70,8 +70,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          set +e
           cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | tee rust-test.log
           status=${PIPESTATUS[0]}
+          set -e
           if [[ "$status" -ne 0 ]]; then
             summary="$(tail -n 100 rust-test.log)"
             summary="${summary//'%'/'%25'}"
