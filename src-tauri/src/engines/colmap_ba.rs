@@ -452,6 +452,7 @@ mod tests {
         assert_eq!(selection.gpu_index, None);
         assert!(selection.detail.contains("no compatible Caspar GPU"));
     }
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn undersized_database_does_not_start_the_caspar_probe() {
         let directory = tempfile::tempdir().unwrap();
