@@ -63,11 +63,26 @@ jobs:
           npm run verify:engines
           node scripts/smoke-colmap-image-io.mjs engines/linux/colmap/bin/colmap
 
-      - name: Rust formatting, tests, and clippy
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust tests
+        shell: bash
         run: |
-          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-          cargo test --manifest-path src-tauri/Cargo.toml
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | tee rust-test.log
+          status=${PIPESTATUS[0]}
+          if [[ "$status" -ne 0 ]]; then
+            summary="$(tail -n 100 rust-test.log)"
+            summary="${summary//'%'/'%25'}"
+            summary="${summary//$'\r'/'%0D'}"
+            summary="${summary//$'\n'/'%0A'}"
+            echo "::error title=Rust tests failed::$summary"
+          fi
+          exit "$status"
+
+      - name: Rust clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: FFmpeg CLI integration
         run: |
