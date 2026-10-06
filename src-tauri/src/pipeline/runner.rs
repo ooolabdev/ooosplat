@@ -4922,12 +4922,11 @@ mod tests {
         image::RgbImage::new(2, 2)
             .save(paths.frames.join("frame_000002.jpg"))
             .unwrap();
-        image::RgbImage::new(2, 2)
-            .save(paths.colmap_frames.join("frame_000001.jpg"))
-            .unwrap();
-        image::RgbImage::new(2, 2)
-            .save(paths.colmap_frames.join("frame_000002.jpg"))
-            .unwrap();
+        for name in ["frame_000001.jpg", "frame_000002.jpg"] {
+            tokio::fs::copy(paths.frames.join(name), paths.colmap_frames.join(name))
+                .await
+                .unwrap();
+        }
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.video = Some(VideoInfo {
             duration: 1.0,
@@ -4956,6 +4955,12 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        state.frames.as_mut().unwrap().colmap_input_version = Some(1);
+        assert!(prepared_frames_from_checkpoint(&paths, &state)
+            .await
+            .unwrap()
+            .is_none());
+        state.frames.as_mut().unwrap().colmap_input_version = Some(COLMAP_INPUT_VERSION);
         tokio::fs::remove_file(paths.frames.join("frame_000002.jpg"))
             .await
             .unwrap();
@@ -5005,7 +5010,7 @@ mod tests {
         let mut state = PipelineStateFile::created(Quality::Balanced);
         state.frames = Some(FrameState {
             extracted_frames: Some(2),
-            colmap_input_version: None,
+            colmap_input_version: Some(1),
             ..FrameState::default()
         });
 
@@ -5055,8 +5060,8 @@ mod tests {
             image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
                 .save(paths.frames.join(name))
                 .unwrap();
-            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
-                .save(paths.colmap_frames.join(name))
+            tokio::fs::copy(paths.frames.join(name), paths.colmap_frames.join(name))
+                .await
                 .unwrap();
         }
         let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
@@ -5067,6 +5072,13 @@ mod tests {
             ..FrameState::default()
         });
 
+        state.frames.as_mut().unwrap().colmap_input_version = Some(1);
+        assert!(
+            validate_current_colmap_input_snapshot(&paths.project, &state)
+                .await
+                .is_err()
+        );
+        state.frames.as_mut().unwrap().colmap_input_version = Some(COLMAP_INPUT_VERSION);
         validate_current_colmap_input_snapshot(&paths.project, &state)
             .await
             .unwrap();
@@ -5104,8 +5116,8 @@ mod tests {
             image::RgbaImage::new(2, 2)
                 .save(extracted_frames.join(&name))
                 .unwrap();
-            image::RgbImage::new(2, 2)
-                .save(extracted_colmap.join(&name))
+            tokio::fs::copy(extracted_frames.join(&name), extracted_colmap.join(&name))
+                .await
                 .unwrap();
             image::GrayImage::new(2, 2)
                 .save(extracted_masks.join(format!("{name}.png")))
@@ -5148,6 +5160,10 @@ mod tests {
             assert!(frames.join(&name).is_file());
             assert!(colmap_frames.join(&name).is_file());
             assert!(masks.join(format!("{name}.png")).is_file());
+            assert_eq!(
+                tokio::fs::read(frames.join(&name)).await.unwrap(),
+                tokio::fs::read(colmap_frames.join(&name)).await.unwrap()
+            );
         }
     }
 
@@ -5170,8 +5186,8 @@ mod tests {
                     .save(paths.frames.join(name))
                     .unwrap();
             }
-            image::RgbImage::new(2, 2)
-                .save(paths.colmap_frames.join(name))
+            tokio::fs::copy(paths.frames.join(name), paths.colmap_frames.join(name))
+                .await
                 .unwrap();
             image::GrayImage::new(2, 2)
                 .save(paths.masks.join(format!("{name}.png")))
@@ -5222,8 +5238,8 @@ mod tests {
             image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
                 .save(paths.frames.join(name))
                 .unwrap();
-            image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
-                .save(paths.colmap_frames.join(name))
+            tokio::fs::copy(paths.frames.join(name), paths.colmap_frames.join(name))
+                .await
                 .unwrap();
         }
         let mut state = PipelineStateFile::created_for(Quality::Balanced, ProjectInputType::Images);
@@ -5267,9 +5283,12 @@ mod tests {
         image::RgbaImage::new(2, 2)
             .save(paths.frames.join("frame_000001.png"))
             .unwrap();
-        image::RgbImage::new(2, 2)
-            .save(paths.colmap_frames.join("frame_000001.png"))
-            .unwrap();
+        tokio::fs::copy(
+            paths.frames.join("frame_000001.png"),
+            paths.colmap_frames.join("frame_000001.png"),
+        )
+        .await
+        .unwrap();
         image::GrayImage::new(2, 2)
             .save(paths.masks.join("frame_000001.png.png"))
             .unwrap();
@@ -5325,9 +5344,12 @@ mod tests {
         image::RgbImage::new(2, 2)
             .save(paths.frames.join("frame_000001.jpg"))
             .unwrap();
-        image::RgbImage::new(2, 2)
-            .save(paths.colmap_frames.join("frame_000001.jpg"))
-            .unwrap();
+        tokio::fs::copy(
+            paths.frames.join("frame_000001.jpg"),
+            paths.colmap_frames.join("frame_000001.jpg"),
+        )
+        .await
+        .unwrap();
         tokio::fs::write(paths.colmap.join("database.db"), b"")
             .await
             .unwrap();

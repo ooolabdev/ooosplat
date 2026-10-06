@@ -12,7 +12,7 @@ use crate::{
 };
 
 pub const PROJECT_APP_ID: &str = "studio.ooo.splat";
-pub const COLMAP_INPUT_VERSION: u32 = 1;
+pub const COLMAP_INPUT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
