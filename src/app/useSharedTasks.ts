@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getSharedTasks, onTaskUpdate } from '../lib/backend';
 import { mergeTask, taskIsActive, type SharedTask } from '../types/tasks';
 import { useAppStore } from '../stores/appStore';
@@ -6,6 +6,8 @@ import { useAppStore } from '../stores/appStore';
 export function useSharedTasks() {
   const [tasks, setTasks] = useState<Record<string, SharedTask>>({});
   const [syncError, setSyncError] = useState<string | null>(null);
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
+  const refreshTasks = useCallback(() => refreshRef.current(), []);
   useEffect(() => {
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
@@ -21,12 +23,16 @@ export function useSharedTasks() {
       } else if (tracked?.task === task.task_id && tracked.run === task.run_id) {
         state.setPhase(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' ? task.status : 'idle');
         if (task.result) state.setResult(task.result);
-        if (task.error && task.status === 'failed') state.setError(task.error.message);
         tracked = undefined;
       }
     };
     const apply = (task: SharedTask, event: import('../types/pipeline').PipelineEvent | null) => {
       if (disposed || (cache[task.task_id]?.revision ?? -1) >= task.revision) return;
+      if (event && !['runtime', 'heartbeat'].includes(event.kind)) {
+        const previous = cache[task.task_id];
+        const history = previous?.run_id === task.run_id ? previous.recent_events : [];
+        task = { ...task, recent_events: [...history, event].slice(-500) };
+      }
       cache = mergeTask(cache, task);
       setTasks(cache);
       phase(task, event);
@@ -48,6 +54,7 @@ export function useSharedTasks() {
       } catch (error) { if (!disposed) setSyncError(error instanceof Error ? error.message : '无法同步任务状态'); }
       finally { refreshing = false; }
     };
+    refreshRef.current = refresh;
     void (async () => {
       // Subscribe before reading a snapshot, and clean up even if unmounted during subscription.
       const fn = await onTaskUpdate(update => {
@@ -65,5 +72,5 @@ export function useSharedTasks() {
     document.addEventListener('visibilitychange', focus);
     return () => { disposed = true; unsubscribe?.(); window.clearInterval(timer); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', focus); };
   }, []);
-  return { tasks, syncError };
+  return { tasks, syncError, refreshTasks };
 }

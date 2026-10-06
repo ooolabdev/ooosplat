@@ -16,8 +16,8 @@ const mocks = vi.hoisted(() => ({
   releaseGaussianPreview: vi.fn(),
   revealFile: vi.fn(),
   resumePipeline: vi.fn(),
-  getSharedTasks: vi.fn(async () => []),
-  onTaskUpdate: vi.fn(async () => () => undefined),
+  getSharedTasks: vi.fn(),
+  onTaskUpdate: vi.fn(),
   getAppRuntimeStatus: vi.fn(),
   getProjectOverview: vi.fn(),
   getProjectTaskDetail: vi.fn(),
@@ -53,8 +53,8 @@ vi.mock("../lib/backend", () => ({
   confirmSmallImageSequence: mocks.confirmSmallImageSequence,
   estimateProjectRuntime: mocks.estimateProjectRuntime,
   exportPly: mocks.exportPly,
-  getSharedTasks: vi.fn(async () => []),
-  onTaskUpdate: vi.fn(async () => () => undefined),
+  getSharedTasks: mocks.getSharedTasks,
+  onTaskUpdate: mocks.onTaskUpdate,
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
   getProjectTaskDetail: mocks.getProjectTaskDetail,
@@ -128,6 +128,8 @@ describe("App preview workspace", () => {
       window.cancelAnimationFrame = (handle) => window.clearTimeout(handle);
     }
     useGaussianTransformStore.getState().close();
+    mocks.getSharedTasks.mockReset().mockResolvedValue([]);
+    mocks.onTaskUpdate.mockReset().mockResolvedValue(() => undefined);
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
@@ -1136,6 +1138,30 @@ describe("App preview workspace", () => {
     expect(mocks.releaseGaussianPreview).toHaveBeenCalledWith(project.id);
   });
 
+  it("opens another completed project while a generation task keeps running", async () => {
+    await publishTask(sharedTask({
+      task_id: "running-task",
+      project_id: null,
+      project_path: null,
+      status: "running",
+      stage: "trainingSplats",
+      estimated_progress: 45,
+      result: null,
+    }));
+    const runtimeReads = mocks.getAppRuntimeStatus.mock.calls.length;
+    mocks.getAppRuntimeStatus.mockImplementation(() => new Promise(() => undefined));
+
+    const previewButton = container.querySelector<HTMLButtonElement>("#completed-task-group-content .preview-link");
+    expect(previewButton?.disabled).toBe(false);
+    await act(async () => previewButton?.click());
+    await flush();
+
+    expect(mocks.prepareGaussianPreview).toHaveBeenCalledWith(project.id);
+    expect(container.querySelector(".preview-workspace")).not.toBeNull();
+    expect(mocks.getAppRuntimeStatus).toHaveBeenCalledTimes(runtimeReads);
+    expect(useAppStore.getState().phase).toBe("running");
+  });
+
   it("keeps the task workspace visible when preview preparation fails", async () => {
     mocks.prepareGaussianPreview.mockRejectedValueOnce(new Error("PLY 无法读取"));
     const previewButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "预览");
@@ -1402,7 +1428,7 @@ describe("App preview workspace", () => {
     expect(mocks.startPipeline).toHaveBeenCalledTimes(1);
   });
 
-  it("removes duplicate completed-project detail actions while retaining card actions", async () => {
+  it("shows completed-project statistics without a duplicate detail action bar", async () => {
     mocks.getProjectTaskDetail.mockResolvedValueOnce({
       project,
       inputType: "video",
@@ -1433,7 +1459,7 @@ describe("App preview workspace", () => {
 
     const detail = container.querySelector(".project-detail-page");
     expect(detail).not.toBeNull();
-    expect(detail?.firstElementChild?.classList.contains("project-detail-stats")).toBe(true);
+    expect(detail?.querySelector('.result-actions')).toBeNull();
     expect(detail?.querySelector(":scope > .project-path")).toBeNull();
     expect(detail?.querySelector(".project-configuration-detail")).not.toBeNull();
     expect(detail?.querySelector(".path-picker.readonly")?.textContent).toContain("input.mp4");
@@ -1523,4 +1549,109 @@ describe("App preview workspace", () => {
     expect(container.querySelector(".inline-error")).toBeNull();
     expect(container.querySelector(".project-failure")).not.toBeNull();
   });
+  const sharedTask = (overrides: Partial<import("../types/tasks").SharedTask> = {}): import("../types/tasks").SharedTask => ({
+    task_id: "shared-1", run_id: "run-1", project_id: project.id, project_path: project.projectPath,
+    input_path: "E:\\Media\\orbit.mov", input_type: "video", quality: "balanced", source: "mcp", task_kind: "generation",
+    planner_enabled: false, projects_root: "E:\\Projects", status: "completed", stage: "completed",
+    revision: 1, sequence: 0, created_at: project.createdAt, updated_at: project.completedAt!, elapsed_ms: 60000,
+    progress: 100, estimated_progress: 100, current: null, total: null, eta_seconds: null,
+    error: null, result: null, recent_events: [], ...overrides,
+  });
+  const publishTask = async (task: import("../types/tasks").SharedTask) => {
+    const handler = mocks.onTaskUpdate.mock.calls.at(-1)![0];
+    await act(async () => handler({ task, event: null }));
+    await flush();
+  };
+
+  it("merges a shared task and its old project into one original project row with direct actions", async () => {
+    await publishTask(sharedTask());
+    const rows = container.querySelectorAll(".project-row:not(.draft-row)");
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row.querySelector(".project-stats")?.textContent).toContain("PLY");
+    expect(row.querySelector(".project-path")?.textContent).toBe(project.projectPath);
+    expect(row.querySelector(".task-origin")?.textContent).toContain("由 AI Agent 创建");
+    expect(row.querySelector(".preview-link")).not.toBeNull();
+    expect(row.querySelector(".reshoot-link")).not.toBeNull();
+    expect(container.textContent).not.toContain("项目操作");
+    expect(container.querySelector(".shared-task-detail")).toBeNull();
+    await act(async () => row.querySelector<HTMLButtonElement>(".preview-link")!.click());
+    expect(mocks.prepareGaussianPreview).toHaveBeenCalledWith(project.id);
+  });
+
+  it("updates completion and project metadata without switching the selected task or starting GUI drafts", async () => {
+    await publishTask(sharedTask({ status: "running", stage: "trainingSplats", estimated_progress: 65 }));
+    const row = container.querySelector<HTMLElement>('[data-task-id="shared-1"]')!;
+    await act(async () => row.click());
+    expect(container.querySelector(".shared-task-detail .stage-timeline .active")).not.toBeNull();
+    expect(container.querySelector(".pane-header .run-state.active")).not.toBeNull();
+    const reads = mocks.getProjectOverview.mock.calls.length;
+    await publishTask(sharedTask({ revision: 2 }));
+    expect(mocks.getProjectOverview.mock.calls.length).toBeGreaterThan(reads);
+    expect(container.querySelector(".shared-task-detail .project-detail-stats")).not.toBeNull();
+    expect(container.querySelectorAll(".shared-task-detail .stage-timeline .done")).toHaveLength(7);
+    expect(container.querySelector(".shared-task-detail .cancel-action")).toBeNull();
+    expect(container.querySelector('#completed-task-group-content [data-task-id="shared-1"].selected')).not.toBeNull();
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+  });
+
+  it("uses the interrupted task state over a stale running project after reopening", async () => {
+    mocks.getProjectOverview.mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [{ ...project, status: "running" }] });
+    await publishTask(sharedTask({ status: "interrupted", stage: "trainingSplats", estimated_progress: 65 }));
+    await act(async () => container.querySelector<HTMLElement>('[data-task-id="shared-1"]')!.click());
+    expect(container.querySelector(".pane-header .run-state")?.textContent).toBe("已中断");
+    expect(container.querySelector('.unfinished [data-task-id="shared-1"] .status-copy')?.textContent).toBe("已中断");
+    expect(container.querySelector(".shared-task-detail .stage-timeline .interrupted")).not.toBeNull();
+    expect(container.querySelector(".shared-task-detail .cancel-action")).toBeNull();
+  });
+
+  it('keeps the original new-task layout and disabled grip after submission without enabling sorting or deletion', async () => {
+    await publishTask(sharedTask({ status: 'running', stage: 'trainingSplats', estimated_progress: 65 }));
+    const row = container.querySelector<HTMLElement>('[data-task-id="shared-1"]')!;
+    expect(row.classList.contains('draft-row')).toBe(true);
+    expect(row.classList.contains('drag-disabled')).toBe(true);
+    expect(row.querySelector('.draft-drag-indicator svg')).not.toBeNull();
+    expect(row.querySelector('.project-title-line strong')?.textContent).toBe('orbit.mov');
+    expect(row.querySelector('.project-path')?.textContent).toBe('E:\\Media\\orbit.mov');
+    expect(row.querySelector('.project-stats')).toBeNull();
+    expect(row.querySelector<HTMLButtonElement>('.danger-link')?.disabled).toBe(true);
+    expect(row.hasAttribute('data-draft-id')).toBe(false);
+    await act(async () => { row.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true })); });
+    expect(container.querySelector('[data-task-id="shared-1"]')).toBe(row);
+    await act(async () => row.click());
+    expect(container.querySelector('.shared-task-detail .locked-setting')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.shared-task-detail .planner-switch')?.disabled).toBe(true);
+  });
+
+  it('reorders GUI drafts while ignoring a submitted new-task row in pointer hit testing', async () => {
+    await act(async () => container.querySelector<HTMLButtonElement>('.group-add-action')!.click());
+    await publishTask(sharedTask({ status: 'created', run_id: null, project_id: null, project_path: null, stage: null }));
+    const submitted = container.querySelector<HTMLElement>('[data-task-id="shared-1"]')!;
+    const drafts = [...container.querySelectorAll<HTMLElement>('.new-task-group [data-draft-id]')];
+    expect(drafts).toHaveLength(2);
+    const ids = drafts.map(row => row.dataset.draftId);
+    submitted.getBoundingClientRect = () => ({ top: 0, height: 100 } as DOMRect);
+    drafts.forEach((row, index) => { row.getBoundingClientRect = () => ({ top: 200 + index * 100, height: 100 } as DOMRect); });
+    const held = drafts[0]; let captured = false;
+    held.setPointerCapture = () => { captured = true; }; held.hasPointerCapture = () => captured; held.releasePointerCapture = () => { captured = false; };
+    const pointer = (type: string, y: number) => {
+      const event = new MouseEvent(type, { bubbles: true, button: 0, clientX: 100, clientY: y });
+      Object.defineProperty(event, 'pointerId', { value: 9 }); return event;
+    };
+    await act(async () => {
+      held.dispatchEvent(pointer('pointerdown', 220));
+      held.dispatchEvent(pointer('pointermove', 450));
+      held.dispatchEvent(pointer('pointerup', 450));
+    });
+    expect([...container.querySelectorAll<HTMLElement>('.new-task-group [data-draft-id]')].map(row => row.dataset.draftId)).toEqual([ids[1], ids[0]]);
+    expect(submitted.classList.contains('drag-disabled')).toBe(true);
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+  });
+
+  it('retains the source-project name and reshoot label after a GUI reshoot is submitted', async () => {
+    await publishTask(sharedTask({ status: 'running', stage: 'trainingSplats', source: 'gui', task_kind: 'reshoot', source_project_id: project.id, project_id: null, project_path: null }));
+    expect(container.querySelector('[data-task-id="shared-1"] .project-title-line strong')?.textContent).toBe(`${project.name} · 补拍`);
+    expect(container.querySelector('[data-task-id="shared-1"] .draft-drag-indicator')).not.toBeNull();
+  });
+
 });

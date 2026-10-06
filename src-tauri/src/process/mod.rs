@@ -39,6 +39,28 @@ fn signal_process_group(process_id: u32, signal: libc::c_int) -> std::io::Result
     }
 }
 
+#[cfg(unix)]
+struct ProcessGroupGuard(u32);
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let _ = signal_process_group(self.0, libc::SIGKILL);
+    }
+}
+
+struct StreamTasksGuard {
+    finished: Arc<AtomicBool>,
+    handles: Vec<tokio::task::AbortHandle>,
+}
+impl Drop for StreamTasksGuard {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Relaxed);
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(windows)]
 mod windows_job {
     use std::{io, mem::size_of, ptr};
@@ -311,6 +333,8 @@ impl ProcessManager {
         let process_id = child
             .id()
             .ok_or_else(|| SplatError::Process("无法读取子进程 ID".into()))?;
+        #[cfg(unix)]
+        let _group = ProcessGroupGuard(process_id);
         #[cfg(windows)]
         {
             if let Err(error) = job.assign(process_id) {
@@ -399,6 +423,14 @@ impl ProcessManager {
             })
         });
 
+        let mut stream_handles = vec![stdout_task.abort_handle(), stderr_task.abort_handle()];
+        if let Some(task) = &heartbeat_task {
+            stream_handles.push(task.abort_handle());
+        }
+        let _streams = StreamTasksGuard {
+            finished: finished.clone(),
+            handles: stream_handles,
+        };
         let status = tokio::select! {
             status = child.wait() => status?,
             _ = self.cancellation.cancelled() => {

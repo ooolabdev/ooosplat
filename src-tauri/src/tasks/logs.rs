@@ -53,6 +53,10 @@ pub(super) struct Position {
     identity: String,
     offset: u64,
     pub(super) anchor: String,
+    #[serde(default)]
+    rebased: bool,
+    #[serde(default)]
+    inside_line: bool,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Cursor {
@@ -121,6 +125,12 @@ pub fn register(root: &Path, path: &Path, start: u64) -> Result<RegisteredLog> {
     }
     let path = std::fs::canonicalize(path)?;
     let file = secure_open(&root, &path)?;
+    if path
+        .file_stem()
+        .is_some_and(|name| name.to_string_lossy().len() > 64)
+    {
+        return Err(ServiceError::new("INVALID_LOG_SOURCE", "日志来源名称过长"));
+    }
     Ok(RegisteredLog {
         source: path
             .file_stem()
@@ -134,17 +144,22 @@ pub fn register(root: &Path, path: &Path, start: u64) -> Result<RegisteredLog> {
         end: None,
     })
 }
-fn encode(cursor: &Cursor) -> Result<String> {
-    Ok(serde_json::to_vec(cursor)?
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+fn cursor_key() -> Result<&'static [u8; 32]> {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if let Some(key) = KEY.get() {
+        return Ok(key);
+    }
+    let mut key = [0; 32];
+    getrandom::fill(&mut key)
+        .map_err(|_| ServiceError::new("RANDOM_SOURCE_FAILED", "无法生成日志 cursor 凭据"))?;
+    let _ = KEY.set(key);
+    Ok(KEY.get().expect("cursor key initialized"))
 }
-pub(super) fn decode(value: &str) -> Result<Cursor> {
-    if value.len() > 16 * 1024 || value.len() % 2 != 0 {
+fn from_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
         return Err(ServiceError::new("INVALID_CURSOR", "日志 cursor 无效"));
     }
-    let bytes = (0..value.len())
+    (0..value.len())
         .step_by(2)
         .map(|i| {
             value
@@ -152,7 +167,42 @@ pub(super) fn decode(value: &str) -> Result<Cursor> {
                 .and_then(|s| u8::from_str_radix(s, 16).ok())
                 .ok_or_else(|| ServiceError::new("INVALID_CURSOR", "日志 cursor 无效"))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+fn encode(cursor: &Cursor) -> Result<String> {
+    use hmac::Mac;
+    let bytes = serde_json::to_vec(cursor)?;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(cursor_key()?).expect("valid HMAC key");
+    mac.update(&bytes);
+    let body: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let tag: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(format!("{body}.{tag}"))
+}
+pub(super) fn decode(value: &str) -> Result<Cursor> {
+    use hmac::Mac;
+    if value.len() > 32 * 1024 {
+        return Err(ServiceError::new("INVALID_CURSOR", "日志 cursor 无效"));
+    }
+    let (body, tag) = value
+        .split_once('.')
+        .ok_or_else(|| ServiceError::new("INVALID_CURSOR", "日志 cursor 无效"))?;
+    let bytes = from_hex(body)?;
+    let tag = from_hex(tag)?;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(cursor_key()?).expect("valid HMAC key");
+    mac.update(&bytes);
+    mac.verify_slice(&tag).map_err(|_| {
+        ServiceError::new(
+            "CURSOR_INVALID_OR_EXPIRED",
+            "cursor 无效或应用已重启，请清空 cursor 重新读取",
+        )
+    })?;
     serde_json::from_slice(&bytes)
         .map_err(|_| ServiceError::new("INVALID_CURSOR", "日志 cursor 无效"))
 }
@@ -234,6 +284,7 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
         }
     };
     let mut remaining = bytes;
+    let mut remaining_lines = if request.cursor.is_none() { lines } else { 500 };
     for source in &sources {
         let log = &run.logs[source];
         let mut file = match secure_open(&log.root, &log.path) {
@@ -249,7 +300,9 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
         let length = file.metadata()?.len();
         let end = log.end.unwrap_or(length).min(length);
         let old = cursor.files.get(source);
-        let mut start = log.start.min(end);
+        let was_rebased = old.is_some_and(|position| position.rebased);
+        let was_inside = old.is_some_and(|position| position.inside_line);
+        let mut start = if was_rebased { 0 } else { log.start.min(end) };
         let mut reset = false;
         if let Some(old) = old {
             if old.identity != identity
@@ -270,8 +323,15 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
             page.cursor_reset = true;
             page.reset_reason = Some("log_rotated_or_truncated".into());
         }
+        if !(task.status.active() && task.run_id == Some(run.run_id))
+            && (reset || identity != log.file_id)
+        {
+            page.cursor_reset = true;
+            page.reset_reason = Some("historical_log_replaced".into());
+            continue;
+        }
         let tail = request.cursor.is_none() || reset || old.is_none();
-        if remaining == 0 {
+        if remaining == 0 || remaining_lines == 0 {
             page.has_more |= start < end;
             page.truncated |= start < end;
             continue;
@@ -305,14 +365,14 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
                 .enumerate()
                 .filter_map(|(i, b)| (*b == b'\n').then_some(i + 1))
                 .collect();
-            if boundaries.len() > lines {
-                let n = boundaries[boundaries.len() - lines - 1];
+            if boundaries.len() > remaining_lines {
+                let n = boundaries[boundaries.len() - remaining_lines - 1];
                 offset += n as u64;
                 data.drain(..n);
                 page.truncated = true;
             }
         }
-        let live = run.ended_at.is_none();
+        let live = task.status.active() && task.run_id == Some(run.run_id);
         let mut partial = false;
         let count = if live && data.last() != Some(&b'\n') {
             if let Some(i) = data.iter().rposition(|b| *b == b'\n') {
@@ -327,12 +387,37 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
             data.len()
         };
         let mut count = count;
+        let boundaries: Vec<_> = data[..count]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (*b == b'\n').then_some(i + 1))
+            .collect();
+        if boundaries.len() > remaining_lines {
+            count = boundaries[remaining_lines - 1];
+        }
+
         if let Err(e) = std::str::from_utf8(&data[..count]) {
             if e.error_len().is_none() {
                 count = e.valid_up_to();
             }
         }
+        if count == 0 && window == remaining && window > 0 {
+            return Err(ServiceError::new(
+                "LOG_WINDOW_TOO_SMALL",
+                "max_bytes 不足以读取完整 UTF-8 字符，请增大读取窗口",
+            ));
+        }
         let text = String::from_utf8_lossy(&data[..count]);
+        let inside_line = count > 0 && data[count - 1] != b'\n';
+        let text = if partial || (tail && offset > start && inside_line) {
+            "[REDACTED_PARTIAL_LINE]".to_string()
+        } else if was_inside {
+            let rest = text.find('\n').map(|i| &text[i + 1..]).unwrap_or("");
+            format!("[REDACTED_PARTIAL_LINE]\n{rest}")
+        } else {
+            text.into_owned()
+        };
+
         if count > 0 {
             let mut cleaned = crate::diagnostics::redact::sanitize(
                 &text,
@@ -351,6 +436,9 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
             });
         }
         remaining = remaining.saturating_sub(count);
+        let used_lines = data[..count].iter().filter(|b| **b == b'\n').count()
+            + usize::from(count > 0 && inside_line);
+        remaining_lines = remaining_lines.saturating_sub(used_lines);
         let next = offset + count as u64;
         cursor.files.insert(
             source.clone(),
@@ -358,10 +446,13 @@ pub fn read(task: &TaskRecord, request: &LogRequest) -> Result<LogPage> {
                 identity,
                 offset: next,
                 anchor: anchor(&mut file, next)?,
+                rebased: reset || was_rebased,
+                inside_line,
             },
         );
         // A pending partial line is retried on the next poll, rather than busy-polled.
-        page.has_more |= next < end && count > 0;
+        page.has_more |=
+            next < end && count > 0 && (!live || window == remaining.saturating_add(count));
         page.truncated |= next < end && count > 0;
     }
     page.next_cursor = Some(encode(&cursor)?);

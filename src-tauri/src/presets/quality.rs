@@ -500,6 +500,10 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.configured_max_splats, Some(cap));
         assert_eq!(resolved.preset.max_splats, Some(cap.max(350_000)));
+        let geometry = cap.saturating_add(350_000);
+        let above =
+            resolve_brush_training_preset(Quality::High, true, Some(4_096), 3_840, geometry as u64);
+        assert_eq!(above.preset.max_splats, Some(geometry));
     }
 
     #[test]

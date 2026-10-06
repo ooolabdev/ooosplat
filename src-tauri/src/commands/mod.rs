@@ -781,6 +781,10 @@ pub async fn get_project_overview(
     state: State<'_, PipelineController>,
 ) -> std::result::Result<ProjectOverview, SplatError> {
     let mut overview = catalog::get_overview().await?;
+    state
+        .reconcile_projects(&overview.projects)
+        .await
+        .map_err(|error| SplatError::Process(error.to_string()))?;
     let tasks = state
         .all()
         .await
@@ -1283,7 +1287,11 @@ pub async fn delete_project(
         *edit_save = None;
     }
     drop(edit_save);
-    catalog::delete_project(id).await
+    catalog::delete_project(id).await?;
+    state
+        .mark_project_deleted(id)
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))
 }
 
 fn parse_project_id(project_id: &str) -> Result<Uuid> {

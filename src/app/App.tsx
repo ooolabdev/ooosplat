@@ -1,8 +1,18 @@
+import { taskStatusLabel, taskProjectSummary } from "./taskPresentation";
+import { NewTaskRow } from "../components/NewTaskRow";
+import { ProjectRow } from "../components/ProjectRow";
+import { ProjectResultStats } from "../components/ProjectResultStats";
+import { TaskConfiguration } from "../components/TaskConfiguration";
+import { TaskProgress } from "../components/TaskProgress";
+import { taskIsActive } from "../types/tasks";
+import { SharedTaskDetail } from "../components/SharedTaskDetail";
+import { useSharedTasks } from "./useSharedTasks";
+import { useProgressMessage } from "./useProgressMessage";
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu, Eye,
-  Film, FolderOpen, GripVertical, Images, Languages, LoaderCircle, MapPin, Minus, Play, Plus, RotateCcw, Settings2,
-  Send, Square, Trash2, Upload, X, Zap, Lock,
+  Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu,
+  FolderOpen, Images, Languages, LoaderCircle, Minus, Play, Plus, RotateCcw, Settings2,
+  Send, Upload, X, Zap, Lock,
 } from "lucide-react";
 import appLogo from "../../assets/app-icon.svg";
 import packageMetadata from "../../package.json";
@@ -10,7 +20,6 @@ import { TelemetryPreferences } from "../components/TelemetryPreferences";
 import { SettingsDialog } from "../components/SettingsDialog";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
-import { RuntimePanel } from "../components/RuntimePanel";
 import {
   cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
   estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
@@ -19,15 +28,16 @@ import {
   initializeTelemetry, inspectReshootSource, onInputDragDrop, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
-import { formatClockDuration, liveTrainingRemainingSeconds } from "../lib/runtimeEstimate";
+import { liveTrainingRemainingSeconds } from "../lib/runtimeEstimate";
 import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type PipelineFailureKind } from "../lib/pipelineError";
+import { displayPath } from "../lib/displayPath";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
-import { displayStatusForDraft, draftIsRunnable, moveDraft, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
+import { displayStatusForDraft, draftIsRunnable, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
 import { loadUiPreferences, saveUiPreferences } from "./uiPreferences";
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
@@ -83,20 +93,6 @@ const loadTaskGroupVisibility = (): TaskGroupVisibility => {
     return DEFAULT_TASK_GROUP_VISIBILITY;
   }
 };
-const friendlyProgressKeyByStage: Record<string, TranslationKey> = {
-  extractingFeatures: "progress.activeFeatures",
-  matching: "progress.activeMatching",
-  reconstructing: "progress.activeReconstruction",
-  trainingSplats: "progress.activeTraining",
-};
-
-const countFromProgressEvent = (event: PipelineEvent, stage: string): { current: number; total: number } | null => {
-  if (event.stage !== stage || event.total == null || event.total <= 0) return null;
-  const current = event.current;
-  if (current == null || !Number.isFinite(current)) return null;
-  return { current: Math.max(0, Math.min(event.total, current)), total: event.total };
-};
-
 type FailureDialogState = {
   kind: PipelineFailureKind | "generic";
   projectId: string | null;
@@ -201,15 +197,8 @@ const qualities: Array<{ value: Quality; label: TranslationKey; description: Tra
   { value: "high", label: "quality.high", description: "quality.highHint" },
 ];
 
-const stages = [
-  ["probingVideo", "stage.material"], ["extractingFrames", "stage.frames"],
-  ["extractingFeatures", "stage.features"], ["matching", "stage.matching"],
-  ["reconstructing", "stage.reconstruction"], ["trainingSplats", "stage.training"],
-  ["exporting", "stage.export"],
-] as const;
-
 const rawMessageOf = pipelineErrorMessage;
-const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
+const basename = (path: string) => displayPath(path).split(/[\\/]/).at(-1) ?? displayPath(path);
 const completedProjectSummary = (result: PipelineResult, draft: TaskDraft): ProjectSummary => ({
   id: result.projectId,
   workspaceTaskId: draft.id,
@@ -230,26 +219,9 @@ const completedProjectSummary = (result: PipelineResult, draft: TaskDraft): Proj
   failureMessage: null,
 });
 const parentPath = (path: string) => path.replace(/[\\/][^\\/]+[\\/]?$/, "") || path;
-const formatBytes = (bytes: number | null, locale: string) => {
-  if (bytes == null) return "—";
-  const [value, unit, digits] = bytes >= 1024 ** 3
-    ? [bytes / 1024 ** 3, "GB", 2] as const
-    : bytes >= 1024 ** 2
-      ? [bytes / 1024 ** 2, "MB", 1] as const
-      : [bytes / 1024, "KB", 1] as const;
-  return `${new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)} ${unit}`;
-};
 const formatVideoDuration = (seconds: number) => `${Math.floor(seconds / 60)}:${Math.round(seconds % 60).toString().padStart(2, "0")}`;
 const qualityKey: Record<Quality, TranslationKey> = { fast: "quality.fast", balanced: "quality.balanced", high: "quality.high" };
 const statusKey: Record<ProjectStatus, TranslationKey> = { running: "status.running", completed: "status.completed", failed: "status.failed", cancelled: "status.cancelled", interrupted: "status.interrupted" };
-const stagePosition = (stage?: string) => {
-  if (!stage || ["created", "probingVideo", "planningFrames"].includes(stage)) return 0;
-  if (stage === "validatingReconstruction") return 4;
-  if (stage === "completed") return 6;
-  const index = stages.findIndex(([key]) => key === stage);
-  return index < 0 ? 0 : index;
-};
-
 const readSavedNumber = (key: string, fallback: number) => {
   try {
     const value = Number(window.localStorage.getItem(key));
@@ -261,49 +233,6 @@ const readSavedNumber = (key: string, fallback: number) => {
 
 function engineReady(engine: EngineStatus) {
   return engine.canStart;
-}
-
-function ProjectRow({ project, selected, busy, previewing, previewDisabled, deleting, revealing, onSelect, onPreview, onReshoot, onResume, onReveal, onDelete }: {
-  project: ProjectSummary;
-  selected: boolean;
-  busy: boolean;
-  previewing: boolean;
-  previewDisabled: boolean;
-  deleting: boolean;
-  revealing: boolean;
-  onSelect: (project: ProjectSummary) => void;
-  onPreview: (project: ProjectSummary) => void;
-  onReshoot: (project: ProjectSummary) => void;
-  onResume: (project: ProjectSummary) => void;
-  onReveal: (project: ProjectSummary) => void;
-  onDelete: (project: ProjectSummary) => void;
-}) {
-  const { locale, t, formatDate, formatDuration } = useI18n();
-  return <article className={selected ? "project-row selected" : "project-row"} tabIndex={0} role="button" aria-pressed={selected} onClick={() => onSelect(project)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(project); } }}>
-    <div className="project-row-main">
-      <div className="project-title-line">
-        <span className={`project-status ${project.status}`} />
-        <strong>{project.name}</strong>
-        <span className="status-copy">{t(statusKey[project.status])}</span>
-      </div>
-      <p className="project-path" title={project.projectPath}>{project.projectPath}</p>
-      {project.failureMessage && <p className="project-failure"><CompactError message={project.failureMessage} /></p>}
-      {project.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
-    </div>
-    <dl className="project-stats">
-      <div><dt>PLY</dt><dd>{formatBytes(project.fileSize, locale)}</dd></div>
-      <div><dt>{t("project.date")}</dt><dd>{formatDate(project.completedAt ?? project.createdAt)}</dd></div>
-      <div><dt>{t("project.elapsed")}</dt><dd>{formatDuration(project.durationMs)}</dd></div>
-      <div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[project.quality])}</dd></div>
-    </dl>
-    <div className="project-actions">
-      {project.status === "completed" && <button className="preview-link" type="button" disabled={previewDisabled} onClick={(event) => { event.stopPropagation(); onSelect(project); onPreview(project); }}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{previewing ? t("project.opening") : t("project.preview")}</button>}
-      {project.status === "completed" && <button className="reshoot-link" type="button" disabled={previewDisabled} onClick={(event) => { event.stopPropagation(); onSelect(project); onReshoot(project); }}><Film size={14} />{t("project.reshoot")}</button>}
-      {project.status !== "completed" && project.status !== "running" && <button className="resume-link" type="button" disabled={busy} onClick={(event) => { event.stopPropagation(); onSelect(project); onResume(project); }}><Play size={14} fill="currentColor" />{t("project.resume")}</button>}
-      <button type="button" disabled={revealing} onClick={(event) => { event.stopPropagation(); onSelect(project); onReveal(project); }}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t("project.reveal")}</button>
-      <button className="danger-link" type="button" disabled={busy || deleting} onClick={(event) => { event.stopPropagation(); onDelete(project); }}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t("project.delete")}</button>
-    </div>
-  </article>;
 }
 
 function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDelete, onPointerDown, onPointerMove, onPointerEnd, onKeyboardMove }: {
@@ -321,34 +250,17 @@ function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDe
 }) {
   const { t } = useI18n();
   const statusKeyByValue: Record<DraftDisplayStatus, TranslationKey> = { standby: "task.idle", preparing: "task.preparing", queued: "task.queued", running: "task.running" };
-  return <article data-draft-id={draft.id} className={`${selected ? "project-row draft-row selected" : "project-row draft-row"}${draft.running ? " drag-disabled" : ""}${dragging ? " dragging" : ""}${insertion ? ` drop-${insertion}` : ""}`} tabIndex={0} role="button" aria-pressed={selected} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onClick={onSelect} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerEnd} onPointerCancel={onPointerEnd} onKeyDown={(event) => {
-    if (event.altKey && !draft.running && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
-      event.preventDefault();
-      onKeyboardMove(event.key === "ArrowUp" ? -1 : 1);
-    } else if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      onSelect();
-    }
-  }}>
-    <span className="draft-drag-indicator" aria-hidden="true"><GripVertical size={15} /></span>
-    <div className="project-title-line"><span className={`project-status ${status}`} /><strong>{draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))}</strong><span className="status-copy">{t(statusKeyByValue[status])}</span></div>
-    <p className="project-path">{draft.inputPath ?? t("workspace.awaitingInput")}</p>
-    {draft.error && <p className="project-failure"><CompactError message={draft.error} /></p>}
-    <div className="project-actions"><button className="danger-link" type="button" disabled={draft.running} onClick={(event) => { event.stopPropagation(); onDelete(); }}><Trash2 size={14} />{t("project.delete")}</button></div>
-  </article>;
+  return <NewTaskRow draftId={draft.id} title={draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))} path={draft.inputPath} status={status} statusLabel={t(statusKeyByValue[status])} selected={selected} canReorder={!draft.running} error={draft.error} insertion={insertion} dragging={dragging} onSelect={onSelect} onDelete={onDelete} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerEnd={onPointerEnd} onKeyboardMove={onKeyboardMove} />;
 }
 
-import { useSharedTasks } from "./useSharedTasks";
-import { SharedTaskDetail } from "../components/SharedTaskDetail";
-import { taskIsActive } from "../types/tasks";
 
 export function App() {
   const { locale, t, toggleLocale, formatNumber, formatDuration } = useI18n();
   const store = useAppStore();
-  const { tasks: sharedTasks, syncError: taskSyncError } = useSharedTasks();
+  const { tasks: sharedTasks, syncError: taskSyncError, refreshTasks } = useSharedTasks();
   const loadGaussian = useGaussianTransformStore((state) => state.load);
   const closeGaussian = useGaussianTransformStore((state) => state.close);
-  const isRunning = store.phase === "running";
+  const isRunning = store.phase === "running" || Object.values(sharedTasks).some(taskIsActive);
   const systemAcceleration = store.colmapAcceleration;
   const systemDetectionTemporary = systemAcceleration?.detectionState === "temporarilyUnavailable";
   const systemAccelerationWarning = systemDetectionTemporary || Boolean(systemAcceleration && !["nvidiaSmiNotFound", "noNvidiaGpu", "macOsCpuOnly"].includes(systemAcceleration.reasonCode) && systemAcceleration.backend !== "gpu");
@@ -421,51 +333,39 @@ export function App() {
   const [reshootBusy, setReshootBusy] = useState(false);
   const drafts = taskWorkspace.drafts;
   const selectedTask = taskWorkspace.selected;
+  const selectedSharedTask = selectedTask.kind === "task" ? sharedTasks[selectedTask.id] : selectedTask.kind === "project" ? Object.values(sharedTasks).find(task => task.project_id === selectedTask.id && !task.project_deleted) : null;
+  const submittedTasks=Object.values(sharedTasks).filter(task=>!task.project_deleted).sort((a,b)=>b.created_at.localeCompare(a.created_at));
+  const submittedNew=submittedTasks.filter(task=>task.status==="created"||taskIsActive(task));
+  const submittedCompleted=submittedTasks.filter(task=>task.status==="completed");
+  const submittedUnfinished=submittedTasks.filter(task=>!["created","completed"].includes(task.status)&&!taskIsActive(task));
+  const visibleDrafts=drafts.filter(draft=>!sharedTasks[draft.id]);
+  const submittedIdsRef = useRef(new Set<string>());
+  submittedIdsRef.current = new Set(Object.keys(sharedTasks));
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
   const selectedProject = selectedTask.kind === "project"
     ? store.projects.find((project) => project.id === selectedTask.id)
       ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
     : null;
-  const detailContextKey = selectedDraft ? `draft:${selectedDraft.id}` : selectedProject ? `project:${selectedProject.id}` : "global";
+  const detailContextKey = selectedSharedTask ? `task:${selectedSharedTask.task_id}` : selectedDraft ? `draft:${selectedDraft.id}` : selectedProject ? `project:${selectedProject.id}` : "global";
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const sharedProjectIds = new Set(Object.values(sharedTasks).map(task => task.project_id));
   const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
+  const projectSyncKey = Object.values(sharedTasks).filter(task => task.project_id && !task.project_deleted)
+    .map(task => `${task.project_id}:${task.run_id}:${task.status}`).sort().join("|");
+  useEffect(() => {
+    if (!projectSyncKey) return;
+    let disposed = false;
+    void getProjectOverview().then(overview => {
+      if (!disposed) useAppStore.getState().setProjects(overview.projects);
+    }).catch(() => { /* Shared snapshots still supply status and results; manual refresh retries metadata. */ });
+    return () => { disposed = true; };
+  }, [projectSyncKey]);
   const progressEvent = useMemo(() => {
     if (!store.latestEvent || !["failed", "cancelled"].includes(store.latestEvent.stage)) return store.latestEvent;
     return [...store.events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage)) ?? null;
   }, [store.events, store.latestEvent]);
-  const activeStageIndex = stagePosition(progressEvent?.stage);
-  const latestMessage = store.latestEvent
-    ? localizePipelineMessage(locale, store.latestEvent.message)
-    : store.progressMessage
-      ? localizePipelineMessage(locale, store.progressMessage)
-      : t("progress.preparing");
-  const latestEventIsTerminal = store.latestEvent != null && ["failed", "cancelled"].includes(store.latestEvent.stage);
-  const friendlyProgressKey = store.phase === "running" && !latestEventIsTerminal && progressEvent
-    ? friendlyProgressKeyByStage[progressEvent.stage]
-    : undefined;
-  const friendlyProgressCount = friendlyProgressKey && progressEvent
-    ? progressEvent.stage === "trainingSplats" && store.latestRuntime?.training?.iteration != null && store.latestRuntime.training.total != null
-      ? { current: store.latestRuntime.training.iteration, total: store.latestRuntime.training.total }
-      : [progressEvent, ...store.events.slice().reverse()]
-        .map((event) => countFromProgressEvent(event, progressEvent.stage))
-        .find((count) => count != null) ?? null
-    : null;
-  const friendlyProgressMessage = friendlyProgressKey
-    ? friendlyProgressCount
-      ? t("progress.activeCount", {
-        label: t(friendlyProgressKey),
-        current: formatNumber(friendlyProgressCount.current),
-        total: formatNumber(friendlyProgressCount.total),
-      })
-      : `${t(friendlyProgressKey)}…`
-    : null;
-  const currentMessage = friendlyProgressMessage
-    ? ["reconstructing", "trainingSplats"].includes(progressEvent?.stage ?? "")
-      ? t("progress.activeLongWait", { label: friendlyProgressMessage })
-      : friendlyProgressMessage
-    : latestMessage;
+  const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime, store.progressMessage);
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const queuedDrafts = useMemo(
     () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingEngines.length === 0),
@@ -477,12 +377,6 @@ export function App() {
       ? { ...workspace, selected: { kind: "task", id: workspace.selected.id } }
       : workspace);
   }, [sharedTasks]);
-  const currentStageLabel = useCallback((stage: string | undefined, index: number) => {
-    if (stage === "completed") return t("stage.completed");
-    if (stage === "failed") return t("stage.failed");
-    if (stage === "cancelled") return t("stage.cancelled");
-    return t(stages[index]?.[1] ?? "stage.preparing");
-  }, [t]);
 
   const mutateTaskWorkspace = useCallback((updater: (workspace: typeof taskWorkspace) => typeof taskWorkspace) => {
     const next = updater(taskWorkspaceRef.current);
@@ -646,6 +540,7 @@ export function App() {
   }, [mutateTaskWorkspace]);
 
   const applyDraftOrder = useCallback((draftId: string, insertionIndex: number) => {
+    if (submittedIdsRef.current.has(draftId)) return;
     queueRevisionRef.current += 1;
     mutateTaskWorkspace((workspace) => ({
       ...workspace,
@@ -654,11 +549,16 @@ export function App() {
   }, [mutateTaskWorkspace]);
 
   const moveDraftWithKeyboard = useCallback((draftId: string, offset: -1 | 1) => {
+    if (submittedIdsRef.current.has(draftId)) return;
     queueRevisionRef.current += 1;
-    mutateTaskWorkspace((workspace) => {
-      const drafts = moveDraft(workspace.drafts, draftId, offset);
-      const position = drafts.findIndex((draft) => draft.id === draftId) + 1;
-      setReorderAnnouncement(t("workspace.reordered", { position }));
+    mutateTaskWorkspace(workspace => {
+      const visible = workspace.drafts.filter(draft => !draft.running && !submittedIdsRef.current.has(draft.id));
+      const position = visible.findIndex(draft => draft.id === draftId);
+      const target = visible[position + offset];
+      if (position < 0 || !target) return workspace;
+      const boundary = workspace.drafts.findIndex(draft => draft.id === target.id) + (offset === 1 ? 1 : 0);
+      const drafts = reorderDrafts(workspace.drafts, draftId, boundary);
+      setReorderAnnouncement(t("workspace.reordered", { position: position + offset + 1 }));
       return { ...workspace, drafts };
     });
   }, [mutateTaskWorkspace, t]);
@@ -666,7 +566,7 @@ export function App() {
   const activateDraftDrag = useCallback((hold: DraftDragHold) => {
     if (draftDragHoldRef.current !== hold || hold.active) return false;
     const currentDraft = taskWorkspaceRef.current.drafts.find((draft) => draft.id === hold.draftId);
-    if (!currentDraft || currentDraft.running) {
+    if (!currentDraft || currentDraft.running || submittedIdsRef.current.has(hold.draftId)) {
       if (hold.target.hasPointerCapture(hold.pointerId)) hold.target.releasePointerCapture(hold.pointerId);
       draftDragHoldRef.current = null;
       return false;
@@ -681,7 +581,7 @@ export function App() {
 
   const beginDraftDrag = useCallback((event: ReactPointerEvent<HTMLElement>, draftId: string) => {
     const origin = event.target instanceof Element ? event.target : null;
-    if (event.button !== 0 || origin?.closest("button, a, input, textarea, select") || taskWorkspaceRef.current.drafts.find((draft) => draft.id === draftId)?.running) return;
+    if (event.button !== 0 || origin?.closest("button, a, input, textarea, select") || submittedIdsRef.current.has(draftId) || taskWorkspaceRef.current.drafts.find((draft) => draft.id === draftId)?.running) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     const hold = {
       pointerId: event.pointerId,
@@ -704,14 +604,15 @@ export function App() {
       if (!activateDraftDrag(hold)) return;
     }
     const current = draftDragRef.current;
-    if (!hold.active || !current) return;
+    if (!hold.active || !current || submittedIdsRef.current.has(current.id)) return;
     event.preventDefault();
-    const rows = Array.from(projectsPaneRef.current?.querySelectorAll<HTMLElement>(".new-task-group .draft-row") ?? []);
-    let insertionIndex = rows.length;
+    const rows = Array.from(projectsPaneRef.current?.querySelectorAll<HTMLElement>(".new-task-group .draft-row[data-draft-id]:not(.drag-disabled)") ?? []);
+    const fullDrafts = taskWorkspaceRef.current.drafts;
+    let insertionIndex = rows.length ? fullDrafts.findIndex(draft => draft.id === rows.at(-1)!.dataset.draftId) + 1 : 0;
     for (let index = 0; index < rows.length; index += 1) {
       const bounds = rows[index].getBoundingClientRect();
       if (event.clientY < bounds.top + bounds.height / 2) {
-        insertionIndex = index;
+        insertionIndex = fullDrafts.findIndex(draft => draft.id === rows[index].dataset.draftId);
         break;
       }
     }
@@ -993,7 +894,7 @@ export function App() {
   useEffect(() => { setInputDropActive(false); }, [selectedTask.kind, selectedTask.id]);
 
   useEffect(() => {
-    if (selectedTask.kind !== "project") return;
+    if (selectedTask.kind !== "project" || selectedSharedTask) return;
     if (isRunning && selectedTask.id === activeProjectId) {
       setProjectDetail(null);
       setProjectEstimate(null);
@@ -1022,7 +923,7 @@ export function App() {
         .catch(() => undefined);
     }
     return () => { cancelled = true; };
-  }, [selectedTask.kind, selectedTask.id, activeProjectId, isRunning, messageOf]);
+  }, [selectedTask.kind, selectedTask.id, activeProjectId, isRunning, messageOf, selectedSharedTask?.task_id]);
 
   useEffect(() => {
     if (viewMode !== "tasks") return;
@@ -1300,8 +1201,9 @@ export function App() {
       updateDraft(draft.id, { error: message });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
-      store.setPhase(cancelled ? "cancelled" : "failed");
-      if (!cancelled) {
+      const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
+      if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
+      if (!cancelled && !taskBusy) {
         const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
@@ -1357,8 +1259,9 @@ export function App() {
       setProjectActionError({ projectId: project.id, message, occurredAt: Date.now() });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
-      store.setPhase(cancelled ? "cancelled" : "failed");
-      if (!cancelled) {
+      const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
+      if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
+      if (!cancelled && !taskBusy) {
         const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
         setFailureDialog(inferFailureDialog(error, fallbackStage, project.id));
       }
@@ -1381,7 +1284,8 @@ export function App() {
       await reconcileRuntimeState();
       if (await confirmAndDeleteProject(project)) {
         await refreshProjects();
-        if (selectedTask.kind === "project" && selectedTask.id === project.id) {
+        await refreshTasks();
+        if ((selectedTask.kind === "project" && selectedTask.id === project.id) || (selectedTask.kind === "task" && sharedTasks[selectedTask.id]?.project_id === project.id)) {
           const fallback = drafts.find((draft) => !draft.running) ?? drafts[0];
           if (fallback) selectDraft(fallback.id);
         }
@@ -1453,7 +1357,6 @@ export function App() {
     setOpeningPreviewProjectId(project.id);
     setProjectActionError(null);
     try {
-      await reconcileRuntimeState();
       closeGaussian();
       if (previous) await withTimeout(releasePreviewSession(previous), PREVIEW_CLOSE_TIMEOUT_MS, t("error.previewCleanupTimeout"));
       const descriptor = await prepareGaussianPreview(project.id);
@@ -1549,8 +1452,9 @@ export function App() {
       updateDraft(draft.id, { error: message });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
-      store.setPhase(cancelled ? "cancelled" : "failed");
-      if (!cancelled) {
+      const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
+      if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
+      if (!cancelled && !taskBusy) {
         const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
         setFailureDialog(inferFailureDialog(error, fallbackStage));
       }
@@ -1692,49 +1596,39 @@ export function App() {
   const activeStageProgress = store.latestEvent == null
     ? null
     : [...store.events].reverse().find((event) => event.stage === store.latestEvent?.stage && event.stageProgress != null)?.stageProgress ?? null;
-  const detailStageIndex = stagePosition(projectDetail?.stage);
   const detailErrorDismissible = !selectedProject || selectedProject.status === "completed";
   const detailErrorBanner = visibleDetailError
     ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
     : null;
   const projectConfigurationDetails = selectedProject && projectDetail
-    ? <div className="project-configuration-detail">
-      <div className="form-section">
-        <label className="field-label">{t("input.label")}</label>
-        <div className="path-picker readonly" title={projectDetail.sourcePath ?? selectedProject.sourceName}>
-          {projectDetail.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
-          <span><strong>{basename(projectDetail.sourcePath ?? selectedProject.sourceName)}</strong><small>{projectDetail.sourcePath ?? selectedProject.sourceName}</small></span>
-        </div>
-      </div>
-      <div className="form-section">
-        <label className="field-label">{t("project.root")}</label>
-        <div className="path-picker compact readonly" title={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)}>
-          <FolderOpen size={18} /><span><strong>{basename(projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath))}</strong><small>{projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)}</small></span>
-        </div>
-      </div>
-      <div className="form-section">
-        <div className="field-label-row"><label className="field-label">{t("quality.label")}</label>{selectedProject.status !== "completed" && <span className="locked-setting"><Lock size={12} />{t("project.inheritedReadonly")}</span>}</div>
-        <div className="quality-settings locked-quality-settings">
-          <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>{qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled aria-checked={selectedProject.quality === quality.value} className={selectedProject.quality === quality.value ? "quality-option selected" : "quality-option"}><span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span></button>)}</div>
-          <button className="planner-switch" type="button" role="switch" aria-checked={projectDetail.plannerEnabled} disabled><span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span><i aria-hidden="true"><span /></i></button>
-        </div>
-      </div>
-      <div className={`acceleration-status ${systemDetectionTemporary ? "warning" : systemAcceleration?.backend === "gpu" ? "gpu" : systemAccelerationWarning ? "warning" : "cpu"}`} aria-live="polite">
-        <span className="acceleration-icon">{systemAcceleration == null ? <LoaderCircle className="spin" size={17} /> : systemDetectionTemporary || systemAccelerationWarning ? <CircleAlert size={17} /> : systemAcceleration.backend === "gpu" ? <Zap size={17} fill="currentColor" /> : <Cpu size={17} />}</span>
-        <span><strong>{systemAcceleration == null ? t("gpu.detecting") : systemDetectionTemporary ? t("gpu.temporarilyUnavailable") : systemAcceleration.backend === "gpu" ? t(selectedProject.status === "completed" ? "gpu.enabledCompleted" : "gpu.enabled") : t("gpu.cpu")}</strong><small>{systemAcceleration == null ? t("gpu.reading") : systemDetectionTemporary ? t("gpu.temporaryHint") : localizePipelineMessage(locale, systemAcceleration.reason)}</small></span>
-      </div>
-      {(projectDetail.video || projectDetail.imageSequence) && <div className="source-metrics project-source-metrics">
-        <span><small>{projectDetail.inputType === "images" ? t("metrics.imageCount") : t("metrics.duration")}</small><b>{projectDetail.imageSequence ? t("common.images", { count: formatNumber(projectDetail.imageSequence.imageCount) }) : formatVideoDuration(projectDetail.video?.duration ?? 0)}</b></span>
-        <span><small>{t("metrics.resolution")}</small><b>{projectDetail.imageSequence?.width ?? projectDetail.video?.width} × {projectDetail.imageSequence?.height ?? projectDetail.video?.height}</b></span>
-        {selectedProject.status !== "completed" && <span><small>{t("metrics.estimatedFrames")}</small><b>{projectDetail.estimatedFrames == null ? "-" : t("metrics.approx", { value: formatNumber(projectDetail.estimatedFrames) })}</b></span>}
-        {selectedProject.status !== "completed" && <span><small>{t("metrics.estimate")}</small><b>{projectEstimate?.projectId === selectedProject.id ? t("metrics.approx", { value: formatDuration(projectEstimate.value.estimatedMs) }) : t("metrics.analyzing")}</b></span>}
-      </div>}
-      {(projectDetail.video?.hasAlpha || projectDetail.imageSequence?.hasAlpha) && <div className="alpha-source-status" role="status"><Blend size={17} /><span><strong>{projectDetail.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{projectDetail.inputType === "images" ? t(selectedProject.status === "completed" ? "alpha.imagesCompletedHint" : "alpha.imagesHint") : t(selectedProject.status === "completed" ? "alpha.videoCompletedHint" : "alpha.videoHint", { format: projectDetail.video?.pixelFormat || "Alpha" })}</small></span></div>}
-    </div>
+    ? <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType} quality={selectedProject.quality} plannerEnabled={projectDetail.plannerEnabled} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
     : null;
   const historicalTaskProgress = selectedProject && projectDetail
-    ? <section className="live-process historical"><div className="live-heading"><div><strong>{t("progress.title")}</strong></div><span className="mono">{projectDetail.progress.toFixed(1)}%</span></div><ol className="stage-timeline">{stages.map(([key, label], index) => <li key={key} className={index < detailStageIndex || selectedProject.status === "completed" ? "done" : index === detailStageIndex ? selectedProject.status === "failed" ? "failed" : selectedProject.status === "cancelled" ? "cancelled" : "active" : ""}><span /><b>{t(label)}</b></li>)}</ol><div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: projectDetail.logs.length })}</small></div><div className="live-log">{projectDetail.logs.map((line, index) => <div className="log-line historical" key={`${line.source}-${index}`}><time /><span>{line.source}</span><p>{line.message}</p></div>)}</div></section>
+    ? <TaskProgress historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
     : null;
+
+  const renderSharedNewRows = () => submittedNew.map(task => {
+    const title = task.task_kind === "reshoot"
+      ? `${store.projects.find(project => project.id === task.source_project_id)?.name ?? basename(task.input_path)} · ${t("project.reshoot")}`
+      : basename(task.input_path);
+    return <NewTaskRow key={task.task_id} taskId={task.task_id} title={title} path={task.input_path}
+      status={taskIsActive(task) ? "running" : task.status} statusLabel={taskStatusLabel(locale, task.status)}
+      selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
+      canReorder={false} agentCreated={task.source === "mcp"} error={task.error?.message}
+      onSelect={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))} />;
+  });
+
+  const renderSharedRows = (items: import("../types/tasks").SharedTask[]) => items.map(task => {
+    const project = taskProjectSummary(task, store.projects.find(item => item.id === task.project_id));
+    return <ProjectRow key={task.task_id} task={task} project={project}
+      selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
+      busy={runBusy} previewing={openingPreviewProjectId === task.project_id}
+      previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === task.project_id}
+      deleting={deletingProjectId === task.project_id} revealing={revealingProjectId === task.project_id}
+      onSelect={selectProject} onSelectTask={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))}
+      onPreview={item => void previewProject(item)} onReshoot={item => void openReshoot(item)}
+      onResume={item => void resume(item)} onReveal={item => void showProject(item)} onDelete={item => void removeProject(item)} />;
+  });
 
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
@@ -1757,9 +1651,10 @@ export function App() {
 
     <section className="workspace" ref={workspaceRef} style={{ "--left-pane-width": `${leftPanePercent}%` } as CSSProperties}>
       <section className="control-pane" ref={controlPaneRef} aria-label={t("task.console")}>
-        <div className="pane-header"><h1>{selectedProject?.name ?? (selectedDraft?.kind === "reshoot" ? draftDisplayName(selectedDraft, t("workspace.newTask"), t("project.reshoot")) : t("task.create"))}</h1><span className={selectedShowsLiveRun ? "run-state active" : "run-state"}>{selectedProject ? t(statusKey[selectedProject.status]) : selectedShowsLiveRun ? t("task.running") : t("task.idle")}</span></div>
+        <div className="pane-header"><h1>{selectedSharedTask ? basename(selectedSharedTask.input_path) : selectedProject?.name ?? (selectedDraft?.kind === "reshoot" ? draftDisplayName(selectedDraft, t("workspace.newTask"), t("project.reshoot")) : t("task.create"))}</h1><span className={(selectedSharedTask ? taskIsActive(selectedSharedTask) : selectedShowsLiveRun) ? "run-state active" : "run-state"}>{selectedSharedTask ? taskStatusLabel(locale,selectedSharedTask.status) : selectedProject ? t(statusKey[selectedProject.status]) : selectedShowsLiveRun ? t("task.running") : t("task.idle")}</span></div>
 
-        {selectedTask.kind === "task" && sharedTasks[selectedTask.id] && <SharedTaskDetail task={sharedTasks[selectedTask.id]} onPreview={id => { void refreshProjects().then(overview => { const project = overview.projects.find(item => item.id === id); if (project) void previewProject(project); }).catch(error => store.setError(messageOf(error))); }} />}
+        {selectedSharedTask && <SharedTaskDetail key={`${selectedSharedTask.task_id}:${selectedSharedTask.run_id}`} task={selectedSharedTask} externalError={projectActionError?.projectId === selectedSharedTask.project_id ? projectActionError.message : null} project={store.projects.find(item => item.id === selectedSharedTask.project_id)} acceleration={systemAcceleration} showRuntimePanel={uiPreferences.showRuntimePanel} canStart={!isRunning && !runGateBusy && missingEngines.length === 0} onResume={resume} />}
+
         {selectedDraft?.kind === "generation" && <><div className="form-section">
           <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
           <div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
@@ -1778,7 +1673,7 @@ export function App() {
               {selectedDraft.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
               <span>
                 <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
-                <small>{selectedDraft.inputPath ?? (selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint"))}</small>
+                <small>{selectedDraft.inputPath ? displayPath(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint")}</small>
               </span>
             </button>
             {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
@@ -1788,7 +1683,7 @@ export function App() {
         <div className="form-section">
           <label className="field-label">{t("project.root")}</label>
           <button className="path-picker compact" type="button" disabled={selectedDraft.running} onClick={() => void chooseRoot()}>
-            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
+            <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot ? displayPath(store.projectsRoot) : "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
           </button>
           <p className="field-note">{t("project.rootHint")}</p>
         </div>
@@ -1857,7 +1752,7 @@ export function App() {
                 {selectedDraft.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
                 <span>
                   <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
-                  <small>{selectedDraft.inputPath ?? (selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint"))}</small>
+                  <small>{selectedDraft.inputPath ? displayPath(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint")}</small>
                 </span>
               </button>
               {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
@@ -1868,7 +1763,7 @@ export function App() {
           <div className="form-section">
             <label className="field-label">{t("project.root")}</label>
             <button className="path-picker compact" type="button" disabled={selectedDraft.running} onClick={() => void chooseRoot()}>
-              <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot || "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
+              <FolderOpen size={18} /><span><strong>{store.projectsRoot ? basename(store.projectsRoot) : t("project.readingRoot")}</strong><small>{store.projectsRoot ? displayPath(store.projectsRoot) : "Documents / SplatStudio / Projects"}</small></span><ChevronRight size={16} />
             </button>
             <p className="field-note">{t("project.rootHint")}</p>
           </div>
@@ -1908,9 +1803,9 @@ export function App() {
           {detailErrorBanner}
         </section>}
 
-        {selectedProject && <section className="project-detail-page">
+        {selectedProject && !selectedSharedTask && <section className="project-detail-page">
           {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : selectedProject.status === "completed" ? <>
-            <dl className="project-detail-stats"><div><dt>{t("result.splats")}</dt><dd>{selectedProject.splatCount == null ? "-" : formatNumber(selectedProject.splatCount)}</dd></div><div><dt>{t("result.fileSize")}</dt><dd>{formatBytes(selectedProject.fileSize, locale)}</dd></div><div><dt>{t("result.registered")}</dt><dd>{projectDetail?.registeredImages == null ? "-" : `${formatNumber(projectDetail.registeredImages)} / ${formatNumber(projectDetail.inputImages ?? 0)}`}</dd></div><div><dt>{t("result.points")}</dt><dd>{selectedProject.points3d == null ? "-" : formatNumber(selectedProject.points3d)}</dd></div><div><dt>{t("project.elapsed")}</dt><dd>{formatDuration(selectedProject.durationMs)}</dd></div><div><dt>{t("project.quality")}</dt><dd>{t(qualityKey[selectedProject.quality])}</dd></div><div><dt>{t("progress.stage")}</dt><dd>{currentStageLabel(projectDetail?.stage, detailStageIndex)}</dd></div></dl>
+            <ProjectResultStats project={selectedProject} detail={projectDetail} />
             {projectConfigurationDetails}
             {selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
             {detailErrorBanner}
@@ -1923,30 +1818,8 @@ export function App() {
           </div> : detailErrorBanner}
         </section>}
 
-        {selectedShowsLiveRun && <section className="live-process">
-          <div className="live-heading"><div><span className="live-dot" /><strong>{t("progress.title")}</strong></div><span className="mono">{store.progress.toFixed(1)}%</span></div>
-          <p className="current-message">{currentMessage}</p>
-          {trainingRemainingSeconds != null && <p className="training-remaining">{t("runtime.remaining")} {formatClockDuration(trainingRemainingSeconds)}</p>}
-          <div className="process-metrics">
-            <span><small>{t("progress.stage")}</small><b>{currentStageLabel(store.latestEvent?.stage, activeStageIndex)}</b></span>
-            <span><small>{t("progress.elapsed")}</small><b>{formatDuration(liveElapsedMs)}</b></span>
-          </div>
-          <ol className="stage-timeline">
-            {stages.map(([key, label], index) => {
-              const terminalClass = index === activeStageIndex && store.phase === "failed" ? "failed" : index === activeStageIndex && store.phase === "cancelled" ? "cancelled" : "";
-              const className = index < activeStageIndex || store.phase === "completed"
-                ? "done"
-                : terminalClass || (index === activeStageIndex && isRunning ? "active" : "");
-              return <li key={key} className={className}><span /><b>{t(label)}</b>{index === activeStageIndex && isRunning && activeStageProgress != null && <small>{Math.min(100, Math.max(0, activeStageProgress)).toFixed(1)}%</small>}</li>;
-            })}
-          </ol>
-          {uiPreferences.showRuntimePanel && store.latestRuntime && <RuntimePanel snapshot={store.latestRuntime} running={isRunning} />}
-          <div className="log-toolbar"><span>{t("progress.log")}</span><small>{t("progress.logCount", { count: store.events.length })}</small></div>
-          <div className="live-log" aria-live="polite" ref={liveLogRef} onScroll={updateLiveLogFollow}>
-            {store.events.map((event, index) => <div className={`log-line ${event.level}`} key={`${event.sequence}-${index}`}><time>{new Date(event.timestamp).toLocaleTimeString(locale, { hour12: false })}</time><span>{event.engine ?? "system"}</span><p>{event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message)}</p></div>)}
-          </div>
-          {isRunning && <button className="cancel-action" type="button" disabled={isCancellationRequested} onClick={() => void requestCancellation()}>{isCancellationRequested ? <LoaderCircle className="spin" size={13} /> : <Square size={12} fill="currentColor" />}{isCancellationRequested ? t("progress.terminating") : t("progress.cancel")}</button>}
-        </section>}
+        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.engine ?? "system", level: event.level, text: event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
+
 
       </section>
 
@@ -1978,36 +1851,29 @@ export function App() {
       ><span /></div>
 
       <section className="projects-pane" ref={projectsPaneRef} aria-label={t("history.aria")}>
-        <div className="pane-header"><h2>{t("history.title")}</h2><button className="refresh-action" type="button" onClick={() => void refreshProjects()}><RotateCcw size={14} />{t("history.refresh")}</button></div>
-        <div className="archive-summary task-summary"><span><b>{drafts.length}</b><small>{t("workspace.newTasks")}</small></span><span><b>{completed.length}</b><small>{t("history.completed")}</small></span><span><b>{unfinished.length}</b><small>{t("history.unfinished")}</small></span></div>
+        <div className="pane-header"><h2>{t("history.title")}</h2><button className="refresh-action" type="button" onClick={() => { void refreshTasks(); void refreshProjects().catch(error => store.setError(messageOf(error))); }}><RotateCcw size={14} />{t("history.refresh")}</button></div>
+        <div className="archive-summary task-summary"><span><b>{visibleDrafts.length + submittedNew.length}</b><small>{t("workspace.newTasks")}</small></span><span><b>{completed.length + submittedCompleted.length}</b><small>{t("history.completed")}</small></span><span><b>{unfinished.length + submittedUnfinished.length}</b><small>{t("history.unfinished")}</small></span></div>
 
         <div className="project-group new-task-group">
           <div className="group-heading">
             <button className="group-toggle" type="button" aria-expanded={expandedGroups.new} aria-controls="new-task-group-content" aria-label={t(expandedGroups.new ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("workspace.newTasks") })} onClick={() => toggleTaskGroup("new")}><ChevronDown size={14} aria-hidden="true" /><span>{t("workspace.newTasks")}</span></button>
             <button className="group-add-action" type="button" onClick={addGenerationDraft}><Plus size={13} />{t("workspace.addTask")}</button>
             <button className="queue-toggle" type="button" role="switch" aria-checked={autoRunNext} onClick={() => setAutoQueueEnabled(!autoRunNext)}><i aria-hidden="true"><span /></i><span>{t("workspace.autoRunNext")}</span></button>
-            <small className="group-count">{t("history.projects", { count: drafts.length })}</small>
+            <small className="group-count">{t("history.projects", { count: visibleDrafts.length + submittedNew.length })}</small>
           </div>
           {taskSyncError && <p role="status">{taskSyncError}</p>}
-          <div className="shared-task-list">{Object.values(sharedTasks).sort((a, b) => b.created_at.localeCompare(a.created_at)).map(task => <article key={task.task_id} className={`project-card ${selectedTask.id === task.task_id ? "selected" : ""}`}>
-            <button className="shared-task-select" type="button" onClick={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))}>
-              <span className={`project-status ${taskIsActive(task) ? "running" : task.status}`} /><strong>{basename(task.input_path)}</strong><span>{task.status}</span>
-              <small>{task.source === "mcp" ? (locale === "zh-CN" ? "由 AI Agent 创建" : "Created by AI Agent") : t("history.title")}</small>
-            </button>
-            {task.project_id && !taskIsActive(task) && <button type="button" onClick={() => { void refreshProjects().then(overview => { const project = overview.projects.find(item => item.id === task.project_id); if (project) selectProject(project); }); }}>{locale === "zh-CN" ? "项目操作" : "Project actions"}</button>}
-          </article>)}</div>
-          <div id="new-task-group-content" className="project-group-content" hidden={!expandedGroups.new}>{drafts.filter(draft => !sharedTasks[draft.id]).map((draft, index) => <DraftRow key={draft.id} draft={draft} status={displayStatusForDraft(draft, queuedDrafts)} insertion={draftDrag?.insertionIndex === index ? "before" : draftDrag?.insertionIndex === drafts.length && index === drafts.length - 1 ? "after" : null} dragging={draftDrag?.id === draft.id} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => {
+          <div id="new-task-group-content" className="project-group-content" hidden={!expandedGroups.new}>{renderSharedNewRows()}{visibleDrafts.map((draft, index) => <DraftRow key={draft.id} draft={draft} status={displayStatusForDraft(draft, queuedDrafts)} insertion={draftDrag?.insertionIndex === drafts.findIndex(item => item.id === draft.id) ? "before" : draftDrag?.insertionIndex === drafts.findIndex(item => item.id === draft.id) + 1 && index === visibleDrafts.length - 1 ? "after" : null} dragging={draftDrag?.id === draft.id} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => {
             if (suppressDraftSelectionRef.current !== draft.id) selectDraft(draft.id);
           }} onDelete={() => removeDraft(draft.id)} onPointerDown={(event) => beginDraftDrag(event, draft.id)} onPointerMove={updateDraftDrag} onPointerEnd={endDraftDrag} onKeyboardMove={(offset) => moveDraftWithKeyboard(draft.id, offset)} />)}</div>
           <span className="visually-hidden" aria-live="polite">{reorderAnnouncement}</span>
         </div>
         <div className="project-group">
-          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length })}</small></button></div>
-          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{completed.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
+          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length + submittedCompleted.length })}</small></button></div>
+          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{renderSharedRows(submittedCompleted)}{completed.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
         </div>
         <div className="project-group unfinished">
-          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.unfinished} aria-controls="unfinished-task-group-content" aria-label={t(expandedGroups.unfinished ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.unfinished") })} onClick={() => toggleTaskGroup("unfinished")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length })}</small></button></div>
-          <div id="unfinished-task-group-content" className="project-group-content" hidden={!expandedGroups.unfinished}>{unfinished.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={() => undefined} onReshoot={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
+          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.unfinished} aria-controls="unfinished-task-group-content" aria-label={t(expandedGroups.unfinished ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.unfinished") })} onClick={() => toggleTaskGroup("unfinished")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length + submittedUnfinished.length })}</small></button></div>
+          <div id="unfinished-task-group-content" className="project-group-content" hidden={!expandedGroups.unfinished}>{renderSharedRows(submittedUnfinished)}{unfinished.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={false} previewDisabled deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={() => undefined} onReshoot={() => undefined} onResume={(item) => void resume(item)} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
         </div>
       </section>
     </section>

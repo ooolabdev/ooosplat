@@ -105,6 +105,10 @@ pub fn scan_image_sequence_with_boundary(
     cancellation: Option<&CancellationToken>,
     boundary: Option<&Path>,
 ) -> Result<ImageSequenceScan> {
+    if let Some(boundary) = boundary {
+        crate::tasks::authorize_input(dir, &[boundary.to_path_buf()])
+            .map_err(|error| SplatError::Process(error.to_string()))?;
+    }
     let files = list_images(dir)?;
     if files.len() < 2 {
         return Err(SplatError::InvalidVideo(

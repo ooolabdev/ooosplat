@@ -122,7 +122,7 @@ export async function startReshootPipeline(request: { sourceProjectId: string; r
 export async function cancelPipeline(): Promise<void> { return invoke("cancel_pipeline"); }
 export async function prepareErrorReport(failureId: string): Promise<ErrorReportDraft> { return invoke("prepare_error_report", { failureId }); }
 export async function sendErrorReport(draftId: string): Promise<ErrorReportReceipt> { return invoke("send_error_report", { draftId }); }
-export async function onPipelineEvent(handler: (event: PipelineEvent) => void): Promise<UnlistenFn> { return listen<PipelineEvent>("pipeline-event", ({ payload }) => handler(payload)); }
+export async function onPipelineEvent(handler: (event: PipelineEvent) => void): Promise<UnlistenFn> { return inTauri() ? listen<PipelineEvent>("pipeline-event", ({ payload }) => handler(payload)) : () => undefined; }
 export async function initializeTelemetry(): Promise<TelemetryPreferences> { return invoke("initialize_telemetry"); }
 export async function setTelemetryConsent(enabled: boolean): Promise<TelemetryPreferences> { return invoke("set_telemetry_consent", { enabled }); }
 
@@ -201,7 +201,7 @@ export async function confirmAndDeleteProject(project: ProjectSummary, beforeDel
   return true;
 }
 
-export async function exportPly(result: PipelineResult): Promise<string | null> {
+export async function exportPly(result: Pick<PipelineResult, 'finalPly'>): Promise<string | null> {
   const locale = getCurrentLocale();
   const destination = await save({ title: translate(locale, "dialog.savePlyTitle"), defaultPath: "final.ply", filters: [{ name: "Gaussian Splat PLY", extensions: ["ply"] }] });
   if (!destination) return null;
@@ -215,7 +215,7 @@ export async function getSharedTask(taskId: string): Promise<SharedTask> { retur
 export async function startGuiTask(taskId: string): Promise<StartReceipt> { return invoke("start_gui_task", { taskId }); }
 export async function cancelSharedTask(taskId: string, runId: string): Promise<SharedTask> { return invoke("cancel_shared_task", { taskId, runId }); }
 export async function onTaskUpdate(handler: (update: TaskUpdate) => void): Promise<UnlistenFn> { return inTauri() ? listen<TaskUpdate>("task-update", ({ payload }) => handler(payload)) : () => undefined; }
-export async function getMcpSettings(): Promise<McpConnection> { return inTauri() ? invoke("get_mcp_settings") : { settings: { enabled: false, port: 39877, inputRoots: [] }, listening: false, address: null, token: null, error: null }; }
+export async function getMcpSettings(): Promise<McpConnection> { return inTauri() ? invoke("get_mcp_settings") : { settings: { enabled: false, port: 39877, inputRoots: [] }, listening: false, address: null, error: null }; }
 export async function setMcpSettings(settings: McpSettings): Promise<McpConnection> { return invoke("set_mcp_settings", { settings }); }
 export async function selectMcpInputRoot(): Promise<string | null> { if (!inTauri()) return null; const path = await open({ directory: true, multiple: false }); return typeof path === 'string' ? path : null; }
 

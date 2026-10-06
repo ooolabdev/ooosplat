@@ -24,8 +24,8 @@ vi.mock("../lib/backend", () => ({
   confirmSmallImageSequence: vi.fn().mockResolvedValue(true),
   estimateProjectRuntime: vi.fn(),
   exportPly: vi.fn(),
-  getSharedTasks: vi.fn(async () => []),
-  onTaskUpdate: vi.fn(async () => () => undefined),
+  getSharedTasks: mocks.getSharedTasks,
+  onTaskUpdate: mocks.onTaskUpdate,
   getAppRuntimeStatus: mocks.getAppRuntimeStatus,
   getProjectOverview: mocks.getProjectOverview,
   initializeTelemetry: mocks.initializeTelemetry,
@@ -99,6 +99,8 @@ describe("App live log", () => {
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
       latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
     });
+    mocks.getSharedTasks.mockReset().mockResolvedValue([]);
+    mocks.onTaskUpdate.mockClear();
     mocks.getProjectOverview.mockReset().mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
     mocks.getAppRuntimeStatus.mockReset().mockResolvedValue({ pipelineRunning: true, pipelineRunElapsedMs: 5_000, pipelineElapsedOffsetMs: 10_000, previewProjectId: null, taskAcceleration: null });
     mocks.initializeTelemetry.mockReset().mockResolvedValue({
@@ -380,4 +382,28 @@ describe("App live log", () => {
     expect(timeline[5].classList.contains("failed")).toBe(true);
     expect(timeline[6].className).toBe("");
   });
+  it("shows Agent tasks without switching selection and synchronizes failure independently of a generation promise", async () => {
+    const { onTaskUpdate } = await import("../lib/backend");
+    const callback = vi.mocked(onTaskUpdate).mock.calls.at(-1)![0];
+    const task = {
+      task_id: "agent-task", run_id: null, project_id: null, project_path: null,
+      input_path: "E:\\Agent\\orbit.mp4", quality: "balanced", source: "mcp", task_kind: "generation",
+      planner_enabled: false, projects_root: "E:\\Projects", status: "created", stage: null,
+      revision: 1, sequence: 0, created_at: "2026-10-06T00:00:00Z", updated_at: "2026-10-06T00:00:00Z",
+      elapsed_ms: 0, progress: null, estimated_progress: null, current: null, total: null, eta_seconds: null,
+      error: null, result: null, recent_events: [],
+    } as import("../types/tasks").SharedTask;
+    await act(async () => callback({ task, event: null }));
+    expect(container.textContent).toContain("由 AI Agent 创建");
+    expect(container.querySelector(".shared-task-detail")).toBeNull();
+    await act(async () => container.querySelector<HTMLElement>('[data-task-id="agent-task"]')!.click());
+    expect(container.querySelector(".shared-task-detail")?.textContent).toContain("orbit.mp4");
+    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 2, status: "running" }, event: null }));
+    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 3, status: "failed", stage: "failed", error: { code: "pipeline_failed", message: "模型校验失败", failed_stage: "trainingSplats", engine: "brush", exit_code: 2, failure_id: null, classification: "brush_gpu", classification_is_heuristic: true } }, event: null }));
+    expect(container.querySelector(".shared-task-detail")?.textContent).toContain("失败");
+    expect(container.querySelector(".shared-task-detail")?.textContent).toContain("模型校验失败");
+    expect(container.querySelector('.unfinished [data-task-id="agent-task"]')?.textContent).toContain("失败");
+    expect(useAppStore.getState().phase).toBe("failed");
+  });
+
 });

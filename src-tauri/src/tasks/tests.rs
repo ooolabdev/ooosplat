@@ -1,6 +1,39 @@
 use super::*;
 use crate::pipeline::runner::default_engine_paths;
 
+#[test]
+fn checkpoint_writer_starts_and_persists_from_a_plain_setup_thread() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let (root, service, task) = tauri::async_runtime::block_on(fixture());
+    {
+        let mut registry = service.records();
+        let record = registry.tasks.get_mut(&task.task_id).unwrap();
+        record.status = TaskStatus::Running;
+        record.revision += 1;
+    }
+    // This call reproduced the startup panic before using Tauri's runtime.
+    let writer = service.spawn_checkpoint_writer();
+    let persisted = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let bytes = tokio::fs::read(root.path().join("registry/tasks.json"))
+                    .await
+                    .unwrap();
+                let registry: Registry = serde_json::from_slice(&bytes).unwrap();
+                if registry.tasks[&task.task_id].revision > task.revision {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+    });
+    writer.abort();
+    let _ = tauri::async_runtime::block_on(writer);
+    persisted.expect("the startup writer must run and persist on Tauri's runtime");
+    assert!(tokio::runtime::Handle::try_current().is_err());
+}
+
 async fn fixture() -> (tempfile::TempDir, TaskService, TaskRecord) {
     let root = tempfile::tempdir().unwrap();
     let input = root.path().join("input.mp4");
@@ -112,7 +145,7 @@ async fn gui_mcp_admission_duplicate_start_and_disconnect_are_independent() {
         TaskStatus::Created
     );
     // Dropping the request/receipt leaves the execution registered and alive.
-    drop(receipt);
+    let _receipt = receipt;
     assert!(service.get(first.task_id).await.unwrap().status.active());
     signal.notify_one();
     let terminal = tokio::time::timeout(
@@ -253,6 +286,14 @@ async fn task_configuration_is_frozen_and_old_run_events_are_rejected() {
                 .minimum_selected_frames,
             987
         );
+        let inherited = crate::presets::spawn_pipeline_blocking(|| {
+            crate::presets::pipeline_optimization_config()
+                .shared
+                .minimum_selected_frames
+        })
+        .await
+        .unwrap();
+        assert_eq!(inherited, 987);
     })
     .await;
     assert_eq!(
@@ -285,6 +326,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
     )
     .unwrap();
     let run = Uuid::new_v4();
+    task.status = TaskStatus::Running;
     task.run_id = Some(run);
     task.runs.push(TaskRun {
         run_id: run,
@@ -294,6 +336,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
         last_engine: None,
         last_exit_code: None,
+        error: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -365,6 +408,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
     let path = logroot.join("brush.log");
     std::fs::write(&path, "Authorization: Bearer private-token\n").unwrap();
     let run = Uuid::new_v4();
+    task.status = TaskStatus::Running;
     task.run_id = Some(run);
     task.runs.push(TaskRun {
         run_id: run,
@@ -374,6 +418,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
         last_engine: None,
         last_exit_code: None,
+        error: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -427,6 +472,10 @@ fn unauthorized_paths_and_log_symlinks_are_rejected() {
     let link = std::os::windows::fs::symlink_file(&private, root.path().join("brush.log"));
     #[cfg(unix)]
     let link = std::os::unix::fs::symlink(&private, root.path().join("brush.log"));
+    assert!(
+        link.is_ok(),
+        "This verification requires permission to create its temporary symlink fixture"
+    );
     if link.is_ok() {
         assert_eq!(
             logs::register(root.path(), &root.path().join("brush.log"), 0)
@@ -435,4 +484,140 @@ fn unauthorized_paths_and_log_symlinks_are_rejected() {
             "LOG_ACCESS_DENIED"
         );
     }
+}
+
+#[tokio::test]
+async fn successful_execution_is_persisted_and_terminal_events_cannot_reactivate_it() {
+    let (root, service, task) = fixture().await;
+    let path = root.path().join("synthetic-project");
+    let project = Uuid::new_v4();
+    *service.executor.lock().unwrap() = Some(Arc::new(move |_| {
+        let path = path.clone();
+        Box::pin(async move {
+            Ok(PipelineResult {
+                project_id: project.to_string(),
+                project_path: path.clone(),
+                final_ply: path.join("final.ply"),
+                file_size: 123,
+                splat_count: 1,
+                input_images: 2,
+                registered_images: 2,
+                registered_ratio: 1.0,
+                points_3d: 1,
+                duration_ms: 1,
+                completed_at: Utc::now(),
+                warning: None,
+                logs_directory: path.join("logs"),
+                source_duration_seconds: None,
+            })
+        })
+    }));
+    let receipt = service
+        .start(task.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.wait(task.task_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(completed.result.as_ref().unwrap()["fileSize"], 123);
+    assert!(service.active.lock().await.is_none());
+    service.on_event(
+        task.task_id,
+        receipt.run_id.unwrap(),
+        PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.5, "late progress"),
+    );
+    assert_eq!(
+        service.get(task.task_id).await.unwrap().revision,
+        completed.revision
+    );
+    let reopened = TaskService::at(root.path().join("registry"));
+    assert_eq!(
+        reopened.get(task.task_id).await.unwrap().status,
+        TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced() {
+    let (root, _, mut task) = fixture().await;
+    let logroot = root.path().join("logs");
+    std::fs::create_dir(&logroot).unwrap();
+    let first = logroot.join("brush.log");
+    let second = logroot.join("colmap.log");
+    std::fs::write(
+        &first,
+        (0..150)
+            .map(|n| format!("brush row {n}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(&second, "colmap row\n").unwrap();
+    let run = Uuid::new_v4();
+    task.status = TaskStatus::Running;
+    task.run_id = Some(run);
+    task.runs.push(TaskRun {
+        run_id: run,
+        kind: "generation".into(),
+        started_at: Utc::now(),
+        ended_at: None,
+        logs: BTreeMap::from([
+            ("brush".into(), logs::register(&logroot, &first, 0).unwrap()),
+            (
+                "colmap".into(),
+                logs::register(&logroot, &second, 0).unwrap(),
+            ),
+        ]),
+        error: None,
+        last_engine: None,
+        last_exit_code: None,
+    });
+    let request = logs::LogRequest {
+        task_id: task.task_id,
+        ..Default::default()
+    };
+    let page = logs::read(&task, &request).unwrap();
+    assert!(
+        page.entries
+            .iter()
+            .map(|chunk| chunk.text.lines().count())
+            .sum::<usize>()
+            <= 100
+    );
+    let mut forged = page.next_cursor.clone().unwrap().into_bytes();
+    forged[0] = if forged[0] == b'0' { b'1' } else { b'0' };
+    assert!(logs::read(
+        &task,
+        &logs::LogRequest {
+            cursor: Some(String::from_utf8(forged).unwrap()),
+            ..request.clone()
+        }
+    )
+    .is_err());
+    let source_request = logs::LogRequest {
+        sources: Some(vec!["brush".into()]),
+        ..request
+    };
+    let before = logs::read(&task, &source_request).unwrap();
+    std::fs::rename(&first, logroot.join("brush.log.1")).unwrap();
+    std::fs::write(&first, "new generation of the same registered source\n").unwrap();
+    task.runs
+        .last_mut()
+        .unwrap()
+        .logs
+        .insert("brush".into(), logs::register(&logroot, &first, 0).unwrap());
+    let after = logs::read(
+        &task,
+        &logs::LogRequest {
+            cursor: before.next_cursor,
+            ..source_request
+        },
+    )
+    .unwrap();
+    assert!(after.cursor_reset);
+    assert!(after.entries[0].text.contains("new generation"));
 }

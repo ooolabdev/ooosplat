@@ -1,5 +1,7 @@
 # OOOSplat
 
+The development branch adds optional local MCP v1. Enable it in desktop settings and authorize input directories to let a local AI Agent create, start, inspect and cancel tasks in the same application. It is disabled by default and listens only on loopback. See [MCP v1 setup, tools and lifecycle](docs/mcp-v1.md).
+
 [中文](README.md) | [English](README_EN.md)
 
 <p align="center">

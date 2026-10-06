@@ -71,6 +71,8 @@ pub struct TaskRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub logs: BTreeMap<String, logs::RegisteredLog>,
     #[serde(default)]
+    pub error: Option<TaskError>,
+    #[serde(default)]
     pub last_engine: Option<crate::pipeline::PipelineEngine>,
     #[serde(default)]
     pub last_exit_code: Option<i32>,
@@ -83,8 +85,14 @@ pub struct TaskRecord {
     pub project_id: Option<Uuid>,
     pub project_path: Option<PathBuf>,
     pub input_path: PathBuf,
+    #[serde(default)]
+    pub input_type: crate::project::ProjectInputType,
+    #[serde(default)]
+    pub project_deleted: bool,
     pub quality: Quality,
-    pub source: String,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub configuration_inferred: bool,
     pub task_kind: String,
     pub source_project_id: Option<Uuid>,
     pub planner_enabled: bool,
@@ -98,6 +106,10 @@ pub struct TaskRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub elapsed_offset_ms: u64,
+    #[serde(default)]
+    pub runtime: Option<crate::pipeline::runtime::RuntimeSnapshot>,
     pub progress: Option<f32>,
     pub estimated_progress: Option<f32>,
     pub current: Option<u64>,
@@ -184,7 +196,7 @@ struct Registry {
     loaded: bool,
 }
 #[cfg(test)]
-type TestExecutor = Arc<
+pub(crate) type TestExecutor = Arc<
     dyn Fn(
             TaskRecord,
         ) -> std::pin::Pin<
@@ -202,7 +214,7 @@ pub struct TaskService {
     pub(crate) diagnostics: Arc<crate::diagnostics::DiagnosticService>,
     emitter: Arc<SyncMutex<Option<Emit>>>,
     #[cfg(test)]
-    executor: Arc<SyncMutex<Option<TestExecutor>>>,
+    pub(crate) executor: Arc<SyncMutex<Option<TestExecutor>>>,
 }
 impl Default for TaskService {
     fn default() -> Self {
@@ -234,7 +246,8 @@ impl TaskService {
     fn records(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.registry.lock().unwrap_or_else(|p| p.into_inner())
     }
-    fn notify(&self, t: TaskRecord, event: Option<PipelineEvent>) {
+    fn notify(&self, mut t: TaskRecord, event: Option<PipelineEvent>) {
+        t.recent_events.clear();
         if let Some(emit) = self
             .emitter
             .lock()
@@ -265,8 +278,9 @@ impl TaskService {
                 task.status = TaskStatus::Interrupted;
                 task.revision += 1;
                 task.updated_at = Utc::now();
+                task.eta_seconds = None;
                 if let Some(run) = task.runs.last_mut() {
-                    run.ended_at = Some(Utc::now());
+                    run.ended_at = None;
                 }
                 if let Some(project) = &task.project_path {
                     if let Ok(bytes) = tokio::fs::read(project.join("project.json")).await {
@@ -280,6 +294,8 @@ impl TaskService {
                                 }
                             } else {
                                 metadata.status = ProjectStatus::Interrupted;
+                                metadata.duration_ms =
+                                    Some(task.elapsed_ms.max(metadata.duration_ms.unwrap_or(0)));
                                 atomic_write_json(&project.join("project.json"), &metadata).await?;
                             }
                         }
@@ -319,6 +335,38 @@ impl TaskService {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
+        &self,
+        id: Option<Uuid>,
+        input: PathBuf,
+        quality: Quality,
+        projects_root: PathBuf,
+        planner_enabled: bool,
+        source: &str,
+        key: Option<String>,
+        parameters: Option<Value>,
+    ) -> Result<TaskRecord> {
+        let service = self.clone();
+        let source = source.to_owned();
+        tokio::spawn(async move {
+            service
+                .create_inner(
+                    id,
+                    input,
+                    quality,
+                    projects_root,
+                    planner_enabled,
+                    &source,
+                    key,
+                    parameters,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| ServiceError::new("CREATE_FAILED", error.to_string()))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
         &self,
         id: Option<Uuid>,
         input: PathBuf,
@@ -390,9 +438,16 @@ impl TaskService {
             run_id: None,
             project_id: None,
             project_path: None,
+            input_type: if input.is_dir() {
+                crate::project::ProjectInputType::Images
+            } else {
+                crate::project::ProjectInputType::Video
+            },
+            project_deleted: false,
             input_path: input,
             quality,
-            source: source.into(),
+            source: Some(source.into()),
+            configuration_inferred: false,
             task_kind: "generation".into(),
             source_project_id: None,
             planner_enabled,
@@ -406,6 +461,8 @@ impl TaskService {
             created_at: now,
             updated_at: now,
             elapsed_ms: 0,
+            elapsed_offset_ms: 0,
+            runtime: None,
             progress: None,
             estimated_progress: None,
             current: None,
@@ -487,9 +544,12 @@ impl TaskService {
                 run_id: Some(run_id),
                 project_id: Some(metadata.id),
                 project_path: Some(path.clone()),
+                input_type: metadata.input_type,
+                project_deleted: false,
                 input_path: metadata.source_path.clone(),
                 quality: metadata.quality,
-                source: "gui".into(),
+                source: summary.workspace_task_id.map(|_| "gui".into()),
+                configuration_inferred: checkpoint.configuration.is_none(),
                 task_kind: if metadata.reshoot.is_some() {
                     "reshoot"
                 } else {
@@ -511,6 +571,8 @@ impl TaskService {
                 created_at: metadata.created_at,
                 updated_at: metadata.completed_at.unwrap_or(metadata.created_at),
                 elapsed_ms: metadata.duration_ms.unwrap_or(0),
+                elapsed_offset_ms: 0,
+                runtime: None,
                 progress: None,
                 estimated_progress: None,
                 current: None,
@@ -541,6 +603,7 @@ impl TaskService {
                     logs: registered,
                     last_engine: None,
                     last_exit_code: None,
+                    error: None,
                 }],
                 client_request_id: None,
                 request_parameters: None,
@@ -676,7 +739,9 @@ impl TaskService {
                 service.on_event(id, run_id, event);
             })
             .with_workspace_task_id(Some(id))
-            .with_input_boundary((task.source == "mcp").then(|| task.input_path.clone()))
+            .with_input_boundary(
+                (task.source.as_deref() == Some("mcp")).then(|| task.input_path.clone()),
+            )
             .with_lifecycle_observer(move |update| lifecycle.on_runner_update(id, run_id, update)),
         );
         let starting = {
@@ -684,7 +749,22 @@ impl TaskService {
             let t = registry.tasks.get_mut(&id).expect("task");
             t.run_id = Some(run_id);
             t.status = TaskStatus::Starting;
+            t.elapsed_offset_ms = t.elapsed_ms;
+            t.progress = None;
+            t.current = None;
+            t.total = None;
+            t.unit = None;
+            t.eta_seconds = None;
+            t.runtime = None;
+            let previous_error = t.error.clone();
+            if let Some(run) = t.runs.last_mut() {
+                if run.error.is_none() {
+                    run.error = previous_error;
+                }
+            }
             t.error = None;
+            t.stage = None;
+            t.estimated_progress = None;
             t.sequence = 0;
             t.recent_events.clear();
             t.revision += 1;
@@ -702,6 +782,7 @@ impl TaskService {
                 logs: Default::default(),
                 last_engine: None,
                 last_exit_code: None,
+                error: None,
             });
             t.clone()
         };
@@ -801,26 +882,41 @@ impl TaskService {
             if t.status == TaskStatus::Starting {
                 t.status = TaskStatus::Running;
             }
+            if t.stage != Some(event.stage) {
+                t.progress = None;
+                t.current = None;
+                t.total = None;
+                t.unit = None;
+                t.eta_seconds = None;
+                t.runtime = None;
+            }
             t.revision += 1;
             t.sequence = event.sequence;
             t.stage = Some(event.stage);
             t.updated_at = event.timestamp;
-            t.elapsed_ms = event.elapsed_ms;
-            t.estimated_progress = Some(event.progress);
-            t.current = event.current;
-            t.total = event.total;
-            t.unit = event.unit.clone();
-            if !event.indeterminate && event.current.is_some() && event.total.is_some_and(|v| v > 0)
-            {
-                t.progress = event.stage_progress;
-            } else {
-                t.progress = None;
+            t.elapsed_ms = t.elapsed_offset_ms.saturating_add(event.elapsed_ms);
+            t.estimated_progress = Some(t.estimated_progress.unwrap_or(0.0).max(event.progress));
+            if event.current.is_some() {
+                t.current = event.current;
+                t.total = event.total;
+                t.unit = event.unit.clone();
+                t.progress = if !event.indeterminate {
+                    event
+                        .current
+                        .zip(event.total)
+                        .filter(|(_, total)| *total > 0)
+                        .map(|(current, total)| (current as f32 / total as f32 * 100.0).min(100.0))
+                } else {
+                    None
+                };
             }
-            t.eta_seconds = event
-                .runtime
-                .as_ref()
-                .and_then(|r| r.training.as_ref())
-                .and_then(|t| t.remaining_seconds);
+            if let Some(runtime) = &event.runtime {
+                t.runtime = Some(runtime.clone());
+                t.eta_seconds = runtime
+                    .training
+                    .as_ref()
+                    .and_then(|training| training.remaining_seconds);
+            }
             event.task_id = Some(id);
             event.run_id = Some(run);
             event.revision = t.revision;
@@ -846,6 +942,9 @@ impl TaskService {
                 return;
             }
             match update {
+                RunnerUpdate::Configuration(configuration) => {
+                    t.actual_configuration = Some(configuration);
+                }
                 RunnerUpdate::Project(metadata) => {
                     t.project_id = Some(metadata.id);
                     t.project_path = Some(metadata.project_path);
@@ -853,12 +952,13 @@ impl TaskService {
                 RunnerUpdate::LogOpened { path, offset } => {
                     if let Some(root) = &t.project_path {
                         if let Ok(log) = logs::register(&root.join("logs"), &path, offset) {
-                            t.runs
-                                .last_mut()
-                                .expect("run")
-                                .logs
-                                .entry(log.source.clone())
-                                .or_insert(log);
+                            let logs = &mut t.runs.last_mut().expect("run").logs;
+                            match logs.get(&log.source) {
+                                Some(existing) if existing.file_id == log.file_id => {}
+                                _ => {
+                                    logs.insert(log.source.clone(), log);
+                                }
+                            }
                         }
                     }
                 }
@@ -903,14 +1003,7 @@ impl TaskService {
             .as_ref()
             .and_then(|e| e.failure_id.as_deref())
             .copied();
-        let actual = if let Some(path) = &context.project_path {
-            tokio::fs::read(path.join("state.json"))
-                .await
-                .ok()
-                .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
-        } else {
-            None
-        };
+        let actual = None::<Value>;
         let task = {
             let mut registry = self.records();
             let Some(t) = registry.tasks.get_mut(&id) else {
@@ -937,7 +1030,9 @@ impl TaskService {
             }
             t.project_id = context.project_id.or(t.project_id);
             t.project_path = context.project_path.or(t.project_path.clone());
-            t.actual_configuration = actual.map(actual_snapshot);
+            if let Some(actual) = actual {
+                t.actual_configuration = Some(actual_snapshot(actual));
+            }
             t.result = result
                 .as_ref()
                 .ok()
@@ -963,10 +1058,13 @@ impl TaskService {
                         .unwrap_or_default(),
                 });
             }
+            if let Some(run) = t.runs.last_mut() {
+                run.error = t.error.clone();
+            }
             t.updated_at = Utc::now();
             t.elapsed_ms = runner
                 .elapsed_ms()
-                .saturating_add(runner.elapsed_offset_ms());
+                .saturating_add(runner.elapsed_offset_ms().max(t.elapsed_offset_ms));
             t.eta_seconds = None;
             t.revision += 1;
             t.clone()
@@ -1057,9 +1155,84 @@ impl TaskService {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
-    pub fn spawn_checkpoint_writer(&self) {
+    pub async fn reconcile_projects(
+        &self,
+        projects: &[crate::project::catalog::ProjectSummary],
+    ) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        self.load_locked().await?;
+        let mut changes = vec![];
+        {
+            let mut registry = self.records();
+            for project in projects {
+                if project.status != ProjectStatus::Interrupted {
+                    continue;
+                }
+                if let Some(task) = registry.tasks.values_mut().find(|task| {
+                    task.project_id == Some(project.id)
+                        && task.status == TaskStatus::Completed
+                        && !task.project_deleted
+                }) {
+                    task.status = TaskStatus::Interrupted;
+                    task.result = None;
+                    task.revision += 1;
+                    task.updated_at = Utc::now();
+                    task.error = Some(TaskError {
+                        code: "ARTIFACT_UNAVAILABLE".into(),
+                        message: project.failure_message.clone().unwrap_or_else(|| {
+                            "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()
+                        }),
+                        failed_stage: None,
+                        engine: None,
+                        exit_code: None,
+                        classification: None,
+                        classification_is_heuristic: false,
+                        failure_id: None,
+                        log_sources: task
+                            .runs
+                            .last()
+                            .map(|run| run.logs.keys().cloned().collect())
+                            .unwrap_or_default(),
+                    });
+                    changes.push(task.clone());
+                }
+            }
+        }
+        if !changes.is_empty() {
+            self.persist().await?;
+            for task in changes {
+                self.notify(task, None);
+            }
+        }
+        Ok(())
+    }
+    pub async fn mark_project_deleted(&self, project: Uuid) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        let task = {
+            let mut registry = self.records();
+            let Some(task) = registry
+                .tasks
+                .values_mut()
+                .find(|task| task.project_id == Some(project))
+            else {
+                return Ok(());
+            };
+            task.project_deleted = true;
+            task.project_path = None;
+            task.result = None;
+            task.revision += 1;
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist().await?;
+        self.notify(task, None);
+        Ok(())
+    }
+    pub fn spawn_checkpoint_writer(&self) -> tauri::async_runtime::JoinHandle<()> {
         let service = self.clone();
-        tokio::spawn(async move {
+        // Tauri's synchronous setup hook runs on the UI thread, outside a
+        // current Tokio runtime. Spawn on the application-owned runtime.
+        tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let _gate = service.gate.lock().await;
@@ -1067,7 +1240,7 @@ impl TaskService {
                     let _ = service.persist().await;
                 }
             }
-        });
+        })
     }
 }
 
@@ -1076,7 +1249,11 @@ pub fn authorize_input(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
         .map_err(|_| ServiceError::new("INVALID_PATH", "输入不存在或不可访问"))?;
     if !roots
         .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .filter_map(|r| {
+            std::fs::canonicalize(r)
+                .ok()
+                .filter(|resolved| resolved == r)
+        })
         .any(|r| path.starts_with(r))
     {
         return Err(ServiceError::new(
@@ -1105,7 +1282,8 @@ impl Drop for ExecutionCleanup {
         let runner = self.runner.clone();
         let task = self.task;
         let run = self.run;
-        tokio::spawn(async move {
+        // Destructors can also run outside an entered Tokio runtime.
+        tauri::async_runtime::spawn(async move {
             if service
                 .get(task)
                 .await
@@ -1124,4 +1302,8 @@ impl Drop for ExecutionCleanup {
             }
         });
     }
+}
+
+pub(crate) fn checkpoint_snapshot(state: &crate::project::PipelineStateFile) -> Value {
+    serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}})
 }

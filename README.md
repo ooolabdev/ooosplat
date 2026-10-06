@@ -21,6 +21,8 @@ Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLM
 
 当前版本：**0.5.0**
 
+开发分支新增可选的本地 MCP v1：在设置中授权素材目录并启用后，AI Agent 可通过七个工具创建、启动、查看及取消同一应用中的任务。默认关闭，仅监听本机；连接与日志说明见 [MCP v1 开发文档](docs/mcp-v1.md)。
+
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
 > 0.5.0 新增默认开启、可关闭的实验性自动优化，可按素材、档位和显存规划重建与训练参数，并在视频重建覆盖不足时尝试桥接补帧；同时加入同相机增量高清补拍、Windows Brush 显卡稳定性与预览体验改进。

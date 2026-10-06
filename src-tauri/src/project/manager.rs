@@ -63,8 +63,11 @@ impl ProjectPaths {
     }
 }
 
-#[derive(Debug, Clone)]
+pub type ProjectCheckpointObserver = Arc<dyn Fn(&PipelineStateFile) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ProjectManager {
+    checkpoint_observer: Option<ProjectCheckpointObserver>,
     projects_root: PathBuf,
     input_boundary: Option<PathBuf>,
     register_in_catalog: bool,
@@ -74,6 +77,7 @@ impl ProjectManager {
     pub fn system_default() -> Result<Self> {
         Ok(Self {
             input_boundary: None,
+            checkpoint_observer: None,
             projects_root: catalog::default_projects_root()?,
             register_in_catalog: true,
         })
@@ -82,6 +86,7 @@ impl ProjectManager {
         Self {
             projects_root,
             input_boundary: None,
+            checkpoint_observer: None,
             register_in_catalog: true,
         }
     }
@@ -89,8 +94,14 @@ impl ProjectManager {
         Self {
             projects_root,
             input_boundary: None,
+            checkpoint_observer: None,
             register_in_catalog: false,
         }
+    }
+
+    pub fn with_checkpoint_observer(mut self, observer: ProjectCheckpointObserver) -> Self {
+        self.checkpoint_observer = Some(observer);
+        self
     }
 
     pub fn with_input_boundary(mut self, boundary: Option<PathBuf>) -> Self {
@@ -229,7 +240,7 @@ impl ProjectManager {
                 .to_ascii_lowercase();
             let stored = source.join(format!("input.{extension}"));
             if let Some(boundary) = &self.input_boundary {
-                if std::fs::canonicalize(input)? != std::fs::canonicalize(boundary)? {
+                if std::fs::canonicalize(input)? != *boundary {
                     return Err(SplatError::InvalidPath(input.to_path_buf()));
                 }
             }
@@ -290,7 +301,11 @@ impl ProjectManager {
     }
 
     pub async fn write_state(&self, path: &Path, state: &PipelineStateFile) -> Result<()> {
-        atomic_write_json(path, state).await
+        atomic_write_json(path, state).await?;
+        if let Some(observer) = &self.checkpoint_observer {
+            observer(state);
+        }
+        Ok(())
     }
     pub async fn read_state(&self, path: &Path) -> Result<PipelineStateFile> {
         Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)

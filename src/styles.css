@@ -728,9 +728,46 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .sparse-preview-error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #f3b7b7; }
 .sparse-preview-hint { padding: 8px 16px; color: #91a4c4; font-size: 11px; }
 
-.shared-task-select { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:0; color:inherit; padding:12px; }
-.shared-task-select small { width:100%; color:var(--text-secondary); }
-.shared-task-detail { padding:20px; }
-.shared-task-detail .pipeline-log { max-height:360px; overflow:auto; overflow-wrap:anywhere; white-space:pre-wrap; font-family:monospace; font-size:12px; }
-.shared-task-detail progress { width:100%; }
 .mcp-configuration { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; user-select:text; }
+
+.mcp-settings .mcp-action { flex-shrink:0; width:auto; padding:8px 12px; border:1px solid #c5cfdf; background:#f4f7fc; color:#314463; font:inherit; font-size:12px; white-space:nowrap; cursor:pointer; }
+.mcp-settings .mcp-action:disabled { opacity:.5; cursor:default; }
+.mcp-settings .mcp-port { width:120px; padding:9px 12px; border:1px solid #c5cfdf; background:#fff; color:#23344e; font:inherit; font-size:13px; }
+.settings-content:has(.mcp-settings) { min-height:0; max-height:calc(100vh - 124px); overflow-x:hidden; }
+.mcp-settings { min-width:0; max-width:100%; }
+.mcp-section { min-width:0; padding:18px 0; border-bottom:1px solid var(--line); }
+.mcp-section:last-of-type { border-bottom:0; padding-bottom:0; }
+.mcp-section-heading, .mcp-root-heading { min-width:0; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px 12px; }
+.mcp-section-heading h4 { margin:0; color:#273248; font-size:13px; }
+.mcp-control-row { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:16px; }
+.mcp-control-row + .mcp-control-row { margin-top:16px; }
+.mcp-control-row > div { min-width:0; }
+.mcp-control-row strong, .mcp-control-row label, .mcp-root-heading strong { color:#273248; font-size:13px; font-weight:650; }
+.mcp-control-row p, .mcp-note { margin:6px 0 0; color:var(--muted); font-size:11px; line-height:1.65; overflow-wrap:anywhere; }
+.mcp-default-root { margin-top:12px; padding:12px; border:1px solid var(--line); background:#f2f4f7; min-width:0; }
+.mcp-root-heading span { color:var(--muted); font-size:10px; }
+.mcp-root-path { min-width:0; margin:8px 0 0; color:#536078; font:11px/1.6 "Cascadia Mono",monospace; overflow-wrap:anywhere; white-space:normal; user-select:text; }
+.mcp-default-root .mcp-action { margin-top:10px; }
+.mcp-root-list { margin:8px 0 0; padding:0; list-style:none; }
+.mcp-root-row { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); }
+.mcp-root-row .mcp-root-path { margin:0; }
+.mcp-root-row:last-child { border-bottom:0; }
+.mcp-save-row { display:flex; align-items:center; flex-wrap:wrap; gap:10px 14px; margin-top:16px; }
+.mcp-save-row .mcp-note { margin:0; flex:1 1 200px; }
+.mcp-connection-state { color:var(--muted); font-size:10px; }
+.mcp-connection-state.listening { color:var(--green); }
+.mcp-client-section > .mcp-note { margin-top:10px; }
+.mcp-endpoint { display:block; max-width:100%; margin:6px 0 12px; padding:9px 12px; border:1px solid var(--line); font:11px/1.6 "Cascadia Mono",monospace; overflow-wrap:anywhere; white-space:normal; user-select:text; }
+.mcp-config-details { min-width:0; margin-top:12px; font-size:11px; }
+.mcp-config-details summary { color:#536078; cursor:pointer; }
+.mcp-config-details h5 { margin:12px 0 6px; color:var(--muted); font-size:10px; }
+.mcp-config-details .mcp-configuration { margin:0; padding:10px 12px; min-width:0; max-width:100%; border:1px solid var(--line); background:#f2f4f7; font:11px/1.55 "Cascadia Mono",monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.mcp-feedback { margin:14px 0 0; color:var(--muted); font-size:11px; line-height:1.65; overflow-wrap:anywhere; }
+.mcp-feedback.error { color:var(--red); }
+
+.task-origin { margin: 8px 0 0 14px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.project-detail-page > .task-origin { margin: 0 0 16px; }
+.stage-timeline li.interrupted { color: var(--ink); }
+.stage-timeline li.interrupted > span { background: var(--amber); border-color: var(--amber); box-shadow: 0 0 0 4px rgba(199,131,20,.1); }
+.log-line.historical p { white-space: pre-wrap; }
+.mcp-copy-actions { display: flex; flex-wrap: wrap; gap: 8px; }

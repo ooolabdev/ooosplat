@@ -340,7 +340,8 @@ struct ActiveProjectContext {
 
 #[derive(Debug, Clone)]
 pub enum RunnerUpdate {
-    Project(crate::project::ProjectMetadata),
+    Configuration(serde_json::Value),
+    Project(Box<crate::project::ProjectMetadata>),
     LogOpened {
         path: PathBuf,
         offset: u64,
@@ -1255,8 +1256,19 @@ impl PipelineRunner {
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
         if let Some(observer) = &self.lifecycle {
-            observer(RunnerUpdate::Project(metadata.clone()));
+            observer(RunnerUpdate::Project(Box::new(metadata.clone())));
+            observer(RunnerUpdate::Configuration(
+                crate::tasks::checkpoint_snapshot(&state),
+            ));
         }
+        let lifecycle = self.lifecycle.clone();
+        let project_manager = project_manager.with_checkpoint_observer(Arc::new(move |state| {
+            if let Some(observer) = &lifecycle {
+                observer(RunnerUpdate::Configuration(
+                    crate::tasks::checkpoint_snapshot(state),
+                ));
+            }
+        }));
         let previous_duration = metadata.duration_ms.unwrap_or(0);
         self.elapsed_offset_ms
             .store(previous_duration, Ordering::Relaxed);
