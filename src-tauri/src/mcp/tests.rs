@@ -90,7 +90,7 @@ async fn official_client_token_free_http_smoke_and_local_request_rejections() {
         )
         .await
         .unwrap();
-    assert_eq!(created.is_error, Some(false));
+    assert_eq!(created.is_error, Some(false), "{created:#?}");
     let task_id = created.structured_content.as_ref().unwrap()["task_id"]
         .as_str()
         .unwrap()

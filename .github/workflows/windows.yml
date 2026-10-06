@@ -54,13 +54,25 @@ jobs:
           npm run verify:engines
           node scripts/smoke-colmap-image-io.mjs engines/colmap/bin/colmap.exe
 
-      - name: Rust formatting, tests, and clippy
+      - name: Rust formatting
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust clippy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Build Windows NSIS installer

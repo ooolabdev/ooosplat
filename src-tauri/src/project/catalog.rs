@@ -222,6 +222,8 @@ fn index_path() -> Result<PathBuf> {
 }
 pub fn default_projects_root() -> Result<PathBuf> {
     dirs::document_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Documents")))
+        .or_else(|| dirs::data_local_dir().map(|data| data.join("Documents")))
         .map(|v| v.join("SplatStudio").join("Projects"))
         .ok_or_else(|| SplatError::Process("无法定位 Documents 目录".into()))
 }
