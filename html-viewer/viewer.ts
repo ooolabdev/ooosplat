@@ -4,6 +4,7 @@ import { PREVIEW_ANIMATION_GLSL, PREVIEW_ANIMATION_WGSL, animationEffectsActive,
 import type { GaussianHtmlView } from "../src/types/pipeline";
 import logo from "../assets/app-icon.svg?raw";
 import { configureViewerResolution } from "./resolution";
+import { configurePreviewRenderer } from "../src/components/GaussianViewer/PreviewBackend";
 const config = JSON.parse(document.getElementById("viewer-config")!.textContent!) as {
     locale: "zh-CN" | "en";
     view: GaussianHtmlView;
@@ -75,6 +76,7 @@ async function boot() {
     }
     app = new Application(canvas, { graphicsDevice: device });
     app.scene.gsplatCentersEnabled = true;
+    configurePreviewRenderer(app);
     app.scene.gsplat.colorUpdateAngle = 0;
     device.on("devicelost", () => fail(labels.lost));
     releaseResolution = configureViewerResolution(app);

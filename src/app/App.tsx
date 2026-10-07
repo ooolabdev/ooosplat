@@ -218,6 +218,20 @@ const completedProjectSummary = (result: PipelineResult, draft: TaskDraft): Proj
   points3d: result.points3d,
   failureMessage: null,
 });
+const resumedProjectSummary = (result: PipelineResult, project: ProjectSummary): ProjectSummary => ({
+  ...project,
+  id: result.projectId,
+  status: "completed",
+  projectPath: result.projectPath,
+  finalPly: result.finalPly,
+  fileSize: result.fileSize,
+  splatCount: result.splatCount,
+  completedAt: result.completedAt,
+  durationMs: result.durationMs,
+  registeredRatio: result.registeredRatio,
+  points3d: result.points3d,
+  failureMessage: null,
+});
 const parentPath = (path: string) => path.replace(/[\\/][^\\/]+[\\/]?$/, "") || path;
 const formatVideoDuration = (seconds: number) => `${Math.floor(seconds / 60)}:${Math.round(seconds % 60).toString().padStart(2, "0")}`;
 const qualityKey: Record<Quality, TranslationKey> = { fast: "quality.fast", balanced: "quality.balanced", high: "quality.high" };
@@ -348,7 +362,7 @@ export function App() {
     : null;
   const detailContextKey = selectedSharedTask ? `task:${selectedSharedTask.task_id}` : selectedDraft ? `draft:${selectedDraft.id}` : selectedProject ? `project:${selectedProject.id}` : "global";
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
-  const sharedProjectIds = new Set(Object.values(sharedTasks).map(task => task.project_id));
+  const sharedProjectIds = new Set(Object.values(sharedTasks).filter(task => !task.project_deleted).map(task => task.project_id));
   const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
   const projectSyncKey = Object.values(sharedTasks).filter(task => task.project_id && !task.project_deleted)
@@ -1247,11 +1261,16 @@ export function App() {
     }
     setFailureDialog(null);
     store.beginRun();
+    let completedProject: ProjectSummary | null = null;
     try {
       const result = await resumePipeline(project.id);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
+      completedProject = resumedProjectSummary(result, project);
+      selectProject(completedProject);
+      await refreshCompletedProject(completedProject);
+      await refreshTasks();
     } catch (error) {
       const backendElapsed = useAppStore.getState().latestEvent?.elapsedMs ?? 0;
       setLiveElapsedMs(runElapsedOffset.current + backendElapsed);
@@ -1266,11 +1285,13 @@ export function App() {
         setFailureDialog(inferFailureDialog(error, fallbackStage, project.id));
       }
     } finally {
-      try {
-        const overview = await refreshProjects();
-        const refreshed = overview.projects.find((item) => item.id === project.id);
-        if (refreshed) selectProject(refreshed);
-      } catch { /* the project remains on disk */ }
+      if (!completedProject) {
+        try {
+          const overview = await refreshProjects();
+          const refreshed = overview.projects.find((item) => item.id === project.id);
+          if (refreshed) selectProject(refreshed);
+        } catch { /* the project remains on disk */ }
+      }
       releaseRunGate();
       setActiveProjectId(null);
     }

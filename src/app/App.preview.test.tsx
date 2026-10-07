@@ -950,6 +950,21 @@ describe("App preview workspace", () => {
     expect(mocks.estimateProjectRuntime).toHaveBeenCalledWith(project.id);
   });
 
+  it("keeps a resumed project in the completed list when the first catalog refresh misses it", async () => {
+    const unfinished = { ...project, status: "failed" as const, finalPly: null, completedAt: null };
+    await act(async () => { useAppStore.setState({ projects: [unfinished] }); });
+    mocks.getProjectOverview.mockResolvedValue({ projectsRoot: "E:\\Projects", projects: [] });
+
+    const resumeButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "继续任务");
+    await act(async () => { resumeButton?.click(); });
+    await flush();
+
+    const completed = useAppStore.getState().projects.find((item) => item.id === project.id);
+    expect(completed).toMatchObject({ status: "completed", finalPly: project.finalPly });
+    expect(container.querySelector(`#completed-task-group-content .project-row`)).not.toBeNull();
+    expect(container.querySelector(`#unfinished-task-group-content .project-row`)).toBeNull();
+  });
+
   it("shows actionable mapper guidance and opens the validated project log folder", async () => {
     const unfinished = { ...project, status: "failed" as const, finalPly: null, completedAt: null };
     mocks.resumePipeline.mockRejectedValueOnce({

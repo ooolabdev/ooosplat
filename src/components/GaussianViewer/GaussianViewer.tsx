@@ -96,7 +96,7 @@ import {
   verticalFovForCapture,
   type NormalizedCaptureRegion,
 } from "./PreviewCapture";
-import { previewDeviceTypes } from "./PreviewBackend";
+import { configurePreviewRenderer, previewDeviceTypes } from "./PreviewBackend";
 import {
   GAUSSIAN_VIDEO_FRAME_COUNT,
   gaussianVideoDimensions,
@@ -276,6 +276,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const editorStateRef = useRef({ crop, mode, tool, deletedMask, selectionMask });
   editorStateRef.current = { crop, mode, tool, deletedMask, selectionMask };
   app.scene.gsplatCentersEnabled = true;
+  configurePreviewRenderer(app);
   app.scene.gsplat.colorUpdateAngle = 0;
   const rangeSource = useMemo(
     () => shouldUseSplatRange(fileSize) ? createSplatRangeSource(assetUrl, fileSize) : null,
