@@ -2261,7 +2261,11 @@ impl PipelineRunner {
             );
         }
 
-        let allow_two_view_tracks = state.planner_enabled && preset.sfm_allow_two_view_tracks;
+        let allow_two_view_tracks = should_allow_two_view_tracks(
+            state.planner_enabled,
+            preset.sfm_allow_two_view_tracks,
+            prepared.has_alpha,
+        );
         if state.reconstruction_complete {
             self.events
                 .stage(PipelineStage::Reconstructing, 1.0, "已复用相机重建检查点");
@@ -3516,6 +3520,14 @@ fn brush_oom_fallback(
         .flatten()
 }
 
+fn should_allow_two_view_tracks(
+    planner_enabled: bool,
+    preset_allows_two_view_tracks: bool,
+    has_transparency_mask: bool,
+) -> bool {
+    planner_enabled && preset_allows_two_view_tracks && has_transparency_mask
+}
+
 fn checkpoint_stage(state: &PipelineStateFile) -> PipelineStage {
     if state.brush_complete {
         PipelineStage::TrainingSplats
@@ -4496,6 +4508,14 @@ mod tests {
     #[test]
     fn reshoot_project_name_uses_the_short_suffix() {
         assert_eq!(reshoot_project_name("示例项目"), "示例项目_补拍");
+    }
+
+    #[test]
+    fn two_view_tracks_require_automatic_optimization_and_transparency_masks() {
+        assert!(should_allow_two_view_tracks(true, true, true));
+        assert!(!should_allow_two_view_tracks(false, true, true));
+        assert!(!should_allow_two_view_tracks(true, true, false));
+        assert!(!should_allow_two_view_tracks(true, false, true));
     }
 
     #[test]
