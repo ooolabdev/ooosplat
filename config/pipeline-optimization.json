@@ -157,9 +157,9 @@
       "maxResolution": 1600,
       "maxSplats": 500000,
       "densification": {
-        "growthGradThreshold": 0.00004,
-        "growthSelectFraction": 0.15,
-        "growthStopIter": 6000
+        "growthGradThreshold": 0.0022,
+        "growthSelectFraction": 0.11,
+        "growthStopIter": 7000
       },
       "oomFallback": null
     },
@@ -174,9 +174,9 @@
       "maxResolution": 1920,
       "maxSplats": 1000000,
       "densification": {
-        "growthGradThreshold": 0.00003,
-        "growthSelectFraction": 0.2,
-        "growthStopIter": 12000
+        "growthGradThreshold": 0.002,
+        "growthSelectFraction": 0.12,
+        "growthStopIter": 13000
       },
       "oomFallback": null
     },
@@ -191,9 +191,9 @@
       "maxResolution": 3200,
       "maxSplats": 1200000,
       "densification": {
-        "growthGradThreshold": 0.00002,
-        "growthSelectFraction": 0.25,
-        "growthStopIter": 23000
+        "growthGradThreshold": 0.0018,
+        "growthSelectFraction": 0.13,
+        "growthStopIter": 21000
       },
       "oomFallback": "highEmergency"
     },
@@ -208,9 +208,9 @@
       "maxResolution": 3840,
       "maxSplats": 1500000,
       "densification": {
-        "growthGradThreshold": 0.00002,
-        "growthSelectFraction": 0.3,
-        "growthStopIter": 25000
+        "growthGradThreshold": 0.0016,
+        "growthSelectFraction": 0.14,
+        "growthStopIter": 23000
       },
       "oomFallback": "highLow"
     },
@@ -225,9 +225,9 @@
       "maxResolution": "source",
       "maxSplats": 4000000,
       "densification": {
-        "growthGradThreshold": 0.00002,
-        "growthSelectFraction": 0.3,
-        "growthStopIter": 25000
+        "growthGradThreshold": 0.0015,
+        "growthSelectFraction": 0.15,
+        "growthStopIter": 24000
       },
       "oomFallback": "highStandard"
     },
@@ -240,11 +240,11 @@
       "sfmMaxImageSize": 2000,
       "totalSteps": 30000,
       "maxResolution": 2000,
-      "maxSplats": 200000,
+      "maxSplats": 1000000,
       "densification": {
-        "growthGradThreshold": 0.00004,
-        "growthSelectFraction": 0.2,
-        "growthStopIter": 20000
+        "growthGradThreshold": 0.0023,
+        "growthSelectFraction": 0.1,
+        "growthStopIter": 16000
       },
       "oomFallback": null
     }

@@ -399,10 +399,10 @@ mod tests {
         assert_eq!(fast.planned_sfm_max_features, 4_096);
         assert_eq!(balanced.planned_sfm_max_features, 8_192);
         assert_eq!(high.planned_sfm_max_features, 16_384);
-        assert_eq!(fast.brush_densification.unwrap().growth_stop_iter, 6_000);
+        assert_eq!(fast.brush_densification.unwrap().growth_stop_iter, 7_000);
         assert_eq!(
             balanced.brush_densification.unwrap().growth_grad_threshold,
-            0.00003
+            0.002
         );
         assert!(high.sfm_allow_two_view_tracks);
     }
@@ -536,6 +536,8 @@ mod tests {
         assert_eq!(low.profile, BrushTrainingProfile::HighLow);
         assert_eq!(emergency.profile, BrushTrainingProfile::HighEmergency);
         assert_eq!(emergency.preset.max_resolution, 2_000);
+        assert_eq!(emergency.configured_max_splats, Some(1_000_000));
+        assert_eq!(emergency.preset.max_splats, Some(1_000_000));
         assert!(emergency.downgrade_after_oom(50_000).is_none());
     }
 

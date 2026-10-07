@@ -489,9 +489,69 @@ mod tests {
         assert_eq!(config.brush_profiles.fast.max_splats, Some(500_000));
         assert_eq!(config.brush_profiles.balanced.max_splats, Some(1_000_000));
         assert_eq!(
+            config.brush_profiles.high_emergency.max_splats,
+            Some(1_000_000)
+        );
+        assert_eq!(
             config.qualities.fast.automatic_optimization_on.initial_fps,
             6.0
         );
+    }
+
+    #[test]
+    fn automatic_densification_profiles_are_exact() {
+        let config = parse_and_validate(EMBEDDED_CONFIG).unwrap();
+        for (profile, threshold, fraction, stop, cap) in [
+            (BrushTrainingProfile::Fast, 0.0022, 0.11, 7_000, 500_000),
+            (
+                BrushTrainingProfile::Balanced,
+                0.002,
+                0.12,
+                13_000,
+                1_000_000,
+            ),
+            (
+                BrushTrainingProfile::HighLow,
+                0.0018,
+                0.13,
+                21_000,
+                1_200_000,
+            ),
+            (
+                BrushTrainingProfile::HighStandard,
+                0.0016,
+                0.14,
+                23_000,
+                1_500_000,
+            ),
+            (
+                BrushTrainingProfile::HighLarge,
+                0.0015,
+                0.15,
+                24_000,
+                4_000_000,
+            ),
+            (
+                BrushTrainingProfile::HighEmergency,
+                0.0023,
+                0.10,
+                16_000,
+                1_000_000,
+            ),
+        ] {
+            let actual = config.brush_profiles.get(profile);
+            assert_eq!(actual.max_splats, Some(cap), "{} cap", profile.label());
+            assert_eq!(
+                actual.densification,
+                Some(BrushDensificationPreset {
+                    growth_grad_threshold: threshold,
+                    growth_select_fraction: fraction,
+                    growth_stop_iter: stop,
+                }),
+                "{} densification",
+                profile.label()
+            );
+        }
     }
 
     #[test]

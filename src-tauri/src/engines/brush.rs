@@ -490,13 +490,13 @@ mod tests {
 
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--growth-grad-threshold", "0.00002"]));
+            .any(|pair| pair == ["--growth-grad-threshold", "0.0016"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--growth-select-fraction", "0.3"]));
+            .any(|pair| pair == ["--growth-select-fraction", "0.14"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--growth-stop-iter", "25000"]));
+            .any(|pair| pair == ["--growth-stop-iter", "23000"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--refine-every", "200"]));
@@ -514,10 +514,13 @@ mod tests {
         ));
         assert!(fast
             .windows(2)
-            .any(|pair| pair == ["--growth-select-fraction", "0.15"]));
+            .any(|pair| pair == ["--growth-grad-threshold", "0.0022"]));
         assert!(fast
             .windows(2)
-            .any(|pair| pair == ["--growth-stop-iter", "6000"]));
+            .any(|pair| pair == ["--growth-select-fraction", "0.11"]));
+        assert!(fast
+            .windows(2)
+            .any(|pair| pair == ["--growth-stop-iter", "7000"]));
         assert!(fast
             .windows(2)
             .any(|pair| pair == ["--max-splats", "500000"]));
@@ -529,10 +532,13 @@ mod tests {
         ));
         assert!(balanced
             .windows(2)
-            .any(|pair| pair == ["--growth-grad-threshold", "0.00003"]));
+            .any(|pair| pair == ["--growth-grad-threshold", "0.002"]));
         assert!(balanced
             .windows(2)
-            .any(|pair| pair == ["--growth-stop-iter", "12000"]));
+            .any(|pair| pair == ["--growth-select-fraction", "0.12"]));
+        assert!(balanced
+            .windows(2)
+            .any(|pair| pair == ["--growth-stop-iter", "13000"]));
         assert!(balanced
             .windows(2)
             .any(|pair| pair == ["--max-splats", "1000000"]));

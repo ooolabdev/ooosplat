@@ -49,12 +49,12 @@ Brush 配置如下：
 
 | Profile | 梯度阈值 | 选择比例 | 停止增密迭代 | Splat 上限 | OOM 后一次降级 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Fast | 0.00004 | 0.15 | 6,000 | 500,000 | 无 |
-| Balanced | 0.00003 | 0.20 | 12,000 | 1,000,000 | 无 |
-| High Low | 0.00002 | 0.25 | 23,000 | 200,000 | High Emergency |
-| High Standard | 0.00002 | 0.30 | 25,000 | 1,500,000 | High Low |
-| High Large | 0.00002 | 0.30 | 25,000 | 4,000,000 | High Standard |
-| High Emergency | 0.00004 | 0.20 | 20,000 | 200,000 | 无 |
+| Fast | 0.0022 | 0.11 | 7,000 | 500,000 | 无 |
+| Balanced | 0.0020 | 0.12 | 13,000 | 1,000,000 | 无 |
+| High Low | 0.0018 | 0.13 | 21,000 | 1,200,000 | High Emergency |
+| High Standard | 0.0016 | 0.14 | 23,000 | 1,500,000 | High Low |
+| High Large | 0.0015 | 0.15 | 24,000 | 4,000,000 | High Standard |
+| High Emergency | 0.0023 | 0.10 | 16,000 | 1,000,000 | 无 |
 
 实际 `maxSplats` 不会低于初始 SfM 三维点数。Fast 和 Balanced 不增加 OOM 降级链；High 只有在错误明确分类为显存不足时才按当前 Profile 的 `oomFallback` 降低一级，并且整次任务最多自动重试一次；`DeviceLost` 或普通进程错误不会触发该降级。
 
