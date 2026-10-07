@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Current version: **0.5.0**. This release adds Quality v2 automatic parameter planning, video bridge-frame recovery, VRAM-aware training, same-camera incremental high-resolution reshoots, and further Windows Brush and preview stability improvements. The main branch has since added local MCP v1, which is not yet part of a published release.
+Main development version: **0.6.0**. Latest published release: **0.5.0**. The current 0.6.0 work adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, corrected transparent-input handling, and further Auto Optimize, training densification, and preview stability improvements.
 
 ## Product Principles
 
@@ -56,7 +56,7 @@ Current version: **0.5.0**. This release adds Quality v2 automatic parameter pla
 | Completed · 0.5.0 | Same-camera incremental high-resolution reshoots | Completed projects can add video or images captured with the same device, lens, and resolution. OOOSplat reuses the source database, shared camera, and sparse model, processes only new views, fully retrains Brush, and supports transparent MOV/PNG media. | [PR #49](https://github.com/ooolabdev/ooosplat/pull/49) |
 | Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
 | Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
-| Completed · main | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented on main; not yet released |
+| Completed · 0.6.0 | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented in the 0.6.0 main development version |
 
 ## Tracking and Contributions
 

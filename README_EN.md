@@ -12,20 +12,20 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.5.0"><strong>⬇️ Download OOOSplat 0.5.0 for Windows, macOS, or Ubuntu</strong></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.5.0"><strong>⬇️ Download the latest release, OOOSplat 0.5.0, for Windows, macOS, or Ubuntu</strong></a>
 </p>
 
 OOOSplat is a local desktop application that turns an ordinary orbit video or image sequence into a 3D Gaussian Splatting project in one workflow. Choose source media, a project directory, and a quality preset, and OOOSplat automatically handles image preparation, camera reconstruction, training, PLY publishing, preview, adjustment, and export.
 
 Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal GUI workflows do not depend on a remote service or localhost API; a loopback HTTP endpoint starts only when the optional MCP service is enabled.
 
-Current version: **0.5.0**
+Main development version: **0.6.0**. Latest published release: **0.5.0**.
 
 The main branch includes optional local MCP v1. It is disabled by default, listens only on `127.0.0.1`, and does not require a token. Enabling it automatically authorizes the projects root's `Inputs` directory, with additional input directories available by explicit authorization. A local AI Agent can use seven tools to create, start, list, inspect, read logs from, and cancel tasks that remain visible in the same application. See [MCP v1 setup, tools, and lifecycle](docs/mcp-v1.md).
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
-> Version 0.5.0 adds experimental Auto Optimize, enabled by default and optional, to plan reconstruction and training from the source, quality preset, and available VRAM, with bridge-frame recovery when video reconstruction coverage is low. It also adds same-camera incremental high-resolution reshoots, more stable Windows Brush GPU selection, and preview improvements.
+> The 0.6.0 main development version adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, unpremultiplied transparent input with binary masks, and further Auto Optimize, training densification, and preview stability improvements.
 
 ## Why OOOSplat
 
@@ -144,10 +144,10 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
-After downloading the `OOOSplat-0.5.0-x64-linux` Artifact from GitHub Actions, install it with:
+After downloading the `OOOSplat-0.6.0-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
 
 ```bash
-sudo apt install ./OOOSplat-0.5.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 ```
 
 The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
@@ -232,7 +232,7 @@ What is sent:
 | Field | Description |
 | --- | --- |
 | Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
-| App version, OS, CPU architecture | For example `0.5.0` / `windows` / `x86_64` |
+| App version, OS, CPU architecture | For example `0.6.0` / `windows` / `x86_64` |
 | Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`, `planner_evaluation`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
 | Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
 | Stage and total durations | Milliseconds |
@@ -363,7 +363,7 @@ npm run package:windows
 The NSIS installer is written to:
 
 ```text
-dist-artifacts\OOOSplat-0.5.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.6.0-x64-windows.exe
 ```
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.
