@@ -12,20 +12,20 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.5.0"><strong>⬇️ 下载最新正式版 OOOSplat 0.5.0（Windows / macOS / Ubuntu）</strong></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.0"><strong>⬇️ 下载最新正式版 OOOSplat 0.6.0（Windows / macOS / Ubuntu）</strong></a>
 </p>
 
 OOOSplat 是一款将普通环绕拍摄视频或图片序列一键转换为 3D Gaussian Splatting 的本地桌面应用。选择素材、项目目录和质量档位后，应用会自动完成画面准备、相机重建、训练与 PLY 发布，并可直接预览、调整和导出结果。
 
 Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLMAP 和 Brush；Linux 支持目前仅作为 Ubuntu 24.04 LTS x86_64 Alpha 提供。整个生成流程使用本机 CPU 和 GPU，输入素材、工程文件、模型与日志无需上传到云端重建或训练服务。React 界面通过 Tauri 直接调用本机 Rust 后端；普通 GUI 工作流不依赖远程服务或 localhost API，只有用户启用可选 MCP 服务时才会启动本机 loopback HTTP 入口。
 
-main 开发版本：**0.6.0**；最新正式发布版本：**0.5.0**。
+当前正式版本：**0.6.0**。
 
-main 分支已包含可选的本地 MCP v1：服务默认关闭、仅监听 `127.0.0.1` 且无需 token。启用后会自动授权项目根目录下的 `Inputs`，也可添加其他素材目录；本机 AI Agent 可通过七个工具创建、启动、列出、查询、读取日志及取消任务，任务会同步显示在同一应用界面中。连接方式与生命周期说明见 [MCP v1 文档](docs/mcp-v1.md)。
+OOOSplat 提供可选的本地 MCP：服务默认关闭、仅监听 `127.0.0.1` 且无需 token。本机 AI Agent 可以创建和启动任务、查看进度与日志，以及取消任务；所有任务都会同步显示在应用界面中。连接方式见 [MCP 文档](docs/mcp-v1.md)。
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.6.0 main 开发版加入本地 MCP v1、共享任务服务、COLMAP 4.2.1 跨平台运行时、透明素材未预乘输入与二值 Mask，并继续调整自动优化、训练增密和预览稳定性。
+> 0.6.0 加入 MCP、多任务管理、透明素材支持、横屏视频与离线 HTML 导出，并升级 COLMAP、自动优化和训练监控。
 
 ## 核心优势
 
@@ -50,34 +50,16 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## 主要功能
 
-- 从 MP4、MOV 视频，或包含 JPG、JPEG、PNG 的图片序列文件夹创建 Gaussian Splatting 项目。
-- 默认开启“自动优化（实验性）”：视频根据档位采用 6 / 8 / 12 FPS 初始采样，并在画面准备、COLMAP 和 Brush 阶段使用对应的分辨率策略；初始重建覆盖不足时，会在剩余预算内尝试补充桥接画面。关闭后继续使用旧版固定比例抽帧和分辨率策略。
-- 图片序列保留全部图片并使用共享相机、穷举匹配和现有增量 Mapper；视频使用顺序匹配，桥接补帧不适用于图片序列。
-- 自动检测透明 MOV 的 Alpha 通道，同步提取未预乘的 RGBA PNG 画面，并按 `alpha >= 128` 生成严格的 0/255 COLMAP Mask；被遮罩区域不会参与特征提取，原始颜色与 Alpha 继续供 Brush 使用。
-- 自动检测透明 PNG，保持原文件及其位深、RGB 和 Alpha 不变，并以等价的 0.5 Alpha 阈值生成二值 COLMAP Mask。
-- 已完成项目支持“高清补拍”：使用同一设备、同一镜头和相同分辨率补充视频或图片后，OOOSplat 会复用原数据库、共享相机与稀疏模型，只处理新增画面的特征、匹配和注册，再使用全部已注册画面完整重训 Brush。透明 MOV/PNG 补拍素材会保留 RGBA 并自动生成 Mask；补拍会创建独立派生项目，不覆盖原项目。
-- 三个平台内置同一 commit 的 COLMAP 4.2.1；Windows/Linux 为自编译 CUDA + Caspar + Ceres 包，macOS 为 arm64 Ceres CPU 包。Brush 使用锁定的 OOOBrush ooo-v1.0.0 无界面 CLI；FFmpeg 策略保持不变。
-- COLMAP 会自动检查内置 CUDA 运行时、NVIDIA 驱动版本和显卡 Compute Capability，满足要求时使用 GPU 加速特征提取与匹配，否则自动回退到 CPU。
-- 精细档会依据检测到的显存选择 Brush 训练分辨率和 Splat 上限；若明确检测到显存不足，会安全降低一次训练配置后重试。Windows 单 NVIDIA 独显环境还会优先稳定选择该独显，并为显卡设备中断提供明确提示。
-- 实时显示处理阶段、引擎输出、关键计数、累计耗时和最多 500 条界面日志。
-- 原始进程输出完整写入项目的 `logs` 目录。
-- 支持取消任务，并通过 Windows Job Object 或 Unix process group 终止整个子进程树。
-- 支持自定义项目根目录，默认位置为 `Documents\SplatStudio\Projects`。
-- 自动记录已完成、失败、中断和取消的历史任务。
-- 可选的本地 MCP v1 与 GUI 共用任务服务、运行锁、进度、日志和结果；本机 Agent 可调用 `get_app_status`、`create_generation_task`、`start_task`、`list_tasks`、`get_task_status`、`read_task_logs` 和 `cancel_task`。
-- 支持阶段级断点续跑：重新检查抽帧、Mask、COLMAP 数据库、稀疏重建和 PLY 检查点，复用可信阶段，并从最早的不可信阶段安全重跑。
-- 根据素材规模、质量档位和本机历史任务估算生成时长；Brush 训练阶段持续更新进度。
-- 在“03 预览”中直接加载历史项目的 `.ply`，支持 Orbit、Pan 和 Zoom；“调整 / 动画”双模式切换不会重新加载模型或重置相机。
-- 调整模式支持整个 Gaussian 模型的位置、旋转、等比缩放，以及撤销 / 重做。
-- 预览地面网格使用持久渲染资源，减少长时间预览中的重复绘制开销；模型 Transform 缩放范围扩展至 `0.001–10000`。
-- 提供矩形、球形和盒形 Gaussian 选择工具：矩形可穿透框选并非破坏式删除点，球形和盒形区域则实时保留区域内的 Gaussian。
-- 裁切区域和删除记录会自动保存；点击“保存”时将编辑结果写入唯一的 `edit.ply`，后续保存会安全替换该文件，始终不覆盖原始 `final.ply`。
-- 动画模式依次播放 5 秒显现、8 秒冲击波和持续相机环绕，可切换竖屏（1080×1920）或横屏（1920×1080）构图，并导出带 OOOSplat 水印的 30 fps、23 秒 H.264 MP4。
-- “导出”菜单还支持完整画质的单文件离线 HTML：内嵌查看器与模型，无需联网，双击即可旋转、平移、缩放和手动播放动画。保留当前变换、裁切、删除结果及全部未删除 Gaussian / SH 数据，不修改 `final.ply` 或 `edit.ply`。文件约为对应 PLY 的 4/3，另加查看器；超大模型仍受浏览器和设备能力限制。
-- 可在平台文件管理器中定位 `final.ply`，或将整个项目移入系统回收站。
-- 可拖动中央分界线调整左右面板宽度；右下角支持 80%–140% 整体界面缩放。
-- 支持中文、空格、长文件名和 UNC 项目路径。
-- 界面支持简体中文与英文即时切换；首次启动按系统语言自动选择，手动切换后会记住用户选择。
+- **一键生成**：支持 MP4、MOV 和 JPG、JPEG、PNG 图片序列，自动完成画面准备、相机重建、训练和 PLY 发布。
+- **三种质量档位**：提供快速、均衡和精细档；自动优化会根据素材与显存选择合适的抽帧、分辨率和训练配置。
+- **透明素材**：支持透明 MOV 和 PNG，保留原始颜色与 Alpha，并自动生成 COLMAP 黑白蒙版。
+- **多任务管理**：保存多个任务草稿和历史记录，实时显示阶段、进度、耗时、硬件占用与日志；支持取消和断点续跑。
+- **MCP**：Codex 等本机 AI Agent 可以创建、启动、查询和取消任务，并读取运行日志。MCP 任务与手动任务显示在同一个界面中。
+- **补拍**：为已完成项目补充新视频或图片，并创建独立的新项目，不覆盖原结果。
+- **预览与编辑**：直接预览 PLY，支持旋转、平移、缩放、模型变换、区域裁切、点删除和撤销重做。
+- **多种导出**：支持竖屏或横屏 MP4、单文件离线 HTML，以及原始或编辑后的 PLY。
+- **本地运行**：COLMAP 重建与 Brush 训练都在本机完成；满足条件时自动使用 GPU，否则使用可用的兼容路径。
+- **跨平台与双语界面**：支持 Windows、Apple Silicon macOS 和 Ubuntu，并可在简体中文与英文之间切换。
 
 ### Gaussian 编辑快捷键
 
@@ -156,7 +138,7 @@ sudo apt install ./OOOSplat-0.6.0-x64-linux.deb
 
 测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
 
-1. Windows 运行 `OOOSplat-0.5.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.5.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.5.0-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.6.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.6.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.6.0-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在“01 创建新任务”的输入类型下拉栏选择“视频”或“图片”，再点击输入框选择视频文件或图片序列文件夹。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -270,19 +252,20 @@ Windows、Ubuntu 和 macOS 的来源与校验策略分别记录在 [`engines/man
 
 ### 下载 COLMAP 开发包
 
-手动运行 Actions 中的 **COLMAP-only development runtime**，选择 `all` 或指定平台，
-构建成功后下载对应 Artifact。解开外层 ZIP 和内部运行归档，将顶层目录的内容放到：
+运行 `npm run setup:engines` 会自动下载并校验开发所需的两个引擎：
+
+- COLMAP 从 [**ooosplat-colmap**](https://github.com/ooolabdev/ooosplat-colmap) 下载。
+- Brush 从 [**OOOBrush**](https://github.com/ooolabdev/OOOBrush) 下载。
+
+如需手动安装，请从两个仓库的 Releases 下载对应平台的包。COLMAP 解压后的内容放到：
 
 - Windows：`engines/colmap/`，可执行文件为 `bin/colmap.exe`。
 - Linux：`engines/linux/colmap/`，可执行文件为 `bin/colmap`。
 - macOS：`engines/macos/arm64/colmap/`，可执行文件为 `bin/colmap`。
 
-完整保留 COLMAP 运行库、许可证和元数据，不要多套一层目录。已有 FFmpeg 保持不变。
-随后运行 `npm run dev:local` 或 `npm run build:local`；这两个本地入口自动下载、校验并缓存锁定的 OOOBrush，COLMAP 则不安装、下载或校验，
-也不修改正式清单。应用运行时健康检查仍然保留，正式构建继续执行严格校验。
+完整保留运行库、许可证和元数据，不要多套一层目录。`npm run dev:local` 和 `npm run build:local` 也会准备并校验锁定版本的 OOOBrush。
 
-Artifact 保留 30 天；手动流水线需先存在于默认分支才能触发。
-详细步骤见 [引擎开发包说明](engines/README.md#download-colmap-only-development-builds)。
+详细目录结构和校验方式见 [引擎开发包说明](engines/README.md)。
 
 ### 开发环境
 

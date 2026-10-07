@@ -12,20 +12,20 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.5.0"><strong>⬇️ Download the latest release, OOOSplat 0.5.0, for Windows, macOS, or Ubuntu</strong></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.6.0"><strong>⬇️ Download the latest release, OOOSplat 0.6.0, for Windows, macOS, or Ubuntu</strong></a>
 </p>
 
 OOOSplat is a local desktop application that turns an ordinary orbit video or image sequence into a 3D Gaussian Splatting project in one workflow. Choose source media, a project directory, and a quality preset, and OOOSplat automatically handles image preparation, camera reconstruction, training, PLY publishing, preview, adjustment, and export.
 
 Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal GUI workflows do not depend on a remote service or localhost API; a loopback HTTP endpoint starts only when the optional MCP service is enabled.
 
-Main development version: **0.6.0**. Latest published release: **0.5.0**.
+Current release: **0.6.0**.
 
-The main branch includes optional local MCP v1. It is disabled by default, listens only on `127.0.0.1`, and does not require a token. Enabling it automatically authorizes the projects root's `Inputs` directory, with additional input directories available by explicit authorization. A local AI Agent can use seven tools to create, start, list, inspect, read logs from, and cancel tasks that remain visible in the same application. See [MCP v1 setup, tools, and lifecycle](docs/mcp-v1.md).
+OOOSplat includes optional local MCP. It is disabled by default, listens only on `127.0.0.1`, and does not require a token. Local AI agents can create and start tasks, inspect progress and logs, and cancel tasks. All tasks remain visible in the application. See the [MCP documentation](docs/mcp-v1.md).
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
-> The 0.6.0 main development version adds local MCP v1, the shared task service, cross-platform COLMAP 4.2.1 runtimes, unpremultiplied transparent input with binary masks, and further Auto Optimize, training densification, and preview stability improvements.
+> 0.6.0 adds MCP, multi-task management, transparent-media support, landscape video and offline HTML exports, plus upgrades to COLMAP, Auto Optimize, and training monitoring.
 
 ## Why OOOSplat
 
@@ -50,34 +50,16 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## Key Features
 
-- Create Gaussian Splatting projects from MP4/MOV videos or folders containing JPG, JPEG, and PNG images.
-- “Auto Optimize (Experimental)” is enabled by default. Video starts at a 6 / 8 / 12 FPS target and uses preset-specific resolution policies for frame preparation, COLMAP, and Brush. If initial reconstruction coverage is low, OOOSplat can add bridge frames within the remaining budget. Disabling it restores the legacy fixed-ratio extraction and resolution strategy.
-- Image sequences keep every image and use a shared camera, exhaustive matching, and the existing incremental Mapper. Videos use sequential matching; bridge-frame recovery does not apply to image sequences.
-- Detect Alpha channels in transparent MOV files, extract unpremultiplied RGBA PNG frames, and create strict 0/255 COLMAP masks at `alpha >= 128` in one pass. Masked pixels are excluded from feature extraction while the original color and Alpha remain available to Brush.
-- Detect transparent PNG images automatically, preserve the original file, bit depth, RGB, and Alpha, and generate binary COLMAP masks at the equivalent 0.5 Alpha threshold.
-- Add high-resolution reshoots to completed projects. Capture video or images with the same device, lens, and resolution; OOOSplat reuses the original database, shared camera, and sparse model, processes only the new features, matches, and registrations, then retrains Brush from every registered image. Transparent MOV/PNG reshoots preserve RGBA and receive automatic masks. Each reshoot creates a separate derived project and never overwrites its source.
-- Bundle COLMAP 4.2.1 from the same commit on all platforms: self-built CUDA/Caspar/Ceres on Windows/Linux, Ceres CPU on Apple Silicon. Brush uses pinned OOOBrush ooo-v1.0.0 headless CLI; FFmpeg policy is unchanged.
-- Automatically check the bundled CUDA runtime, NVIDIA driver version, and GPU Compute Capability. COLMAP uses GPU acceleration for feature extraction and matching when the requirements are met, and otherwise falls back to CPU.
-- Detailed quality selects the Brush training resolution and Splat limit from detected VRAM. If an explicit out-of-memory failure occurs, OOOSplat safely retries once with a lower training profile. On Windows systems with one NVIDIA discrete GPU, Brush also prefers that adapter and provides clearer guidance for device-loss failures.
-- Show processing stages, engine output, key counters, elapsed time, and up to 500 UI log entries in real time.
-- Write complete raw process output to the project `logs` directory.
-- Cancel tasks and terminate the full child-process tree with a Windows Job Object or Unix process group.
-- Choose a custom projects root, defaulting to `Documents\SplatStudio\Projects`.
-- Track completed, failed, interrupted, and cancelled tasks.
-- Share tasks, the execution lock, progress, logs, and results between the GUI and optional local MCP v1. Local Agents can call `get_app_status`, `create_generation_task`, `start_task`, `list_tasks`, `get_task_status`, `read_task_logs`, and `cancel_task`.
-- Resume interrupted pipelines at stage boundaries. OOOSplat validates frame, mask, COLMAP database, sparse reconstruction, and PLY checkpoints, reuses trusted stages, and safely reruns from the earliest invalid stage.
-- Estimate generation time from source size, quality preset, and recent successful local projects, while continuously updating Brush training progress.
-- Preview completed `.ply` projects under “03 Preview” with Orbit, Pan, and Zoom. Switching between Adjust and Animation does not reload the model or reset the camera.
-- Use Adjust mode to edit whole-model position, rotation, and uniform scale, with undo and redo.
-- The preview ground grid uses persistent rendering resources to reduce repeated work during long sessions, and the model Transform scale range is expanded to `0.001–10000`.
-- Use rectangle, sphere, and box Gaussian selection tools. Rectangle selection projects centers through the scene for non-destructive deletion, while sphere and box crops keep points inside the live selection volume.
-- Crop and deletion state is saved automatically. “Save” writes the current result to the single `edit.ply`; later saves safely replace it, while the original `final.ply` is never overwritten.
-- Play a 5-second reveal, an 8-second shockwave, and a continuous camera orbit. Choose portrait (1080×1920) or landscape (1920×1080) composition and export a watermarked 30 fps, 23-second H.264 MP4.
-- The Export menu also creates a full-quality, single-file offline HTML viewer with the runtime and model embedded. Double-click to rotate, pan, zoom, and manually play the animation without internet access. Current transforms, crops, deletions, and all retained Gaussian / SH data are preserved; `final.ply` and `edit.ply` are not modified. File size is roughly 4/3 of the corresponding PLY, plus the viewer. Very large models remain subject to browser and device capacity.
-- Reveal `final.ply` in the platform file manager or move the complete project to the system trash.
-- Resize the left and right panels by dragging the divider, and scale the full interface from 80% to 140%.
-- Support Chinese characters, spaces, long file names, and UNC project paths.
-- Switch instantly between the Simplified Chinese and English interfaces. The first launch follows the system language, and an explicit choice is remembered.
+- **One-click generation**: Create a Gaussian Splat from MP4/MOV video or a JPG, JPEG, and PNG image folder. OOOSplat handles image preparation, camera reconstruction, training, and PLY publishing.
+- **Three quality presets**: Fast, Balanced, and High are available. Auto Optimize selects suitable extraction, resolution, and training settings for the source and available VRAM.
+- **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
+- **Multi-task workspace**: Keep multiple drafts and task histories, monitor stages, progress, elapsed time, hardware usage, and logs, and cancel or resume tasks.
+- **MCP**: Local AI agents such as Codex can create, start, inspect, and cancel tasks and read their logs. MCP and manual tasks appear in the same interface.
+- **High-resolution reshoots**: Add video or images to a completed project and create a separate result without overwriting the original.
+- **Preview and editing**: Preview PLY files and use orbit, pan, zoom, transforms, crop tools, point deletion, undo, and redo.
+- **Multiple export formats**: Export portrait or landscape MP4, standalone offline HTML, and original or edited PLY files.
+- **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
+- **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
 
 ### Gaussian Editing Shortcuts
 
@@ -156,7 +138,7 @@ The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned
 
 Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
 
-1. On Windows, run `OOOSplat-0.5.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.5.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.5.0-x64-linux.deb`.
+1. On Windows, run `OOOSplat-0.6.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.6.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.6.0-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Under “01 Create New Task,” choose Video or Images from the input-type menu, then click the input field to select a video file or image-sequence folder.
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -268,22 +250,20 @@ Third-party licenses and notices are in [`licenses/`](licenses/):
 
 ### Download COLMAP Development Packages
 
-Manually run **COLMAP-only development runtime** in Actions, selecting `all` or
-one platform. Download the successful job's Artifact, extract its outer ZIP and
-inner runtime archive, and copy the top-level directory's **contents** into:
+Run `npm run setup:engines` to download and verify both engines required for development:
+
+- COLMAP is downloaded from [**ooosplat-colmap**](https://github.com/ooolabdev/ooosplat-colmap).
+- Brush is downloaded from [**OOOBrush**](https://github.com/ooolabdev/OOOBrush).
+
+For manual installation, download the package for your platform from each repository's Releases page. Copy the extracted COLMAP contents into:
 
 - Windows: `engines/colmap/` (`bin/colmap.exe`).
 - Linux: `engines/linux/colmap/` (`bin/colmap`).
 - macOS: `engines/macos/arm64/colmap/` (`bin/colmap`).
 
-Keep libraries, licenses and metadata together; do not add another wrapper
-directory. Keep your existing FFmpeg, then use `npm run dev:local` or
-`npm run build:local`. These commands automatically prepare and cache pinned
-OOOBrush, but do not install, download or verify COLMAP, or modify formal manifests. Application runtime health
-checks and strict normal release verification remain unchanged.
+Keep the runtime libraries, licenses, and metadata together without adding another wrapper directory. `npm run dev:local` and `npm run build:local` also prepare and verify the pinned OOOBrush release.
 
-Artifacts expire after 30 days. The manual workflow must exist on the default
-branch before it can be dispatched. See the [engine development package guide](engines/README.md#download-colmap-only-development-builds).
+See the [engine development package guide](engines/README.md) for directory layout and verification details.
 
 ### Development Environment
 
