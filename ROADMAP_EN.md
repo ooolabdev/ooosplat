@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Current version: **0.5.0**. This release adds Quality v2 automatic parameter planning, video bridge-frame recovery, VRAM-aware training, same-camera incremental high-resolution reshoots, and further Windows Brush and preview stability improvements.
+Current version: **0.5.0**. This release adds Quality v2 automatic parameter planning, video bridge-frame recovery, VRAM-aware training, same-camera incremental high-resolution reshoots, and further Windows Brush and preview stability improvements. The main branch has since added local MCP v1, which is not yet part of a published release.
 
 ## Product Principles
 
@@ -33,7 +33,6 @@ Current version: **0.5.0**. This release adds Quality v2 automatic parameter pla
 | P1 | Video capture guidance UI | Provide guidance on orbit paths, movement speed, overlap, lighting, and common capture problems before generation begins. | To be created |
 | P1 | Automatic update notifications | Detect new releases and present version information, release notes, and trusted download links. | To be created |
 | P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
-| P2 | MCP tool support | Provide safe MCP tools for AI Agents to analyze media, start generation, query status, resume tasks, and retrieve results. | To be created |
 | P2 | Create projects and import PLY from “02 History” | Import an existing PLY directly as an OOOSplat project for preview and editing without running the generation pipeline. | To be created |
 | P3 | Panoramic video support | Explore a workflow for using panoramic video as input and producing usable Gaussian Splatting results. | To be created |
 
@@ -48,7 +47,7 @@ Current version: **0.5.0**. This release adds Quality v2 automatic parameter pla
 | Completed · 0.4.0 | Stage-level pipeline resume and time estimation | Validates and reuses frame, mask, feature, matching, and sparse-reconstruction checkpoints. Missing or damaged stages safely fall back for rerun, with duration estimates. | [PR #27](https://github.com/ooolabdev/ooosplat/pull/27) |
 | Completed · 0.4.0 | Improved Brush training progress | Updates the training-stage percentage continuously from actual Brush steps so long-running training remains visible and traceable. | Implemented in 0.4.0 |
 | Completed · 0.4.0 | Removed the 50% registration stop threshold | Continues to Brush when valid registered images and 3D points exist. Low registration remains a quality warning but no longer stops automatically below 50%. | Implemented in 0.4.0 |
-| Completed · 0.4.0 | Automatic masks for transparent video and images | Detects transparent MOV and PNG media, preserves RGBA data for Brush, and generates COLMAP masks to exclude transparent backgrounds. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) and follow-up work |
+| Completed · 0.4.0 | Automatic masks for transparent video and images | Detects transparent MOV and PNG media, preserves unpremultiplied source color and Alpha for Brush, and generates strict 0/255 COLMAP masks at the 0.5 Alpha threshold. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) and follow-up work |
 | Completed · 0.4.0 | Image-sequence input | Unifies video and image input. Image sequences use a shared camera, exhaustive matching, and the incremental Mapper, with automatic masks for transparent PNG files. | [PR #19](https://github.com/ooolabdev/ooosplat/pull/19) |
 | Completed · 0.4.0 | Gaussian editing | Supports rectangle, sphere, and box selection, non-destructive deletion, crop freezing, undo/redo, and saving to `edit.ply`, with a foundation compatible with future AI Agent workflows. | Implemented in 0.4.0; issue to be created |
 | Completed · 0.4.0 | English UI and Chinese/English switching | Switches instantly between Simplified Chinese and English, chooses the first-run default from the system language, and persists explicit choices across restarts; task, settings, preview, status, and interaction guidance are covered. | Implemented in 0.4.0; issue to be created |
@@ -57,6 +56,7 @@ Current version: **0.5.0**. This release adds Quality v2 automatic parameter pla
 | Completed · 0.5.0 | Same-camera incremental high-resolution reshoots | Completed projects can add video or images captured with the same device, lens, and resolution. OOOSplat reuses the source database, shared camera, and sparse model, processes only new views, fully retrains Brush, and supports transparent MOV/PNG media. | [PR #49](https://github.com/ooolabdev/ooosplat/pull/49) |
 | Completed · 0.5.0 | Windows Brush GPU stability and device-loss diagnostics | Stabilizes Brush device selection on systems with one NVIDIA discrete GPU, separates out-of-memory and device-loss failures, and provides clearer recovery guidance. | Implemented in 0.5.0 |
 | Completed · 0.5.0 | Anonymous planner effectiveness telemetry and preview fixes | Records planning, reconstruction, training, and result metrics without collecting media, paths, or logs, while improving preview ground-grid resource handling and large Transform scales. | Implemented in 0.5.0 |
+| Completed · main | Local MCP v1 and shared task service | Provides seven token-free, loopback-only MCP tools for app inspection, task creation and start, task listing and status, incremental log reading, and run-specific cancellation. The GUI and local Agents share task state, the execution lock, progress, and results. | Implemented on main; not yet released |
 
 ## Tracking and Contributions
 

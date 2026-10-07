@@ -1,7 +1,5 @@
 # OOOSplat
 
-The development branch adds optional local MCP v1. Enable it in desktop settings and authorize input directories to let a local AI Agent create, start, inspect and cancel tasks in the same application. It is disabled by default and listens only on loopback. See [MCP v1 setup, tools and lifecycle](docs/mcp-v1.md).
-
 [中文](README.md) | [English](README_EN.md)
 
 <p align="center">
@@ -19,9 +17,11 @@ The development branch adds optional local MCP v1. Enable it in desktop settings
 
 OOOSplat is a local desktop application that turns an ordinary orbit video or image sequence into a 3D Gaussian Splatting project in one workflow. Choose source media, a project directory, and a quality preset, and OOOSplat automatically handles image preparation, camera reconstruction, training, PLY publishing, preview, adjustment, and export.
 
-Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly, with no remote service or localhost API required.
+Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal GUI workflows do not depend on a remote service or localhost API; a loopback HTTP endpoint starts only when the optional MCP service is enabled.
 
 Current version: **0.5.0**
+
+The main branch includes optional local MCP v1. It is disabled by default, listens only on `127.0.0.1`, and does not require a token. Enabling it automatically authorizes the projects root's `Inputs` directory, with additional input directories available by explicit authorization. A local AI Agent can use seven tools to create, start, list, inspect, read logs from, and cancel tasks that remain visible in the same application. See [MCP v1 setup, tools, and lifecycle](docs/mcp-v1.md).
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
@@ -53,8 +53,8 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - Create Gaussian Splatting projects from MP4/MOV videos or folders containing JPG, JPEG, and PNG images.
 - “Auto Optimize (Experimental)” is enabled by default. Video starts at a 6 / 8 / 12 FPS target and uses preset-specific resolution policies for frame preparation, COLMAP, and Brush. If initial reconstruction coverage is low, OOOSplat can add bridge frames within the remaining budget. Disabling it restores the legacy fixed-ratio extraction and resolution strategy.
 - Image sequences keep every image and use a shared camera, exhaustive matching, and the existing incremental Mapper. Videos use sequential matching; bridge-frame recovery does not apply to image sequences.
-- Detect Alpha channels in transparent MOV files, extract RGBA PNG frames and matching COLMAP masks in one pass, and preserve transparency for Brush training.
-- Detect transparent PNG images automatically, preserve Alpha for Brush, and generate COLMAP masks for transparent regions.
+- Detect Alpha channels in transparent MOV files, extract unpremultiplied RGBA PNG frames, and create strict 0/255 COLMAP masks at `alpha >= 128` in one pass. Masked pixels are excluded from feature extraction while the original color and Alpha remain available to Brush.
+- Detect transparent PNG images automatically, preserve the original file, bit depth, RGB, and Alpha, and generate binary COLMAP masks at the equivalent 0.5 Alpha threshold.
 - Add high-resolution reshoots to completed projects. Capture video or images with the same device, lens, and resolution; OOOSplat reuses the original database, shared camera, and sparse model, processes only the new features, matches, and registrations, then retrains Brush from every registered image. Transparent MOV/PNG reshoots preserve RGBA and receive automatic masks. Each reshoot creates a separate derived project and never overwrites its source.
 - Bundle COLMAP 4.2.1 from the same commit on all platforms: self-built CUDA/Caspar/Ceres on Windows/Linux, Ceres CPU on Apple Silicon. Brush uses pinned OOOBrush ooo-v1.0.0 headless CLI; FFmpeg policy is unchanged.
 - Automatically check the bundled CUDA runtime, NVIDIA driver version, and GPU Compute Capability. COLMAP uses GPU acceleration for feature extraction and matching when the requirements are met, and otherwise falls back to CPU.
@@ -64,6 +64,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - Cancel tasks and terminate the full child-process tree with a Windows Job Object or Unix process group.
 - Choose a custom projects root, defaulting to `Documents\SplatStudio\Projects`.
 - Track completed, failed, interrupted, and cancelled tasks.
+- Share tasks, the execution lock, progress, logs, and results between the GUI and optional local MCP v1. Local Agents can call `get_app_status`, `create_generation_task`, `start_task`, `list_tasks`, `get_task_status`, `read_task_logs`, and `cancel_task`.
 - Resume interrupted pipelines at stage boundaries. OOOSplat validates frame, mask, COLMAP database, sparse reconstruction, and PLY checkpoints, reuses trusted stages, and safely reruns from the earliest invalid stage.
 - Estimate generation time from source size, quality preset, and recent successful local projects, while continuously updating Brush training progress.
 - Preview completed `.ply` projects under “03 Preview” with Orbit, Pan, and Zoom. Switching between Adjust and Animation does not reload the model or reset the camera.
