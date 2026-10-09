@@ -451,6 +451,88 @@ pub async fn match_pairs(
     .await
 }
 
+/// Upper bound on how many frames at each end of a sequence take part in loop
+/// closure. Only the frames that overlap where the path closes matter, so a
+/// larger window buys nothing but matching time.
+const LOOP_CLOSURE_MAX_WINDOW: usize = 40;
+/// Lower bound on the loop-closure window, so short clips still cover the region
+/// around the seam.
+const LOOP_CLOSURE_MIN_WINDOW: usize = 5;
+/// Sequences shorter than this are treated as too short to close a loop.
+const LOOP_CLOSURE_MIN_FRAMES: usize = 24;
+
+fn is_image_file_name(name: &str) -> bool {
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("jpg" | "jpeg" | "png")
+    )
+}
+
+/// Writes the `matches_importer --match_type pairs` list that reconnects the end
+/// of a sequential capture to its beginning.
+///
+/// `sequential_matcher` only links each frame to the following `overlap` frames,
+/// so on a closed path — the orbit captures this app targets — the last frames
+/// are never matched against the first ones. Those missing pairs are what keep
+/// the reconstruction from drifting where the path closes.
+///
+/// Returns the number of pairs written. `0` means loop closure does not apply
+/// here and the caller must skip the extra matching pass.
+pub fn write_loop_closure_pair_list(
+    path: &Path,
+    frames_directory: &Path,
+    window: Option<usize>,
+) -> Result<usize> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(frames_directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if is_image_file_name(name) {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort_unstable();
+
+    let total = names.len();
+    if total < LOOP_CLOSURE_MIN_FRAMES {
+        return Ok(0);
+    }
+    // COLMAP hands out image ids in this same sorted order, so every pair below
+    // keeps the earlier image first.
+    let window = window
+        .unwrap_or_else(|| (total / 8).clamp(LOOP_CLOSURE_MIN_WINDOW, LOOP_CLOSURE_MAX_WINDOW))
+        .min(total / 2);
+    if window == 0 {
+        return Ok(0);
+    }
+
+    let head = &names[..window];
+    let tail = &names[total - window..];
+    let mut text = String::new();
+    let mut pairs = 0_usize;
+    for left in head {
+        for right in tail {
+            text.push_str(left);
+            text.push(' ');
+            text.push_str(right);
+            text.push('\n');
+            pairs += 1;
+        }
+    }
+    std::fs::write(path, text)?;
+    Ok(pairs)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn feature_extraction_args(
     database: &Path,
@@ -823,6 +905,84 @@ mod tests {
         args.into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn frame_directory(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let frames = directory.path().join("frames");
+        std::fs::create_dir(&frames).unwrap();
+        for index in 0..count {
+            std::fs::write(frames.join(format!("frame_{index:010}.jpg")), b"").unwrap();
+        }
+        (directory, frames)
+    }
+
+    #[test]
+    fn loop_closure_pairs_reconnect_the_start_and_end_of_a_sequence() {
+        let (directory, frames) = frame_directory(40);
+        let pair_list = directory.path().join("loop-closure-pairs.txt");
+
+        let pairs = write_loop_closure_pair_list(&pair_list, &frames, Some(3)).unwrap();
+
+        assert_eq!(pairs, 9);
+        let text = std::fs::read_to_string(&pair_list).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 9);
+        assert!(lines.contains(&"frame_0000000000.jpg frame_0000000037.jpg"));
+        assert!(lines.contains(&"frame_0000000002.jpg frame_0000000039.jpg"));
+        // COLMAP assigns image ids in file-name order, so every pair must keep
+        // the earlier frame first.
+        for line in lines {
+            let (left, right) = line.split_once(' ').unwrap();
+            assert!(left < right);
+        }
+    }
+
+    #[test]
+    fn loop_closure_is_skipped_for_short_sequences_and_foreign_files() {
+        let (directory, frames) = frame_directory(10);
+        std::fs::write(frames.join("notes.txt"), b"").unwrap();
+        let pair_list = directory.path().join("loop-closure-pairs.txt");
+
+        assert_eq!(
+            write_loop_closure_pair_list(&pair_list, &frames, None).unwrap(),
+            0
+        );
+        assert!(!pair_list.exists());
+    }
+
+    #[test]
+    fn loop_closure_window_stays_within_its_bounds() {
+        let (directory, frames) = frame_directory(32);
+        let pair_list = directory.path().join("loop-closure-pairs.txt");
+
+        // 32 / 8 = 4, raised to the minimum window of 5.
+        assert_eq!(
+            write_loop_closure_pair_list(&pair_list, &frames, None).unwrap(),
+            25
+        );
+
+        let (large_directory, large_frames) = frame_directory(320);
+        let large_pair_list = large_directory.path().join("loop-closure-pairs.txt");
+        // 320 / 8 = 40, which is exactly the cap.
+        assert_eq!(
+            write_loop_closure_pair_list(&large_pair_list, &large_frames, None).unwrap(),
+            1600
+        );
+    }
+
+    #[test]
+    fn loop_closure_never_pairs_a_frame_with_itself() {
+        let (directory, frames) = frame_directory(24);
+        let pair_list = directory.path().join("loop-closure-pairs.txt");
+
+        write_loop_closure_pair_list(&pair_list, &frames, Some(12)).unwrap();
+
+        let text = std::fs::read_to_string(&pair_list).unwrap();
+        for line in text.lines() {
+            let (left, right) = line.split_once(' ').unwrap();
+            assert_ne!(left, right);
+        }
     }
 
     #[test]
