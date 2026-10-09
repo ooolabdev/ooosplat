@@ -133,7 +133,7 @@ describe("App preview workspace", () => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
-      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
     mocks.prepareGaussianPreview.mockReset();
     mocks.classifyDroppedInput.mockReset().mockResolvedValue({ inputType: "video" });
@@ -1574,7 +1574,7 @@ describe("App preview workspace", () => {
   });
   const publishTask = async (task: import("../types/tasks").SharedTask) => {
     const handler = mocks.onTaskUpdate.mock.calls.at(-1)![0];
-    await act(async () => handler({ task, event: null }));
+    await act(async () => handler({ task, events: [], dropped_event_count: 0 }));
     await flush();
   };
 

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
+import type { SharedTask } from "../types/tasks";
 
 interface AppState {
   inputPath: string | null;
@@ -22,6 +23,7 @@ interface AppState {
   latestRuntime: RuntimeSnapshot | null;
   lastEventSequence: number;
   events: PipelineEvent[];
+  liveTask: Pick<SharedTask, "task_id" | "run_id" | "status" | "elapsed_ms" | "updated_at"> | null;
   result: PipelineResult | null;
   error: string | null;
   errorAt: number | null;
@@ -38,9 +40,46 @@ interface AppState {
   setPhase: (phase: RunPhase) => void;
   beginRun: () => void;
   receiveEvent: (event: PipelineEvent) => void;
+  receiveTaskBatch: (task: SharedTask, events: PipelineEvent[], reset: boolean) => void;
   setResult: (result: PipelineResult | null) => void;
   setError: (error: string | null) => void;
 }
+
+/** Reduce a notification in sequence order, allocating the log array only once. */
+function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
+  let next = state;
+  let logs: PipelineEvent[] | undefined;
+  for (const event of batch) {
+    if (event.taskId && next.latestEvent?.taskId === event.taskId && event.runId !== next.latestEvent.runId && (event.revision ?? 0) <= (next.latestEvent.revision ?? 0)) continue;
+    const sameRun = !event.runId || (next.liveTask
+      ? event.runId === next.liveTask.run_id && (!event.taskId || event.taskId === next.liveTask.task_id)
+      : event.runId === next.latestEvent?.runId);
+    if (sameRun && event.sequence > 0 && event.sequence <= Math.max(next.lastEventSequence, next.latestEvent?.sequence ?? 0)) continue;
+    if (event.kind === "runtime") {
+      if (next.phase !== "running" || ["completed", "failed", "cancelled"].includes(next.latestEvent?.stage ?? "")) continue;
+      next = { ...next, latestRuntime: event.runtime ?? next.latestRuntime, lastEventSequence: event.sequence };
+      continue;
+    }
+    logs ??= state.events.slice();
+    logs.push(event);
+    const terminal = event.stage === "failed" || event.stage === "cancelled";
+    next = {
+      ...next,
+      latestEvent: event,
+      lastEventSequence: event.sequence,
+      progress: terminal ? next.progress : Math.max(next.progress, Math.min(100, event.progress)),
+      progressMessage: event.message,
+      taskColmapAcceleration: event.acceleration ?? next.taskColmapAcceleration,
+    };
+  }
+  return logs ? { ...next, events: logs.slice(-500) } : next;
+}
+
+const newRunState = {
+  phase: "running" as const, progress: 0, progressMessage: "正在创建项目", latestEvent: null,
+  latestRuntime: null, lastEventSequence: 0, events: [] as PipelineEvent[], result: null,
+  error: null, errorAt: null, taskColmapAcceleration: null, liveTask: null,
+};
 
 export const useAppStore = create<AppState>((set) => ({
   inputPath: null,
@@ -63,6 +102,7 @@ export const useAppStore = create<AppState>((set) => ({
   latestRuntime: null,
   lastEventSequence: 0,
   events: [],
+  liveTask: null,
   result: null,
   error: null,
   errorAt: null,
@@ -80,6 +120,7 @@ export const useAppStore = create<AppState>((set) => ({
     latestRuntime: null,
     lastEventSequence: 0,
     events: [],
+    liveTask: null,
     result: null,
     error: null,
     errorAt: null,
@@ -96,24 +137,22 @@ export const useAppStore = create<AppState>((set) => ({
   setEstimate: (estimate) => set({ estimate }),
   setEngines: (engines) => set({ engines }),
   setPhase: (phase) => set({ phase }),
-  beginRun: () => set({ phase: "running", progress: 0, progressMessage: "正在创建项目", latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null, taskColmapAcceleration: null }),
-  receiveEvent: (event) => set((state) => {
-    if (event.taskId && state.latestEvent?.taskId === event.taskId && event.runId !== state.latestEvent.runId && (event.revision ?? 0) <= (state.latestEvent.revision ?? 0)) return state;
-    const sameRun = !event.runId || event.runId === state.latestEvent?.runId;
-    if (sameRun && event.sequence > 0 && event.sequence <= Math.max(state.lastEventSequence, state.latestEvent?.sequence ?? 0)) return state;
-    if (event.kind === "runtime") {
-      if (state.phase !== "running" || ["completed", "failed", "cancelled"].includes(state.latestEvent?.stage ?? "")) return state;
-      return { latestRuntime: event.runtime ?? state.latestRuntime, lastEventSequence: event.sequence };
-    }
-    const events = [...state.events, event].slice(-500);
-    const terminal = event.stage === "failed" || event.stage === "cancelled";
+  beginRun: () => set(newRunState),
+  receiveEvent: (event) => set((state) => reduceEvents(state, [event])),
+  receiveTaskBatch: (task, events, reset) => set((state) => {
+    const ordered = events.filter(event => (!event.taskId || event.taskId === task.task_id)
+      && (!event.runId || event.runId === task.run_id)).sort((a, b) => a.sequence - b.sequence);
+    const next = reduceEvents(reset ? { ...state, ...newRunState } : state, ordered);
     return {
-      events,
-      latestEvent: event,
-      lastEventSequence: event.sequence,
-      progress: terminal ? state.progress : Math.max(state.progress, Math.min(100, event.progress)),
-      progressMessage: event.message,
-      taskColmapAcceleration: event.acceleration ?? state.taskColmapAcceleration,
+      ...next,
+      phase: ["starting", "running", "cancelling"].includes(task.status) ? "running"
+        : task.status === "completed" || task.status === "failed" || task.status === "cancelled" ? task.status : "idle",
+      progress: task.estimated_progress == null ? next.progress : Math.max(next.progress, Math.min(100, task.estimated_progress)),
+      latestRuntime: task.runtime === undefined ? next.latestRuntime : task.runtime,
+      result: task.result ?? next.result,
+      // Advance the snapshot watermark only after its earlier log entries are merged.
+      lastEventSequence: Math.max(next.lastEventSequence, task.sequence ?? 0),
+      liveTask: { task_id: task.task_id, run_id: task.run_id, status: task.status, elapsed_ms: task.elapsed_ms, updated_at: task.updated_at },
     };
   }),
   setResult: (result) => set({ result }),

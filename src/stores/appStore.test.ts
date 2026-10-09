@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAppStore } from "./appStore";
 import type { PipelineEvent, RuntimeSnapshot } from "../types/pipeline";
+import type { SharedTask } from "../types/tasks";
 
 const event = (sequence: number, progress: number): PipelineEvent => ({
   sequence,
@@ -25,12 +26,61 @@ describe("app store", () => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "", projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null, video: null, imageSequence: null,
       plan: null, estimate: null, engines: [], phase: "idle", progress: 0, progressMessage: "",
-      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
   });
 
   it("uses Balanced by default", () => {
     expect(useAppStore.getState().quality).toBe("balanced");
+  });
+
+  it("commits a whole ordered task batch once without losing logs before the latest runtime", () => {
+    const task = { task_id: "task-1", run_id: "run-1", status: "running", estimated_progress: 42,
+      elapsed_ms: 15_000, updated_at: new Date().toISOString(), result: null } as SharedTask;
+    const snapshot: RuntimeSnapshot = { processId: 42, phase: "running", updatedAt: task.updated_at,
+      lastOutputAgeMs: 0, training: null, device: null, backend: null, config: {}, resources: null };
+    const batch = Array.from({ length: 200 }, (_, index) => ({ ...event(index + 1, 42), taskId: task.task_id, runId: task.run_id }));
+    batch.push({ ...event(201, 42), taskId: task.task_id, runId: task.run_id, kind: "runtime", runtime: snapshot });
+    const changed = { count: 0 };
+    const unsubscribe = useAppStore.subscribe(() => { changed.count++; });
+    useAppStore.getState().receiveTaskBatch(task, batch.reverse(), true);
+    unsubscribe();
+    expect(changed.count).toBe(1);
+    expect(useAppStore.getState().events.map(item => item.sequence)).toEqual(Array.from({ length: 200 }, (_, index) => index + 1));
+    expect(useAppStore.getState().latestRuntime).toEqual(snapshot);
+    expect(useAppStore.getState().liveTask?.elapsed_ms).toBe(15_000);
+    expect(useAppStore.getState().lastEventSequence).toBe(201);
+  });
+
+  it("applies the terminal snapshot after its final logs and ignores cross-run entries", () => {
+    const task = { task_id: "task-1", run_id: "run-1", status: "running", estimated_progress: 63,
+      elapsed_ms: 15_000, updated_at: new Date().toISOString(), result: null } as SharedTask;
+    useAppStore.getState().receiveTaskBatch(task, [{ ...event(1, 63), taskId: task.task_id, runId: task.run_id }], true);
+    useAppStore.getState().receiveTaskBatch({ ...task, status: "cancelled", elapsed_ms: 16_000 }, [
+      { ...event(2, 63), taskId: task.task_id, runId: task.run_id, kind: "log", message: "last useful line" },
+      { ...event(999, 100), taskId: task.task_id, runId: "old-run", message: "foreign line" },
+    ], false);
+    expect(useAppStore.getState()).toMatchObject({ phase: "cancelled", progress: 63, lastEventSequence: 2 });
+    expect(useAppStore.getState().events.at(-1)?.message).toBe("last useful line");
+    expect(useAppStore.getState().liveTask?.elapsed_ms).toBe(16_000);
+  });
+
+  it("rejects older events after a runtime-only batch and advances snapshots after merging their logs", () => {
+    const task = { task_id: "task-1", run_id: "run-1", status: "running", sequence: 10, estimated_progress: 42,
+      elapsed_ms: 15_000, updated_at: new Date().toISOString(), result: null } as SharedTask;
+    const snapshot: RuntimeSnapshot = { processId: 42, phase: "running", updatedAt: task.updated_at,
+      lastOutputAgeMs: 0, training: null, device: null, backend: null, config: {}, resources: null };
+    useAppStore.getState().receiveTaskBatch(task, [{ ...event(10, 42), taskId: task.task_id,
+      runId: task.run_id, kind: "runtime", runtime: snapshot }], true);
+    useAppStore.getState().receiveTaskBatch(task, [{ ...event(9, 42), taskId: task.task_id, runId: task.run_id }], false);
+    expect(useAppStore.getState().events).toHaveLength(0);
+    expect(useAppStore.getState().lastEventSequence).toBe(10);
+    useAppStore.getState().receiveTaskBatch({ ...task, sequence: 20 }, [
+      { ...event(11, 42), taskId: task.task_id, runId: task.run_id },
+      { ...event(12, 42), taskId: task.task_id, runId: task.run_id },
+    ], false);
+    expect(useAppStore.getState().events.map(item => item.sequence)).toEqual([11, 12]);
+    expect(useAppStore.getState().lastEventSequence).toBe(20);
   });
 
   it("timestamps global errors and clears their timestamp with the message", () => {

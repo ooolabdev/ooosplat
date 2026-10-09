@@ -36,6 +36,7 @@ pub fn run_app() {
             use tauri::Manager;
             let tasks = app.state::<commands::PipelineController>().inner().clone();
             tasks.attach(app.handle().clone());
+            tasks.spawn_notification_pump();
             tasks.spawn_checkpoint_writer();
             let mcp = app.state::<mcp::McpController>().inner().clone();
             let handle = app.handle().clone();

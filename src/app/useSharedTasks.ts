@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getSharedTasks, onTaskUpdate } from '../lib/backend';
 import { mergeTask, taskIsActive, type SharedTask } from '../types/tasks';
 import { useAppStore } from '../stores/appStore';
+import type { PipelineEvent } from '../types/pipeline';
 
 export function useSharedTasks() {
   const [tasks, setTasks] = useState<Record<string, SharedTask>>({});
@@ -13,29 +14,40 @@ export function useSharedTasks() {
     let unsubscribe: (() => void) | undefined;
     let refreshing = false;
     let cache: Record<string, SharedTask> = {};
-    let tracked: { task: string; run: string | null } | undefined;
-    const phase = (task: SharedTask, event: import('../types/pipeline').PipelineEvent | null) => {
+    let tracked: { task: string; run: string | null; revision: number } | undefined;
+    const phase = (task: SharedTask, events: PipelineEvent[]) => {
       const state = useAppStore.getState();
       if (taskIsActive(task)) {
-        if (tracked?.run !== task.run_id || state.phase !== 'running') state.beginRun();
-        tracked = { task: task.task_id, run: task.run_id };
-        if (event) state.receiveEvent(event);
-      } else if (tracked?.task === task.task_id && tracked.run === task.run_id) {
-        state.setPhase(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' ? task.status : 'idle');
-        if (task.result) state.setResult(task.result);
+        const reset = tracked?.task !== task.task_id || tracked.run !== task.run_id || state.phase !== 'running';
+        if (!reset && tracked && tracked.revision >= task.revision) return;
+        state.receiveTaskBatch(task, events, reset);
+        tracked = { task: task.task_id, run: task.run_id, revision: task.revision };
+      } else if ((tracked?.task === task.task_id && tracked.run === task.run_id)
+        || (state.liveTask?.task_id === task.task_id && state.liveTask.run_id === task.run_id)) {
+        state.receiveTaskBatch(task, events, false);
         tracked = undefined;
       }
     };
-    const apply = (task: SharedTask, event: import('../types/pipeline').PipelineEvent | null) => {
+    const apply = (task: SharedTask, batch: PipelineEvent[], dropped: number) => {
       if (disposed || (cache[task.task_id]?.revision ?? -1) >= task.revision) return;
-      if (event && !['runtime', 'heartbeat'].includes(event.kind)) {
-        const previous = cache[task.task_id];
-        const history = previous?.run_id === task.run_id ? previous.recent_events : [];
-        task = { ...task, recent_events: [...history, event].slice(-500) };
-      }
+      const events = batch.filter(event => (!event.taskId || event.taskId === task.task_id)
+        && (!event.runId || event.runId === task.run_id)).sort((a, b) => a.sequence - b.sequence);
+      const previous = cache[task.task_id];
+      const sameRun = previous?.run_id === task.run_id;
+      const history = sameRun ? previous.recent_events : [];
+      const seen = new Set(history.map(event => event.sequence));
+      const appended = events.filter(event => {
+        if (['runtime', 'heartbeat'].includes(event.kind) || seen.has(event.sequence)) return false;
+        seen.add(event.sequence);
+        return true;
+      });
+      task = { ...task,
+        recent_events: appended.length ? [...history, ...appended].sort((a, b) => a.sequence - b.sequence).slice(-500) : history,
+        dropped_event_count: (sameRun ? previous.dropped_event_count ?? 0 : 0) + dropped,
+      };
       cache = mergeTask(cache, task);
       setTasks(cache);
-      phase(task, event);
+      phase(task, events);
     };
     const refresh = async () => {
       if (disposed || refreshing) return;
@@ -43,13 +55,22 @@ export function useSharedTasks() {
       try {
         const snapshot = await getSharedTasks();
         if (disposed) return;
+        const before = cache;
         for (const task of snapshot) cache = mergeTask(cache, task);
-        setTasks(cache);
+        if (before !== cache) setTasks(cache);
         const active = Object.values(cache).find(taskIsActive);
         if (active) {
-          phase(active, null);
-          for (const event of active.recent_events) useAppStore.getState().receiveEvent(event);
-        } else if (tracked && cache[tracked.task]) phase(cache[tracked.task], null);
+          phase(active, active.recent_events);
+        } else {
+          const live = useAppStore.getState().liveTask;
+          const previous = tracked ? cache[tracked.task] : live ? cache[live.task_id] : undefined;
+          const run = tracked?.run ?? live?.run_id;
+          if (previous && previous.run_id === run) phase(previous, previous.recent_events);
+          else if (tracked || live) {
+            useAppStore.setState({ phase: 'idle', liveTask: null });
+            tracked = undefined;
+          }
+        }
         if (!disposed) setSyncError(null);
       } catch (error) { if (!disposed) setSyncError(error instanceof Error ? error.message : '无法同步任务状态'); }
       finally { refreshing = false; }
@@ -58,9 +79,8 @@ export function useSharedTasks() {
     void (async () => {
       // Subscribe before reading a snapshot, and clean up even if unmounted during subscription.
       const fn = await onTaskUpdate(update => {
-        const previous = cache[update.task.task_id];
-        apply(update.task, update.event);
-        if (previous && update.task.revision > previous.revision + 1) void refresh();
+        // Revisions can legitimately jump because runtime/progress are coalesced.
+        apply(update.task, update.events, update.dropped_event_count);
       });
       if (disposed) { fn(); return; }
       unsubscribe = fn;

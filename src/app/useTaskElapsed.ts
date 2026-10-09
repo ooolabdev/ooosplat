@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { taskIsActive, type SharedTask } from '../types/tasks';
 
-type ElapsedTask = Pick<SharedTask, 'run_id' | 'status' | 'elapsed_ms' | 'updated_at' | 'revision'>;
+type ElapsedTask = Pick<SharedTask, 'run_id' | 'status' | 'elapsed_ms' | 'updated_at'>;
 
 export function taskElapsedAt(task: ElapsedTask | null | undefined, now: number): number | null {
   if (!task?.run_id) return null;
@@ -21,7 +21,7 @@ export function useTaskElapsed(task: ElapsedTask | null | undefined): number | n
     if (!active) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [active, task?.revision, task?.run_id]);
+  }, [active, task?.run_id]);
 
   return taskElapsedAt(task, now);
 }

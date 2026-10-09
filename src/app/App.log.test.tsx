@@ -97,7 +97,7 @@ describe("App live log", () => {
     useAppStore.setState({
       inputPath: null, inputType: "video", projectsRoot: "E:\\Projects", plannerEnabled: true, projects: [], quality: "balanced", colmapAcceleration: null, taskColmapAcceleration: null,
       video: null, imageSequence: null, plan: null, estimate: null, engines: [], phase: "running", progress: 0, progressMessage: "",
-      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], result: null, error: null, errorAt: null,
+      latestEvent: null, latestRuntime: null, lastEventSequence: 0, events: [], liveTask: null, result: null, error: null, errorAt: null,
     });
     mocks.getSharedTasks.mockReset().mockResolvedValue([]);
     mocks.onTaskUpdate.mockClear();
@@ -284,6 +284,17 @@ describe("App live log", () => {
     }
   });
 
+  it('uses preset captions in preparation, validation, publishing, and unknown stages', async () => {
+    const stages = ['created', 'probingVideo', 'planningFrames', 'extractingFrames', 'validatingReconstruction', 'exporting', 'unknownEngineStage'];
+    for (const [index, stage] of stages.entries()) {
+      await act(async () => useAppStore.getState().receiveEvent({ ...event(index + 1), stage, kind: 'log',
+        message: 'RAW_ENGINE_DETAIL: internal path and diagnostic output', current: null, total: null }));
+      await flush();
+      expect(container.querySelector('.current-message')?.textContent).not.toContain('RAW_ENGINE_DETAIL');
+      expect(container.querySelector('.live-log')?.textContent).toContain('RAW_ENGINE_DETAIL');
+    }
+  });
+
   it("keeps the latest count when a later technical log has no count", async () => {
     await act(async () => {
       useAppStore.getState().receiveEvent({
@@ -364,7 +375,7 @@ describe("App live log", () => {
     });
     await flush();
 
-    expect(container.querySelector(".current-message")?.textContent).toBe("任务已取消");
+    expect(container.querySelector(".current-message")?.textContent).toBe("已取消");
   });
 
   it("keeps the real percentage and marks the failing stage", async () => {
@@ -393,17 +404,41 @@ describe("App live log", () => {
       elapsed_ms: 0, progress: null, estimated_progress: null, current: null, total: null, eta_seconds: null,
       error: null, result: null, recent_events: [],
     } as import("../types/tasks").SharedTask;
-    await act(async () => callback({ task, event: null }));
+    await act(async () => callback({ task, events: [], dropped_event_count: 0 }));
     expect(container.textContent).toContain("由 AI Agent 创建");
     expect(container.querySelector(".shared-task-detail")).toBeNull();
     await act(async () => container.querySelector<HTMLElement>('[data-task-id="agent-task"]')!.click());
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("orbit.mp4");
-    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 2, status: "running" }, event: null }));
-    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 3, status: "failed", stage: "failed", error: { code: "pipeline_failed", message: "模型校验失败", failed_stage: "trainingSplats", engine: "brush", exit_code: 2, failure_id: null, classification: "brush_gpu", classification_is_heuristic: true } }, event: null }));
+    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 2, status: "running" }, events: [], dropped_event_count: 0 }));
+    await act(async () => callback({ task: { ...task, run_id: "agent-run", revision: 3, status: "failed", stage: "failed", error: { code: "pipeline_failed", message: "模型校验失败", failed_stage: "trainingSplats", engine: "brush", exit_code: 2, failure_id: null, classification: "brush_gpu", classification_is_heuristic: true } }, events: [], dropped_event_count: 0 }));
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("失败");
     expect(container.querySelector(".shared-task-detail")?.textContent).toContain("模型校验失败");
     expect(container.querySelector('.unfinished [data-task-id="agent-task"]')?.textContent).toContain("失败");
     expect(useAppStore.getState().phase).toBe("failed");
+  });
+
+  it("does not write drafts to localStorage while a submitted task keeps updating", async () => {
+    const { onTaskUpdate } = await import('../lib/backend');
+    const callback = vi.mocked(onTaskUpdate).mock.calls.at(-1)![0];
+    const task = {
+      task_id: "busy-agent", run_id: "busy-run", project_id: null, project_path: null,
+      input_path: "E:\\Agent\\orbit.mov", quality: "high", source: "mcp", task_kind: "generation",
+      planner_enabled: true, projects_root: "E:\\Projects", status: "running", stage: "reconstructing",
+      revision: 1, sequence: 1, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      elapsed_ms: 0, progress: null, estimated_progress: 50, current: null, total: null, eta_seconds: null,
+      error: null, result: null, recent_events: [],
+    } as import('../types/tasks').SharedTask;
+    await act(async () => callback({ task, events: [], dropped_event_count: 0 }));
+    await flush();
+    const writes = vi.spyOn(Storage.prototype, "setItem");
+    try {
+      for (let revision = 2; revision <= 20; revision++) {
+        await act(async () => callback({ task: { ...task, revision, elapsed_ms: revision * 250 }, events: [], dropped_event_count: 0 }));
+      }
+      expect(writes.mock.calls.filter(([key]) => key === "ooo-splat-task-workspace-v1")).toHaveLength(0);
+      await act(async () => container.querySelector<HTMLButtonElement>('.group-add-action')!.click());
+      expect(writes.mock.calls.some(([key]) => key === "ooo-splat-task-workspace-v1")).toBe(true);
+    } finally { writes.mockRestore(); }
   });
 
 });

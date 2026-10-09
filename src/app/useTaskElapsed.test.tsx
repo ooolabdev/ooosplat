@@ -12,7 +12,7 @@ const running = {
   revision: 2,
 };
 
-function ElapsedProbe({ task }: { task: typeof running }) {
+function ElapsedProbe({ task }: { task: Parameters<typeof useTaskElapsed>[0] }) {
   return <output>{useTaskElapsed(task)}</output>;
 }
 
@@ -34,5 +34,27 @@ describe('useTaskElapsed', () => {
     expect(container.textContent).toBe('7000');
 
     await act(async () => root.unmount());
+  });
+
+  it('keeps one timer across progress revisions and stops at the frozen terminal elapsed time', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(running.updated_at));
+    const interval = vi.spyOn(window, 'setInterval');
+    const clear = vi.spyOn(window, 'clearInterval');
+    const container = document.createElement('div'); const root = createRoot(container);
+    await act(async () => root.render(<ElapsedProbe task={running} />));
+    for (let index = 1; index <= 8; index++) {
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      const snapshot = { ...running, revision: index + 2,
+        elapsed_ms: 5000 + index * 250, updated_at: new Date().toISOString() };
+      await act(async () => root.render(<ElapsedProbe task={snapshot} />));
+    }
+    expect(interval).toHaveBeenCalledOnce();
+    expect(clear).not.toHaveBeenCalled();
+    expect(container.textContent).toBe('7000');
+    await act(async () => root.render(<ElapsedProbe task={{ ...running, status: 'completed', elapsed_ms: 7250 }} />));
+    expect(clear).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(container.textContent).toBe('7250');
+    await act(async () => root.unmount()); interval.mockRestore(); clear.mockRestore();
   });
 });

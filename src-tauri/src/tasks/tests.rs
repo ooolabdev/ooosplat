@@ -1,6 +1,509 @@
 use super::*;
 use crate::pipeline::runner::default_engine_paths;
 
+type RecordedUpdates = Arc<SyncMutex<Vec<TaskUpdate>>>;
+
+fn record_notifications(service: &TaskService) -> RecordedUpdates {
+    let updates: RecordedUpdates = Default::default();
+    let observed = updates.clone();
+    *service.emitter.lock().unwrap() = Some(Arc::new(move |update| {
+        observed.lock().unwrap().push(update);
+    }));
+    updates
+}
+
+fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
+    let run = Uuid::new_v4();
+    let mut registry = service.records();
+    let task = registry.tasks.get_mut(&id).unwrap();
+    task.status = TaskStatus::Running;
+    task.stage = Some(PipelineStage::Reconstructing);
+    task.run_id = Some(run);
+    task.sequence = 0;
+    task.runs.push(TaskRun {
+        run_id: run,
+        kind: "generation".into(),
+        started_at: Utc::now(),
+        ended_at: None,
+        logs: Default::default(),
+        last_engine: None,
+        last_exit_code: None,
+        error: None,
+    });
+    run
+}
+
+fn notification_event(sequence: u64, kind: crate::pipeline::EventKind) -> PipelineEvent {
+    let mut event = PipelineEvent::mapped(
+        PipelineStage::Reconstructing,
+        0.5,
+        format!("line {sequence}"),
+    );
+    event.kind = kind;
+    event.sequence = sequence;
+    event.elapsed_ms = sequence;
+    event
+}
+
+#[tokio::test]
+async fn notification_bursts_are_bounded_and_do_not_clone_full_records() {
+    use notifications::{MAX_PENDING_LOGS, MAX_PENDING_LOG_BYTES};
+    for lines in [1000, 5000] {
+        let (root, service, task) = fixture().await;
+        let updates = record_notifications(&service);
+        let run = notification_run(&service, task.task_id);
+        // Represent stdout persistence independently of the lossy UI transport.
+        let log = root.path().join("colmap.log");
+        let mut output = std::fs::File::create(&log).unwrap();
+        use std::io::Write;
+        for sequence in 1..=lines {
+            let event = notification_event(sequence, crate::pipeline::EventKind::Log);
+            writeln!(output, "{}", event.message).unwrap();
+            service.on_event(task.task_id, run, event);
+        }
+        assert!(updates.lock().unwrap().is_empty());
+        {
+            let pending = service.notifications.lock().unwrap();
+            let pending = &pending.tasks[&task.task_id];
+            assert!(pending.log_count() <= MAX_PENDING_LOGS);
+            assert!(pending.log_bytes <= MAX_PENDING_LOG_BYTES);
+        }
+        service.flush_notifications();
+        let messages = updates.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        let update = &messages[0];
+        assert_eq!(update.task.sequence, lines);
+        assert_eq!(update.events.last().unwrap().sequence, lines);
+        assert!(update.events.len() <= MAX_PENDING_LOGS);
+        assert_eq!(
+            update.dropped_event_count,
+            lines - update.events.len() as u64
+        );
+        assert!(update
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+        let wire = serde_json::to_value(update).unwrap();
+        for field in [
+            "configuration",
+            "actual_configuration",
+            "request_parameters",
+            "client_request_id",
+            "elapsed_offset_ms",
+        ] {
+            assert!(
+                wire["task"].get(field).is_none(),
+                "unexpected heavyweight {field}"
+            );
+        }
+        assert_eq!(wire["task"]["recent_events"], serde_json::json!([]));
+        assert_eq!(wire["task"]["runs"].as_array().unwrap().len(), 1);
+        assert!(wire["task"]["runs"][0].get("logs").is_none());
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().lines().count() as u64,
+            lines
+        );
+        // The full query/persistence shape remains untouched.
+        assert!(
+            serde_json::to_value(&service.records().tasks[&task.task_id])
+                .unwrap()
+                .get("configuration")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_process_logs_remain_complete_when_ui_notifications_overflow() {
+    use crate::process::{ProcessManager, ProcessSpec, ProcessUpdate};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    for lines in [1000u64, 5000] {
+        let (root, service, task) = fixture().await;
+        let updates = record_notifications(&service);
+        let run = notification_run(&service, task.task_id);
+        let observed_service = service.clone();
+        let task_id = task.task_id;
+        let sequence = Arc::new(AtomicU64::new(0));
+        let observed_sequence = sequence.clone();
+        let observer = Arc::new(move |update| {
+            if let ProcessUpdate::Line { line, .. } = update {
+                let number = observed_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut event = notification_event(number, crate::pipeline::EventKind::Log);
+                event.message = line;
+                observed_service.on_event(task_id, run, event);
+            }
+        });
+        #[cfg(windows)]
+        let (executable, args) = (
+            PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+            // ProcessManager starts this fixed-output test process hidden.
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!("1..{lines} | ForEach-Object {{ Write-Output ('COLMAP-STRESS ' + $_) }}")
+                    .into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (executable, args) = (
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".into(),
+                format!("i=1; while [ \"$i\" -le {lines} ]; do printf 'COLMAP-STRESS %s\\n' \"$i\"; i=$((i + 1)); done").into(),
+            ],
+        );
+        let path = root.path().join("logs/colmap.log");
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            ProcessManager::new().run(ProcessSpec {
+                executable,
+                args,
+                working_directory: None,
+                log_path: Some(path.clone()),
+                observer: Some(observer),
+            }),
+        )
+        .await
+        .expect("the synthetic output process must finish")
+        .unwrap();
+        assert!(output.success, "synthetic process failed: {output:?}");
+        assert_eq!(sequence.load(Ordering::Relaxed), lines);
+        assert_eq!(output.stdout.lines().count() as u64, lines);
+        let persisted = std::fs::read_to_string(path).unwrap();
+        let stdout_lines: Vec<_> = persisted
+            .lines()
+            .filter(|line| line.starts_with("COLMAP-STRESS "))
+            .collect();
+        assert_eq!(stdout_lines.len() as u64, lines);
+        assert_eq!(stdout_lines.first().unwrap(), &"COLMAP-STRESS 1");
+        assert_eq!(
+            *stdout_lines.last().unwrap(),
+            format!("COLMAP-STRESS {lines}")
+        );
+        assert!(updates.lock().unwrap().is_empty());
+        service.flush_notifications();
+        let messages = updates.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].events.len() <= notifications::MAX_PENDING_LOGS);
+        assert_eq!(
+            messages[0].events.last().unwrap().message,
+            format!("COLMAP-STRESS {lines}")
+        );
+        assert_eq!(
+            messages[0].dropped_event_count,
+            lines - messages[0].events.len() as u64
+        );
+    }
+}
+
+#[tokio::test]
+async fn notification_byte_limit_counts_escaped_utf8_and_keeps_recent_logs() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    for sequence in 1..=300 {
+        let mut event = notification_event(sequence, crate::pipeline::EventKind::Log);
+        event.message = "中文\\\"\n".repeat(500);
+        service.on_event(task.task_id, run, event);
+    }
+    {
+        let pending = service.notifications.lock().unwrap();
+        let pending = &pending.tasks[&task.task_id];
+        assert!(pending.log_bytes <= notifications::MAX_PENDING_LOG_BYTES);
+        assert!(pending.log_count() < 200);
+    }
+    service.flush_notifications();
+    let messages = updates.lock().unwrap();
+    let update = &messages[0];
+    assert_eq!(update.events.last().unwrap().sequence, 300);
+    assert!(update.dropped_event_count > 0);
+    assert!(
+        update
+            .events
+            .iter()
+            .map(|e| serde_json::to_vec(e).unwrap().len())
+            .sum::<usize>()
+            <= notifications::MAX_PENDING_LOG_BYTES
+    );
+}
+
+#[tokio::test]
+async fn progress_and_runtime_are_coalesced_and_phase_changes_flush_logs_immediately() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    for sequence in 1..=1000 {
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence * 2 - 1, crate::pipeline::EventKind::Progress),
+        );
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence * 2, crate::pipeline::EventKind::Runtime),
+        );
+    }
+    service.flush_notifications();
+    {
+        let messages = updates.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].events.len(), 2);
+        assert_eq!(messages[0].events[0].sequence, 1999);
+        assert_eq!(messages[0].events[1].sequence, 2000);
+    }
+    service.on_event(
+        task.task_id,
+        run,
+        notification_event(2001, crate::pipeline::EventKind::Log),
+    );
+    let mut phase = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.0, "training starts");
+    phase.sequence = 2002;
+    service.on_event(task.task_id, run, phase);
+    let messages = updates.lock().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].task.stage, Some(PipelineStage::TrainingSplats));
+    assert_eq!(
+        messages[1]
+            .events
+            .iter()
+            .map(|e| e.sequence)
+            .collect::<Vec<_>>(),
+        vec![2001, 2002]
+    );
+}
+
+#[tokio::test]
+async fn notification_pump_skips_lifecycle_gate_and_preserves_queued_events() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    let gate = service.gate.lock().await;
+    let mut phase = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.0, "phase");
+    phase.sequence = 1;
+    service.on_event(task.task_id, run, phase);
+    service.flush_notifications();
+    assert!(updates.lock().unwrap().is_empty());
+    assert!(service
+        .notifications
+        .lock()
+        .unwrap()
+        .tasks
+        .contains_key(&task.task_id));
+    drop(gate);
+    service.flush_notifications();
+    assert_eq!(updates.lock().unwrap().len(), 1);
+    assert!(service.notifications.lock().unwrap().tasks.is_empty());
+}
+
+#[tokio::test]
+async fn terminal_notification_flushes_last_logs_and_cannot_emit_old_running_state() {
+    for terminal in [
+        TaskStatus::Completed,
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+    ] {
+        let (root, service, task) = fixture().await;
+        let updates = record_notifications(&service);
+        let run = notification_run(&service, task.task_id);
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(1, crate::pipeline::EventKind::Log),
+        );
+        let gate = service.gate.lock().await;
+        {
+            let mut registry = service.records();
+            let task = registry.tasks.get_mut(&task.task_id).unwrap();
+            task.status = terminal;
+            task.revision += 1;
+        }
+        service.flush_notifications();
+        assert!(updates.lock().unwrap().is_empty());
+        service.persist().await.unwrap();
+        service.notify(task.task_id);
+        drop(gate);
+        service.flush_notifications();
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(2, crate::pipeline::EventKind::Log),
+        );
+        let messages = updates.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].task.status, terminal);
+        assert_eq!(messages[0].events.len(), 1);
+        let disk: Registry = serde_json::from_slice(
+            &std::fs::read(root.path().join("registry/tasks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disk.tasks[&task.task_id].status, terminal);
+        assert!(service.notifications.lock().unwrap().tasks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_new_run_clears_pending_old_logs_and_only_sends_its_current_kind() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let old = notification_run(&service, task.task_id);
+    service.on_event(
+        task.task_id,
+        old,
+        notification_event(1, crate::pipeline::EventKind::Log),
+    );
+    let current = notification_run(&service, task.task_id);
+    service
+        .records()
+        .tasks
+        .get_mut(&task.task_id)
+        .unwrap()
+        .runs
+        .last_mut()
+        .unwrap()
+        .kind = "resume".into();
+    service.notify(task.task_id);
+    service.on_event(
+        task.task_id,
+        old,
+        notification_event(2, crate::pipeline::EventKind::Log),
+    );
+    service.on_event(
+        task.task_id,
+        current,
+        notification_event(1, crate::pipeline::EventKind::Log),
+    );
+    service.flush_notifications();
+    let messages = updates.lock().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].events.is_empty());
+    assert_eq!(messages[0].task.runs[0].kind, "resume");
+    assert_eq!(messages[0].task.runs.len(), 1);
+    assert_eq!(messages[1].events.len(), 1);
+    assert_eq!(messages[1].events[0].run_id, Some(current));
+}
+
+#[tokio::test]
+async fn delayed_positive_sequence_cannot_regress_stage_runtime_or_progress() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    let mut newer = notification_event(10, crate::pipeline::EventKind::Progress);
+    newer.stage = PipelineStage::TrainingSplats;
+    newer.current = Some(10);
+    newer.total = Some(100);
+    service.on_event(task.task_id, run, newer);
+    let before = service.get(task.task_id).await.unwrap();
+    for sequence in [9, 10] {
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence, crate::pipeline::EventKind::Runtime),
+        );
+    }
+    let after = service.get(task.task_id).await.unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.stage, Some(PipelineStage::TrainingSplats));
+    assert_eq!(after.sequence, 10);
+    assert_eq!(after.progress, Some(10.0));
+    service.flush_notifications();
+    assert_eq!(updates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_flushes_and_callbacks_cannot_announce_running_after_terminal() {
+    let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let background_service = service.clone();
+    let background_stop = stopped.clone();
+    let flusher = std::thread::spawn(move || {
+        while !background_stop.load(std::sync::atomic::Ordering::Acquire) {
+            background_service.flush_notifications();
+            std::thread::yield_now();
+        }
+    });
+    for sequence in 1..=1000 {
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence, crate::pipeline::EventKind::Log),
+        );
+    }
+    let gate = service.gate.lock().await;
+    {
+        let mut records = service.records();
+        let task = records.tasks.get_mut(&task.task_id).unwrap();
+        task.status = TaskStatus::Failed;
+        task.revision += 1;
+    }
+    service.persist().await.unwrap();
+    service.notify(task.task_id);
+    drop(gate);
+    for sequence in 1001..=2000 {
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence, crate::pipeline::EventKind::Log),
+        );
+    }
+    stopped.store(true, std::sync::atomic::Ordering::Release);
+    flusher.join().unwrap();
+    service.flush_notifications();
+    let messages = updates.lock().unwrap();
+    assert_eq!(messages.last().unwrap().task.status, TaskStatus::Failed);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.task.status == TaskStatus::Failed)
+            .count(),
+        1
+    );
+    assert!(messages
+        .windows(2)
+        .all(|pair| pair[0].task.revision < pair[1].task.revision));
+    assert!(service.notifications.lock().unwrap().tasks.is_empty());
+}
+
+#[test]
+fn notification_pump_starts_on_tauri_runtime_and_sends_once_per_interval() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let (_root, service, task) = tauri::async_runtime::block_on(fixture());
+    let updates = record_notifications(&service);
+    let run = notification_run(&service, task.task_id);
+    let pump = service.spawn_notification_pump();
+    tauri::async_runtime::block_on(async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(850);
+        let mut sequence = 0;
+        while tokio::time::Instant::now() < deadline {
+            for _ in 0..100 {
+                sequence += 1;
+                service.on_event(
+                    task.task_id,
+                    run,
+                    notification_event(sequence, crate::pipeline::EventKind::Log),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+    pump.abort();
+    let _ = tauri::async_runtime::block_on(pump);
+    let messages = updates.lock().unwrap();
+    assert!(!messages.is_empty());
+    assert!(
+        messages.len() <= 4,
+        "ordinary output must not produce a per-line burst"
+    );
+    assert!(messages
+        .iter()
+        .all(|batch| batch.events.len() <= notifications::MAX_PENDING_LOGS));
+}
+
 #[test]
 fn checkpoint_writer_starts_and_persists_from_a_plain_setup_thread() {
     assert!(tokio::runtime::Handle::try_current().is_err());
@@ -194,6 +697,7 @@ async fn early_failure_remains_queryable_and_releases_the_lock() {
 #[tokio::test]
 async fn cancellation_rejects_stale_execution_then_confirms_terminal_state() {
     let (_root, service, task) = fixture().await;
+    let updates = record_notifications(&service);
     let observe = service.clone();
     *service.executor.lock().unwrap() = Some(Arc::new(move |task| {
         let service = observe.clone();
@@ -211,6 +715,16 @@ async fn cancellation_rejects_stale_execution_then_confirms_terminal_state() {
         .await
         .unwrap();
     let run = receipt.run_id.unwrap();
+    service.on_event(
+        task.task_id,
+        run,
+        notification_event(1, crate::pipeline::EventKind::Progress),
+    );
+    service.on_event(
+        task.task_id,
+        run,
+        notification_event(2, crate::pipeline::EventKind::Log),
+    );
     assert_eq!(
         service
             .cancel(task.task_id, Uuid::new_v4())
@@ -236,6 +750,14 @@ async fn cancellation_rejects_stale_execution_then_confirms_terminal_state() {
         TaskStatus::Cancelled
     );
     assert!(service.active.lock().await.is_none());
+    let messages = updates.lock().unwrap();
+    let cancelling = messages
+        .iter()
+        .find(|message| message.task.status == TaskStatus::Cancelling)
+        .unwrap();
+    assert_eq!(cancelling.events.last().unwrap().sequence, 2);
+    assert_eq!(messages.last().unwrap().task.status, TaskStatus::Cancelled);
+    assert!(service.notifications.lock().unwrap().tasks.is_empty());
     *service.executor.lock().unwrap() = None;
 }
 #[tokio::test]

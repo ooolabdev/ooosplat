@@ -32,6 +32,45 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); window.localStorage.clear(); });
 
 describe('restored shared task detail', () => {
+  it.each(['zh-CN', 'en'])('uses only preset progress captions for every stage in %s', async locale => {
+    window.localStorage.setItem('ooo-splat-language', locale);
+    const stages = [
+      'created', 'probingVideo', 'planningFrames', 'extractingFrames', 'extractingFeatures', 'matching',
+      'reconstructing', 'validatingReconstruction', 'trainingSplats', 'exporting', 'completed', 'failed', 'cancelled',
+      'unknownEngineStage', '__proto__', null,
+    ];
+    const raw = 'RAW_ENGINE_DETAIL: CUDA worker 42 at E:\\Private\\input.png';
+    for (const stage of stages) {
+      const event: import('../types/pipeline').PipelineEvent = { sequence: 1, timestamp: '2026-10-09T00:00:00Z',
+        kind: 'log', level: 'info', stage: stage ?? 'created', engine: 'colmap', progress: 50, stageProgress: null,
+        indeterminate: true, message: raw, current: null, total: null, unit: null, elapsedMs: 1000, acceleration: null };
+      await render(task({ stage, current: null, total: null, recent_events: [event] }));
+      const caption = container.querySelector('.current-message')?.textContent;
+      expect(caption, `caption for ${stage}`).toBeTruthy();
+      expect(caption).not.toContain('RAW_ENGINE_DETAIL');
+      expect(caption).not.toContain('Private');
+      expect(container.querySelector('.live-log')?.textContent).toContain(raw);
+      if (stage === 'planningFrames') expect(caption).toBe(locale === 'zh-CN' ? '正在规划画面…' : 'Planning frames…');
+      if (stage === 'unknownEngineStage' || stage === '__proto__') expect(caption).toBe(locale === 'zh-CN' ? '运行中' : 'Running');
+      if (stage == null) expect(caption).toBe(locale === 'zh-CN' ? '正在准备任务' : 'Preparing task');
+    }
+  });
+
+  it('uses lifecycle templates without leaking the failure detail into the progress caption', async () => {
+    const expected = { created: '正在准备任务', starting: '正在准备任务', cancelling: '正在终止任务',
+      completed: '已完成', failed: '任务失败', cancelled: '已取消', interrupted: '已中断' };
+    const error = { code: 'pipeline_failed', message: 'RAW_FAILURE_DETAIL: GPU driver reset at source.cpp:88',
+      failed_stage: 'trainingSplats', engine: 'brush', exit_code: 2, failure_id: null,
+      classification: null, classification_is_heuristic: false };
+    for (const [status, caption] of Object.entries(expected)) {
+      await render(task({ status: status as SharedTask['status'], error }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(caption);
+      expect(container.querySelector('.current-message')?.textContent).not.toContain('RAW_FAILURE_DETAIL');
+    }
+    await act(async () => container.querySelector<HTMLElement>('.inline-error .compact-error')!.focus());
+    expect(document.querySelector('.error-detail-tooltip')?.textContent).toBe(error.message);
+  });
+
   it('uses the original configuration, timeline and log layout with frozen settings and observed counters', async () => {
     await render(task({ input_path: '\\\\?\\E:\\Media\\orbit.mov', projects_root: '\\\\?\\E:\\Projects' }));
     expect(container.querySelectorAll('.path-picker.readonly')).toHaveLength(2);
@@ -106,6 +145,24 @@ describe('restored shared task detail', () => {
     expect(container.querySelector('.log-line time')?.textContent).toBe('');
     expect(container.querySelector('.log-line')?.className).toBe('log-line historical');
     expect(container.querySelector('.live-log')?.textContent).not.toContain('raw 0');
+  });
+
+  it('keeps log rows stable during runtime-only updates and explains display truncation', async () => {
+    const events: import('../types/pipeline').PipelineEvent[] = [{ sequence: 1, timestamp: '2026-10-09T00:00:00Z',
+      kind: 'log', level: 'info', stage: 'reconstructing', engine: 'colmap', progress: 50, stageProgress: null,
+      indeterminate: true, message: 'registration detail', current: null, total: null, unit: null,
+      elapsedMs: 1000, acceleration: null }];
+    await render(task({ stage: 'reconstructing', recent_events: events }));
+    const format = vi.spyOn(Date.prototype, 'toLocaleTimeString');
+    try {
+      for (let index = 0; index < 10; index++) await render(task({ stage: 'reconstructing', revision: index + 3,
+        elapsed_ms: 60000 + index * 250, recent_events: events, dropped_event_count: 25 }));
+      expect(format).not.toHaveBeenCalled();
+      expect(container.querySelectorAll('.log-line')).toHaveLength(1);
+      expect(container.textContent).toContain('完整内容保存在项目日志中');
+      await render(task({ task_id: 'other-task', run_id: 'other-run' }));
+      expect(container.textContent).not.toContain('完整内容保存在项目日志中');
+    } finally { format.mockRestore(); }
   });
 
   it('ignores delayed log reads from another task/run after selection changes', async () => {

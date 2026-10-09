@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { CircleAlert, LoaderCircle, Play } from 'lucide-react';
 import { cancelSharedTask, startGuiTask, readSharedTaskLogs } from '../lib/backend';
 import { pipelineErrorMessage } from '../lib/pipelineError';
@@ -6,7 +6,7 @@ import { liveTrainingRemainingSeconds } from '../lib/runtimeEstimate';
 import { taskIsActive, type SharedTask } from '../types/tasks';
 import type { ColmapAccelerationStatus, ProjectSummary } from '../types/pipeline';
 import { localizePipelineMessage, useI18n } from '../i18n';
-import { taskProjectSummary, taskStatusLabel } from '../app/taskPresentation';
+import { taskProjectSummary } from '../app/taskPresentation';
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useProgressMessage } from '../app/useProgressMessage';
 import { useTaskElapsed } from '../app/useTaskElapsed';
@@ -71,20 +71,21 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     finally { setBusy(false); }
   };
   const events = task.recent_events;
-  const lastEvent = events.at(-1);
   const runtime = task.runtime ?? [...events].reverse().find(event => event.runtime)?.runtime;
   const stage = task.error?.failed_stage ?? (['failed', 'cancelled', 'interrupted'].includes(task.status)
     ? [...events].reverse().find(event => !['failed', 'cancelled', 'completed'].includes(event.stage))?.stage ?? detail?.stage
     : task.stage) ?? null;
-  const rawKeys = new Set(fileLogs.map(line => `${line.source}:${line.text.trim()}`));
-  const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.engine}:${event.message.trim()}`)).map(event => ({
-    key: `event:${event.sequence}`, source: event.engine, timestamp: event.timestamp, level: event.level,
-    text: event.kind === 'log' ? event.message : localizePipelineMessage(locale, event.message),
-  }));
-  const logs = boundLogLines([...fileLogs, ...eventLogs]);
+  const logs = useMemo(() => {
+    const rawKeys = new Set(fileLogs.map(line => `${line.source}:${line.text.trim()}`));
+    const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.engine}:${event.message.trim()}`)).map(event => ({
+      key: `event:${event.sequence}`, source: event.engine, timestamp: event.timestamp, level: event.level,
+      text: event.kind === 'log' ? event.message : localizePipelineMessage(locale, event.message),
+    }));
+    return boundLogLines([...fileLogs, ...eventLogs]);
+  }, [events, fileLogs, locale]);
   const resumable = project && detail && !active && ['failed', 'cancelled', 'interrupted'].includes(task.status);
   const error = actionError ?? externalError ?? task.error?.message;
-  const message = useProgressMessage(task.status, stage, events, runtime, error ?? lastEvent?.message ?? taskStatusLabel(locale, task.status), { current: task.current, total: task.total });
+  const message = useProgressMessage(task.status, stage, events, runtime, { current: task.current, total: task.total });
   return <section className="project-detail-page shared-task-detail" aria-label={locale === 'zh-CN' ? '任务详情' : 'Task details'}>
     {task.source === 'mcp' && <p className="task-origin">{locale === 'zh-CN' ? '由 AI Agent 创建' : 'Created by AI Agent'}</p>}
     {task.status === 'completed' && project && <ProjectResultStats project={project} detail={detail} inputImages={task.result?.inputImages} registeredImages={task.result?.registeredImages} />}
@@ -94,6 +95,6 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     {task.error?.classification_is_heuristic && <p className="project-failure">{locale === 'zh-CN' ? '错误分类为启发式判断，请结合日志确认。' : 'Error classification is heuristic; inspect logs for evidence.'}</p>}
     {task.status === 'created' && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => startGuiTask(task.task_id))}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('generate.start')}</button>}
     {resumable && onResume && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => onResume(project))}><Play size={16} fill="currentColor" />{t('project.continue')}</button>}
-    <TaskProgress status={task.status} stage={stage} progress={task.estimated_progress} estimated stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={logs} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
+    <TaskProgress status={task.status} stage={stage} progress={task.estimated_progress} estimated stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={logs} logsTruncated={(task.dropped_event_count ?? 0) > 0} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
   </section>;
 }

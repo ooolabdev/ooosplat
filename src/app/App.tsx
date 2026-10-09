@@ -22,12 +22,13 @@ import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
 import {
   cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
-  estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, onPipelineEvent, probeAndPlan, revealProject, revealProjectLogs,
+  estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, inspectReshootSource, onInputDragDrop, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
+import { useTaskElapsed } from "./useTaskElapsed";
 import { liveTrainingRemainingSeconds } from "../lib/runtimeEstimate";
 import { pipelineCommandError, pipelineErrorMessage, pipelineWasCancelled, type PipelineFailureKind } from "../lib/pipelineError";
 import { displayPath } from "../lib/displayPath";
@@ -300,7 +301,9 @@ export function App() {
   const cancellationOverlayTimer = useRef<number | null>(null);
   const pipelineRunningRef = useRef(isRunning);
   const accelerationRequestRevision = useRef(0);
-  const [liveElapsedMs, setLiveElapsedMs] = useState(0);
+  const [fallbackLiveElapsedMs, setLiveElapsedMs] = useState(0);
+  const sharedElapsedMs = useTaskElapsed(store.liveTask);
+  const liveElapsedMs = sharedElapsedMs ?? fallbackLiveElapsedMs;
   const [elapsedAnchorRevision, setElapsedAnchorRevision] = useState(0);
   const [isCancellationRequested, setIsCancellationRequested] = useState(false);
   const [showCancellationOverlay, setShowCancellationOverlay] = useState(false);
@@ -355,6 +358,7 @@ export function App() {
   const visibleDrafts=drafts.filter(draft=>!sharedTasks[draft.id]);
   const submittedIdsRef = useRef(new Set<string>());
   submittedIdsRef.current = new Set(Object.keys(sharedTasks));
+  const submittedIdsKey = Object.keys(sharedTasks).sort().join('|');
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
   const selectedProject = selectedTask.kind === "project"
     ? store.projects.find((project) => project.id === selectedTask.id)
@@ -379,7 +383,7 @@ export function App() {
     if (!store.latestEvent || !["failed", "cancelled"].includes(store.latestEvent.stage)) return store.latestEvent;
     return [...store.events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage)) ?? null;
   }, [store.events, store.latestEvent]);
-  const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime, store.progressMessage);
+  const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime);
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const queuedDrafts = useMemo(
     () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingEngines.length === 0),
@@ -837,22 +841,6 @@ export function App() {
   // The install guard must read live state: a download can outlive many renders.
   useEffect(() => { pipelineRunningRef.current = isRunning; }, [isRunning]);
 
-  useEffect(() => {
-    let unlisten: undefined | (() => void);
-    void onPipelineEvent((event) => {
-      store.receiveEvent(event);
-      if (!["completed", "failed", "cancelled"].includes(event.stage)) {
-        runStartedAt.current = Date.now() - event.elapsedMs;
-        setLiveElapsedMs(runElapsedOffset.current + event.elapsedMs);
-      }
-      if (["completed", "failed", "cancelled"].includes(event.stage)) {
-        runStartedAt.current = null;
-        setLiveElapsedMs(runElapsedOffset.current + event.elapsedMs);
-      }
-    }).then((fn) => { unlisten = fn; });
-    return () => unlisten?.();
-  }, [store.receiveEvent]);
-
   // The log keeps only the most recent 500 events, so depend on the replaced array rather
   // than its length. Updating scrollTop directly confines auto-follow to the log viewport
   // and never moves the surrounding task pane.
@@ -872,13 +860,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isRunning || store.liveTask) return;
     const startedAt = runStartedAt.current;
     if (startedAt == null) return;
     return startElapsedTicker(startedAt, (elapsed) => {
       setLiveElapsedMs(runElapsedOffset.current + elapsed);
     });
-  }, [elapsedAnchorRevision, isRunning]);
+  }, [elapsedAnchorRevision, isRunning, store.liveTask?.run_id]);
 
   useEffect(() => {
     if (!isRunning) clearCancellationFeedback();
@@ -902,8 +890,8 @@ export function App() {
   }, [expandedGroups]);
 
   useEffect(() => {
-    saveTaskWorkspace(taskWorkspace.drafts.filter(draft => !sharedTasks[draft.id]), taskWorkspace.selected, taskWorkspace.nextOrdinal);
-  }, [taskWorkspace, sharedTasks]);
+    saveTaskWorkspace(taskWorkspace.drafts.filter(draft => !submittedIdsRef.current.has(draft.id)), taskWorkspace.selected, taskWorkspace.nextOrdinal);
+  }, [taskWorkspace, submittedIdsKey]);
 
   useEffect(() => { setInputDropActive(false); }, [selectedTask.kind, selectedTask.id]);
 

@@ -1,7 +1,10 @@
 //! Application-owned task registry. Transports never own a generation future.
 pub mod logs;
+mod notifications;
 #[cfg(test)]
 mod tests;
+
+pub use notifications::TaskView;
 
 use crate::{
     engines::EnginePaths,
@@ -126,8 +129,9 @@ pub struct TaskRecord {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskUpdate {
-    pub task: TaskRecord,
-    pub event: Option<PipelineEvent>,
+    pub task: TaskView,
+    pub events: Vec<PipelineEvent>,
+    pub dropped_event_count: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct StartReceipt {
@@ -213,6 +217,7 @@ pub struct TaskService {
     pub(crate) active: Arc<Mutex<Option<Arc<PipelineRunner>>>>,
     pub(crate) diagnostics: Arc<crate::diagnostics::DiagnosticService>,
     emitter: Arc<SyncMutex<Option<Emit>>>,
+    notifications: Arc<SyncMutex<notifications::PendingNotifications>>,
     #[cfg(test)]
     pub(crate) executor: Arc<SyncMutex<Option<TestExecutor>>>,
 }
@@ -230,6 +235,7 @@ impl TaskService {
             active: Arc::new(Mutex::new(None)),
             diagnostics: Arc::new(Default::default()),
             emitter: Arc::new(SyncMutex::new(None)),
+            notifications: Arc::new(SyncMutex::new(Default::default())),
             #[cfg(test)]
             executor: Arc::new(SyncMutex::new(None)),
         }
@@ -238,24 +244,100 @@ impl TaskService {
         use tauri::Emitter;
         *self.emitter.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |update| {
             let _ = app.emit("task-update", &update);
-            if let Some(event) = update.event {
-                let _ = app.emit("pipeline-event", event);
-            }
         }));
     }
     fn records(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.registry.lock().unwrap_or_else(|p| p.into_inner())
     }
-    fn notify(&self, mut t: TaskRecord, event: Option<PipelineEvent>) {
-        t.recent_events.clear();
-        if let Some(emit) = self
-            .emitter
+    fn emitter(&self) -> Option<Emit> {
+        self.emitter
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
-        {
-            emit(TaskUpdate { task: t, event });
+    }
+
+    /// Lifecycle callers hold `gate` through persistence and notification.
+    /// The notification mutex serializes emission with synchronous runner events.
+    fn notify(&self, id: Uuid) {
+        let Some(emit) = self.emitter() else {
+            return;
+        };
+        let mut pending = self.notifications.lock().unwrap_or_else(|p| p.into_inner());
+        self.emit_pending(&mut pending, id, &emit, true);
+    }
+
+    fn emit_pending(
+        &self,
+        pending: &mut notifications::PendingNotifications,
+        id: Uuid,
+        emit: &Emit,
+        immediate: bool,
+    ) {
+        let queued = pending.tasks.remove(&id);
+        if queued.is_none() && !immediate {
+            return;
         }
+        let task = {
+            let registry = self.records();
+            let Some(task) = registry.tasks.get(&id) else {
+                return;
+            };
+            // Only lifecycle code may announce a non-active status, after persistence.
+            if !immediate && !task.status.active() {
+                return;
+            }
+            TaskView::from(task)
+        };
+        let queued = queued.filter(|queued| queued.run_id == task.run_id);
+        let dropped_event_count = queued
+            .as_ref()
+            .map_or(0, |queued| queued.dropped_event_count);
+        let events = queued
+            .map(|queued| queued.into_events())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| {
+                event.task_id == Some(id)
+                    && event.run_id == task.run_id
+                    && event.revision <= task.revision
+            })
+            .collect();
+        emit(TaskUpdate {
+            task,
+            events,
+            dropped_event_count,
+        });
+    }
+
+    fn flush_notifications(&self) {
+        // Do not wait for a start/cancel/finish checkpoint, or announce its state early.
+        let Ok(_gate) = self.gate.try_lock() else {
+            return;
+        };
+        let Some(emit) = self.emitter() else {
+            return;
+        };
+        let mut pending = self.notifications.lock().unwrap_or_else(|p| p.into_inner());
+        let ids: Vec<_> = pending.tasks.keys().copied().collect();
+        for id in ids {
+            self.emit_pending(&mut pending, id, &emit, false);
+        }
+    }
+
+    pub fn spawn_notification_pump(&self) -> tauri::async_runtime::JoinHandle<()> {
+        let service = self.clone();
+        tauri::async_runtime::spawn(async move {
+            // Construct the timer inside Tauri's runtime, never in the setup hook.
+            let mut timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + notifications::NOTIFICATION_INTERVAL,
+                notifications::NOTIFICATION_INTERVAL,
+            );
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                service.flush_notifications();
+            }
+        })
     }
     async fn persist(&self) -> Result<()> {
         let snapshot = serde_json::to_value(&*self.records())?;
@@ -481,7 +563,7 @@ impl TaskService {
             self.records().tasks.remove(&task.task_id);
             return Err(e);
         }
-        self.notify(task.clone(), None);
+        self.notify(task.task_id);
         Ok(task)
     }
 
@@ -634,7 +716,7 @@ impl TaskService {
                 }
             };
             self.persist().await?;
-            self.notify(task, None);
+            self.notify(task.task_id);
         }
         Ok(())
     }
@@ -792,7 +874,7 @@ impl TaskService {
             return Err(e);
         }
         *self.active.lock().await = Some(runner.clone());
-        self.notify(starting.clone(), None);
+        self.notify(id);
         let service = self.clone();
         tokio::spawn(async move {
             let _cleanup = ExecutionCleanup {
@@ -864,12 +946,18 @@ impl TaskService {
         Ok(receipt)
     }
     fn on_event(&self, id: Uuid, run: Uuid, mut event: PipelineEvent) {
-        let task = {
+        // A single lock orders record updates, queued events, and emitted snapshots.
+        // In particular, an old run cannot enqueue after a new run's notification.
+        let mut pending = self.notifications.lock().unwrap_or_else(|p| p.into_inner());
+        let immediate = {
             let mut registry = self.records();
             let Some(t) = registry.tasks.get_mut(&id) else {
                 return;
             };
             if t.run_id != Some(run) || !t.status.active() {
+                return;
+            }
+            if event.sequence > 0 && event.sequence <= t.sequence {
                 return;
             }
             // The supervisor, after durable result/error capture, owns terminal transitions.
@@ -879,10 +967,12 @@ impl TaskService {
             ) {
                 return;
             }
-            if t.status == TaskStatus::Starting {
+            let starting = t.status == TaskStatus::Starting;
+            let stage_changed = t.stage != Some(event.stage);
+            if starting {
                 t.status = TaskStatus::Running;
             }
-            if t.stage != Some(event.stage) {
+            if stage_changed {
                 t.progress = None;
                 t.current = None;
                 t.total = None;
@@ -891,7 +981,7 @@ impl TaskService {
                 t.runtime = None;
             }
             t.revision += 1;
-            t.sequence = event.sequence;
+            t.sequence = t.sequence.max(event.sequence);
             t.stage = Some(event.stage);
             t.updated_at = event.timestamp;
             t.elapsed_ms = t.elapsed_offset_ms.saturating_add(event.elapsed_ms);
@@ -928,12 +1018,23 @@ impl TaskService {
                     t.recent_events.remove(0);
                 }
             }
-            t.clone()
+            starting || stage_changed || event.kind == crate::pipeline::EventKind::Capability
         };
-        self.notify(task, Some(event));
+        pending.task(id, Some(run)).push(event);
+        if immediate {
+            // Runner callbacks are synchronous. A lifecycle operation in progress
+            // will flush this batch itself after its checkpoint becomes durable.
+            if let Ok(_gate) = self.gate.try_lock() {
+                if let Some(emit) = self.emitter() {
+                    self.emit_pending(&mut pending, id, &emit, false);
+                }
+            }
+        }
     }
     fn on_runner_update(&self, id: Uuid, run: Uuid, update: RunnerUpdate) {
-        let task = {
+        let mut pending = self.notifications.lock().unwrap_or_else(|p| p.into_inner());
+        let immediate = matches!(&update, RunnerUpdate::Project(_));
+        {
             let mut registry = self.records();
             let Some(t) = registry.tasks.get_mut(&id) else {
                 return;
@@ -970,9 +1071,15 @@ impl TaskService {
                 }
             }
             t.revision += 1;
-            t.clone()
-        };
-        self.notify(task, None);
+        }
+        pending.task(id, Some(run));
+        if immediate {
+            if let Ok(_gate) = self.gate.try_lock() {
+                if let Some(emit) = self.emitter() {
+                    self.emit_pending(&mut pending, id, &emit, false);
+                }
+            }
+        }
     }
     async fn finish(
         &self,
@@ -1073,7 +1180,7 @@ impl TaskService {
             tracing::error!(code=%e.code,"Could not persist task terminal state");
         }
         *self.active.lock().await = None;
-        self.notify(task, None);
+        self.notify(task.task_id);
     }
     pub async fn cancel(&self, id: Uuid, run: Uuid) -> Result<TaskRecord> {
         let service = self.clone();
@@ -1104,7 +1211,7 @@ impl TaskService {
                 service.records().tasks.insert(id, old);
                 return Err(e);
             }
-            service.notify(task.clone(), None);
+            service.notify(id);
             if let Some(runner) = service.active.lock().await.as_ref() {
                 runner.cancel();
             }
@@ -1201,7 +1308,7 @@ impl TaskService {
         if !changes.is_empty() {
             self.persist().await?;
             for task in changes {
-                self.notify(task, None);
+                self.notify(task.task_id);
             }
         }
         Ok(())
@@ -1225,7 +1332,7 @@ impl TaskService {
             task.clone()
         };
         self.persist().await?;
-        self.notify(task, None);
+        self.notify(task.task_id);
         Ok(())
     }
     pub fn spawn_checkpoint_writer(&self) -> tauri::async_runtime::JoinHandle<()> {
