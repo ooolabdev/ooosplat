@@ -1530,6 +1530,22 @@ impl PipelineRunner {
         .await
         .map_err(|error| SplatError::Process(format!("校验补拍基线模型失败：{error}")))??;
         let source_model_files = reusable_model_files(&source_reconstruction.model)?;
+        // Warm start: Brush loads `init.ply` from the dataset as its initial
+        // Gaussians. Reuse the source project's published model when it is a
+        // valid Gaussian PLY; otherwise fall back to sparse-point training.
+        let source_final_ply = source_root.join("final.ply");
+        let warm_start_ply = if source_final_ply.is_file() {
+            let candidate = source_final_ply.clone();
+            let valid = crate::presets::spawn_pipeline_blocking(move || {
+                inspect_gaussian_ply(&candidate).map(|_| ())
+            })
+            .await
+            .map_err(|error| SplatError::Process(format!("校验原高斯模型失败：{error}")))?
+            .is_ok();
+            valid.then_some(source_final_ply)
+        } else {
+            None
+        };
         let base_model = paths.colmap.join("base-model");
         let database = paths.colmap.join("database.db");
         let base_database = paths.colmap.join("base-database.db");
@@ -1961,19 +1977,30 @@ impl PipelineRunner {
                 .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失".into()))?
         } else {
             reset_directory(&paths.brush).await?;
-            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let dataset = prepare_brush_dataset(
+                &paths.brush,
+                &paths.frames,
+                &model,
+                warm_start_ply.as_deref(),
+            )
+            .await?;
             let source_long_edge = provenance
                 .width
                 .max(provenance.height)
                 .min(u64::from(u32::MAX)) as u32;
             let resolved_brush = state.brush_training.resolved.unwrap_or_else(|| {
-                resolve_brush_training_preset(
+                let resolved = resolve_brush_training_preset(
                     metadata.quality,
                     state.planner_enabled,
                     acceleration.usable_gpu_total_memory_mb(),
                     source_long_edge,
                     report.points_3d,
-                )
+                );
+                if warm_start_ply.is_some() {
+                    resolve_reshoot_warm_start_preset(resolved)
+                } else {
+                    resolved
+                }
             });
             if !state.brush_training.oom_retry_used {
                 state
@@ -1991,7 +2018,11 @@ impl PipelineRunner {
                 EventLevel::Info,
                 None,
                 true,
-                "正在使用全部已注册画面重新训练高斯",
+                if warm_start_ply.is_some() {
+                    "正在基于原高斯模型训练补拍画面"
+                } else {
+                    "正在使用全部已注册画面重新训练高斯"
+                },
                 Some(0),
                 Some(resolved_brush.preset.total_steps as u64),
                 Some("iterations"),
@@ -2518,7 +2549,7 @@ impl PipelineRunner {
                 .ok_or_else(|| SplatError::Process("Brush 检查点文件缺失，无法继续发布".into()))?
         } else {
             reset_directory(&paths.brush).await?;
-            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?;
+            let dataset = prepare_brush_dataset(&paths.brush, &paths.frames, &model, None).await?;
             let source_long_edge = prepared
                 .video
                 .as_ref()
@@ -4556,7 +4587,37 @@ async fn remove_bridge_outputs(
     }
 }
 
-async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Result<PathBuf> {
+/// Training steps for a reshoot that starts from the source project's model.
+///
+/// On a DTU scan6 defect benchmark (31 old + 10 reshoot views, 3 runs each),
+/// warm start with 3000 steps matched a full 15000-step retrain on held-out
+/// reshoot-region views (23.5-23.8 dB vs 22.6-23.6 dB) in ~34 s instead of
+/// ~125 s; 1500 steps lost ~0.3-0.5 dB. 3000 is the shortest budget tested
+/// that held quality, not a tuned optimum.
+const RESHOOT_WARM_START_STEPS: usize = 3_000;
+
+fn resolve_reshoot_warm_start_preset(
+    mut resolved: ResolvedBrushTrainingPreset,
+) -> ResolvedBrushTrainingPreset {
+    resolved.preset.total_steps = resolved
+        .preset
+        .total_steps
+        .clamp(1, RESHOOT_WARM_START_STEPS);
+    if let Some(mut densification) = resolved.preset.densification {
+        densification.growth_stop_iter = densification
+            .growth_stop_iter
+            .min(resolved.preset.total_steps as u32);
+        resolved.preset.densification = Some(densification);
+    }
+    resolved
+}
+
+async fn prepare_brush_dataset(
+    root: &Path,
+    frames: &Path,
+    model: &Path,
+    init_ply: Option<&Path>,
+) -> Result<PathBuf> {
     let dataset = root.join("dataset");
     let images = dataset.join("images");
     let sparse = dataset.join("sparse").join("0");
@@ -4576,6 +4637,12 @@ async fn prepare_brush_dataset(root: &Path, frames: &Path, model: &Path) -> Resu
     for name in ["cameras.bin", "images.bin", "points3D.bin"] {
         tokio::fs::copy(model.join(name), sparse.join(name)).await?;
     }
+    if let Some(init_ply) = init_ply {
+        let destination = dataset.join("init.ply");
+        if tokio::fs::hard_link(init_ply, &destination).await.is_err() {
+            tokio::fs::copy(init_ply, &destination).await?;
+        }
+    }
     Ok(dataset)
 }
 
@@ -4588,6 +4655,57 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reshoot_warm_start_caps_steps_and_growth() {
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            let resolved = resolve_brush_training_preset(quality, false, None, 1_600, 100);
+            let original = resolved.preset;
+            let adapted = resolve_reshoot_warm_start_preset(resolved).preset;
+
+            assert_eq!(
+                adapted.total_steps,
+                original.total_steps.min(RESHOOT_WARM_START_STEPS)
+            );
+            if let Some(densification) = adapted.densification {
+                assert!(densification.growth_stop_iter <= adapted.total_steps as u32);
+            }
+            // Only the step budget changes; resolution and refine cadence stay.
+            assert_eq!(adapted.max_resolution, original.max_resolution);
+            assert_eq!(adapted.refine_every, original.refine_every);
+        }
+    }
+
+    #[tokio::test]
+    async fn brush_dataset_links_warm_start_model_only_when_given() {
+        let temporary = tempfile::tempdir().unwrap();
+        let frames = temporary.path().join("frames");
+        let model = temporary.path().join("model");
+        let init = temporary.path().join("source-final.ply");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(frames.join("frame.jpg"), b"image").unwrap();
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            std::fs::write(model.join(name), name.as_bytes()).unwrap();
+        }
+        std::fs::write(&init, b"ply-warm-start").unwrap();
+
+        let warm =
+            prepare_brush_dataset(&temporary.path().join("warm"), &frames, &model, Some(&init))
+                .await
+                .unwrap();
+        assert_eq!(
+            std::fs::read(warm.join("init.ply")).unwrap(),
+            b"ply-warm-start"
+        );
+        assert!(warm.join("images/frame.jpg").is_file());
+        assert!(warm.join("sparse/0/points3D.bin").is_file());
+
+        let cold = prepare_brush_dataset(&temporary.path().join("cold"), &frames, &model, None)
+            .await
+            .unwrap();
+        assert!(!cold.join("init.ply").exists());
+    }
 
     #[test]
     fn reshoot_project_name_uses_the_short_suffix() {
