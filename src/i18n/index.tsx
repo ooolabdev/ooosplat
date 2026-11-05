@@ -1444,6 +1444,8 @@ export function localizePipelineMessage(locale: Locale, message: string): string
     [/^补拍画面已加入：(\d+)\/(\d+)$/, (current,total) => `Reshoot images registered: ${current}/${total}`],
     [/^复用已完成的补拍缓存：(.+)$/, stage => `Reusing completed reshoot cache: ${reshootCacheEnglish[stage] ?? localizePipelineMessage('en', stage)}`],
     [/^已发布 ([\d,]+) 个 Splat$/, (count) => `Published ${count} splats`],
+    [/^Brush 训练开始（使用可用图形后端）· ([\d,]+) iterations · 最大分辨率 ([\d,]+) · 预计约 (\d+:\d{2}:\d{2})$/, (iterations, resolution, estimate) => `Brush training started (using an available graphics backend) · ${iterations} iterations · max resolution ${resolution} · estimated about ${estimate}`],
+    [/^Brush 训练 · ([\d,]+)\/([\d,]+) 步$/, (current, total) => `Brush training · ${current}/${total} steps`],
     [/^进程已启动 · PID ([\d]+)$/, (pid) => `Process started · PID ${pid}`],
     [/^FFmpeg 已输出 ([\d,]+) 帧$/, (count) => `FFmpeg produced ${count} frames`],
     [/^已注册 ([\d,]+) 张图像$/, (count) => `Registered ${count} images`],

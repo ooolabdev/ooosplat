@@ -32,6 +32,17 @@ it('localizes the approved reshoot lifecycle logs without exposing Chinese cache
   }
 });
 
+it('localizes Brush training start and step progress messages', () => {
+  for (const [message, expected] of [
+    ['Brush 训练开始（使用可用图形后端）· 15000 iterations · 最大分辨率 1920 · 预计约 00:12:34', 'Brush training started (using an available graphics backend) · 15000 iterations · max resolution 1920 · estimated about 00:12:34'],
+    ['Brush 训练开始（使用可用图形后端）· 30000 iterations · 最大分辨率 3840 · 预计约 100:05:09', 'Brush training started (using an available graphics backend) · 30000 iterations · max resolution 3840 · estimated about 100:05:09'],
+    ['Brush 训练 · 1200/15000 步', 'Brush training · 1200/15000 steps'],
+  ]) {
+    expect(localizePipelineMessage('en', message)).toBe(expected);
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+  }
+});
+
 function Harness() {
   const { locale, t, toggleLocale, formatDuration } = useI18n();
   return <div>
