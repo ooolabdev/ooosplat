@@ -327,6 +327,8 @@ export function App() {
   };
   const [uiPreferences, setUiPreferences] = useState(loadUiPreferences);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
+  const telemetryRequestRevision = useRef(0);
+  const telemetryRequestPending = useRef(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
   const [taskWorkspace, setTaskWorkspace] = useState(loadTaskWorkspace);
   const taskWorkspaceRef = useRef(taskWorkspace);
@@ -1039,9 +1041,18 @@ export function App() {
   }, [reconcileRuntimeState, refreshSystemAcceleration, viewMode]);
 
   useEffect(() => {
+    let disposed = false;
+    const revision = telemetryRequestRevision.current;
     void initializeTelemetry()
-      .then(setTelemetryPreferences)
-      .catch(() => undefined);
+      .then((preferences) => {
+        if (!disposed && telemetryRequestRevision.current === revision) setTelemetryPreferences(preferences);
+      })
+      .catch((error) => {
+        if (!disposed && telemetryRequestRevision.current === revision) {
+          setTelemetryPreferences({ analyticsEnabled: false, consentDecided: true, deliveryStatus: "notConfigured", settingsError: rawMessageOf(error) ?? String(error) });
+        }
+      });
+    return () => { disposed = true; };
   }, []);
 
   // The install guard must read live state: a download can outlive many renders.
@@ -1157,16 +1168,27 @@ export function App() {
   const changeScale = (delta: number) => setUiScale((current) => Math.min(140, Math.max(80, current + delta)));
 
   const changeTelemetryConsent = async (enabled: boolean) => {
-    if (telemetryBusy) return;
+    if (telemetryRequestPending.current) return;
+    telemetryRequestPending.current = true;
+    const revision = ++telemetryRequestRevision.current;
     setTelemetryBusy(true);
+    if (!enabled) {
+      setTelemetryPreferences((previous) => ({ ...previous ?? { consentDecided: true, deliveryStatus: "notConfigured" }, analyticsEnabled: false }));
+    }
     try {
       const preferences = await setTelemetryConsent(enabled);
-      setTelemetryPreferences(preferences);
-      store.setError(null);
+      if (telemetryRequestRevision.current === revision) {
+        setTelemetryPreferences((previous) => ({ ...preferences, analyticsEnabled: enabled && preferences.analyticsEnabled, consentDecided: preferences.settingsError && previous?.consentDecided === false ? false : preferences.consentDecided }));
+      }
     } catch (error) {
-      store.setError(t("progress.privacyError", { detail: messageOf(error) }));
+      if (telemetryRequestRevision.current === revision) {
+        setTelemetryPreferences((previous) => ({ ...previous ?? { consentDecided: true, deliveryStatus: "notConfigured" }, analyticsEnabled: false, settingsError: messageOf(error) }));
+      }
     } finally {
-      setTelemetryBusy(false);
+      if (telemetryRequestRevision.current === revision) {
+        telemetryRequestPending.current = false;
+        setTelemetryBusy(false);
+      }
     }
   };
 

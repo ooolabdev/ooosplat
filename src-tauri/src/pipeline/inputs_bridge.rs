@@ -52,6 +52,9 @@ impl PipelineRunner {
         publish(paths, &pending, &cancel).await?;
         state.inputs = Some(pending.checkpoint);
         state.bridge_backfill.status = BridgeBackfillStatus::Completed;
+        if let Some(checkpoint) = state.inputs.as_ref() {
+            self.restore_collection_metrics(checkpoint, state.preset, state.generation_policy);
+        }
         if let Some(frames) = state.frames.as_mut() {
             frames.extracted_frames = Some(
                 state
@@ -104,6 +107,35 @@ impl PipelineRunner {
             c.bridge_used = false;
         }
         if !c.bridge_used {
+            let observations = c.telemetry.get_or_insert_with(Default::default);
+            observations.gpu_vendor = Some(if accel.detected_nvidia_device_count > 0 {
+                PlannerGpuVendor::Nvidia
+            } else if cfg!(target_os = "macos") {
+                PlannerGpuVendor::Apple
+            } else {
+                PlannerGpuVendor::Unknown
+            });
+            let input_images = c.sources.iter().map(|s| s.names.len() as u64).sum();
+            observations.bridge = Some(PlannerBridgeMetrics {
+                status: PlannerBridgeStatus::NotEvaluated,
+                trigger_ratio: bridge_trigger_ratio(),
+                initial_input_images: input_images,
+                initial_registered_images: initial.images.len() as u64,
+                initial_points_3d: initial.points.len() as u64,
+                final_input_images: input_images,
+                final_registered_images: initial.images.len() as u64,
+                final_points_3d: initial.points.len() as u64,
+                ..Default::default()
+            });
+            if let Some(allow_two_view_tracks) = state.actual_transparency {
+                observations.initial_reconstruction = Some(PlannerInitialReconstructionMetrics {
+                    input_images,
+                    registered_images: initial.images.len() as u64,
+                    points_3d: initial.points.len() as u64,
+                    backend: accel.backend,
+                    allow_two_view_tracks,
+                });
+            }
             c.bridge_used = true;
             let new_video_sources_only = c
                 .execution_plan
@@ -171,6 +203,13 @@ impl PipelineRunner {
             }
             state.bridge_backfill.status =
                 joint_bridge_status(&source_plans, selected_bridge_frames);
+            observe_joint_selection(
+                c,
+                &source_plans,
+                selected_bridge_frames,
+                state.bridge_backfill.status,
+            );
+            self.restore_collection_metrics(c, state.preset, state.generation_policy);
             state.inputs = Some(c.clone());
             manager.write_state(&paths.state, state).await?;
         }
@@ -208,6 +247,8 @@ impl PipelineRunner {
         .await?;
         let mut updated = c.clone();
         let mut additions = vec![];
+        let started = Instant::now();
+        let mut extracted_count = 0u64;
         let result = async {
             for s in &c.sources {
                 for name in &s.names {
@@ -278,6 +319,7 @@ impl PipelineRunner {
                 if extracted.frame_count != s.bridge_frames.len() as u64 {
                     return Err(SplatError::Process("Incomplete bridge extraction".into()));
                 }
+                extracted_count = extracted_count.saturating_add(extracted.frame_count);
                 let times: Vec<crate::video::panorama::FrameTime> = serde_json::from_slice(
                     &tokio::fs::read(
                         paths
@@ -400,18 +442,41 @@ impl PipelineRunner {
                 accel.gpu_index(),
             )
             .await?;
-            self.collection_mapper(&p, &updated, state, Some(&authority), accel)
+            let transparent = self
+                .collection_mapper(&p, &updated, state, Some(&authority), accel)
                 .await?;
+            state.actual_transparency = Some(transparent);
             let count = updated.sources.iter().map(|s| s.names.len() as u64).sum();
             let (candidate, report) = best_model(&sparse_attempt(&p, state), count)?;
             if report.registered_images < initial.images.len() as u64 {
                 return Err(SplatError::Process("Bridge registration regressed".into()));
             }
-            Ok(candidate)
+            Ok((candidate, report))
         }
         .await;
+        if let Some(metrics) = c.telemetry.as_mut().and_then(|saved| saved.bridge.as_mut()) {
+            metrics.added_frames = metrics.added_frames.max(extracted_count);
+            metrics.duration_ms = Some(
+                metrics
+                    .duration_ms
+                    .unwrap_or(0)
+                    .saturating_add(started.elapsed().as_millis() as u64),
+            );
+        }
         match result {
-            Ok(candidate) => {
+            Ok((candidate, report)) => {
+                updated.telemetry = c.telemetry.clone();
+                if let Some(metrics) = updated
+                    .telemetry
+                    .as_mut()
+                    .and_then(|saved| saved.bridge.as_mut())
+                {
+                    metrics.status = PlannerBridgeStatus::Completed;
+                    metrics.final_input_images = report.input_images;
+                    metrics.final_registered_images = report.registered_images;
+                    metrics.final_points_3d = report.points_3d;
+                    metrics.adopted = true;
+                }
                 let model = candidate
                     .strip_prefix(&attempt)
                     .map(Path::to_path_buf)
@@ -429,11 +494,22 @@ impl PipelineRunner {
                 *c = pending.checkpoint;
                 state.bridge_backfill.status = BridgeBackfillStatus::Completed;
             }
-            Err(error) if !matches!(&error,SplatError::Process(message) if message=="Bridge registration regressed"||message=="稀疏重建没有可用的注册图像或三维点") => {
-                return Err(error)
+            Err(error) if !matches!(&error,SplatError::Process(message) if message=="Bridge registration regressed"||message=="稀疏重建没有可用的注册图像或三维点") =>
+            {
+                self.restore_collection_metrics(c, state.preset, state.generation_policy);
+                state.inputs = Some(c.clone());
+                if let Err(save_error) = manager.write_state(&paths.state, state).await {
+                    tracing::warn!(%save_error, "Could not save failed Bridge observation");
+                }
+                return Err(error);
             }
             Err(error) => {
                 state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+                if let Some(metrics) = c.telemetry.as_mut().and_then(|saved| saved.bridge.as_mut())
+                {
+                    metrics.status = PlannerBridgeStatus::FailedRolledBack;
+                    metrics.adopted = false;
+                }
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
                     Some(PipelineEngine::System),
@@ -449,12 +525,36 @@ impl PipelineRunner {
             }
         }
         state.inputs = Some(c.clone());
+        self.restore_collection_metrics(c, state.preset, state.generation_policy);
         if let Some(f) = state.frames.as_mut() {
             f.extracted_frames = Some(c.sources.iter().map(|s| s.names.len() as u64).sum());
         }
         self.record_collection_artifacts(paths, state).await?;
         manager.write_state(&paths.state, state).await?;
         Ok(())
+    }
+}
+
+fn observe_joint_selection(
+    checkpoint: &mut InputCheckpoint,
+    plans: &[BridgeBackfillPlan],
+    requested_frames: usize,
+    status: BridgeBackfillStatus,
+) {
+    if let Some(metrics) = checkpoint
+        .telemetry
+        .as_mut()
+        .and_then(|saved| saved.bridge.as_mut())
+    {
+        metrics.status = if plans.is_empty() {
+            PlannerBridgeStatus::NotApplicable
+        } else {
+            status.into()
+        };
+        metrics.available_budget = plans.iter().map(|plan| plan.available_budget).sum();
+        metrics.requested_frames = requested_frames as u64;
+        metrics.internal_bridge_count = plans.iter().map(|plan| plan.internal_bridge_count).sum();
+        metrics.edge_extension_count = plans.iter().map(|plan| plan.edge_extension_count).sum();
     }
 }
 
@@ -499,6 +599,9 @@ fn validate_pending_publication(
     }
     let mut unchanged = pending.checkpoint.clone();
     unchanged.sources = current.sources.clone();
+    // An observation may be completed before publication is reconciled. It
+    // must never become an execution-plan or source-admission constraint.
+    unchanged.telemetry = current.telemetry.clone();
     if !current.prepared
         || !current.bridge_used
         || pending.additions.is_empty()
@@ -760,6 +863,193 @@ mod tests {
             available_budget,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn joint_observation_sums_source_local_frames_without_summing_shared_model_points() {
+        let mut checkpoint = InputCheckpoint::new(GenerationInputs::Materials { items: vec![] });
+        checkpoint.telemetry = Some(crate::pipeline::effectiveness::CollectionTelemetry {
+            bridge: Some(PlannerBridgeMetrics {
+                initial_points_3d: 123,
+                final_points_3d: 123,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let first = BridgeBackfillPlan {
+            available_budget: 2,
+            selected_frame_indices: vec![10],
+            internal_bridge_count: 1,
+            ..Default::default()
+        };
+        let second = BridgeBackfillPlan {
+            available_budget: 3,
+            selected_frame_indices: vec![10],
+            edge_extension_count: 1,
+            ..Default::default()
+        };
+        observe_joint_selection(
+            &mut checkpoint,
+            &[first, second],
+            2,
+            BridgeBackfillStatus::Running,
+        );
+        let saved: InputCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let metrics = saved.telemetry.unwrap().bridge.unwrap();
+        assert_eq!(metrics.available_budget, 5);
+        assert_eq!(metrics.requested_frames, 2);
+        assert_eq!(
+            (metrics.internal_bridge_count, metrics.edge_extension_count),
+            (1, 1)
+        );
+        assert_eq!(
+            (metrics.initial_points_3d, metrics.final_points_3d),
+            (123, 123)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_bridge_no_budget_records_real_initial_model_without_starting_engines() {
+        let (root, paths, mut state, pending) = recovery_fixture();
+        let mut checkpoint = pending.checkpoint;
+        checkpoint.bridge_used = false;
+        checkpoint.telemetry = None;
+        let frames = checkpoint.sources[0].frames.as_mut().unwrap();
+        frames.initial_extracted_frames = 2;
+        frames.estimated_frames = 2;
+        frames.selected_frames = vec![
+            crate::video::PlannedFrame {
+                source_frame_index: 0,
+                timestamp_seconds: 0.0,
+            },
+            crate::video::PlannedFrame {
+                source_frame_index: 1,
+                timestamp_seconds: 1.0,
+            },
+        ];
+        frames.rescue_max_frames = 2;
+        checkpoint.sources[0].bridge_frames.clear();
+        state.inputs = Some(checkpoint.clone());
+        state.bridge_backfill.status = BridgeBackfillStatus::NotEvaluated;
+        state.actual_transparency = Some(true);
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        )
+        .with_effectiveness_tracker(tracker.clone());
+        let acceleration = serde_json::from_value(serde_json::json!({
+            "backend":"cpu","detectionState":"ready","reasonCode":"gpuReady","reason":"fixture",
+            "device":null,"requirements":{"minimumDriverVersion":"580","minimumComputeCapability":"7.5"}
+        })).unwrap();
+        runner
+            .collection_bridge(
+                &ProjectManager::for_diagnostics(root.path().to_path_buf()),
+                &paths,
+                &mut state,
+                &mut checkpoint,
+                Quality::Balanced,
+                &acceleration,
+            )
+            .await
+            .unwrap();
+        let metrics = tracker.snapshot();
+        assert_eq!(
+            metrics.bridge.as_ref().unwrap().status,
+            PlannerBridgeStatus::NoBudget
+        );
+        assert_eq!(metrics.bridge.as_ref().unwrap().initial_input_images, 2);
+        assert_eq!(
+            metrics.bridge.as_ref().unwrap().initial_registered_images,
+            1
+        );
+        assert_eq!(
+            metrics
+                .initial_reconstruction
+                .as_ref()
+                .unwrap()
+                .registered_images,
+            1
+        );
+        assert!(
+            metrics
+                .initial_reconstruction
+                .as_ref()
+                .unwrap()
+                .allow_two_view_tracks
+        );
+        assert!(!paths.logs.join("joint-bridge-frames.log").exists());
+    }
+
+    #[tokio::test]
+    async fn bridge_publication_observations_are_not_admission_identity_and_restore_after_restart()
+    {
+        let (root, paths, mut state, mut pending) = recovery_fixture();
+        state.inputs.as_mut().unwrap().telemetry =
+            Some(crate::pipeline::effectiveness::CollectionTelemetry {
+                bridge: Some(PlannerBridgeMetrics {
+                    status: PlannerBridgeStatus::Running,
+                    initial_input_images: 1,
+                    initial_registered_images: 1,
+                    initial_points_3d: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        pending.checkpoint.telemetry = state.inputs.as_ref().unwrap().telemetry.clone();
+        let observed = pending
+            .checkpoint
+            .telemetry
+            .as_mut()
+            .unwrap()
+            .bridge
+            .as_mut()
+            .unwrap();
+        observed.status = PlannerBridgeStatus::Completed;
+        observed.requested_frames = 1;
+        observed.added_frames = 1;
+        observed.final_input_images = 2;
+        observed.final_registered_images = 2;
+        observed.final_points_3d = 9;
+        observed.adopted = true;
+        validate_pending_publication(
+            &paths,
+            state.inputs.as_ref().unwrap(),
+            &pending,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        crate::project::manager::atomic_write_json(
+            &paths.work.join("joint-bridge/publication.json"),
+            &pending,
+        )
+        .await
+        .unwrap();
+        let tracker = PlannerEffectivenessTracker::default();
+        let manager = ProjectManager::for_diagnostics(root.path().to_path_buf());
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        )
+        .with_effectiveness_tracker(tracker.clone());
+        assert!(runner
+            .reconcile_collection_bridge(&manager, &paths, &mut state)
+            .await
+            .unwrap());
+        let saved = manager.read_state(&paths.state).await.unwrap();
+        let observed = tracker.snapshot().bridge.unwrap();
+        assert_eq!(observed.status, PlannerBridgeStatus::Completed);
+        assert_eq!(
+            (observed.initial_points_3d, observed.final_points_3d),
+            (7, 9)
+        );
+        assert_eq!(observed.added_frames, 1);
+        let restored = PlannerEffectivenessTracker::default();
+        PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(restored.clone())
+            .restore_source_metrics(&saved);
+        assert_eq!(restored.snapshot().bridge, Some(observed));
     }
 
     #[test]

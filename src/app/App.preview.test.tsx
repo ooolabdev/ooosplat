@@ -1753,6 +1753,74 @@ describe("App preview workspace", () => {
     expect(mocks.setTelemetryConsent).not.toHaveBeenCalled();
   });
 
+  it("turns analytics off immediately and preserves the task error when saving fails", async () => {
+    let rejectSave!: (reason: Error) => void;
+    mocks.setTelemetryConsent.mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject; }));
+    await act(async () => useAppStore.getState().setError("Original generation failure"));
+    await act(async () => container.querySelector<HTMLButtonElement>('.settings-action:not(.language-action)')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('#settings-tab-privacy')!.click());
+    const toggle = () => container.querySelector<HTMLButtonElement>('.privacy-switch')!;
+    expect(toggle().getAttribute('aria-checked')).toBe('true');
+    await act(async () => toggle().click());
+    expect(toggle().getAttribute('aria-checked')).toBe('false');
+    expect(toggle().disabled).toBe(true);
+    expect(mocks.setTelemetryConsent).toHaveBeenCalledExactlyOnceWith(false);
+    await act(async () => rejectSave(new Error('settings write denied'))); await flush();
+    expect(toggle().getAttribute('aria-checked')).toBe('false');
+    expect(toggle().disabled).toBe(false);
+    expect(container.querySelector('.settings-dialog [role="alert"]')?.textContent).toContain('settings write denied');
+    expect(useAppStore.getState().error).toBe('Original generation failure');
+    expect(mocks.prepareErrorReport).not.toHaveBeenCalled();
+  });
+
+  it("enables analytics only after a successful save without clearing a generation error", async () => {
+    mocks.initializeTelemetry.mockResolvedValueOnce({ analyticsEnabled: false, consentDecided: true, deliveryStatus: 'configured' });
+    await act(async () => root.render(<LanguageProvider><App key="privacy-save" /></LanguageProvider>)); await flush();
+    await act(async () => useAppStore.getState().setError('Existing engine failure'));
+    await act(async () => container.querySelector<HTMLButtonElement>('.settings-action:not(.language-action)')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('#settings-tab-privacy')!.click());
+    let finishSave!: (value: { analyticsEnabled: boolean; consentDecided: boolean; deliveryStatus: string }) => void;
+    mocks.setTelemetryConsent.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+    const toggle = () => container.querySelector<HTMLButtonElement>('.privacy-switch')!;
+    await act(async () => toggle().click());
+    expect(toggle().getAttribute('aria-checked')).toBe('false');
+    expect(toggle().disabled).toBe(true);
+    await act(async () => finishSave({ analyticsEnabled: true, consentDecided: true, deliveryStatus: 'configured' })); await flush();
+    expect(toggle().getAttribute('aria-checked')).toBe('true');
+    expect(useAppStore.getState().error).toBe('Existing engine failure');
+  });
+
+  it("honors fail-closed preference responses and confines their errors to privacy settings", async () => {
+    mocks.setTelemetryConsent.mockResolvedValueOnce({ analyticsEnabled: false, consentDecided: true, deliveryStatus: 'configured', settingsError: 'cannot persist privacy choice' });
+    await act(async () => useAppStore.getState().setError('Keep original task error'));
+    await act(async () => container.querySelector<HTMLButtonElement>('.settings-action:not(.language-action)')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('#settings-tab-privacy')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.privacy-switch')!.click()); await flush();
+    expect(container.querySelector('.privacy-switch')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.settings-dialog [role="alert"]')?.textContent).toContain('cannot persist privacy choice');
+    expect(useAppStore.getState().error).toBe('Keep original task error');
+    mocks.setTelemetryConsent.mockResolvedValueOnce({ analyticsEnabled: false, consentDecided: true, deliveryStatus: 'configured', settingsError: 'enable save failed' });
+    await act(async () => container.querySelector<HTMLButtonElement>('.privacy-switch')!.click()); await flush();
+    expect(container.querySelector('.privacy-switch')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.settings-dialog [role="alert"]')?.textContent).toContain('enable save failed');
+    expect(useAppStore.getState().error).toBe('Keep original task error');
+  });
+
+  it("keeps initialization failures fail-closed and ignores an unmounted initialization response", async () => {
+    let completeOld!: (value: { analyticsEnabled: boolean; consentDecided: boolean; deliveryStatus: string }) => void;
+    mocks.initializeTelemetry.mockImplementationOnce(() => new Promise(resolve => { completeOld = resolve; }));
+    await act(async () => root.render(<LanguageProvider><App key="old-privacy-init" /></LanguageProvider>));
+    mocks.initializeTelemetry.mockRejectedValueOnce(new Error('damaged privacy configuration'));
+    await act(async () => root.render(<LanguageProvider><App key="new-privacy-init" /></LanguageProvider>)); await flush();
+    await act(async () => useAppStore.getState().setError('Unrelated task failure'));
+    await act(async () => completeOld({ analyticsEnabled: true, consentDecided: true, deliveryStatus: 'configured' })); await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('.settings-action:not(.language-action)')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('#settings-tab-privacy')!.click());
+    expect(container.querySelector('.privacy-switch')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.settings-dialog [role="alert"]')?.textContent).toContain('damaged privacy configuration');
+    expect(useAppStore.getState().error).toBe('Unrelated task failure');
+  });
+
   it("blocks the interface while a slow cancellation is still terminating processes", async () => {
     mocks.getAppRuntimeStatus.mockResolvedValueOnce({ pipelineRunning: true, pipelineProjectId: null, pipelineWorkspaceTaskId: null, previewProjectId: null, taskAcceleration: null });
     act(() => useAppStore.setState({ phase: "running" }));

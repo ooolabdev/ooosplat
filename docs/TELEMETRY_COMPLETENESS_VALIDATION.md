@@ -1,5 +1,40 @@
 # 埋点与实际 GPU 快照验证
 
+## 2026-11-11：统一流水线统计与诊断可靠性修复
+
+本轮在本地 `main` 工作区实施，不修改数据库、上传 DTO、事件名称、统计版本、训练配方或项目 schema 版本；不提交、不推送、不向线上发送测试数据。以下为当前实现，后面的 2026-10-27 记录保留为历史验证。
+
+### 行为与兼容
+
+- 既有统计配置损坏或不可读时，本会话停发，保留原文件，不生成新安装 ID；只有明确设置操作才重读。首次安装默认不变。关闭在等待磁盘前生效，即使保存失败仍停发；开启须保存成功。排队事件和心跳绑定授权代次，不能跨关闭／重开复活。已交付 HTTP 的请求无法保证撤回，保存失败也不承诺重启后继续关闭。
+- 本地偏好响应仅新增可选 `settingsError`。错误复用隐私区域已有提示，不再覆盖或清除任务错误；旧初始化响应不能覆盖后来的开关选择。按 React 检查表复核异步回调、重复操作及卸载清理，没有新增弹窗或文案。
+- 基础运行事件与 Planner 汇总准入分开。全视频／全图片可准确发送开始事件；真正的视频＋图片混合跳过无法表达的开始事件，但保留阶段、失败和完成事件。无法用现有字段准确表达的完整素材汇总仍不发送，不新增 `unknown` 类型或借用第一份素材，多素材时不伪造单一时长。
+- 分析、准备和继续准入共用来源观测，按唯一新增来源 ID＋身份定位，排除补拍 `__source`。恢复只读保存的 `inputs.sources`／观测，不重新访问原素材；旧顶层记录保留兼容。视频请求 FPS、实际 FPS、最少30帧覆盖及候选范围分别记录；短视频覆盖标记不会改变抽帧计划。已知首次实际数量优先于旧估算，统计只提取标量，不为观测复制整份帧索引。
+- 初始重建在 Bridge 前冻结，Bridge 后、GPS／跨源扩展前冻结补帧结果。预算和实际新增数按来源相加，不把不同视频的同编号帧去重，也不重复相加联合模型三维点。成功、无预算、无须执行、回滚均保留真实状态；旧初始证据不足时为空。可选本地观测不进入素材、候选或发布准入身份，额外保存失败只警告，不覆盖生成错误。
+- 诊断日志改为当前 run／operation／engine／PID 的文件身份和字节区间。终止行完成写入后冻结64 KiB／200行尾部，内部最多32条执行记录；GPS、联合 Bridge、同文件重试不再按名称或 mtime 猜测。成功进程后的应用校验、启动、I/O、取消或终止信息不匹配时不借用上一进程日志。旧任务无可信归属时附件为空；#83 仍使用本次准备操作内存缓冲。
+- 同一执行／同一已确认 GPU 的临时 N/A 或采样失败不清空已知显存及驱动；换设备、换进程、退出或同名多卡歧义仍隔离。歧义状态不会在下一次空采样时恢复旧值。MCP 设备字段按既有 snake_case Schema 显式映射，不改 Schema 或诊断上传字段。
+
+### 本轮验证
+
+| 命令／范围 | 结果 |
+| --- | --- |
+| Rust `cargo test --offline --all-targets`，显式排除下列3项既有 Windows 链接权限用例 | 库857通过、38忽略、3排除；CLI 1通过；主程序目标0项 |
+| `npm test` | 84文件、895项前端测试及7项诊断协议测试通过 |
+| `npm run build` | HTML viewer、TypeScript、Vite生产构建通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --offline --all-targets -- -D warnings` | 通过 |
+| `git diff --check` | 通过 |
+
+排除项：`commands::model_export::tests::mcp_rejects_redirected_exports_and_holds_target_edit_lock`、`mcp::tests::default_input_directory_rejects_redirected_folders`、`tasks::tests::unauthorized_paths_and_log_symlinks_are_rejected`。未过滤的首轮确实遇到 Windows OS1314／链接权限限制，不能将排除计为通过；另发现并修复短视频最少帧覆盖统计断言，最终复测通过。
+
+新增回归实际进入共享图片准备，再以不存在的引擎路径停止，检查录制报文及移走原图后的保存数据恢复；不是仅手填 Tracker。另覆盖真实无引擎 Bridge 无预算与发布恢复、候选／素材身份不受观测变化影响、隔离 Windows 子进程的退出日志顺序、配置读写故障与并发开关、旧日志较新和重复执行区间、冻结预览／重发、设备 N/A 及MCP字段一致性。录制传输与模拟数据库均不访问线上。
+
+未重新执行完整 SfM／Brush、未故意触发硬件 OOM、未上传测试诊断。桌面自然交互、其他平台及线上服务部署仍须单独验收；既有浏览器模块外部化、WASM URL、大分块及Windows链接器提示保留。原素材、模型、已有实验和工作树未清理。
+
+English: anonymous telemetry now fails closed for existing settings faults, preserves an immediate session opt-out when saving fails, and isolates queued requests by consent epoch. Basic lifecycle events no longer depend on scalar Planner-summary eligibility. Source and Bridge observations are restored from identity-bound local checkpoints without changing recipes or cache identities. Diagnostic attachments are frozen from the failed execution's proven byte interval rather than filename/mtime guesses; preparation failures keep their bounded memory context. Confirmed GPU metadata survives unavailable samples without crossing adapters or runs, and MCP uses its existing field names. Validation passed: 857 Rust library tests and one CLI test, 895 frontend tests, seven diagnostic protocol tests, production build, formatting and Clippy; 38 ignored and three Windows symlink-permission exclusions are not claimed as passed. No production upload or full-training/hardware acceptance was performed.
+
+## 历史验证记录
+
 日期：2026-10-27；分支：`main`。
 
 ## 采集口径

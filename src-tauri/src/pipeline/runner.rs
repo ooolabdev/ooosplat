@@ -613,6 +613,7 @@ pub struct PipelineRunner {
     engines: EnginePaths,
     process_manager: ProcessManager,
     events: EventSink,
+    diagnostic_logs: Arc<std::sync::Mutex<crate::diagnostics::logs::ExecutionLogs>>,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     preparation_context: std::sync::Mutex<Option<PreparationContext>>,
     current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
@@ -703,6 +704,7 @@ impl PipelineRunner {
                 started: Instant::now(),
             },
             active_project: Arc::new(std::sync::Mutex::new(None)),
+            diagnostic_logs: Default::default(),
             preparation_context: std::sync::Mutex::new(None),
             current_acceleration: Arc::new(std::sync::Mutex::new(None)),
             automatic_retry_this_run: AtomicBool::new(false),
@@ -999,9 +1001,33 @@ impl PipelineRunner {
         self.record_frame_metrics(&state, plan.estimated_frames, Some(plan));
     }
 
+    fn record_material_frame_plan(
+        &self,
+        quality: Quality,
+        video: &VideoInfo,
+        plan: &FramePlan,
+        is_reshoot: bool,
+        removal_fps: Option<f64>,
+    ) {
+        if let Some(policy) = self.policy() {
+            if let (Some(tracker), Some(metrics)) = (
+                &self.effectiveness,
+                PlannerFramePlanMetrics::video(video, plan, quality, Some(policy), removal_fps),
+            ) {
+                tracker.record_frame_plan(metrics);
+            }
+        } else {
+            self.record_input_plan(quality, video, plan, is_reshoot);
+        }
+    }
+
     /// Restore known source facts before a resumed run performs fallible cache checks.
     /// A reshoot's frame checkpoint contains old + new images, not its source count.
     fn restore_source_metrics(&self, state: &PipelineStateFile) {
+        if let Some(checkpoint) = &state.inputs {
+            self.restore_collection_metrics(checkpoint, state.preset, state.generation_policy);
+            return;
+        }
         let selected = if let Some(reshoot) = &state.reshoot {
             reshoot
                 .supplemental_frames_complete
@@ -1031,6 +1057,139 @@ impl PipelineRunner {
                 UniformRatioFrameSelection.create_plan(video, &state.preset.preset())
             };
             self.record_frame_metrics(state, plan.estimated_frames, Some(&plan));
+        }
+    }
+
+    pub(super) fn restore_collection_metrics(
+        &self,
+        checkpoint: &crate::pipeline::inputs::InputCheckpoint,
+        quality: Quality,
+        policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    ) {
+        let Some(tracker) = &self.effectiveness else {
+            return;
+        };
+        let requested = match &checkpoint.request {
+            crate::pipeline::inputs::GenerationInputs::Materials { items } => {
+                match items.as_slice() {
+                    [item] => Some(item),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let saved_frame = checkpoint
+            .telemetry
+            .as_ref()
+            .filter(|saved| {
+                requested.is_some_and(|item| {
+                    saved.source_id.as_deref() == Some(item.id.as_str())
+                        && item.identity.is_some()
+                        && saved.source_identity.as_deref() == item.identity.as_deref()
+                })
+            })
+            .and_then(|saved| saved.frame_plan.clone());
+        let frame = saved_frame.or_else(|| {
+            let source = checkpoint.single_requested_source()?;
+            if let (Some(video), Some(frames)) = (&source.video, &source.frames) {
+                let plan = FramePlan {
+                    retention_ratio: frames.retention_ratio,
+                    sampling_fps: frames.sampling_fps,
+                    estimated_frames: if frames.initial_extracted_frames > 0 {
+                        frames.initial_extracted_frames
+                    } else {
+                        frames.estimated_frames
+                    },
+                    // This is a scalar observation, not an execution plan.
+                    // Keep availability without copying potentially millions of indices.
+                    selected_frames: Vec::new(),
+                    candidate_frames: Vec::new(),
+                    bridge_source_frames: Some(
+                        frames
+                            .bridge_source_frames
+                            .unwrap_or(frames.candidate_frames.len() as u64),
+                    ),
+                    rescue_max_frames: frames.rescue_max_frames,
+                    minimum_frame_override_applied: frames.minimum_frame_override_applied,
+                };
+                PlannerFramePlanMetrics::video(
+                    video,
+                    &plan,
+                    quality,
+                    policy,
+                    requested.and_then(|item| item.frame_removal_fps),
+                )
+            } else if source.dimensions.len() == 1 {
+                source.image_sequence.as_ref().map(|images| {
+                    PlannerFramePlanMetrics::images(images.width, images.height, images.image_count)
+                })
+            } else {
+                None
+            }
+        });
+        if let Some(frame) = frame {
+            tracker.record_frame_plan(frame);
+        }
+        if let Some(saved) = checkpoint.telemetry.as_ref() {
+            if let Some(vendor) = saved.gpu_vendor {
+                tracker.record_gpu_vendor(vendor);
+            }
+            if let Some(initial) = &saved.initial_reconstruction {
+                tracker.record_initial_reconstruction(initial.clone());
+            }
+            if let Some(bridge) = &saved.bridge {
+                tracker.record_bridge(bridge.clone());
+            }
+        }
+    }
+
+    pub(super) fn observe_collection_source(
+        &self,
+        checkpoint: &mut crate::pipeline::inputs::InputCheckpoint,
+        item: &crate::pipeline::inputs::MaterialInput,
+        analysis: &crate::pipeline::inputs::MaterialAnalysis,
+        quality: Quality,
+        policy: crate::pipeline::generation_policy::GenerationPolicy,
+    ) {
+        let frame = match (&analysis.video, &analysis.image_sequence, &analysis.plan) {
+            (Some(video), _, Some(plan)) => PlannerFramePlanMetrics::video(
+                video,
+                plan,
+                quality,
+                Some(policy),
+                item.frame_removal_fps,
+            ),
+            (_, Some(images), _) if analysis.dimensions.len() == 1 => Some(
+                PlannerFramePlanMetrics::images(images.width, images.height, images.image_count),
+            ),
+            _ => None,
+        };
+        if let Some(frame) = frame {
+            self.observe_collection_frame(checkpoint, item, &analysis.identity, frame);
+        }
+    }
+
+    pub(super) fn observe_collection_frame(
+        &self,
+        checkpoint: &mut crate::pipeline::inputs::InputCheckpoint,
+        item: &crate::pipeline::inputs::MaterialInput,
+        identity: &str,
+        frame: PlannerFramePlanMetrics,
+    ) {
+        let crate::pipeline::inputs::GenerationInputs::Materials { items } = &checkpoint.request
+        else {
+            return;
+        };
+        if items.len() != 1 || items[0].id != item.id || item.identity.as_deref() != Some(identity)
+        {
+            return;
+        }
+        let saved = checkpoint.telemetry.get_or_insert_with(Default::default);
+        saved.source_id = Some(item.id.clone());
+        saved.source_identity = Some(identity.to_owned());
+        saved.frame_plan = Some(frame.clone());
+        if let Some(tracker) = &self.effectiveness {
+            tracker.record_frame_plan(frame);
         }
     }
 
@@ -1258,6 +1417,45 @@ impl PipelineRunner {
         }
     }
 
+    /// Only the failed operation's proven byte range may become a report.
+    /// Unobserved/legacy processes have no evidence and therefore no log tail.
+    pub(crate) fn freeze_failure_log(
+        &self,
+        error: &SplatError,
+        engine: Option<PipelineEngine>,
+    ) -> Option<crate::diagnostics::logs::FrozenLog> {
+        let expected_termination = match error {
+            SplatError::EngineProcess(failure) if Some(failure.engine) == engine => {
+                Some(&failure.termination)
+            }
+            // FFmpeg's legacy adapters still return these types. A failed
+            // native status in this exact operation is required below; a
+            // successful extraction followed by mapping validation is not it.
+            SplatError::Process(_) | SplatError::InvalidVideo(_)
+                if engine == Some(PipelineEngine::Ffmpeg) =>
+            {
+                None
+            }
+            _ => return None,
+        };
+        let operation = self
+            .events
+            .context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .current
+            .clone()?;
+        let log = self
+            .diagnostic_logs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .for_failure(self.execution_run_id?, &operation, engine?)?;
+        if expected_termination.is_some_and(|status| !log.termination_matches(status)) {
+            return None;
+        }
+        log.freeze()
+    }
+
     pub fn current_acceleration(&self) -> Option<crate::engines::ColmapAccelerationStatus> {
         self.current_acceleration
             .lock()
@@ -1356,7 +1554,13 @@ impl PipelineRunner {
         } else {
             UniformRatioFrameSelection.create_plan(&video, &quality.preset())
         };
-        self.record_input_plan(quality, &video, &plan, self.reshoot_options.is_some());
+        self.record_material_frame_plan(
+            quality,
+            &video,
+            &plan,
+            self.reshoot_options.is_some(),
+            frame_removal_fps,
+        );
         // Exact frame timing is shared by ordinary and ERP videos. It does not
         // imply a projection change; only `panorama` selects the ERP path.
         if panorama || self.policy().is_some_and(|p| p.version >= 4) {
@@ -1389,6 +1593,15 @@ impl PipelineRunner {
             if let Some(total) = plan.bridge_source_frames {
                 video.total_frames = total;
             }
+            // The real PTS table can refine counts and the effective sampling
+            // plan. Observe the final plan, not only its earlier estimate.
+            self.record_material_frame_plan(
+                quality,
+                &video,
+                &plan,
+                self.reshoot_options.is_some(),
+                frame_removal_fps,
+            );
             self.events.stage(
                 PipelineStage::ExtractingFrames,
                 0.0,
@@ -5449,6 +5662,9 @@ impl PipelineRunner {
         let effectiveness = self.effectiveness.clone();
         let artifact_recorder = self.artifact_recorder.clone();
         let preparation_notice = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let diagnostic_logs = self.diagnostic_logs.clone();
+        let project = self.active_project.clone();
+        let run_id = self.execution_run_id;
         Arc::new(move |update| {
             let mut scoped = events.clone();
             if matches!(update, ProcessUpdate::Started { .. }) {
@@ -5461,7 +5677,54 @@ impl PipelineRunner {
             }
             let events = scoped;
             match update {
-                ProcessUpdate::LogOpened { .. } => {}
+                ProcessUpdate::LogOpened { path, offset } => {
+                    let root = project
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                        .map(|value| value.logs_directory.clone());
+                    if let (Some(run), Some(operation), Some(root)) =
+                        (run_id, events.bound_operation.as_ref(), root)
+                    {
+                        let process_id = runtime
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .snapshot
+                            .process_id;
+                        diagnostic_logs
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .opened(run, operation, engine, process_id, &root, &path, offset);
+                    }
+                }
+                ProcessUpdate::LogClosed {
+                    path,
+                    end,
+                    success,
+                    termination,
+                } => {
+                    if let (Some(run), Some(operation)) = (run_id, events.bound_operation.as_ref())
+                    {
+                        let process_id = runtime
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .snapshot
+                            .process_id;
+                        diagnostic_logs
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .closed(
+                                run,
+                                operation,
+                                engine,
+                                process_id,
+                                &path,
+                                end,
+                                success,
+                                termination,
+                            );
+                    }
+                }
                 ProcessUpdate::Exited { .. } => {
                     process_active.store(false, Ordering::Relaxed);
                 }
@@ -10315,6 +10578,178 @@ mod tests {
                 .as_deref(),
             Some("panoramaTimestamps")
         );
+    }
+
+    #[test]
+    fn diagnostic_log_observer_binds_the_run_operation_and_failed_native_status() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        std::fs::create_dir_all(&paths.logs).unwrap();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_execution_run_id(Some(uuid::Uuid::new_v4()));
+        *runner.active_project.lock().unwrap() = Some(ActiveProjectContext {
+            project_id: paths.id,
+            workspace_task_id: None,
+            project_path: paths.project.clone(),
+            logs_directory: paths.logs.clone(),
+        });
+        let path = paths.logs.join("gps.log");
+        std::fs::write(&path, "old visual attempt\n").unwrap();
+        let observer = runner.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            None,
+            ObserverMode::Mapper,
+        );
+        observer(ProcessUpdate::Started { process_id: 17 });
+        let start = std::fs::metadata(&path).unwrap().len();
+        observer(ProcessUpdate::LogOpened {
+            path: path.clone(),
+            offset: start,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"current GPS failure\nexit_code: Some(7)\n")
+            .unwrap();
+        let termination = crate::process::ProcessTermination {
+            exit_code: Some(7),
+            ..Default::default()
+        };
+        observer(ProcessUpdate::LogClosed {
+            path: path.clone(),
+            end: file.metadata().unwrap().len(),
+            success: false,
+            termination: termination.clone(),
+        });
+        drop(file);
+        let output = crate::process::ProcessOutput {
+            success: false,
+            exit_code: Some(7),
+            termination,
+            stdout: String::new(),
+            stderr: "current GPS failure".into(),
+        };
+        let failure =
+            SplatError::EngineProcess(Box::new(crate::failure::EngineProcessFailure::from_output(
+                PipelineEngine::Colmap,
+                "pose_prior_mapper",
+                &output,
+            )));
+        let frozen = runner
+            .freeze_failure_log(&failure, Some(PipelineEngine::Colmap))
+            .unwrap();
+        assert!(frozen.text.contains("current GPS failure"));
+        assert!(frozen.text.contains("exit_code: Some(7)"));
+        assert!(!frozen.text.contains("old visual"));
+        std::fs::write(&path, "later overwrite\n".repeat(100)).unwrap();
+        assert_eq!(
+            runner
+                .freeze_failure_log(&failure, Some(PipelineEngine::Colmap))
+                .unwrap()
+                .text,
+            frozen.text
+        );
+        assert!(runner
+            .freeze_failure_log(
+                &SplatError::Process("application validation failed".into()),
+                Some(PipelineEngine::Colmap)
+            )
+            .is_none());
+        assert!(runner
+            .freeze_failure_log(
+                &SplatError::Io(std::io::Error::other("write state")),
+                Some(PipelineEngine::Colmap)
+            )
+            .is_none());
+        let mut different = output.clone();
+        different.termination.exit_code = Some(8);
+        let different =
+            SplatError::EngineProcess(Box::new(crate::failure::EngineProcessFailure::from_output(
+                PipelineEngine::Colmap,
+                "pose_prior_mapper",
+                &different,
+            )));
+        assert!(runner
+            .freeze_failure_log(&different, Some(PipelineEngine::Colmap))
+            .is_none());
+
+        // A new successful process cannot lend its log to a later validation
+        // error, nor fall back to this operation's previous failed process.
+        observer(ProcessUpdate::Started { process_id: 18 });
+        let start = std::fs::metadata(&path).unwrap().len();
+        observer(ProcessUpdate::LogOpened {
+            path: path.clone(),
+            offset: start,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"successful process\nexit_code: Some(0)\n")
+            .unwrap();
+        observer(ProcessUpdate::LogClosed {
+            path,
+            end: file.metadata().unwrap().len(),
+            success: true,
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0),
+                ..Default::default()
+            },
+        });
+        assert!(runner
+            .freeze_failure_log(&failure, Some(PipelineEngine::Colmap))
+            .is_none());
+
+        let ffmpeg = runner.process_observer(
+            PipelineStage::ExtractingFrames,
+            PipelineEngine::Ffmpeg,
+            None,
+            ObserverMode::Ffmpeg,
+        );
+        let path = paths.logs.join("joint-bridge-frames.log");
+        std::fs::write(&path, b"").unwrap();
+        ffmpeg(ProcessUpdate::Started { process_id: 19 });
+        ffmpeg(ProcessUpdate::LogOpened {
+            path: path.clone(),
+            offset: 0,
+        });
+        std::fs::write(&path, "failed extraction\nexit_code: Some(7)\n").unwrap();
+        ffmpeg(ProcessUpdate::LogClosed {
+            path: path.clone(),
+            end: std::fs::metadata(&path).unwrap().len(),
+            success: false,
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(7),
+                ..Default::default()
+            },
+        });
+        let legacy_error = SplatError::Process("FFmpeg extraction failed".into());
+        assert!(runner
+            .freeze_failure_log(&legacy_error, Some(PipelineEngine::Ffmpeg))
+            .unwrap()
+            .text
+            .contains("failed extraction"));
+        assert!(runner
+            .freeze_failure_log(&SplatError::Cancelled, Some(PipelineEngine::Ffmpeg))
+            .is_none());
+        assert!(runner
+            .freeze_failure_log(
+                &SplatError::EngineStart {
+                    engine: "ffmpeg".into(),
+                    detail: "launch failed".into(),
+                },
+                Some(PipelineEngine::Ffmpeg)
+            )
+            .is_none());
+        // A new process without an opened log cannot inherit the last failed
+        // process, even though its stage and engine are unchanged.
+        ffmpeg(ProcessUpdate::Started { process_id: 20 });
+        assert!(runner
+            .freeze_failure_log(&legacy_error, Some(PipelineEngine::Ffmpeg))
+            .is_none());
     }
 
     #[test]

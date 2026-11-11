@@ -657,7 +657,8 @@ impl PipelineRunner {
                     checkpoint.request.check_identities()?;
                     self.events
                         .stage(PipelineStage::ExtractingFrames, 0., "正在准备训练图片");
-                    match &checkpoint.request {
+                    let request = checkpoint.request.clone();
+                    match &request {
                         GenerationInputs::Colmap { input } => {
                             let info = crate::reconstruction::direct_input::inspect(input)?;
                             let model = read_model(&input.model)?;
@@ -923,6 +924,18 @@ impl PipelineRunner {
                                     return Err(SplatError::Process("INPUT_CHANGED".into()));
                                 }
                                 let resolved = projection(item, &a)?;
+                                self.observe_collection_source(
+                                    &mut checkpoint,
+                                    item,
+                                    &a,
+                                    metadata.quality,
+                                    policy,
+                                );
+                                state.inputs = Some(checkpoint.clone());
+                                if let Err(error) = manager.write_state(&paths.state, &state).await
+                                {
+                                    tracing::warn!(%error, "Could not save source telemetry observation");
+                                }
                                 let prefix = format!("b{}_s{index:04}_", paths.id.simple());
                                 let batch = paths.work.join(format!("inputs/{index:04}"));
                                 if batch.exists() {
@@ -953,7 +966,7 @@ impl PipelineRunner {
                                     adopted: 0,
                                     bridge_frames: vec![],
                                 };
-                                if let Some(video) = a.video {
+                                if let Some(video) = a.video.clone() {
                                     let erp = resolved == VideoProjection::Equirectangular;
                                     let (w, h) = oriented_video_dimensions(&video);
                                     let target = if erp {
@@ -989,6 +1002,22 @@ impl PipelineRunner {
                                             item.frame_removal_fps,
                                         )
                                         .await?;
+                                    if let Some(frame) = prepared.video.as_ref().and_then(|video| {
+                                        PlannerFramePlanMetrics::video(
+                                            video,
+                                            &prepared.plan,
+                                            metadata.quality,
+                                            Some(policy),
+                                            item.frame_removal_fps,
+                                        )
+                                    }) {
+                                        self.observe_collection_frame(
+                                            &mut checkpoint,
+                                            item,
+                                            &a.identity,
+                                            frame,
+                                        );
+                                    }
                                     source.video = prepared.video.clone();
                                     source.working_dimensions =
                                         Some([prepared.working_width, prepared.working_height]);
@@ -1224,14 +1253,16 @@ impl PipelineRunner {
                         loop {
                             let base = paths.colmap.join("base-model");
                             let incremental = execution_plan_is_incremental(&checkpoint);
-                            self.collection_mapper(
-                                paths,
-                                &checkpoint,
-                                &state,
-                                incremental.then_some(base.as_path()),
-                                acceleration,
-                            )
-                            .await?;
+                            let transparent = self
+                                .collection_mapper(
+                                    paths,
+                                    &checkpoint,
+                                    &state,
+                                    incremental.then_some(base.as_path()),
+                                    acceleration,
+                                )
+                                .await?;
+                            state.actual_transparency = Some(transparent);
                             let (selected, _) =
                                 best_model(&sparse_attempt(paths, &state), names.len() as u64)?;
                             let mismatch =
@@ -1403,16 +1434,10 @@ impl PipelineRunner {
                         names.len() as u64,
                         &effective_model,
                     )?;
-                    self.record_reconstruction_metrics(
-                        &report,
-                        acceleration,
-                        has_transparency(
-                            &paths.frames,
-                            &names,
-                            &self.process_manager.child_token(),
-                        )?,
-                        metadata.reshoot.is_some(),
-                    );
+                    // Initial reconstruction and Bridge observations were frozen
+                    // before Bridge/GPS changed the model. Never overwrite them
+                    // with the final adopted reconstruction.
+                    self.restore_collection_metrics(&checkpoint, metadata.quality, Some(policy));
                     // Adoption is already known even if undistortion, face preparation or
                     // training fails/cancels later. Do not defer it until a successful dataset.
                     state.inputs = Some(checkpoint.clone());
@@ -2458,14 +2483,16 @@ impl PipelineRunner {
         loop {
             if rerun_mapper {
                 let incremental = execution_plan_is_incremental(checkpoint);
-                self.collection_mapper(
-                    paths,
-                    checkpoint,
-                    state,
-                    incremental.then_some(base.as_path()),
-                    acceleration,
-                )
-                .await?;
+                let transparent = self
+                    .collection_mapper(
+                        paths,
+                        checkpoint,
+                        state,
+                        incremental.then_some(base.as_path()),
+                        acceleration,
+                    )
+                    .await?;
+                state.actual_transparency = Some(transparent);
                 let (selected, _) = best_model(&sparse_attempt(paths, state), input_count)?;
                 if incremental && !collection_coordinates_match(&base, &selected)? {
                     let fallback = apply_execution_plan_fallback(
@@ -2594,7 +2621,7 @@ impl PipelineRunner {
         state: &PipelineStateFile,
         input: Option<&Path>,
         accel: &crate::engines::ColmapAccelerationStatus,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.events.source(None);
         let names = c
             .sources
@@ -2623,7 +2650,7 @@ impl PipelineRunner {
                 .as_ref()
                 .is_some_and(|plan| plan.source_has_erp);
         if !erp && !execution_plan_is_reshoot(c) {
-            return if let Some(base) = input {
+            return (if let Some(base) = input {
                 colmap::map_from_existing(
                     &self.engines.colmap,
                     &paths.colmap.join("database.db"),
@@ -2662,7 +2689,8 @@ impl PipelineRunner {
                     accel.gpu_index(),
                 )
                 .await
-            };
+            })
+            .map(|_| transparent);
         }
         let fixed = paths.colmap.join("fixed-cameras.txt");
         if let Some(base) = input {
@@ -2705,6 +2733,7 @@ impl PipelineRunner {
             )),
         )
         .await
+        .map(|_| transparent)
     }
 }
 

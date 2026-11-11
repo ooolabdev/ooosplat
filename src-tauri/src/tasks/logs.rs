@@ -144,6 +144,42 @@ pub fn register(root: &Path, path: &Path, start: u64) -> Result<RegisteredLog> {
         end: None,
     })
 }
+
+/// Read only the proven byte interval of one execution. Unlike interactive log
+/// cursors, diagnostics must never rebase a replaced/truncated file to zero.
+pub(crate) fn diagnostic_tail(
+    log: &RegisteredLog,
+    end: u64,
+    max_bytes: usize,
+    max_lines: usize,
+) -> Option<(String, bool)> {
+    if max_bytes == 0 || max_lines == 0 || end < log.start {
+        return None;
+    }
+    let mut file = secure_open(&log.root, &log.path).ok()?;
+    if file_id(&file).ok()? != log.file_id || file.metadata().ok()?.len() < end {
+        return None;
+    }
+    let offset = end.saturating_sub(max_bytes as u64).max(log.start);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = vec![0; (end - offset) as usize];
+    file.read_exact(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if offset > log.start {
+        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+    } else {
+        &text
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let truncated = offset > log.start || lines.len() > max_lines;
+    Some((
+        crate::diagnostics::redact::bounded(
+            &lines[lines.len().saturating_sub(max_lines)..].join("\n"),
+            max_bytes,
+        ),
+        truncated,
+    ))
+}
 fn cursor_key() -> Result<&'static [u8; 32]> {
     static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     if let Some(key) = KEY.get() {

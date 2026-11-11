@@ -75,4 +75,23 @@ describe("SettingsDialog", () => {
     expect(document.activeElement).toBe(tabs[0]);
     expect(tabs[0].getAttribute("aria-selected")).toBe("true");
   });
+
+  it("keeps privacy initialization errors inside the privacy section", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    await act(async () => root.render(<LanguageProvider><SettingsDialog
+      preferences={{ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured", settingsError: "damaged telemetry settings" }}
+      telemetryBusy={false}
+      showRuntimePanel={false}
+      onTelemetryChange={() => undefined}
+      onRuntimePanelChange={() => undefined}
+      onClose={() => undefined}
+    /></LanguageProvider>));
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('#settings-tab-privacy')!.click());
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("damaged telemetry settings");
+    expect(container.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("false");
+  });
 });

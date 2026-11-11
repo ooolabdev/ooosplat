@@ -29,6 +29,7 @@ export function PrivacySettingsPanel({ preferences, busy, onChange }: {
         onClick={() => onChange(!preferences.analyticsEnabled)}
       ><span /></button>
     </div>
+    {preferences.settingsError && <p className="settings-unavailable" role="alert">{t("progress.privacyError", { detail: preferences.settingsError })}</p>}
     <div className="privacy-summary">
       <p><b>{t("privacy.collectSummary")}</b>{t("privacy.collectSummaryText")}</p>
       <p><b>{t("privacy.noCollectSummary")}</b>{t("privacy.noCollectSummaryText")}</p>
@@ -61,6 +62,7 @@ export function TelemetryPreferences({ mode, preferences, busy, onChange, onClos
         <p className="privacy-footnote">{t("privacy.uuid")}</p>
         {preferences.deliveryStatus === "notConfigured" && <p className="privacy-delivery-note">{t("privacy.noEndpoint")}</p>}
         {preferences.deliveryStatus === "debug" && <p className="privacy-delivery-note">{t("privacy.debug")}</p>}
+        {preferences.settingsError && <p className="settings-unavailable" role="alert">{t("progress.privacyError", { detail: preferences.settingsError })}</p>}
         <div className="privacy-actions">
           <button className="privacy-secondary" type="button" disabled={busy} onClick={() => onChange(false)}>{t("privacy.decline")}</button>
           <button className="privacy-primary" type="button" disabled={busy} onClick={() => onChange(true)}>{busy ? t("privacy.saving") : t("privacy.share")}</button>

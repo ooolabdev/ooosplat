@@ -1155,12 +1155,13 @@ impl TaskService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn capture_failure(
         &self,
         error: crate::commands::PipelineCommandError,
         paths: &[PathBuf],
     ) -> crate::commands::PipelineCommandError {
-        self.capture_failure_with_executions(error, paths, &[], None)
+        self.capture_failure_with_executions(error, paths, &[], None, None)
             .await
     }
 
@@ -1170,6 +1171,7 @@ impl TaskService {
         paths: &[PathBuf],
         executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
         current: Option<usize>,
+        log: Option<crate::diagnostics::logs::FrozenLog>,
     ) -> crate::commands::PipelineCommandError {
         if error.code != "cancelled" {
             let project = error
@@ -1178,7 +1180,7 @@ impl TaskService {
                 .and_then(|id| Uuid::parse_str(id).ok());
             error.failure_id = Some(Box::new(
                 self.diagnostics
-                    .capture_with_executions(
+                    .capture_with_execution_log(
                         error.failed_stage,
                         error.engine,
                         error.failure_kind,
@@ -1187,6 +1189,7 @@ impl TaskService {
                         paths,
                         executions,
                         current,
+                        log,
                     )
                     .await,
             ));
@@ -1591,6 +1594,25 @@ impl TaskService {
         let lifecycle = self.clone();
         let ready_service = self.clone();
         let effectiveness = PlannerEffectivenessTracker::default();
+        let telemetry_inputs = task
+            .request_parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("inputs"))
+            .and_then(|value| {
+                serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(value.clone())
+                    .ok()
+            });
+        let started_input_type = if let Some(inputs) = telemetry_inputs.as_ref() {
+            crate::telemetry::material_input_type(inputs)
+        } else if task.input_type == crate::project::ProjectInputType::Images {
+            Some(TelemetryInputType::Images)
+        } else {
+            Some(TelemetryInputType::Video)
+        };
+        let report_source_duration = telemetry_inputs.as_ref().is_none_or(|inputs| {
+            matches!(inputs, crate::pipeline::inputs::GenerationInputs::Materials { items }
+                if items.len() == 1 && matches!(items[0].source, crate::pipeline::inputs::InputSource::Video { .. }))
+        });
         let summary_supported = if let Some(value) = task
             .request_parameters
             .as_ref()
@@ -1611,7 +1633,15 @@ impl TaskService {
                             .as_ref()
                             .and_then(|saved| saved.inputs.as_ref())
                             .is_some_and(|c| {
-                                c.sources.len() == 1 && c.sources[0].dimensions.len() == 1
+                                c.single_requested_source()
+                                    .is_some_and(|source| source.dimensions.len() == 1)
+                                    || c.telemetry.as_ref().is_some_and(|saved| {
+                                        saved.source_id.as_deref() == Some(items[0].id.as_str())
+                                            && items[0].identity.is_some()
+                                            && saved.source_identity.as_deref()
+                                                == items[0].identity.as_deref()
+                                            && saved.frame_plan.is_some()
+                                    })
                             })
                     } else {
                         crate::pipeline::inputs::inspect_material(
@@ -1629,15 +1659,18 @@ impl TaskService {
         } else {
             true
         };
-        let session = telemetry.filter(|_| summary_supported).map(|telemetry| {
+        let session = telemetry.map(|telemetry| {
+            let Some(input_type) = started_input_type.filter(|_| summary_supported) else {
+                return Arc::new(PipelineTelemetrySession::new_for_input(
+                    telemetry,
+                    task.quality,
+                    started_input_type,
+                ));
+            };
             Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
                 telemetry,
                 task.quality,
-                if task.input_type == crate::project::ProjectInputType::Images {
-                    TelemetryInputType::Images
-                } else {
-                    TelemetryInputType::Video
-                },
+                input_type,
                 if task.project_id.is_some() {
                     TelemetryRunKind::Resume
                 } else {
@@ -1842,7 +1875,9 @@ impl TaskService {
                     Ok(r) => s.generation_completed(
                         r.duration_ms,
                         r.input_images,
-                        r.source_duration_seconds,
+                        report_source_duration
+                            .then_some(r.source_duration_seconds)
+                            .flatten(),
                     ),
                     Err(e) => s.generation_failed(e),
                 }
@@ -2136,14 +2171,14 @@ impl TaskService {
                 Some(if let Some(preparation) = preparation {
                     self.capture_preparation_failure(error, &preparation, &[input])
                         .await
-                } else if executions.is_empty() {
-                    self.capture_failure(error, &[input]).await
                 } else {
+                    let log = runner.freeze_failure_log(e, error.engine);
                     self.capture_failure_with_executions(
                         error,
                         &[input],
                         &executions,
                         current_execution,
+                        log,
                     )
                     .await
                 })

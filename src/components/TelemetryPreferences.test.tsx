@@ -59,4 +59,24 @@ describe("TelemetryPreferences", () => {
     await act(async () => toggle?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onChange).toHaveBeenCalledWith(false);
   });
+
+  it("shows a local settings failure while keeping the switch off and usable", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    roots.push({ root, container });
+    const onChange = vi.fn();
+    await act(async () => root.render(<TelemetryPreferences
+      mode="settings"
+      preferences={{ analyticsEnabled: false, consentDecided: true, deliveryStatus: "configured", settingsError: "settings write denied" }}
+      busy={false}
+      onChange={onChange}
+    />));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("settings write denied");
+    const toggle = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(false);
+    await act(async () => toggle.click());
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
 });

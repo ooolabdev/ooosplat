@@ -1,5 +1,6 @@
 //! Explicit, one-shot diagnostic consent. Never uses the anonymous telemetry service.
 mod hardware;
+pub(crate) mod logs;
 pub(crate) mod redact;
 
 use crate::{
@@ -10,35 +11,13 @@ use crate::{
 use chrono::{DateTime, Utc};
 use hardware::Environment;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    future::Future,
-    io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, path::PathBuf, sync::Mutex, time::Duration};
 use tauri::State;
 use uuid::Uuid;
 
 const LOG_BYTES: usize = 64 * 1024;
 const REPORT_BYTES: usize = 128 * 1024;
 const ENDPOINT: &str = include_str!("../../../config/diagnostics-endpoint.txt");
-
-fn diagnostic_log_names(engine: Option<PipelineEngine>, message: &str) -> &'static [&'static str] {
-    match engine {
-        Some(PipelineEngine::Brush) => &["brush.log", "brush-retry.log"],
-        Some(PipelineEngine::Colmap) => &[
-            "colmap.log",
-            "colmap-bridge-features.log",
-            "colmap-bridge-matching.log",
-            "colmap-bridge-mapper.log",
-        ],
-        Some(PipelineEngine::Ffmpeg) => &["ffmpeg.log", "ffprobe.log", "ffmpeg-bridge.log"],
-        _ if message.contains(crate::error::RETRY_PREPARATION_MARKER) => &["retry-preparation.log"],
-        _ => &[],
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,30 +119,6 @@ fn reason(kind: Option<&str>) -> &'static str {
     }
 }
 
-fn read_tail(path: &Path) -> std::io::Result<(String, bool)> {
-    let mut file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    let offset = size.saturating_sub(LOG_BYTES as u64);
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = Vec::new();
-    file.take(LOG_BYTES as u64).read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if offset > 0 {
-        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
-    } else {
-        &text
-    };
-    let lines = text.lines().collect::<Vec<_>>();
-    let truncated = offset > 0 || lines.len() > 200;
-    Ok((
-        redact::bounded(
-            &lines[lines.len().saturating_sub(200)..].join("\n"),
-            LOG_BYTES,
-        ),
-        truncated,
-    ))
-}
-
 impl DiagnosticService {
     pub async fn capture(
         &self,
@@ -240,42 +195,36 @@ impl DiagnosticService {
         executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
         current: Option<usize>,
     ) -> Uuid {
+        self.capture_with_execution_log(
+            stage, engine, kind, message, project_id, paths, executions, current, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn capture_with_execution_log(
+        &self,
+        stage: Option<PipelineStage>,
+        engine: Option<PipelineEngine>,
+        kind: Option<&str>,
+        message: &str,
+        project_id: Option<Uuid>,
+        paths: &[PathBuf],
+        executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
+        current: Option<usize>,
+        log: Option<logs::FrozenLog>,
+    ) -> Uuid {
         let mut private_paths = paths.to_vec();
         let mut private_names = Vec::new();
-        let mut log = String::new();
-        let mut logs_truncated = false;
         if let Some(project_id) = project_id {
             if let Ok((root, metadata)) = catalog::load_registered_project(project_id).await {
                 private_names.push(metadata.name);
                 private_paths.extend([root.clone(), metadata.source_path]);
-                let names = diagnostic_log_names(engine, message);
-                let names = names.iter().map(|v| v.to_string()).collect::<Vec<_>>();
-                if let Ok(Some((tail, truncated))) = tokio::task::spawn_blocking(move || {
-                    let root = std::fs::canonicalize(root).ok()?;
-                    let directory = std::fs::canonicalize(root.join("logs")).ok()?;
-                    if !directory.starts_with(&root) {
-                        return None;
-                    }
-                    let mut candidates = names
-                        .into_iter()
-                        .filter_map(|name| {
-                            let path = std::fs::canonicalize(directory.join(name)).ok()?;
-                            if !path.starts_with(&directory) {
-                                return None;
-                            }
-                            Some((std::fs::metadata(&path).ok()?.modified().ok()?, path))
-                        })
-                        .collect::<Vec<_>>();
-                    candidates.sort_by_key(|(modified, _)| *modified);
-                    read_tail(&candidates.last()?.1).ok()
-                })
-                .await
-                {
-                    log = tail;
-                    logs_truncated = truncated;
-                }
             }
         }
+        // Missing provenance is not permission to search an old run's files.
+        // Preparation failures use their separate bounded in-memory capture.
+        let (log, logs_truncated) = log.map(|log| (log.text, log.truncated)).unwrap_or_default();
         let mut private = redact::private_values(&private_paths);
         private.extend(private_names.into_iter().filter(|v| !v.is_empty()));
         self.capture_with_log(
@@ -590,14 +539,73 @@ pub async fn send_error_report(
 mod tests {
     use super::*;
 
-    #[test]
-    fn retry_preparation_failures_select_only_their_bounded_local_log() {
-        let names = diagnostic_log_names(
-            Some(PipelineEngine::System),
-            "retry_preparation_operation=archive_retry_cache",
-        );
-        assert_eq!(names, ["retry-preparation.log"]);
-        assert!(diagnostic_log_names(Some(PipelineEngine::System), "other failure").is_empty());
+    #[tokio::test]
+    async fn frozen_operation_log_is_redacted_once_and_preview_never_reloads_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gps.log");
+        std::fs::write(&path, "current GPS attempt\nprivate-photo.png failed\n").unwrap();
+        let registered = crate::tasks::logs::register(root.path(), &path, 0).unwrap();
+        let (text, truncated) = crate::tasks::logs::diagnostic_tail(
+            &registered,
+            std::fs::metadata(&path).unwrap().len(),
+            LOG_BYTES,
+            200,
+        )
+        .unwrap();
+        let service = DiagnosticService::default();
+        let id = service
+            .capture_with_execution_log(
+                Some(PipelineStage::Reconstructing),
+                Some(PipelineEngine::Colmap),
+                Some("colmap_crash"),
+                "current attempt failed",
+                None,
+                &[],
+                &[],
+                None,
+                Some(logs::FrozenLog { text, truncated }),
+            )
+            .await;
+        std::fs::write(&path, "later unrelated output\n").unwrap();
+        let draft = service
+            .prepare_with(id, || async { blank_environment() })
+            .await
+            .unwrap();
+        assert!(draft.report.log_tail.contains("current GPS attempt"));
+        assert!(!draft.report.log_tail.contains("private-photo"));
+        assert!(!draft.report.log_tail.contains("unrelated"));
+        let preview = draft.report.clone();
+        service
+            .send_with(draft.draft_id, |sent| async move {
+                assert_eq!(
+                    serde_json::to_value(sent).unwrap(),
+                    serde_json::to_value(preview).unwrap()
+                );
+                Err(error("report_unavailable"))
+            })
+            .await
+            .unwrap_err();
+        let again = service
+            .prepare_with(id, || async { panic!("must not recollect") })
+            .await
+            .unwrap();
+        assert_eq!(again.draft_id, draft.draft_id);
+        assert_eq!(again.report.log_tail, draft.report.log_tail);
+        let unproven = service
+            .capture(
+                Some(PipelineStage::Reconstructing),
+                Some(PipelineEngine::Colmap),
+                None,
+                "unobserved process failed",
+                None,
+                &[],
+            )
+            .await;
+        assert!(service
+            .captured_report_for_test(unproven)
+            .unwrap()
+            .log_tail
+            .is_empty());
     }
 
     #[tokio::test]
@@ -873,6 +881,21 @@ mod tests {
             .config
             .insert("directory".into(), "C:/private/GPU-secret-uuid".into());
         let mut first = BrushExecutionSnapshot::new(&runtime.snapshot, None);
+        // A later N/A resource sample must not erase evidence already known
+        // for this same execution before the report freezes it.
+        runtime.snapshot.resources = Some(crate::process::resources::ProcessResources {
+            process_id: 123,
+            sampled_at: Utc::now(),
+            cpu_percent: None,
+            memory_bytes: None,
+            gpus: vec![],
+            gpu_status: "unavailable".into(),
+        });
+        runtime.snapshot.config.remove("device_total_memory_mb");
+        runtime.snapshot.config.remove("device_driver_version");
+        first.update(&runtime.snapshot);
+        runtime.snapshot.resources = None;
+        first.update(&runtime.snapshot);
         first.finish(Some(101));
         let unknown = BrushExecutionSnapshot::new(&RuntimeTracker::new().snapshot, None);
         for current in [Some(0), Some(1), None] {
@@ -1074,7 +1097,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("stage.log");
         std::fs::write(&path, "line\n".repeat(100_000)).unwrap();
-        let (text, truncated) = read_tail(&path).unwrap();
+        let registered = crate::tasks::logs::register(root.path(), &path, 0).unwrap();
+        let (text, truncated) = crate::tasks::logs::diagnostic_tail(
+            &registered,
+            std::fs::metadata(&path).unwrap().len(),
+            LOG_BYTES,
+            200,
+        )
+        .unwrap();
         assert_eq!(text.lines().count(), 200);
         assert!(truncated);
         assert!(text.len() <= LOG_BYTES);

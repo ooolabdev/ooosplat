@@ -51,6 +51,73 @@ impl PlannerFramePlanMetrics {
             ..Default::default()
         }
     }
+
+    pub fn video(
+        video: &crate::video::VideoInfo,
+        plan: &crate::video::FramePlan,
+        quality: crate::presets::Quality,
+        policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+        removal_fps: Option<f64>,
+    ) -> Option<Self> {
+        if !video.duration.is_finite() || video.duration <= 0.0 {
+            return None;
+        }
+        let count = plan.estimated_frames;
+        let candidates = plan.candidate_count();
+        let preset = quality.preset();
+        let manual = removal_fps.is_some()
+            || policy.is_some_and(|policy| {
+                policy.frame_sampling_ratio.is_some() || policy.frame_sampling_fps.is_some()
+            });
+        let configured = if let Some(policy) = policy {
+            if let Some(fps) = policy.frame_sampling_fps {
+                Some(fps.min(video.fps))
+            } else if let Some(ratio) = policy.frame_sampling_ratio {
+                Some(video.fps * ratio)
+            } else if policy.version >= 5 {
+                if let Some(removal) = removal_fps {
+                    Some((video.fps - removal).max(0.1))
+                } else if policy.version == 5 {
+                    preset
+                        .initial_fps
+                        .map(|removal| (video.fps - removal).max(0.1))
+                } else {
+                    preset.initial_fps
+                }
+            } else {
+                preset.initial_fps
+            }
+        } else {
+            preset.initial_fps
+        };
+        // v6 may raise its target before creating FramePlan, so that plan's
+        // flag alone no longer proves whether the 30-frame floor added frames.
+        // Compare the original requested rate (bounded by the source rate)
+        // with the actual selected count, without changing the execution plan.
+        let minimum = crate::video::minimum_selected_frames().min(video.total_frames);
+        let minimum_override = configured.is_some_and(|fps| {
+            let requested = fps.min(video.fps) * video.duration;
+            requested.is_finite()
+                && minimum > 0
+                && count >= minimum
+                && requested + 1e-9 < minimum as f64
+                && count as f64 > requested + 1e-9
+        });
+        Some(Self {
+            source_width: video.width.into(),
+            source_height: video.height.into(),
+            source_item_count: video.total_frames,
+            configured_target_fps: configured.filter(|fps| fps.is_finite() && *fps > 0.0),
+            configured_candidate_fps: (!manual).then_some(preset.rescue_max_fps).flatten(),
+            effective_target_fps: Some(count as f64 / video.duration),
+            effective_candidate_fps: Some(candidates as f64 / video.duration),
+            initial_selected_count: count,
+            candidate_count: candidates,
+            minimum_frame_override_applied: plan.minimum_frame_override_applied || minimum_override,
+            minimum_frame_target_unreachable: video.total_frames
+                < crate::video::minimum_selected_frames(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,6 +279,25 @@ pub struct PlannerEffectivenessSnapshot {
     pub stage_durations: PlannerStageDurationMetrics,
 }
 
+/// Optional local observation, not an execution recipe or a cache identity.
+/// The source ID binds the scalar frame plan to the one newly requested input.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_vendor: Option<PlannerGpuVendor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_plan: Option<PlannerFramePlanMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_reconstruction: Option<PlannerInitialReconstructionMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<PlannerBridgeMetrics>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PlannerEffectivenessTracker {
     inner: Arc<Mutex<PlannerEffectivenessSnapshot>>,
@@ -331,6 +417,86 @@ impl PlannerEffectivenessTracker {
 mod tests {
     use super::*;
     use crate::presets::{BrushTrainingPreset, Quality, ResolvedBrushTrainingPreset};
+
+    #[test]
+    fn video_observation_keeps_requested_rates_separate_from_minimum_and_manual_plans() {
+        let mut video = crate::video::VideoInfo {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            duration: 2.0,
+            total_frames: 60,
+            codec: "fixture".into(),
+            rotation: 0,
+            pixel_format: "rgb24".into(),
+            has_alpha: false,
+        };
+        let policy = crate::pipeline::generation_policy::GenerationPolicy::default();
+        let plan = policy
+            .frame_plan_for_material(&video, Quality::Balanced, None)
+            .unwrap();
+        let observed =
+            PlannerFramePlanMetrics::video(&video, &plan, Quality::Balanced, Some(policy), None)
+                .unwrap();
+        assert_eq!(observed.configured_target_fps, Some(8.0));
+        assert_eq!(observed.configured_candidate_fps, Some(12.0));
+        assert_eq!(observed.initial_selected_count, 30);
+        assert_eq!(observed.effective_target_fps, Some(15.0));
+        assert!(observed.minimum_frame_override_applied);
+        let low_source = crate::video::VideoInfo {
+            fps: 2.0,
+            duration: 10.0,
+            total_frames: 20,
+            ..video.clone()
+        };
+        let all = policy
+            .frame_plan_for_material(&low_source, Quality::Balanced, None)
+            .unwrap();
+        let low = PlannerFramePlanMetrics::video(
+            &low_source,
+            &all,
+            Quality::Balanced,
+            Some(policy),
+            None,
+        )
+        .unwrap();
+        assert_eq!(low.initial_selected_count, 20);
+        assert!(!low.minimum_frame_override_applied);
+        assert!(low.minimum_frame_target_unreachable);
+        video.duration = 60.0;
+        video.total_frames = 1800;
+        let plan = policy
+            .frame_plan_for_material(&video, Quality::Balanced, Some(10.0))
+            .unwrap();
+        let manual = PlannerFramePlanMetrics::video(
+            &video,
+            &plan,
+            Quality::Balanced,
+            Some(policy),
+            Some(10.0),
+        )
+        .unwrap();
+        assert_eq!(manual.configured_target_fps, Some(20.0));
+        assert_eq!(manual.configured_candidate_fps, None);
+        assert_eq!(manual.initial_selected_count, plan.estimated_frames);
+        assert_eq!(
+            manual.effective_target_fps,
+            Some(plan.estimated_frames as f64 / 60.0)
+        );
+        let old = crate::pipeline::generation_policy::GenerationPolicy {
+            version: 5,
+            ..policy
+        };
+        let plan = old
+            .frame_plan_for_material(&video, Quality::Balanced, None)
+            .unwrap();
+        assert_eq!(
+            PlannerFramePlanMetrics::video(&video, &plan, Quality::Balanced, Some(old), None)
+                .unwrap()
+                .configured_target_fps,
+            Some(22.0)
+        );
+    }
 
     #[test]
     fn a_failed_first_execution_and_its_retry_keep_both_profiles_and_actual_caps() {

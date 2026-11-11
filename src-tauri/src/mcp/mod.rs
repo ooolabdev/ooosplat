@@ -472,7 +472,7 @@ fn public_task(mut task: crate::tasks::TaskRecord) -> Result<Value> {
     }
     let runs=task.runs.iter().map(|run|json!({"run_id":run.run_id,"kind":run.kind,"continued_from_status":run.continued_from_status,"started_at":run.started_at,"ended_at":run.ended_at,"log_sources":run.logs.keys().collect::<Vec<_>>(),"error":run.error,
         "brush_executions_truncated":run.brush_executions.len()>8,
-        "brush_executions":run.brush_executions.iter().rev().take(8).rev().map(|e|json!({"operation":e.operation,"started_at":e.started_at,"ended_at":e.ended_at,"exit_code":e.exit_code,"backend":e.backend,"device":e.device,"configuration":e.configuration})).collect::<Vec<_>>()
+        "brush_executions":run.brush_executions.iter().rev().take(8).rev().map(|e|json!({"operation":e.operation,"started_at":e.started_at,"ended_at":e.ended_at,"exit_code":e.exit_code,"backend":e.backend,"device":e.device.as_ref().map(|device|json!({"name":device.name,"total_memory_mb":device.total_memory_mb,"driver_version":device.driver_version})),"configuration":e.configuration})).collect::<Vec<_>>()
     })).collect::<Vec<_>>();
     task.recent_events.clear();
     task.client_request_id = None;

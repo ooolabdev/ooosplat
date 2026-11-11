@@ -38,6 +38,9 @@ pub struct InputCheckpoint {
     pub prepared: bool,
     #[serde(default)]
     pub bridge_used: bool,
+    /// Anonymous observations only; excluded from artifact and recipe identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<super::effectiveness::CollectionTelemetry>,
     #[serde(default)]
     pub expanded_matching: bool,
     #[serde(default)]
@@ -83,6 +86,7 @@ impl InputCheckpoint {
             recovery_sources: vec![],
             prepared: false,
             bridge_used: false,
+            telemetry: None,
             expanded_matching: false,
             imported_reconstruction: false,
             reshoot_eligible: false,
@@ -95,6 +99,23 @@ impl InputCheckpoint {
             temporary_png_focal_pending_records: None,
             temporary_png_focal_active_records: None,
         }
+    }
+
+    pub(crate) fn single_requested_source(&self) -> Option<&SourceCheckpoint> {
+        let GenerationInputs::Materials { items } = &self.request else {
+            return None;
+        };
+        let [item] = items.as_slice() else {
+            return None;
+        };
+        self.sources.iter().find(|source| {
+            source.id != "__source"
+                && source.id == item.id
+                && item
+                    .identity
+                    .as_deref()
+                    .is_some_and(|id| id == source.identity)
+        })
     }
 }
 

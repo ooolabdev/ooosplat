@@ -2212,6 +2212,41 @@ fn hash_label(hash: &mut Sha256, value: &str) {
 mod tests {
     use super::*;
     #[test]
+    fn collection_observations_never_change_source_or_candidate_recipe_identity() {
+        use crate::pipeline::effectiveness::{
+            CollectionTelemetry, PlannerBridgeMetrics, PlannerBridgeStatus,
+            PlannerFramePlanMetrics, PlannerGpuVendor,
+        };
+        for reshoot in [false, true] {
+            let mut fixture = fixture(reshoot);
+            let source_before =
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap();
+            let candidate_before = candidate_recipe_identity(&fixture.state).unwrap();
+            fixture.state.inputs.as_mut().unwrap().telemetry = Some(CollectionTelemetry {
+                source_id: Some("observation-only".into()),
+                source_identity: Some("not-an-execution-input".into()),
+                gpu_vendor: Some(PlannerGpuVendor::Nvidia),
+                frame_plan: Some(PlannerFramePlanMetrics::images(1920, 1080, 100)),
+                bridge: Some(PlannerBridgeMetrics {
+                    status: PlannerBridgeStatus::Completed,
+                    added_frames: 20,
+                    duration_ms: Some(1500),
+                    adopted: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let saved: PipelineStateFile =
+                serde_json::from_slice(&serde_json::to_vec(&fixture.state).unwrap()).unwrap();
+            assert_eq!(
+                source_identity(&saved, saved.inputs.as_ref().unwrap()).unwrap(),
+                source_before
+            );
+            assert_eq!(candidate_recipe_identity(&saved).unwrap(), candidate_before);
+        }
+    }
+
+    #[test]
     fn legacy_candidate_hash_stays_stable_but_explicit_alpha_options_bind_new_candidates() {
         let mut state = PipelineStateFile::created(crate::presets::Quality::Balanced);
         let legacy = candidate_recipe_identity(&state).unwrap();

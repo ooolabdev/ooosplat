@@ -807,6 +807,12 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
     runtime
         .config
         .insert("private".into(), "PRIVATE_DEVICE_ID".into());
+    runtime
+        .config
+        .insert("device_total_memory_mb".into(), "8192".into());
+    runtime
+        .config
+        .insert("device_driver_version".into(), "616.92".into());
     let execution = crate::pipeline::brush_execution::BrushExecutionSnapshot::new(&runtime, None);
     task.runs.push(crate::tasks::TaskRun {
         run_id: Uuid::new_v4(),
@@ -846,7 +852,11 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
         public["runs"][0]["brush_executions"][7]["device"]["name"],
         "Fixture GPU"
     );
-    assert!(public["runs"][0]["brush_executions"][7]["device"]["total_memory_mb"].is_null());
+    let device = &public["runs"][0]["brush_executions"][7]["device"];
+    assert_eq!(device["total_memory_mb"], 8192);
+    assert_eq!(device["driver_version"], "616.92");
+    assert!(device.get("totalMemoryMb").is_none());
+    assert!(device.get("driverVersion").is_none());
 }
 
 #[tokio::test]

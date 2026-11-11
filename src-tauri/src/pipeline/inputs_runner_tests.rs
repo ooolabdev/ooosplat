@@ -1,5 +1,202 @@
 use super::*;
 
+#[tokio::test]
+async fn shared_image_preparation_records_source_before_engine_failure_and_restores_without_originals(
+) {
+    let root = tempfile::tempdir().unwrap();
+    let images = root.path().join("images");
+    std::fs::create_dir(&images).unwrap();
+    for index in 0..2 {
+        image::RgbImage::new(32, 24)
+            .save(images.join(format!("{index}.jpg")))
+            .unwrap();
+    }
+    let source = InputSource::ImageFolder {
+        path: images.clone(),
+    };
+    let item = MaterialInput {
+        id: "new-images".into(),
+        identity: Some(source.identity().unwrap()),
+        source,
+        projection: VideoProjection::Perspective,
+        image_matching_strategy: Default::default(),
+        camera_relation: None,
+        confirmed_small_images: true,
+        confirmed_image_order: false,
+        frame_removal_fps: None,
+    };
+    let manager = ProjectManager::for_diagnostics(root.path().join("projects"));
+    let (paths, mut metadata) = manager
+        .create_collection(
+            Quality::Balanced,
+            GenerationInputs::Materials { items: vec![item] },
+        )
+        .await
+        .unwrap();
+    let policy = crate::pipeline::generation_policy::GenerationPolicy::default();
+    let mut state = manager.read_state(&paths.state).await.unwrap();
+    state.generation_policy = Some(policy);
+    let metrics = PlannerEffectivenessTracker::default();
+    let (telemetry, captured) =
+        crate::telemetry::TelemetryService::recording(root.path().join("telemetry.json"));
+    telemetry.enable_for_test().await;
+    let session = Arc::new(
+        crate::telemetry::PipelineTelemetrySession::new_with_planner_evaluation(
+            telemetry,
+            Quality::Balanced,
+            crate::telemetry::TelemetryInputType::Images,
+            crate::telemetry::TelemetryRunKind::New,
+            true,
+            metrics.clone(),
+        ),
+    );
+    let observe = session.clone();
+    let runner = PipelineRunner::new(
+        EnginePaths::from_root(root.path().join("missing-engines")),
+        move |event| observe.observe(&event),
+    )
+    .with_effectiveness_tracker(metrics.clone());
+    let acceleration = serde_json::from_value(serde_json::json!({
+        "backend":"cpu","detectionState":"ready","reasonCode":"gpuReady","reason":"fixture",
+        "device":null,"detectedNvidiaDeviceCount":0,
+        "requirements":{"minimumDriverVersion":"580","minimumComputeCapability":"7.5"}
+    }))
+    .unwrap();
+    let error = runner
+        .run_inputs(&manager, &paths, &mut metadata, state, &acceleration)
+        .await
+        .unwrap_err();
+    session.generation_failed(&error);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "planner_evaluation")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let events = captured.lock().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event["event"] == "planner_evaluation")
+            .unwrap();
+        assert_eq!(event["properties"]["framePlan"]["sourceWidth"], 32);
+        assert_eq!(event["properties"]["framePlan"]["sourceItemCount"], 2);
+        assert!(event["properties"]["finalResult"].is_null());
+    }
+    let mut saved = manager.read_state(&paths.state).await.unwrap();
+    assert!(saved.inputs.as_ref().unwrap().prepared);
+    let old_artifacts = serde_json::to_value(&saved.artifact_manifests).unwrap();
+    // Observations cannot invalidate images/features or candidate recipe identities.
+    saved
+        .inputs
+        .as_mut()
+        .unwrap()
+        .telemetry
+        .as_mut()
+        .unwrap()
+        .bridge = Some(PlannerBridgeMetrics::default());
+    crate::pipeline::artifacts::record_collection_artifacts(&paths, &mut saved, None).unwrap();
+    assert_eq!(
+        serde_json::to_value(&saved.artifact_manifests).unwrap(),
+        old_artifacts
+    );
+    std::fs::rename(&images, root.path().join("moved-images")).unwrap();
+    let restored_metrics = PlannerEffectivenessTracker::default();
+    let restored = PipelineRunner::new(
+        EnginePaths::from_root(root.path().join("no-engines")),
+        |_| {},
+    )
+    .with_effectiveness_tracker(restored_metrics.clone());
+    restored.restore_source_metrics(&saved);
+    let frame = restored_metrics.snapshot().frame_plan.unwrap();
+    assert_eq!(
+        (
+            frame.source_width,
+            frame.source_height,
+            frame.source_item_count
+        ),
+        (32, 24, 2)
+    );
+}
+
+#[test]
+fn single_new_source_observation_requires_its_saved_identity_and_ignores_the_seed() {
+    let inputs: GenerationInputs = serde_json::from_value(serde_json::json!({
+        "mode":"materials","items":[{"id":"new","source":{"kind":"imageFolder","path":"unused"},"identity":"new-identity"}]
+    })).unwrap();
+    let mut checkpoint = InputCheckpoint::new(inputs);
+    let make_source = |id: &str, identity: &str| {
+        serde_json::from_value::<SourceCheckpoint>(serde_json::json!({
+        "id":id,"identity":identity,"projection":"perspective","names":[],"originals":[],
+        "video":null,"imageSequence":{"imageCount":2,"width":32,"height":24,"hasAlpha":false,"requiresLargeSequenceConfirmation":false},
+        "dimensions":[[32,24]],"frames":null
+    })).unwrap()
+    };
+    checkpoint.sources = vec![
+        make_source("__source", "old-identity"),
+        make_source("new", "new-identity"),
+    ];
+    assert_eq!(checkpoint.single_requested_source().unwrap().id, "new");
+    let mut state = PipelineStateFile::created(Quality::Balanced);
+    state.inputs = Some(checkpoint.clone());
+    let tracker = PlannerEffectivenessTracker::default();
+    PipelineRunner::new(default_engine_paths(None), |_| {})
+        .with_effectiveness_tracker(tracker.clone())
+        .restore_source_metrics(&state);
+    assert_eq!(tracker.snapshot().frame_plan.unwrap().source_item_count, 2);
+    checkpoint.sources[1].image_sequence = None;
+    checkpoint.sources[1].video = Some(VideoInfo {
+        width: 1920,
+        height: 1080,
+        fps: 30.0,
+        duration: 2.0,
+        total_frames: 60,
+        codec: "fixture".into(),
+        rotation: 0,
+        pixel_format: "rgb24".into(),
+        has_alpha: false,
+    });
+    checkpoint.sources[1].frames = Some(FrameState {
+        initial_extracted_frames: 30,
+        estimated_frames: 31,
+        extracted_frames: Some(33),
+        sampling_fps: 15.0,
+        candidate_frames: (0..3)
+            .map(|source_frame_index| crate::video::PlannedFrame {
+                source_frame_index,
+                timestamp_seconds: source_frame_index as f64 / 30.0,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    state.inputs = Some(checkpoint.clone());
+    let tracker = PlannerEffectivenessTracker::default();
+    PipelineRunner::new(default_engine_paths(None), |_| {})
+        .with_effectiveness_tracker(tracker.clone())
+        .restore_source_metrics(&state);
+    let frame = tracker.snapshot().frame_plan.unwrap();
+    assert_eq!(frame.initial_selected_count, 30);
+    assert_eq!(frame.effective_target_fps, Some(15.0));
+    assert_eq!(frame.candidate_count, 3);
+    if let GenerationInputs::Materials { items } = &mut checkpoint.request {
+        items[0].identity = None;
+    }
+    assert!(checkpoint.single_requested_source().is_none());
+    if let GenerationInputs::Materials { items } = &mut checkpoint.request {
+        items[0].identity = Some("changed".into());
+    }
+    assert!(checkpoint.single_requested_source().is_none());
+}
+
 #[test]
 fn source_mask_requirement_preserves_alpha_when_old_frame_fields_default_to_false() {
     let mut source = SourceCheckpoint {

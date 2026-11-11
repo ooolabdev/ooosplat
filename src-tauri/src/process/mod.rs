@@ -200,6 +200,14 @@ pub enum ProcessUpdate {
         path: PathBuf,
         offset: u64,
     },
+    /// The execution's termination row has been written. The interval is now
+    /// safe to freeze without including a later process appending to this file.
+    LogClosed {
+        path: PathBuf,
+        end: u64,
+        success: bool,
+        termination: ProcessTermination,
+    },
     Exited {
         executable: PathBuf,
         exit_code: Option<i32>,
@@ -446,11 +454,15 @@ impl ProcessManager {
                 .append(true)
                 .open(path)
                 .await?;
+            let opened = ProcessUpdate::LogOpened {
+                path: path.clone(),
+                offset: file.metadata().await?.len(),
+            };
             if let Some(observer) = &self.lifecycle {
-                observer(ProcessUpdate::LogOpened {
-                    path: path.clone(),
-                    offset: file.metadata().await?.len(),
-                });
+                observer(opened.clone());
+            }
+            if let Some(observer) = &spec.observer {
+                observer(opened);
             }
             let args = spec
                 .args
@@ -581,17 +593,38 @@ impl ProcessManager {
         };
 
         if let Some(file) = log_file {
-            file.lock()
-                .await
-                .write_all(
-                    format!(
-                        "{}\nelapsed_ms: {}\n\n",
-                        output.termination,
-                        started.elapsed().as_millis()
-                    )
-                    .as_bytes(),
+            let mut file = file.lock().await;
+            file.write_all(
+                format!(
+                    "{}\nelapsed_ms: {}\n\n",
+                    output.termination,
+                    started.elapsed().as_millis()
                 )
-                .await?;
+                .as_bytes(),
+            )
+            .await?;
+            // Provenance collection is best effort: failure to stat the log
+            // must not replace the engine's actual result.
+            let end = if file.flush().await.is_ok() {
+                file.metadata().await.ok().map(|metadata| metadata.len())
+            } else {
+                None
+            };
+            drop(file);
+            if let (Some(observer), Some(path), Some(end)) = (&spec.observer, &spec.log_path, end) {
+                observer(ProcessUpdate::LogClosed {
+                    path: path.clone(),
+                    end,
+                    success: output.success,
+                    termination: output.termination.clone(),
+                });
+            }
+        }
+        if let Some(observer) = &spec.observer {
+            observer(ProcessUpdate::Exited {
+                executable: spec.executable.clone(),
+                exit_code: output.exit_code,
+            });
         }
 
         Ok(output)
@@ -636,6 +669,72 @@ async fn pump_stream<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn scoped_log_interval_is_sealed_after_the_termination_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gps.log");
+        std::fs::write(&path, "previous attempt\n").unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = events.clone();
+        #[cfg(windows)]
+        let (executable, args) = (
+            system_executable("cmd.exe"),
+            vec![
+                "/D".into(),
+                "/C".into(),
+                "echo scoped-output & exit /B 7".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (executable, args) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), "printf 'scoped-output\\n'; exit 7".into()],
+        );
+        let output = ProcessManager::new()
+            .run(ProcessSpec {
+                executable,
+                args,
+                working_directory: Some(directory.path().to_owned()),
+                log_path: Some(path.clone()),
+                observer: Some(Arc::new(move |event| {
+                    let name = match event {
+                        ProcessUpdate::Started { .. } => "started",
+                        ProcessUpdate::LogOpened { offset, .. } => {
+                            assert_eq!(offset, start);
+                            "opened"
+                        }
+                        ProcessUpdate::LogClosed {
+                            path,
+                            end,
+                            success,
+                            termination,
+                        } => {
+                            assert!(!success);
+                            assert_eq!(termination.exit_code, Some(7));
+                            let text = std::fs::read_to_string(&path).unwrap();
+                            assert!(text.contains("scoped-output"));
+                            assert!(text.contains("exit_code: Some(7)"));
+                            assert!(text.contains("elapsed_ms:"));
+                            assert_eq!(text.len() as u64, end);
+                            "closed"
+                        }
+                        ProcessUpdate::Exited { .. } => "exited",
+                        _ => return,
+                    };
+                    received.lock().unwrap().push(name);
+                })),
+            })
+            .await
+            .unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["started", "opened", "closed", "exited"]
+        );
+    }
 
     #[cfg(windows)]
     #[tokio::test]
