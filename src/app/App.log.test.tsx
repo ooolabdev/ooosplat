@@ -285,6 +285,34 @@ describe("App live log", () => {
     }
   });
 
+  it.each(['zh-CN', 'en'] as const)('localizes Brush progress and legacy stage events without changing raw logs or the current caption (%s)', async locale => {
+    const legacyStart = 'Brush 训练开始（使用可用图形后端）· 15000 iterations · 最大分辨率 1920 · 预计约 100:05:09';
+    const step = 'Brush 训练 · 1200/15000 步';
+    // A matching translation pattern must still remain raw when its event is
+    // engine output, rather than an application-generated progress event.
+    const raw = 'Brush 训练 · 7/15000 步';
+    await act(async () => {
+      useAppStore.getState().receiveEvent({ ...event(1), kind: 'stage', message: legacyStart,
+        current: 0, total: 15_000, unit: 'iterations', progress: 0, stageProgress: null, indeterminate: true });
+      useAppStore.getState().receiveEvent({ ...event(2), message: step, current: 1200, total: 15_000, unit: 'steps' });
+      useAppStore.getState().receiveEvent({ ...event(3), kind: 'log', message: raw,
+        current: null, total: 15_000, unit: null, progress: 50, stageProgress: null, indeterminate: true });
+    });
+    await flush();
+    if (locale === 'en') {
+      await act(async () => container.querySelector<HTMLButtonElement>('.language-action')!.click());
+      await flush();
+    }
+    const lines = [...container.querySelectorAll('.live-log .log-line p')].map(line => line.textContent);
+    expect(lines).toEqual(locale === 'zh-CN' ? [legacyStart, step, raw] : [
+      'Brush training started (using an available graphics backend) · 15000 iterations · max resolution 1920 · estimated about 100:05:09',
+      'Brush training · 1200/15000 steps', raw,
+    ]);
+    expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'zh-CN'
+      ? '正在生成高斯泼溅（1,200/15,000）。此步骤可能耗时较长，请耐心等待'
+      : 'Generating Gaussian splats (1,200/15,000). This step may take a while. Please wait.');
+  });
+
   it('uses preset captions in preparation, validation, publishing, and unknown stages', async () => {
     const stages = ['created', 'probingVideo', 'planningFrames', 'extractingFrames', 'validatingReconstruction', 'exporting', 'unknownEngineStage'];
     for (const [index, stage] of stages.entries()) {

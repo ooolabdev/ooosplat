@@ -80,6 +80,34 @@ describe('restored shared task detail', () => {
     expect(container.querySelector('.live-log')?.textContent).toContain('system');
     expect(container.querySelector('.stage-timeline li.active small')?.textContent).not.toBe('100.0%');
   });
+  it.each(['zh-CN', 'en'] as const)('localizes Brush progress and legacy stage events but preserves raw event/file logs and the current caption (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    const legacyStart = 'Brush 训练开始（使用可用图形后端）· 15000 iterations · 最大分辨率 1920 · 预计约 100:05:09';
+    const step = 'Brush 训练 · 1200/15000 步';
+    const rawEvent = 'Brush 训练 · 7/15000 步';
+    const rawFile = 'Brush 训练 · 9/15000 步';
+    mocks.logs.mockResolvedValue(page(rawFile));
+    const progress: import('../types/pipeline').PipelineEvent = {
+      sequence: 2, timestamp: '2026-10-09T00:00:00Z', kind: 'progress', level: 'info',
+      stage: 'trainingSplats', engine: 'brush', progress: 66, stageProgress: 8, indeterminate: false,
+      message: step, current: 1200, total: 15_000, unit: 'steps', elapsedMs: 1000, acceleration: null,
+    };
+    await render(task({ current: 1200, total: 15_000, unit: 'steps', substage: 'training', recent_events: [
+      { ...progress, sequence: 1, kind: 'stage', message: legacyStart, current: 0, unit: 'iterations',
+        progress: 60, stageProgress: null, indeterminate: true },
+      progress,
+      { ...progress, sequence: 3, kind: 'log', message: rawEvent, current: null, unit: null,
+        progress: 66, stageProgress: null, indeterminate: true },
+    ] }));
+    const lines = [...container.querySelectorAll('.live-log .log-line p')].map(line => line.textContent);
+    expect(lines).toEqual(locale === 'zh-CN' ? [rawFile, legacyStart, step, rawEvent] : [rawFile,
+      'Brush training started (using an available graphics backend) · 15000 iterations · max resolution 1920 · estimated about 100:05:09',
+      'Brush training · 1200/15000 steps', rawEvent,
+    ]);
+    expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'zh-CN'
+      ? '正在生成高斯泼溅（1,200/15,000）。此步骤可能耗时较长，请耐心等待'
+      : 'Generating Gaussian splats (1,200/15,000). This step may take a while. Please wait.');
+  });
   it('does not revive an old monitor or count after the task snapshot explicitly cleared them', async () => {
     const old = { sequence: 1, timestamp: '2026-10-09T00:00:00Z', kind: 'progress', stage: 'trainingSplats', message: '', engine: 'system',
       substage: 'panoramaTrainingPreparation', current: 72, total: 228, unit: 'panoramaFaces',
