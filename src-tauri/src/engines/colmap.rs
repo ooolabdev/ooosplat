@@ -1941,6 +1941,7 @@ mod tests {
             "fixed.txt".into(),
         ];
         std::fs::write(root.path().join("fixed.txt"), "1\n").unwrap();
+        super::super::colmap_ba::mapper_compatibility(&database, &args, root.path()).unwrap();
         let (selected, ba) = with_ba_policy(
             &executable,
             &database,
@@ -1951,16 +1952,28 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ba.gpu_index, Some(3));
+        // The macOS runtime is CPU-only, even when a successful GPU probe is
+        // cached. Keep its safety gate while testing the same mapper constraints.
+        let (expected_gpu, expected_global_backend) = if cfg!(target_os = "macos") {
+            assert!(ba.detail.contains("macOS CPU build"));
+            (None, "CERES")
+        } else {
+            (Some(3), "CASPAR")
+        };
+        assert_eq!(ba.gpu_index, expected_gpu);
         let selected = strings(selected);
         for pair in [
             ["--Mapper.ba_local_backend", "CERES"],
-            ["--Mapper.ba_global_backend", "CASPAR"],
+            ["--Mapper.ba_global_backend", expected_global_backend],
             ["--Mapper.fix_existing_frames", "1"],
             ["--Mapper.constant_camera_list_path", "fixed.txt"],
         ] {
             assert!(selected.windows(2).any(|v| v == pair));
         }
+        assert_eq!(
+            selected.iter().any(|v| v == "--Mapper.ba_gpu_index"),
+            expected_gpu.is_some()
+        );
         for restricted in [
             MapperBaPolicy {
                 policy_version: None,
