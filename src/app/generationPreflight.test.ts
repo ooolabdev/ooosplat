@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createGenerationDraft, loadTaskWorkspace, saveTaskWorkspace } from './taskWorkspace';
-import { answerIsValid, collectPreflightQuestions, imageMatchingStrategy, preflightSnapshot, resolvedProjection } from './generationPreflight';
+import { answerIsValid, collectPreflightQuestions, preflightSnapshot, resolvedProjection } from './generationPreflight';
 import { draftProjectionReady } from './taskQueue';
 const video = () => ({ ...createGenerationDraft(1), inputPath: 'E:/clip.mp4', projectionDetection: { sourceIdentity: 'source-A', confirmedErp: false, requiresChoice: true, supportedErp: true, reason: '', previewJpeg: [] } });
 beforeEach(() => localStorage.clear());
@@ -37,20 +37,13 @@ describe('generation preflight registry', () => {
     expect(answerIsValid(question, 'accepted')).toBe(true);
     expect(answerIsValid(question)).toBe(false);
   });
-  it.each([100, 101, 500, 501])('asks exactly once above 100 images (%i), regardless of projection', imageCount => {
+  it.each([100, 101, 500, 501])('leaves image-order choices to the inline input control (%i)', imageCount => {
     for (const projection of ['perspective', 'equirectangular'] as const) {
       const draft = { ...createGenerationDraft(1), inputType: 'images' as const, inputPath: 'E:/images', projectionAnswer: { identity: 'E:/images', projection }, imageSequence: { imageCount, width: 200, height: 100, hasAlpha: false, requiresLargeSequenceConfirmation: imageCount > 500 } };
       const questions = collectPreflightQuestions([draft]);
-      expect(questions.map(q => q.kind)).toEqual(imageCount > 100 ? ['imageOrder'] : []);
-      expect(imageMatchingStrategy(draft, {})).toBe('exhaustive');
-      expect(imageMatchingStrategy(draft, { [`${draft.id}:imageOrder`]: 'sequential' })).toBe(imageCount > 100 ? 'sequential' : 'exhaustive');
-      expect(imageMatchingStrategy(draft, { [`${draft.id}:imageOrder`]: 'exhaustive' })).toBe('exhaustive');
-      if (questions.length) {
-        for (const value of [undefined, '', 'accepted', 'other']) expect(answerIsValid(questions[0], value)).toBe(false);
-        for (const value of ['sequential', 'exhaustive']) expect(answerIsValid(questions[0], value)).toBe(true);
-      }
+      expect(questions).toEqual([]);
       const reshoot = { ...draft, kind: 'reshoot' as const, reshootSource: { projection } as import('../types/pipeline').ReshootSourceInfo };
-      expect(collectPreflightQuestions([reshoot]).map(q => q.kind)).toEqual(['reshootCondition', ...(projection === 'perspective' ? ['reshootCamera'] : []), ...(imageCount > 100 ? ['imageOrder'] : [])]);
+      expect(collectPreflightQuestions([reshoot]).map(q => q.kind)).toEqual(['reshootCondition', ...(projection === 'perspective' ? ['reshootCamera'] : [])]);
       if (projection === 'perspective') {
         const camera = collectPreflightQuestions([reshoot])[1];
         for (const answer of [undefined, '', 'accepted', 'good']) expect(answerIsValid(camera, answer)).toBe(false);

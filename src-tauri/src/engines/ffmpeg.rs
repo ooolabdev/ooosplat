@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
@@ -39,6 +40,40 @@ pub struct FrameExtractionResult {
     pub has_alpha: bool,
     pub width: u32,
     pub height: u32,
+}
+
+const FRAME_MAPPING_VERSION: u32 = 1;
+const FRAME_STATS_FORMAT: &str = "{n}\t{ni}\t{ptsi}\t{tbi}";
+const MAX_FRAME_STATS_LINE_BYTES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncodedFrameMapping {
+    output_sequence: u64,
+    source_frame_index: u64,
+    input_pts: Option<i64>,
+    input_time_base: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrameExtractionManifest<'a> {
+    version: u32,
+    planned_count: usize,
+    unique_planned_count: usize,
+    planned_frames: &'a [PlannedFrame],
+    emitted_frames: &'a [EncodedFrameMapping],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emitted_masks: Option<&'a [EncodedFrameMapping]>,
+    output_frame_count: usize,
+    output_mask_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drop_frames: Option<u64>,
+    missing_source_indices: &'a [u64],
+    unexpected_source_indices: &'a [u64],
+    mapping_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,22 +160,22 @@ pub async fn extract_selected_frames(
     if !input.is_file() {
         return Err(SplatError::InvalidPath(input.to_path_buf()));
     }
-    if selected_frames.is_empty() {
-        return Err(SplatError::Process(
-            "Quality v2 did not select any source frames".into(),
-        ));
-    }
+    let selected_frames = validated_selected_frames(selected_frames)?;
     ensure_clean_output(output_directory, colmap_directory, mask_directory).await?;
     tokio::fs::create_dir_all(output_directory).await?;
     tokio::fs::create_dir_all(colmap_directory).await?;
     if has_alpha {
         tokio::fs::create_dir_all(mask_directory).await?;
     }
-    let script_path = output_directory
-        .parent()
-        .unwrap_or(output_directory)
-        .join(format!("frame-selection-{}.ffscript", uuid::Uuid::new_v4()));
-    let expression = selection_expression(selected_frames);
+    let parent = output_directory.parent().unwrap_or(output_directory);
+    let extraction_id = uuid::Uuid::new_v4();
+    let script_path = parent.join(format!("frame-selection-{extraction_id}.ffscript"));
+    let frame_stats_path = parent.join(format!("frame-selection-{extraction_id}-frames.stats"));
+    let mask_stats_path =
+        has_alpha.then(|| parent.join(format!("frame-selection-{extraction_id}-masks.stats")));
+    let manifest_path = parent.join("frame-extraction-map.json");
+    let _ = tokio::fs::remove_file(&manifest_path).await;
+    let expression = selection_expression(&selected_frames);
     let script = selected_filter_script(&expression, has_alpha, target_dimensions);
     tokio::fs::write(&script_path, script).await?;
     let args = selected_frame_extraction_args(
@@ -149,7 +184,10 @@ pub async fn extract_selected_frames(
         mask_directory,
         &script_path,
         has_alpha,
+        &frame_stats_path,
+        mask_stats_path.as_deref(),
     );
+    let diagnostic_log = log_path.clone();
     let output = process_manager
         .run(ProcessSpec {
             executable: executable.to_path_buf(),
@@ -160,9 +198,16 @@ pub async fn extract_selected_frames(
         })
         .await;
     let _ = tokio::fs::remove_file(&script_path).await;
-    let output = output?;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+            return Err(error);
+        }
+    };
     if !output.success {
         let detail = output.failure_detail();
+        cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
         return Err(SplatError::Process(format!(
             "FFmpeg failed to extract the Quality v2 frame list, exit code {:?}{}",
             output.exit_code,
@@ -173,7 +218,120 @@ pub async fn extract_selected_frames(
             }
         )));
     }
-    rename_selected_outputs(output_directory, mask_directory, selected_frames, has_alpha).await?;
+
+    let drop_frames = last_progress_value(&output.stdout, "drop_frames");
+    let emitted_frames = match read_frame_stats(&frame_stats_path, selected_frames.len()).await {
+        Ok(records) => records,
+        Err(error) => {
+            let detail = format!("FFmpeg exact frame statistics are unavailable: {error}");
+            persist_frame_manifest(
+                &manifest_path,
+                &selected_frames,
+                &[],
+                None,
+                image_paths(output_directory, if has_alpha { "png" } else { "jpg" })
+                    .await
+                    .map_or(0, |paths| paths.len()),
+                0,
+                drop_frames,
+                &[],
+                &[],
+                false,
+                Some(&detail),
+            )
+            .await;
+            append_frame_mapping_log(diagnostic_log.as_deref(), &detail).await;
+            cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+            return Err(SplatError::Process(detail));
+        }
+    };
+    let emitted_masks = if let Some(path) = mask_stats_path.as_deref() {
+        match read_frame_stats(path, selected_frames.len()).await {
+            Ok(records) => Some(records),
+            Err(error) => {
+                let detail = format!("FFmpeg alpha-mask frame statistics are unavailable: {error}");
+                persist_frame_manifest(
+                    &manifest_path,
+                    &selected_frames,
+                    &emitted_frames,
+                    None,
+                    image_paths(output_directory, "png")
+                        .await
+                        .map_or(0, |paths| paths.len()),
+                    image_paths(mask_directory, "png")
+                        .await
+                        .map_or(0, |paths| paths.len()),
+                    drop_frames,
+                    &[],
+                    &[],
+                    false,
+                    Some(&detail),
+                )
+                .await;
+                append_frame_mapping_log(diagnostic_log.as_deref(), &detail).await;
+                cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+                return Err(SplatError::Process(detail));
+            }
+        }
+    } else {
+        None
+    };
+    let extension = if has_alpha { "png" } else { "jpg" };
+    let output_frame_count = match image_paths(output_directory, extension).await {
+        Ok(paths) => paths.len(),
+        Err(error) => {
+            cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+            return Err(error);
+        }
+    };
+    let output_mask_count = if has_alpha {
+        match image_paths(mask_directory, "png").await {
+            Ok(paths) => paths.len(),
+            Err(error) => {
+                cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+                return Err(error);
+            }
+        }
+    } else {
+        0
+    };
+    let assessment = assess_frame_mapping(
+        &selected_frames,
+        &emitted_frames,
+        emitted_masks.as_deref(),
+        output_frame_count,
+        output_mask_count,
+        has_alpha,
+    );
+    let summary = frame_mapping_summary(
+        &selected_frames,
+        &emitted_frames,
+        output_frame_count,
+        output_mask_count,
+        drop_frames,
+        &assessment,
+    );
+    persist_frame_manifest(
+        &manifest_path,
+        &selected_frames,
+        &emitted_frames,
+        emitted_masks.as_deref(),
+        output_frame_count,
+        output_mask_count,
+        drop_frames,
+        &assessment.missing,
+        &assessment.unexpected,
+        assessment.valid,
+        (!assessment.valid).then_some(summary.as_str()),
+    )
+    .await;
+    append_frame_mapping_log(diagnostic_log.as_deref(), &summary).await;
+    cleanup_frame_stats(&frame_stats_path, mask_stats_path.as_deref()).await;
+    if !assessment.valid {
+        return Err(SplatError::Process(summary));
+    }
+
+    rename_selected_outputs(output_directory, mask_directory, &emitted_frames, has_alpha).await?;
     mirror_images(output_directory, colmap_directory).await?;
     validate_extraction(
         output_directory,
@@ -286,25 +444,352 @@ async fn remove_selected_outputs(
     Ok(())
 }
 
+fn validated_selected_frames(selected_frames: &[PlannedFrame]) -> Result<Vec<PlannedFrame>> {
+    if selected_frames.is_empty() {
+        return Err(SplatError::Process(
+            "Quality v2 did not select any source frames".into(),
+        ));
+    }
+    if selected_frames
+        .iter()
+        .any(|frame| !frame.timestamp_seconds.is_finite())
+    {
+        return Err(SplatError::Process(
+            "Quality v2 frame plan contains a non-finite timestamp".into(),
+        ));
+    }
+    let mut selected = selected_frames.to_vec();
+    selected.sort_by_key(|frame| frame.source_frame_index);
+    if selected
+        .windows(2)
+        .any(|frames| frames[0].source_frame_index == frames[1].source_frame_index)
+    {
+        return Err(SplatError::Process(
+            "Quality v2 frame plan contains duplicate source indices".into(),
+        ));
+    }
+    Ok(selected)
+}
+
+async fn read_frame_stats(path: &Path, expected_count: usize) -> Result<Vec<EncodedFrameMapping>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || parse_frame_stats(&path, expected_count))
+        .await
+        .map_err(|error| {
+            SplatError::Process(format!("FFmpeg frame statistics task failed: {error}"))
+        })?
+}
+
+fn parse_frame_stats(path: &Path, expected_count: usize) -> Result<Vec<EncodedFrameMapping>> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| SplatError::Process(format!("cannot open frame statistics: {error}")))?;
+    let mut records = Vec::with_capacity(expected_count.min(16_384));
+    for (line_number, line) in BufReader::new(file).split(b'\n').enumerate() {
+        let mut line = line.map_err(|error| {
+            SplatError::Process(format!("cannot read frame statistics: {error}"))
+        })?;
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_FRAME_STATS_LINE_BYTES {
+            return Err(SplatError::Process(format!(
+                "frame statistics line {} exceeds the size limit",
+                line_number + 1
+            )));
+        }
+        if records.len() >= expected_count.saturating_add(1) {
+            return Err(SplatError::Process(
+                "frame statistics contain more records than the extraction plan".into(),
+            ));
+        }
+        let line = std::str::from_utf8(&line).map_err(|_| {
+            SplatError::Process(format!(
+                "frame statistics line {} is not UTF-8",
+                line_number + 1
+            ))
+        })?;
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 4 {
+            return Err(SplatError::Process(format!(
+                "frame statistics line {} has {} fields instead of 4",
+                line_number + 1,
+                fields.len()
+            )));
+        }
+        let output_sequence = fields[0].parse::<u64>().map_err(|_| {
+            SplatError::Process(format!(
+                "frame statistics line {} has an invalid output sequence",
+                line_number + 1
+            ))
+        })?;
+        if output_sequence != records.len() as u64 {
+            return Err(SplatError::Process(format!(
+                "frame statistics output sequence is not contiguous at line {}",
+                line_number + 1
+            )));
+        }
+        let source_frame_index = fields[1].parse::<i64>().map_err(|_| {
+            SplatError::Process(format!(
+                "frame statistics line {} has an invalid source frame index",
+                line_number + 1
+            ))
+        })?;
+        let source_frame_index = u64::try_from(source_frame_index).map_err(|_| {
+            SplatError::Process(format!(
+                "frame statistics line {} does not identify a source frame",
+                line_number + 1
+            ))
+        })?;
+        let input_pts = fields[2].parse::<i64>().map_err(|_| {
+            SplatError::Process(format!(
+                "frame statistics line {} has an invalid input PTS",
+                line_number + 1
+            ))
+        })?;
+        let (time_base_numerator, time_base_denominator) = fields[3]
+            .split_once('/')
+            .and_then(|(numerator, denominator)| {
+                Some((
+                    numerator.parse::<i64>().ok()?,
+                    denominator.parse::<i64>().ok()?,
+                ))
+            })
+            .ok_or_else(|| {
+                SplatError::Process(format!(
+                    "frame statistics line {} has an invalid input time base",
+                    line_number + 1
+                ))
+            })?;
+        if time_base_denominator == 0 {
+            return Err(SplatError::Process(format!(
+                "frame statistics line {} has a zero time-base denominator",
+                line_number + 1
+            )));
+        }
+        records.push(EncodedFrameMapping {
+            output_sequence,
+            source_frame_index,
+            input_pts: (input_pts != i64::MAX).then_some(input_pts),
+            input_time_base: format!("{time_base_numerator}/{time_base_denominator}"),
+        });
+    }
+    Ok(records)
+}
+
+#[derive(Debug)]
+struct FrameMappingAssessment {
+    valid: bool,
+    sequence_valid: bool,
+    emitted_indices_unique: bool,
+    alpha_mapping_valid: bool,
+    missing: Vec<u64>,
+    unexpected: Vec<u64>,
+}
+
+fn assess_frame_mapping(
+    selected_frames: &[PlannedFrame],
+    emitted_frames: &[EncodedFrameMapping],
+    emitted_masks: Option<&[EncodedFrameMapping]>,
+    output_frame_count: usize,
+    output_mask_count: usize,
+    has_alpha: bool,
+) -> FrameMappingAssessment {
+    let planned = selected_frames
+        .iter()
+        .map(|frame| frame.source_frame_index)
+        .collect::<BTreeSet<_>>();
+    let emitted = emitted_frames
+        .iter()
+        .map(|frame| frame.source_frame_index)
+        .collect::<BTreeSet<_>>();
+    let sequence_valid = emitted_frames
+        .iter()
+        .enumerate()
+        .all(|(index, frame)| frame.output_sequence == index as u64);
+    let emitted_indices_unique = emitted.len() == emitted_frames.len();
+    let alpha_mapping_valid = if has_alpha {
+        emitted_masks.is_some_and(|masks| masks == emitted_frames)
+    } else {
+        emitted_masks.is_none()
+    };
+    let missing = planned.difference(&emitted).copied().collect::<Vec<_>>();
+    let unexpected = emitted.difference(&planned).copied().collect::<Vec<_>>();
+    let expected = selected_frames.len();
+    let valid = sequence_valid
+        && emitted_indices_unique
+        && alpha_mapping_valid
+        && missing.is_empty()
+        && unexpected.is_empty()
+        && emitted_frames.len() == expected
+        && output_frame_count == expected
+        && (!has_alpha || output_mask_count == expected);
+    FrameMappingAssessment {
+        valid,
+        sequence_valid,
+        emitted_indices_unique,
+        alpha_mapping_valid,
+        missing,
+        unexpected,
+    }
+}
+
+fn last_progress_value(output: &str, key: &str) -> Option<u64> {
+    output.lines().rev().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        (name == key).then(|| value.trim().parse::<u64>().ok())?
+    })
+}
+
+fn compact_index_ranges(indices: &[u64]) -> String {
+    const MAX_RANGES: usize = 64;
+    if indices.is_empty() {
+        return "none".into();
+    }
+    let mut ranges = Vec::new();
+    let mut start = indices[0];
+    let mut end = start;
+    for index in indices.iter().copied().skip(1) {
+        if index == end.saturating_add(1) {
+            end = index;
+        } else {
+            ranges.push((start, end));
+            start = index;
+            end = index;
+        }
+    }
+    ranges.push((start, end));
+    let omitted = ranges.len().saturating_sub(MAX_RANGES);
+    let mut text = ranges
+        .iter()
+        .take(MAX_RANGES)
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if omitted > 0 {
+        text.push_str(&format!(",...(+{omitted} ranges)"));
+    }
+    text
+}
+
+fn frame_mapping_summary(
+    selected_frames: &[PlannedFrame],
+    emitted_frames: &[EncodedFrameMapping],
+    output_frame_count: usize,
+    output_mask_count: usize,
+    drop_frames: Option<u64>,
+    assessment: &FrameMappingAssessment,
+) -> String {
+    let unique_planned_count = selected_frames
+        .iter()
+        .map(|frame| frame.source_frame_index)
+        .collect::<BTreeSet<_>>()
+        .len();
+    format!(
+        "FFmpeg exact frame mapping: planned={}, unique={}, emitted={}, images={}, masks={}, drop_frames={}, sequence_valid={}, emitted_unique={}, alpha_mapping_valid={}, missing={}, unexpected={}",
+        selected_frames.len(),
+        unique_planned_count,
+        emitted_frames.len(),
+        output_frame_count,
+        output_mask_count,
+        drop_frames.map_or_else(|| "unknown".into(), |value| value.to_string()),
+        assessment.sequence_valid,
+        assessment.emitted_indices_unique,
+        assessment.alpha_mapping_valid,
+        compact_index_ranges(&assessment.missing),
+        compact_index_ranges(&assessment.unexpected),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_frame_manifest(
+    path: &Path,
+    selected_frames: &[PlannedFrame],
+    emitted_frames: &[EncodedFrameMapping],
+    emitted_masks: Option<&[EncodedFrameMapping]>,
+    output_frame_count: usize,
+    output_mask_count: usize,
+    drop_frames: Option<u64>,
+    missing_source_indices: &[u64],
+    unexpected_source_indices: &[u64],
+    mapping_valid: bool,
+    error: Option<&str>,
+) {
+    let unique_planned_count = selected_frames
+        .iter()
+        .map(|frame| frame.source_frame_index)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let manifest = FrameExtractionManifest {
+        version: FRAME_MAPPING_VERSION,
+        planned_count: selected_frames.len(),
+        unique_planned_count,
+        planned_frames: selected_frames,
+        emitted_frames,
+        emitted_masks,
+        output_frame_count,
+        output_mask_count,
+        drop_frames,
+        missing_source_indices,
+        unexpected_source_indices,
+        mapping_valid,
+        error,
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+        let _ = tokio::fs::write(path, bytes).await;
+    }
+}
+
+async fn append_frame_mapping_log(path: Option<&Path>, summary: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = file
+            .write_all(format!("\n[OOOSplat] {summary}\n").as_bytes())
+            .await;
+    }
+}
+
+async fn cleanup_frame_stats(frame_stats: &Path, mask_stats: Option<&Path>) {
+    let _ = tokio::fs::remove_file(frame_stats).await;
+    if let Some(path) = mask_stats {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
 async fn rename_selected_outputs(
     frames: &Path,
     masks: &Path,
-    selected_frames: &[PlannedFrame],
+    emitted_frames: &[EncodedFrameMapping],
     has_alpha: bool,
 ) -> Result<()> {
     let extension = if has_alpha { "png" } else { "jpg" };
     let mut frame_paths = image_paths(frames, extension).await?;
-    let mut selected = selected_frames.to_vec();
-    selected.sort_by_key(|frame| frame.source_frame_index);
-    if frame_paths.len() != selected.len() {
+    if frame_paths.len() != emitted_frames.len() {
         return Err(SplatError::Process(format!(
-            "Quality v2 selected {} frames but FFmpeg wrote {}",
-            selected.len(),
+            "FFmpeg frame mapping contains {} records but {} images were written",
+            emitted_frames.len(),
             frame_paths.len()
         )));
     }
     frame_paths.sort();
-    for (source, frame) in frame_paths.into_iter().zip(&selected) {
+    for (source, frame) in frame_paths.into_iter().zip(emitted_frames) {
         tokio::fs::rename(
             source,
             frames.join(format!(
@@ -317,12 +802,12 @@ async fn rename_selected_outputs(
     if has_alpha {
         let mut mask_paths = image_paths(masks, "png").await?;
         mask_paths.sort();
-        if mask_paths.len() != selected.len() {
+        if mask_paths.len() != emitted_frames.len() {
             return Err(SplatError::Process(
                 "Quality v2 alpha mask count mismatch".into(),
             ));
         }
-        for (source, frame) in mask_paths.into_iter().zip(&selected) {
+        for (source, frame) in mask_paths.into_iter().zip(emitted_frames) {
             tokio::fs::rename(
                 source,
                 masks.join(format!("frame_{:010}.png.png", frame.source_frame_index)),
@@ -446,6 +931,8 @@ fn selected_frame_extraction_args(
     mask_directory: &Path,
     script_path: &Path,
     has_alpha: bool,
+    frame_stats_path: &Path,
+    mask_stats_path: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = vec![
         "-hide_banner".into(),
@@ -465,8 +952,12 @@ fn selected_frame_extraction_args(
             "png".into(),
             "-pix_fmt".into(),
             "rgba".into(),
-            "-vsync".into(),
-            "vfr".into(),
+            "-fps_mode".into(),
+            "passthrough".into(),
+            "-stats_enc_pre".into(),
+            frame_stats_path.as_os_str().to_owned(),
+            "-stats_enc_pre_fmt".into(),
+            FRAME_STATS_FORMAT.into(),
             "-start_number".into(),
             "1".into(),
             output_directory.join("frame_%06d.png").into_os_string(),
@@ -476,8 +967,15 @@ fn selected_frame_extraction_args(
             "png".into(),
             "-pix_fmt".into(),
             "gray".into(),
-            "-vsync".into(),
-            "vfr".into(),
+            "-fps_mode".into(),
+            "passthrough".into(),
+            "-stats_enc_pre".into(),
+            mask_stats_path
+                .expect("alpha extraction requires mask stats")
+                .as_os_str()
+                .to_owned(),
+            "-stats_enc_pre_fmt".into(),
+            FRAME_STATS_FORMAT.into(),
             "-start_number".into(),
             "1".into(),
             mask_directory.join("frame_%06d.png.png").into_os_string(),
@@ -486,8 +984,12 @@ fn selected_frame_extraction_args(
         args.extend([
             "-filter_script:v".into(),
             script_path.as_os_str().to_owned(),
-            "-vsync".into(),
-            "vfr".into(),
+            "-fps_mode".into(),
+            "passthrough".into(),
+            "-stats_enc_pre".into(),
+            frame_stats_path.as_os_str().to_owned(),
+            "-stats_enc_pre_fmt".into(),
+            FRAME_STATS_FORMAT.into(),
             "-q:v".into(),
             "2".into(),
             "-start_number".into(),
@@ -785,6 +1287,8 @@ mod tests {
             Path::new("masks"),
             Path::new("selection.ffscript"),
             true,
+            Path::new("frames.stats"),
+            Some(Path::new("masks.stats")),
         ));
         assert_eq!(
             args.iter().filter(|value| value.as_str() == "-i").count(),
@@ -796,6 +1300,123 @@ mod tests {
             args.iter().filter(|value| value.as_str() == "-map").count(),
             2
         );
+        assert_eq!(
+            args.iter()
+                .filter(|value| value.as_str() == "-fps_mode")
+                .count(),
+            2
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|value| value.as_str() == "passthrough")
+                .count(),
+            2
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|value| value.as_str() == "-stats_enc_pre")
+                .count(),
+            2
+        );
+        assert!(!args.iter().any(|value| value == "-vsync"));
+        assert!(!args.iter().any(|value| value == "vfr"));
+    }
+
+    #[test]
+    fn selected_frame_plan_rejects_duplicate_indices_and_invalid_timestamps() {
+        let duplicate = [
+            PlannedFrame {
+                source_frame_index: 4,
+                timestamp_seconds: 0.1,
+            },
+            PlannedFrame {
+                source_frame_index: 4,
+                timestamp_seconds: 0.2,
+            },
+        ];
+        assert!(validated_selected_frames(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        let invalid = [PlannedFrame {
+            source_frame_index: 4,
+            timestamp_seconds: f64::NAN,
+        }];
+        assert!(validated_selected_frames(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite"));
+    }
+
+    #[test]
+    fn frame_statistics_keep_source_indices_and_reject_unavailable_mapping() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stats = temporary.path().join("frames.stats");
+        std::fs::write(&stats, "0\t5\t100\t1/1000\n1\t9\t200\t1/1000\n").unwrap();
+        assert_eq!(
+            parse_frame_stats(&stats, 2).unwrap(),
+            vec![
+                EncodedFrameMapping {
+                    output_sequence: 0,
+                    source_frame_index: 5,
+                    input_pts: Some(100),
+                    input_time_base: "1/1000".into(),
+                },
+                EncodedFrameMapping {
+                    output_sequence: 1,
+                    source_frame_index: 9,
+                    input_pts: Some(200),
+                    input_time_base: "1/1000".into(),
+                },
+            ]
+        );
+
+        std::fs::write(&stats, "0\t-1\t9223372036854775807\t0/1\n").unwrap();
+        assert!(parse_frame_stats(&stats, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("does not identify"));
+    }
+
+    #[test]
+    fn mapping_assessment_rejects_missing_unexpected_and_divergent_alpha_records() {
+        let selected = [
+            PlannedFrame {
+                source_frame_index: 5,
+                timestamp_seconds: 0.1,
+            },
+            PlannedFrame {
+                source_frame_index: 9,
+                timestamp_seconds: 0.3,
+            },
+        ];
+        let emitted = [EncodedFrameMapping {
+            output_sequence: 0,
+            source_frame_index: 5,
+            input_pts: Some(100),
+            input_time_base: "1/1000".into(),
+        }];
+        let assessment = assess_frame_mapping(&selected, &emitted, None, 1, 0, false);
+        assert!(!assessment.valid);
+        assert_eq!(assessment.missing, vec![9]);
+        assert!(assessment.unexpected.is_empty());
+
+        let unexpected = [
+            emitted[0].clone(),
+            EncodedFrameMapping {
+                output_sequence: 1,
+                source_frame_index: 12,
+                input_pts: Some(200),
+                input_time_base: "1/1000".into(),
+            },
+        ];
+        let assessment = assess_frame_mapping(&selected, &unexpected, None, 2, 0, false);
+        assert_eq!(assessment.missing, vec![9]);
+        assert_eq!(assessment.unexpected, vec![12]);
+
+        let assessment = assess_frame_mapping(&selected[..1], &emitted, Some(&[]), 1, 1, true);
+        assert!(!assessment.valid);
+        assert!(!assessment.alpha_mapping_valid);
     }
 
     #[test]
@@ -873,18 +1494,22 @@ mod tests {
                 .save(masks.join(format!("{name}.png")))
                 .unwrap();
         }
-        let selected = [
-            PlannedFrame {
-                source_frame_index: 9,
-                timestamp_seconds: 0.3,
-            },
-            PlannedFrame {
+        let emitted = [
+            EncodedFrameMapping {
+                output_sequence: 0,
                 source_frame_index: 5,
-                timestamp_seconds: 0.1,
+                input_pts: Some(100),
+                input_time_base: "1/1000".into(),
+            },
+            EncodedFrameMapping {
+                output_sequence: 1,
+                source_frame_index: 9,
+                input_pts: Some(300),
+                input_time_base: "1/1000".into(),
             },
         ];
 
-        rename_selected_outputs(&frames, &masks, &selected, true)
+        rename_selected_outputs(&frames, &masks, &emitted, true)
             .await
             .unwrap();
         mirror_images(&frames, &colmap_frames).await.unwrap();
@@ -955,6 +1580,123 @@ mod tests {
         assert!(validate_extraction(&frames, &colmap_frames, &masks, true)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bundled FFmpeg"]
+    async fn duplicate_pts_selected_frames_are_not_dropped() {
+        let executable = PathBuf::from(
+            std::env::var("OOOSPLAT_VALIDATION_FFMPEG")
+                .expect("OOOSPLAT_VALIDATION_FFMPEG is required"),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("duplicate-pts.mkv");
+        let process_manager = ProcessManager::new();
+        let generated = process_manager
+            .run(ProcessSpec {
+                executable: executable.clone(),
+                args: vec![
+                    "-hide_banner".into(),
+                    "-loglevel".into(),
+                    "error".into(),
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "testsrc2=size=64x64:rate=10:duration=1".into(),
+                    "-vf".into(),
+                    "setpts=5/TB+floor(N/2)".into(),
+                    "-fps_mode".into(),
+                    "passthrough".into(),
+                    "-c:v".into(),
+                    "ffv1".into(),
+                    "-y".into(),
+                    input.clone().into_os_string(),
+                ],
+                working_directory: Some(temporary.path().to_path_buf()),
+                log_path: None,
+                observer: None,
+            })
+            .await
+            .unwrap();
+        assert!(generated.success, "{}", generated.failure_detail());
+
+        let selected = (0..10)
+            .map(|source_frame_index| PlannedFrame {
+                source_frame_index,
+                timestamp_seconds: 5.0 + (source_frame_index / 2) as f64 / 10.0,
+            })
+            .collect::<Vec<_>>();
+        let frames = temporary.path().join("frames");
+        let colmap_frames = temporary.path().join("colmap_frames");
+        let masks = temporary.path().join("masks");
+        let result = extract_selected_frames(
+            &executable,
+            &input,
+            &frames,
+            &colmap_frames,
+            &masks,
+            &selected,
+            false,
+            None,
+            Some(temporary.path().join("ffmpeg.log")),
+            &process_manager,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.frame_count, 10);
+        for index in 0..10 {
+            assert!(frames.join(format!("frame_{index:010}.jpg")).is_file());
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(temporary.path().join("frame-extraction-map.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["mappingValid"], true);
+        assert_eq!(manifest["emittedFrames"].as_array().unwrap().len(), 10);
+
+        let missing_root = temporary.path().join("missing-selection");
+        let missing = [
+            PlannedFrame {
+                source_frame_index: 0,
+                timestamp_seconds: 0.0,
+            },
+            PlannedFrame {
+                source_frame_index: 10,
+                timestamp_seconds: 0.0,
+            },
+        ];
+        let error = extract_selected_frames(
+            &executable,
+            &input,
+            &missing_root.join("frames"),
+            &missing_root.join("colmap_frames"),
+            &missing_root.join("masks"),
+            &missing,
+            false,
+            None,
+            Some(missing_root.join("ffmpeg.log")),
+            &process_manager,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing=10"));
+        assert!(
+            crate::video::list_images(&missing_root.join("colmap_frames"))
+                .unwrap()
+                .is_empty()
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(missing_root.join("frame-extraction-map.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["mappingValid"], false);
+        assert_eq!(manifest["missingSourceIndices"], serde_json::json!([10]));
     }
 
     #[tokio::test]

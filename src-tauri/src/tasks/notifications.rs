@@ -15,6 +15,9 @@ pub(super) const MAX_PENDING_LOG_BYTES: usize = 64 * 1024;
 /// Only fields consumed by the UI. Full records remain available to query tools.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_assistance: Option<crate::pipeline::inputs::GpsAssistance>,
+    pub imported_reconstruction: bool,
     pub task_id: Uuid,
     pub run_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
@@ -61,6 +64,23 @@ pub struct RunView {
 impl From<&TaskRecord> for TaskView {
     fn from(task: &TaskRecord) -> Self {
         Self {
+            gps_assistance: task
+                .actual_configuration
+                .as_ref()
+                .and_then(|s| s.pointer("/inputs/gpsAssistance"))
+                .and_then(|s| serde_json::from_value(s.clone()).ok()),
+            imported_reconstruction: task
+                .request_parameters
+                .as_ref()
+                .and_then(|p| p.pointer("/inputs/mode"))
+                .and_then(Value::as_str)
+                == Some("colmap")
+                || task
+                    .actual_configuration
+                    .as_ref()
+                    .and_then(|p| p.pointer("/inputs/importedReconstruction"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
             task_id: task.task_id,
             run_id: task.run_id,
             project_id: task.project_id,

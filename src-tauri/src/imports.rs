@@ -17,6 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{Result, SplatError},
+    pipeline::input_admission::{
+        ensure_colmap_import_enabled, is_colmap_input_file, unsupported_input,
+        COLMAP_IMPORT_ENABLED,
+    },
     presets::Quality,
     project::{
         catalog,
@@ -566,6 +570,38 @@ fn detect_colmap(files: &[PathBuf]) -> Vec<ColmapCandidate> {
     result
 }
 
+fn new_import_colmap(source: &Path, files: &[PathBuf]) -> Result<Vec<ColmapCandidate>> {
+    if !COLMAP_IMPORT_ENABLED {
+        return Ok(Vec::new());
+    }
+    let context = if source.is_file() {
+        source
+            .parent()
+            .map(scan_files)
+            .transpose()?
+            .unwrap_or_else(|| files.to_vec())
+    } else {
+        files.to_vec()
+    };
+    Ok(detect_colmap(&context))
+}
+
+fn unsupported_gaussian_source(files: &[PathBuf]) -> SplatError {
+    if files.iter().any(|path| is_colmap_input_file(path)) {
+        return ensure_colmap_import_enabled()
+            .err()
+            .unwrap_or_else(unsupported_input);
+    }
+    unsupported_input()
+}
+
+fn validate_new_import_colmap(colmap_id: Option<Uuid>) -> Result<()> {
+    if colmap_id.is_some() {
+        ensure_colmap_import_enabled()?;
+    }
+    Ok(())
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
@@ -704,15 +740,6 @@ pub async fn probe_gaussian_import(
         tokio::task::spawn_blocking(move || -> Result<_> {
             let canonical_source = std::fs::canonicalize(&source)?;
             let files = scan_files(&canonical_source)?;
-            let context_files = if canonical_source.is_file() {
-                canonical_source
-                    .parent()
-                    .map(scan_files)
-                    .transpose()?
-                    .unwrap_or_else(|| files.clone())
-            } else {
-                files.clone()
-            };
             let mut models = Vec::new();
             for path in &files {
                 let Some(mut format) = import_format(path) else {
@@ -749,22 +776,9 @@ pub async fn probe_gaussian_import(
                 });
             }
             if models.is_empty() {
-                if files.iter().any(|path| {
-                    path.extension()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|value| {
-                            value.eq_ignore_ascii_case("lcc") || value.eq_ignore_ascii_case("lcc2")
-                        })
-                }) {
-                    return Err(SplatError::Process(
-                        "暂不支持 LCC/LCC2；请先转换为 PLY、SOG、SPZ、SPLAT 或 KSPLAT".into(),
-                    ));
-                }
-                return Err(SplatError::Process(
-                    "未找到受支持的 Gaussian 模型；不能只导入 COLMAP 项目".into(),
-                ));
+                return Err(unsupported_gaussian_source(&files));
             }
-            let colmap = detect_colmap(&context_files);
+            let colmap = new_import_colmap(&canonical_source, &files)?;
             let suggested_name = canonical_source
                 .file_stem()
                 .or_else(|| canonical_source.file_name())
@@ -836,6 +850,7 @@ pub async fn begin_gaussian_import(
     tasks: tauri::State<'_, crate::commands::PipelineController>,
     request: BeginGaussianImportRequest,
 ) -> Result<GaussianImportSessionInfo> {
+    validate_new_import_colmap(request.colmap_id)?;
     let _admission = imports.admission().await;
     if tasks
         .running()
@@ -1240,11 +1255,77 @@ pub async fn relink_imported_project(
 #[cfg(test)]
 mod tests {
     use super::{
-        fingerprint_files, import_format, scan_files, sog_allowed_files, validate_colmap_database,
+        fingerprint_files, import_format, new_import_colmap, scan_files, sog_allowed_files,
+        unsupported_gaussian_source, validate_colmap_database, validate_new_import_colmap,
         ImportedGaussianFormat,
     };
+    use crate::error::{InputAdmissionReason, SplatError};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn new_gaussian_import_ignores_colmap_sidecars() {
+        let root = tempdir().unwrap();
+        let model = root.path().join("model.ply");
+        fs::write(&model, b"Gaussian import fixture").unwrap();
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "database.db"] {
+            fs::write(root.path().join(name), b"read-only sidecar").unwrap();
+        }
+        let files = scan_files(root.path()).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|path| import_format(path).is_some())
+                .count(),
+            1
+        );
+        assert!(new_import_colmap(&model, std::slice::from_ref(&model))
+            .unwrap()
+            .is_empty());
+        assert!(new_import_colmap(root.path(), &files).unwrap().is_empty());
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "database.db"] {
+            assert_eq!(
+                fs::read(root.path().join(name)).unwrap(),
+                b"read-only sidecar"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_colmap_import_does_not_read_a_gaussian_files_parent() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("unread-parent").join("model.ply");
+        assert!(new_import_colmap(&source, std::slice::from_ref(&source))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pure_colmap_and_unsupported_gaussian_sources_use_typed_rejections() {
+        assert!(matches!(
+            unsupported_gaussian_source(&["cameras.bin".into(), "images.bin".into()]),
+            SplatError::InputAdmission(InputAdmissionReason::ColmapDisabled)
+        ));
+        assert!(matches!(
+            unsupported_gaussian_source(&["unsupported.lcc".into()]),
+            SplatError::InputAdmission(InputAdmissionReason::UnsupportedInput)
+        ));
+        assert!(matches!(
+            unsupported_gaussian_source(&[]),
+            SplatError::InputAdmission(InputAdmissionReason::UnsupportedInput)
+        ));
+    }
+
+    #[test]
+    fn explicit_new_colmap_association_is_rejected_before_import_setup() {
+        assert!(validate_new_import_colmap(None).is_ok());
+        assert!(matches!(
+            validate_new_import_colmap(Some(uuid::Uuid::new_v4())),
+            Err(SplatError::InputAdmission(
+                InputAdmissionReason::ColmapDisabled
+            ))
+        ));
+    }
 
     #[test]
     fn imported_database_camera_rejects_malformed_parameter_blobs() {

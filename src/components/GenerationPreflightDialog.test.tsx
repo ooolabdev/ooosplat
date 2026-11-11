@@ -9,27 +9,17 @@ import { GenerationPreflightDialog } from './GenerationPreflightDialog';
 let root: Root, container: HTMLDivElement;
 const finish = vi.fn();
 const draft = { ...createGenerationDraft(1), inputType: 'images' as const, inputPath: 'E:/small-images', imageSequence: { imageCount: 20, width: 100, height: 100, hasAlpha: false, requiresLargeSequenceConfirmation: false } };
-const second = { ...draft, id: 'second', inputPath: 'E:/large-images', imageSequence: { ...draft.imageSequence, imageCount: 600, requiresLargeSequenceConfirmation: true } };
 const button = () => container.querySelector<HTMLButtonElement>('.primary-action')!;
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); localStorage.setItem('ooo-splat-language', 'zh-CN'); finish.mockReset(); container = document.createElement('div'); document.body.append(container); root = createRoot(container); });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
-async function render() { await act(async () => root.render(<LanguageProvider><GenerationPreflightDialog session={{ questions: collectPreflightQuestions([draft, second]), finalLabel: '开始生成', resolve: finish }} onFinish={finish} /></LanguageProvider>)); }
-it('requires every answer, supports back navigation and submits all answers once', async () => {
+async function render() { await act(async () => root.render(<LanguageProvider><GenerationPreflightDialog session={{ questions: collectPreflightQuestions([draft]), finalLabel: '开始生成', resolve: finish }} onFinish={finish} /></LanguageProvider>)); }
+it('submits the remaining small-image warning once', async () => {
   await render(); expect(button().disabled).toBe(true);
   expect(container.querySelector('img')).toBeNull();
   await act(async () => container.querySelector<HTMLInputElement>('input')!.click());
-  await act(async () => button().click());
-  expect(container.textContent).toContain('2/2'); expect(button().disabled).toBe(true);
-  expect(container.textContent).toContain('确认图片顺序');
-  expect(container.querySelectorAll('input[type="radio"]')).toHaveLength(2);
-  expect(container.querySelector('input:checked')).toBeNull();
-  await act(async () => Array.from(container.querySelectorAll('button')).find(node => node.textContent === '上一步')!.click());
-  expect(container.querySelector<HTMLInputElement>('input')!.checked).toBe(true);
-  await act(async () => button().click());
-  await act(async () => container.querySelector<HTMLInputElement>('input')!.click());
   await act(async () => { button().click(); button().click(); });
   expect(finish).toHaveBeenCalledTimes(1);
-  expect(finish.mock.calls[0][0]).toEqual({ [`${draft.id}:smallImages`]: 'accepted', 'second:imageOrder': 'sequential' });
+  expect(finish.mock.calls[0][0]).toEqual({ [`${draft.id}:smallImages`]: 'accepted' });
 });
 it('Esc cancels without submitting any partial answer and traps keyboard focus', async () => {
   await render();
@@ -44,23 +34,11 @@ it('Esc cancels without submitting any partial answer and traps keyboard focus',
   await act(async () => cancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
   expect(finish).toHaveBeenCalledWith(null);
 });
-it('switches mutually exclusive choices, retains them across navigation, and uses approved English copy', async () => {
+it('does not include the image-order question in the generation dialog', async () => {
   localStorage.setItem('ooo-splat-language', 'en');
   await render();
-  await act(async () => container.querySelector<HTMLInputElement>('input')!.click());
-  await act(async () => button().click());
-  expect(container.querySelector('h2')?.textContent).toBe('Confirm image order');
-  expect(container.querySelector('#preflight-description')?.textContent).toContain('This folder contains 600 images. Are they arranged in capture order?');
-  const ordered = container.querySelector<HTMLInputElement>('input[value="sequential"]')!;
-  const unordered = container.querySelector<HTMLInputElement>('input[value="exhaustive"]')!;
-  await act(async () => ordered.click());
-  await act(async () => unordered.click());
-  expect(unordered.checked).toBe(true); expect(ordered.checked).toBe(false);
-  await act(async () => container.querySelector<HTMLButtonElement>('footer > div > .secondary-action')!.click());
-  await act(async () => button().click());
-  expect(container.querySelector<HTMLInputElement>('input[value="exhaustive"]')!.checked).toBe(true);
-  await act(async () => button().click());
-  expect(finish.mock.calls[0][0]['second:imageOrder']).toBe('exhaustive');
+  expect(container.querySelector('h2')?.textContent).toBe('Not enough images');
+  expect(container.textContent).not.toContain('Confirm image order');
 });
 
 it.each(['good','appearance','geometry','unsure'])('reshoot explains each approach and asks camera settings before starting (%s)', async condition => {
@@ -95,27 +73,19 @@ it('reshoot cancellation submits no partial answer and missing models are explai
   expect(finish).toHaveBeenCalledWith(null);
 });
 
-it('reshoot with more than 100 images asks condition, camera and order and preserves Back answers', async () => {
-  const reshoot = {...createReshootDraft(1,'source','Original','balanced'), inputType:'images' as const, inputPath:'E:/new-images',imageSequence:{...second.imageSequence,imageCount:101}};
+it('reshoot keeps image order outside the modal and preserves Back answers', async () => {
+  const reshoot = {...createReshootDraft(1,'source','Original','balanced'), inputType:'images' as const, inputPath:'E:/new-images',imageSequence:{...draft.imageSequence,imageCount:101}};
   await act(async () => root.render(<LanguageProvider><GenerationPreflightDialog session={{questions:collectPreflightQuestions([reshoot]),finalLabel:'开始生成',resolve:finish}} onFinish={finish} /></LanguageProvider>));
   await act(async () => container.querySelector<HTMLInputElement>('input[value="appearance"]')!.click());
   await act(async () => button().click());
   expect(container.querySelector('h2')?.textContent).toBe('补拍素材与原素材的拍摄设置相同吗？');
   await act(async () => container.querySelector<HTMLInputElement>('input[value="different"]')!.click());
-  await act(async () => button().click());
-  expect(container.querySelector('h2')?.textContent).toBe('确认图片顺序');
-  expect(button().textContent).toBe('开始生成');
-  expect(button().disabled).toBe(true);
-  await act(async () => container.querySelector<HTMLInputElement>('input[value="sequential"]')!.click());
-  await act(async () => container.querySelector<HTMLButtonElement>('footer > div > .secondary-action')!.click());
-  expect(container.querySelector<HTMLInputElement>('input[value="different"]')!.checked).toBe(true);
   await act(async () => container.querySelector<HTMLButtonElement>('footer > div > .secondary-action')!.click());
   expect(container.querySelector<HTMLInputElement>('input[value="appearance"]')!.checked).toBe(true);
   await act(async () => button().click());
+  expect(container.querySelector<HTMLInputElement>('input[value="different"]')!.checked).toBe(true);
   await act(async () => button().click());
-  expect(container.querySelector<HTMLInputElement>('input[value="sequential"]')!.checked).toBe(true);
-  await act(async () => button().click());
-  expect(finish).toHaveBeenCalledWith({[`${reshoot.id}:reshootCondition`]:'appearance',[`${reshoot.id}:reshootCamera`]:'different',[`${reshoot.id}:imageOrder`]:'sequential'});
+  expect(finish).toHaveBeenCalledWith({[`${reshoot.id}:reshootCondition`]:'appearance',[`${reshoot.id}:reshootCamera`]:'different'});
 });
 
 it('reshoot descriptions use plain English without a second plan confirmation', async () => {

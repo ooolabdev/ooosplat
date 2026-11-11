@@ -400,6 +400,145 @@ pub fn verify_alignment(model: &Path, records: &[Record], origin: &GpsFix) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gps_manifest_round_trip_preserves_coordinates_and_cache_identities() {
+        fn fix_bits(fix: &GpsFix) -> [Option<u64>; 5] {
+            [
+                Some(fix.latitude.to_bits()),
+                Some(fix.longitude.to_bits()),
+                fix.altitude.map(f64::to_bits),
+                Some(fix.horizontal_std.to_bits()),
+                Some(fix.vertical_std.to_bits()),
+            ]
+        }
+
+        // Synthetic values from serde_json's public f64 round-trip regressions,
+        // not a user's GPS. Its default fast parser changes these by one ULP;
+        // that is enough to invalidate a previously saved GPS cache identity.
+        let known_regression = GpsFix {
+            latitude: 51.248178375505404,
+            longitude: -93.31137037688033,
+            altitude: Some(52.314008204106244),
+            horizontal_std: 97.45365320034685,
+            vertical_std: 36.573994842753436,
+        };
+        let mut records = vec![Record {
+            name: "synthetic-000.png".into(),
+            fix: known_regression.clone(),
+            source: PathBuf::from("synthetic/000.png"),
+            source_identity: "synthetic-source-000".into(),
+        }];
+        // Reproducible finite values across legal geographic ranges, including
+        // missing altitude. No image decoding, external files or GPS is needed.
+        let mut random = 0x5e12_d9b4_8a73_c601_u64;
+        let mut unit = || {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (random >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        for index in 1..=128 {
+            records.push(Record {
+                name: format!("synthetic-{index:03}.png"),
+                fix: GpsFix {
+                    latitude: unit() * 178. - 89.,
+                    longitude: unit() * 358. - 179.,
+                    altitude: (index % 7 != 0).then(|| unit() * 10_000. - 1_000.),
+                    horizontal_std: unit() * 50. + 0.1,
+                    vertical_std: unit() * 100. + 0.1,
+                },
+                source: PathBuf::from(format!("synthetic/{index:03}.png")),
+                source_identity: format!("synthetic-source-{index:03}"),
+            });
+        }
+        let mut manifest = Manifest {
+            version: POLICY_VERSION,
+            records,
+            origin: Some(known_regression),
+        };
+        let expected_bits: Vec<_> = manifest
+            .records
+            .iter()
+            .map(|record| fix_bits(&record.fix))
+            .collect();
+        let expected_origin_bits = fix_bits(manifest.origin.as_ref().unwrap());
+        let expected_fingerprint = fingerprint(&manifest.records).unwrap();
+        let expected_manifest_identity = manifest_identity(&manifest).unwrap();
+        let mut checkpoint = Checkpoint {
+            version: POLICY_VERSION,
+            status: "aligned".into(),
+            fingerprint: expected_fingerprint.clone(),
+            manifest_identity: Some(expected_manifest_identity.clone()),
+            input_identity: Some("synthetic-input".into()),
+            output_identity: Some("synthetic-output".into()),
+            reference_valid: true,
+            transform: Some(Similarity {
+                rotation: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                scale: 1.2345678901234567,
+                translation: [51.248178375505404, -93.31137037688033, 52.314008204106244],
+            }),
+        };
+        let expected_manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
+        let expected_checkpoint_json = serde_json::to_vec_pretty(&checkpoint).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("gps-manifest.json");
+        let checkpoint_path = directory.path().join("checkpoint.json");
+
+        for round in 0..4 {
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                &checkpoint_path,
+                serde_json::to_vec_pretty(&checkpoint).unwrap(),
+            )
+            .unwrap();
+            manifest = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            checkpoint = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+
+            let actual_bits: Vec<_> = manifest
+                .records
+                .iter()
+                .map(|record| fix_bits(&record.fix))
+                .collect();
+            assert_eq!(
+                actual_bits, expected_bits,
+                "GPS f64 bits changed in round {round}"
+            );
+            assert_eq!(
+                fix_bits(manifest.origin.as_ref().unwrap()),
+                expected_origin_bits,
+                "origin f64 bits changed in round {round}"
+            );
+            assert_eq!(
+                fingerprint(&manifest.records).unwrap(),
+                expected_fingerprint
+            );
+            assert_eq!(
+                manifest_identity(&manifest).unwrap(),
+                expected_manifest_identity
+            );
+            assert_eq!(checkpoint.fingerprint, expected_fingerprint);
+            assert_eq!(
+                checkpoint.manifest_identity.as_ref(),
+                Some(&expected_manifest_identity)
+            );
+            assert_eq!(
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+                expected_manifest_json,
+                "manifest JSON changed in round {round}"
+            );
+            assert_eq!(
+                serde_json::to_vec_pretty(&checkpoint).unwrap(),
+                expected_checkpoint_json,
+                "checkpoint JSON changed in round {round}"
+            );
+        }
+    }
+
     #[test]
     fn local_axes_match_existing_preview_mapping() {
         let t = Similarity::enu_to_ply();

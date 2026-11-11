@@ -13,19 +13,47 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm, open: vi.f
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 
 import { probeAndPlan, prepareErrorReport,sendErrorReport,beginGaussianVideoExport,beginGaussianHtmlExport,commitGaussianHtmlExport,cancelGaussianHtmlExport,checkColmapAcceleration, classifyDroppedInput, confirmSmallImageSequence, getAppRuntimeStatus, revealProject, revealProjectLogs } from "./backend";
-import { startPipeline } from './backend';
+import { resumePipeline, startPipeline } from './backend';
 
 describe("backend browser guards", () => {
+  it('continues an identified task before project creation and preserves terminal task/run identity', async () => {
+    const { continueTaskPipeline } = await import('./backend');
+    mocks.invoke.mockResolvedValueOnce({ accepted: true, task_id: 'task-without-project', run_id: 'next-run', status: 'starting', revision: 1 })
+      .mockResolvedValueOnce({ task_id: 'task-without-project', run_id: 'next-run', project_id: null, revision: 2,
+        status: 'failed', error: { message: 'Preparation failed', engine: 'system', failed_stage: null } });
+    await expect(continueTaskPipeline('task-without-project', 'captured-failed-run')).rejects.toMatchObject({
+      code: 'pipeline_failed', taskId: 'task-without-project', runId: 'next-run', projectId: null,
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'start_gui_task', { taskId: 'task-without-project', retryFailedRunId: 'captured-failed-run' });
+    expect(mocks.invoke).toHaveBeenCalledTimes(2);
+  });
+  it('does not query or retry a newer task after the captured failed run was rejected as stale', async () => {
+    const { continueTaskPipeline } = await import('./backend');
+    mocks.invoke.mockRejectedValueOnce({ code: 'STALE_RUN_ID', message: 'stale execution' });
+    await expect(continueTaskPipeline('task', 'old-run')).rejects.toMatchObject({ code: 'STALE_RUN_ID' });
+    expect(mocks.invoke).toHaveBeenCalledOnce();
+    expect(mocks.invoke).toHaveBeenCalledWith('start_gui_task', { taskId: 'task', retryFailedRunId: 'old-run' });
+  });
+  it.each(['saved-run', undefined])('continues through the existing project endpoint with run identity %s', async expectedRunId => {
+    const result = { projectId: 'project' };
+    mocks.invoke.mockResolvedValueOnce({ accepted: true, task_id: 'task', run_id: 'next-run', status: 'starting', revision: 1 })
+      .mockResolvedValueOnce({ task_id: 'task', run_id: 'next-run', revision: 1, status: 'completed', result });
+    await expect(resumePipeline('project', expectedRunId)).resolves.toEqual(result);
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'resume_gui_task', {
+      projectId: 'project', ...(expectedRunId ? { expectedRunId } : {}),
+    });
+    expect(mocks.invoke).toHaveBeenCalledTimes(2);
+  });
   it("preserves new failure classification and native termination when waiting for a task", async () => {
     const termination = { exitCode: -1073740940, windowsStatus: "0xC0000374" };
-    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'failed', project_id: 'project',
+    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ accepted: true, task_id: 'task', run_id: 'run', status: 'starting', revision: 1 }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run', revision: 1, status: 'failed', project_id: 'project',
       error: { message: 'Could not register image', failed_stage: 'reconstructing', engine: 'colmap', classification: 'colmap_crash', classification_version: 1, classification_is_heuristic: false, termination } });
     await expect(startPipeline('E:/input.mp4', 'balanced', 'E:/projects', false)).rejects.toMatchObject({ code: 'pipeline_failed', failureKind: 'colmap_crash', classificationVersion: 1, classificationIsHeuristic: false, termination });
     expect(mocks.invoke).toHaveBeenCalledTimes(3);
   });
   it.each(['sequential', 'exhaustive', undefined] as const)('forwards image matching %s before starting exactly one task', async imageMatchingStrategy => {
     const result = { projectId: 'project' };
-    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run' }).mockResolvedValueOnce({ task_id: 'task', revision: 1, status: 'completed', result });
+    mocks.invoke.mockResolvedValueOnce({ task_id: 'task' }).mockResolvedValueOnce({ accepted: true, task_id: 'task', run_id: 'run', status: 'starting', revision: 1 }).mockResolvedValueOnce({ task_id: 'task', run_id: 'run', revision: 1, status: 'completed', result });
     await expect(startPipeline('E:/photos', 'balanced', 'E:/projects', true, 'draft', 'equirectangular', 'identity', imageMatchingStrategy)).resolves.toEqual(result);
     expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'create_gui_task', { path: 'E:/photos', quality: 'balanced', projectsRoot: 'E:/projects', plannerEnabled: true, workspaceTaskId: 'draft', inputProjection: 'equirectangular', inputSourceIdentity: 'identity', imageMatchingStrategy });
     expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'start_gui_task', { taskId: 'task' });

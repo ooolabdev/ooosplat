@@ -7,7 +7,324 @@ use rmcp::{
 };
 
 #[test]
-fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v3() {
+fn preparation_service_error_redacts_nested_details_without_losing_safe_context() {
+    let mut error = ServiceError::new("IO_ERROR", r"Cannot read C:\private\project\state.json");
+    let failure_id = Uuid::new_v4();
+    let preparation_id = Uuid::new_v4();
+    error.details = Some(json!({
+        "pipelineError": { "code":"pipeline_failed", "engine":"system", "failedStage":null,
+            "message":r"read_retry_state failed for C:\private\project\state.json (os error 5)",
+            "failureId":failure_id, "classificationVersion":1, "classificationIsHeuristic":false,
+            "projectPath":r"C:\private\project", "logsDirectory":r"C:\private\project\logs",
+            "extra":[r"/private/source/input.mov", {"detail":"https://private.invalid/path"}] },
+        "preparation": { "preparationId":preparation_id, "operation":"read_retry_state", "pathRole":"project_state",
+            "ioSubstep":"read_file", "osError":5, "errorKind":"PermissionDenied", "projectRoot":"/private/root" },
+    }));
+    let sanitized = sanitize_service_error(error);
+    let encoded = serde_json::to_string(&sanitized).unwrap();
+    assert!(!encoded.contains("private"));
+    let details = sanitized.details.unwrap();
+    assert_eq!(
+        details["pipelineError"]["failureId"],
+        failure_id.to_string()
+    );
+    assert_eq!(details["pipelineError"]["engine"], "system");
+    assert!(details["pipelineError"]["failedStage"].is_null());
+    assert_eq!(
+        details["preparation"]["preparationId"],
+        preparation_id.to_string()
+    );
+    assert_eq!(details["preparation"]["operation"], "read_retry_state");
+    assert_eq!(details["preparation"]["pathRole"], "project_state");
+    assert_eq!(details["preparation"]["osError"], 5);
+    assert_eq!(details["preparation"]["ioSubstep"], "read_file");
+    assert!(details["pipelineError"].get("projectPath").is_none());
+    assert!(details["pipelineError"].get("logsDirectory").is_none());
+    assert!(details["preparation"].get("projectRoot").is_none());
+    assert!(details["pipelineError"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("os error 5"));
+}
+
+#[test]
+fn preparation_redaction_keeps_confirmation_identities_and_source_ids_unchanged() {
+    let preflight = Uuid::new_v4();
+    let identity = "a8b7c6d5e4f30123456789";
+    let source_id = r"C:\authorized\capture\photo.jpg";
+    let mut error = ServiceError::new("CONFIRMATION_REQUIRED", "Collect the missing answers");
+    error.details = Some(
+        json!({"preflight_id":preflight, "input_source_identity":identity,
+        "questions":[{"sourceId":source_id,"key":"camera_relation",
+            "title":r"Confirm C:\private\capture\photo.jpg", "nested":{"detail":"Read /private/file.png"},
+            "options":[{"value":"same","label":"Same settings"}]}]}),
+    );
+    let details = sanitize_service_error(error).details.unwrap();
+    assert_eq!(details["preflight_id"], preflight.to_string());
+    assert_eq!(details["input_source_identity"], identity);
+    assert_eq!(details["questions"][0]["sourceId"], source_id);
+    assert_eq!(details["questions"][0]["key"], "camera_relation");
+    assert_eq!(details["questions"][0]["options"][0]["value"], "same");
+    assert!(!details["questions"][0]["title"]
+        .as_str()
+        .unwrap()
+        .contains("private"));
+    assert!(!details["questions"][0]["nested"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("private"));
+}
+
+#[test]
+fn disabled_colmap_is_not_advertised_as_a_generation_capability() {
+    let capabilities = generation_capabilities();
+    assert!(!capabilities.contains(&"colmap_direct_training"));
+    assert!(capabilities.contains(&"task_resume"));
+    let encoded = serde_json::to_value(ServiceError::from(
+        crate::error::SplatError::InputAdmission(
+            crate::error::InputAdmissionReason::ColmapDisabled,
+        ),
+    ))
+    .unwrap();
+    assert_eq!(encoded["code"], "UNSUPPORTED_INPUT");
+    assert_eq!(encoded["reason"], "colmap_disabled");
+    assert!(encoded.get("task_id").unwrap().is_null());
+}
+
+#[test]
+fn public_generation_schema_and_descriptions_match_the_import_capability() {
+    for name in ["inspect_generation_input", "create_generation_task"] {
+        let tool = definitions()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap();
+        let value = serde_json::to_value(tool).unwrap();
+        let branches = value
+            .pointer("/inputSchema/properties/inputs/oneOf")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(
+            branches[0].pointer("/properties/mode/const").unwrap(),
+            "materials"
+        );
+        assert!(value["description"]
+            .as_str()
+            .unwrap()
+            .contains("Importing COLMAP files or folders is temporarily unavailable."));
+    }
+    // Public discovery changes do not remove the saved-data/request parser.
+    let old = serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(json!({
+        "mode":"colmap","input":{"model":"saved-model","images":"saved-images"}}));
+    assert!(old.is_ok());
+}
+
+#[tokio::test]
+async fn continuation_defers_original_reads_and_uses_the_current_callers_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("original.mov");
+    std::fs::write(&input, b"fixture").unwrap();
+    let registry = root.path().join("registry");
+    let tasks = TaskService::at(registry.clone());
+    let task = tasks
+        .create(
+            None,
+            input.clone(),
+            Quality::Fast,
+            root.path().join("projects"),
+            true,
+            "gui",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    *tasks.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async {
+            Err(crate::error::SplatError::Process(
+                "controlled failure".into(),
+            ))
+        })
+    }));
+    tasks
+        .start(
+            task.task_id,
+            crate::pipeline::runner::default_engine_paths(None),
+            None,
+        )
+        .await
+        .unwrap();
+    let stopped = tasks.wait(task.task_id).await.unwrap();
+    let request = crate::pipeline::inputs::GenerationInputs::Materials { items: vec![] };
+    let manager = crate::project::ProjectManager::for_diagnostics(root.path().join("projects"));
+    let (paths, _) = manager
+        .create_collection(Quality::Fast, request)
+        .await
+        .unwrap();
+    let mut state = manager.read_state(&paths.state).await.unwrap();
+    state.generation_policy = Some(Default::default());
+    manager.write_state(&paths.state, &state).await.unwrap();
+    // Simulate the already-bound project of a stopped GUI task. MCP must use
+    // this caller's scope, not infer a grant from who originally created it.
+    let mut saved: Value =
+        serde_json::from_slice(&std::fs::read(registry.join("tasks.json")).unwrap()).unwrap();
+    saved["tasks"][task.task_id.to_string()]["project_id"] = json!(paths.id);
+    saved["tasks"][task.task_id.to_string()]["project_path"] = json!(paths.project);
+    crate::project::manager::atomic_write_json(&registry.join("tasks.json"), &saved)
+        .await
+        .unwrap();
+    std::fs::remove_file(&input).unwrap();
+    let reloaded = TaskService::at(registry);
+    let old_path = input.clone();
+    *reloaded.executor.lock().unwrap() = Some(Arc::new(move |_, runner| {
+        let old_path = old_path.clone();
+        Box::pin(async move {
+            // A real external read is checked, even though acceptance itself
+            // can proceed without originals (e.g. publication-only recovery).
+            let error = runner
+                .prepare_frames(
+                    &old_path,
+                    Quality::Fast,
+                    Path::new("unused"),
+                    Path::new("unused"),
+                    Path::new("unused"),
+                    None,
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .err()
+                .expect("the original is missing and cannot be read");
+            assert!(error.to_string().contains("INVALID_PATH"));
+            Err(crate::error::SplatError::Cancelled)
+        })
+    }));
+    let tools = McpTools {
+        app: None,
+        tasks: reloaded.clone(),
+        engines: crate::pipeline::runner::default_engine_paths(None),
+        settings: McpSettings {
+            input_roots: vec![],
+            ..Default::default()
+        },
+        telemetry: None,
+    };
+    let accepted = tools
+        .dispatch(
+            "resume_task",
+            json!({"task_id":task.task_id,"expected_run_id":stopped.run_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(
+        reloaded.wait(task.task_id).await.unwrap().status,
+        crate::tasks::TaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn resume_and_legacy_retry_tool_aliases_share_continuation_without_new_consent() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("clip.mp4");
+    std::fs::write(&input, b"protocol fixture; no engine executed").unwrap();
+    let tasks = TaskService::at(temp.path().join("registry"));
+    let task = tasks
+        .create(
+            None,
+            input,
+            Quality::Balanced,
+            temp.path().join("projects"),
+            true,
+            "mcp",
+            None,
+            Some(json!({"generationPolicy":{"autoRetryEnabled":false}})),
+        )
+        .await
+        .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    *tasks.executor.lock().unwrap() = Some(Arc::new(move |task, _| {
+        let attempt = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            assert!(!task.generation_policy.unwrap().auto_retry_enabled);
+            if attempt == 0 {
+                Err(crate::error::SplatError::Process(
+                    "controlled initial failure".into(),
+                ))
+            } else {
+                Err(crate::error::SplatError::Cancelled)
+            }
+        })
+    }));
+    let tools = McpTools {
+        app: None,
+        tasks: tasks.clone(),
+        engines: crate::pipeline::runner::default_engine_paths(None),
+        settings: McpSettings {
+            input_roots: vec![std::fs::canonicalize(temp.path()).unwrap()],
+            ..Default::default()
+        },
+        telemetry: None,
+    };
+    let first = tools
+        .dispatch("start_task", json!({"task_id":task.task_id}))
+        .await
+        .unwrap();
+    let stopped = tasks.wait(task.task_id).await.unwrap();
+    assert_eq!(stopped.status, crate::tasks::TaskStatus::Failed);
+    let continued = tools
+        .dispatch(
+            "resume_task",
+            json!({"task_id":task.task_id,"expected_run_id":first["run_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued["accepted"], true);
+    let cancelled = tasks.wait(task.task_id).await.unwrap();
+    assert_eq!(cancelled.status, crate::tasks::TaskStatus::Cancelled);
+    assert_eq!(cancelled.runs[1].kind, "continue");
+    assert_eq!(
+        cancelled.runs[1].continued_from_status,
+        Some(crate::tasks::TaskStatus::Failed)
+    );
+    let alias = tools
+        .dispatch(
+            "start_task",
+            json!({"task_id":task.task_id,"retry_failed_run_id":continued["run_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(alias["accepted"], true);
+    let terminal = tasks.wait(task.task_id).await.unwrap();
+    assert_eq!(terminal.status, crate::tasks::TaskStatus::Cancelled);
+    assert_eq!(
+        terminal.runs[2].continued_from_status,
+        Some(crate::tasks::TaskStatus::Cancelled)
+    );
+    assert!(!terminal.automatically_retried);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        tools
+            .dispatch(
+                "resume_task",
+                json!({"task_id":task.task_id,"expected_run_id":first["run_id"]})
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
+    );
+    let public = public_task(terminal).unwrap();
+    assert_eq!(public["runs"][1]["continued_from_status"], "failed");
+    assert_eq!(public["runs"][2]["continued_from_status"], "cancelled");
+}
+
+#[test]
+fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v7() {
     let definition = definitions()
         .into_iter()
         .find(|t| t.name == "create_generation_task")
@@ -17,9 +334,9 @@ fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v3() {
         .pointer("/properties/generation_policy/properties/version")
         .unwrap();
     assert_eq!(version["minimum"], 1);
-    assert_eq!(version["maximum"], 3);
-    assert_eq!(version["default"], 3);
-    for version in [1, 2, 3] {
+    assert_eq!(version["maximum"], 7);
+    assert_eq!(version["default"], 7);
+    for version in [1, 2, 3, 4, 5, 6, 7] {
         let request: CreateRequest = serde_json::from_value(json!({"input_path":"clip.mp4","quality":"fast",
             "client_request_id":"version-test","generation_policy":{"version":version,"frameSamplingRatio":0.9}})).unwrap();
         assert_eq!(
@@ -32,6 +349,12 @@ fn generation_policy_schema_accepts_saved_versions_and_defaults_to_v3() {
             version
         );
     }
+    assert_eq!(
+        schema
+            .pointer("/properties/inputs/oneOf/0/properties/items/items/properties/frameRemovalFps/minimum")
+            .unwrap(),
+        0.0
+    );
 }
 
 #[test]
@@ -488,6 +811,7 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
     task.runs.push(crate::tasks::TaskRun {
         run_id: Uuid::new_v4(),
         kind: "generation".into(),
+        continued_from_status: None,
         started_at: chrono::Utc::now(),
         ended_at: None,
         logs: Default::default(),
@@ -523,4 +847,101 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
         "Fixture GPU"
     );
     assert!(public["runs"][0]["brush_executions"][7]["device"]["total_memory_mb"].is_null());
+}
+
+#[tokio::test]
+async fn task_status_reports_bounded_per_source_frame_plans_without_zero_fps_aggregate() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("video.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let mut task = service
+        .create(
+            None,
+            input,
+            Quality::High,
+            root.path().join("projects"),
+            true,
+            "mcp",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let source = |id: &str, fps: f64, frames: u64| {
+        json!({
+            "id": id,
+            "identity": format!("{id}-identity"),
+            "projection": "perspective",
+            "cameraIds": [1],
+            "cameraAssignment": null,
+            "names": [format!("{id}-000001.png")],
+            "originals": [],
+            "video": {"duration":10.0,"width":1920,"height":1080,"fps":30.0,"totalFrames":300,"codec":"h264","rotation":0,"pixelFormat":"yuv420p","hasAlpha":false},
+            "imageSequence": null,
+            "dimensions": [[1920,1080]],
+            "frames": {
+                "retentionRatio": frames as f64 / 300.0,
+                "samplingFps": fps,
+                "estimatedFrames": frames,
+                "extractedFrames": frames + 2,
+                "initialExtractedFrames": frames,
+                "selectedFrames": [{"sourceFrameIndex":0,"timestampSeconds":0.0}],
+                "candidateFrames": [{"sourceFrameIndex":0,"timestampSeconds":0.0}],
+                "bridgeSourceFrames": 300,
+                "rescueMaxFrames": frames + frames / 5,
+                "minimumFrameOverrideApplied": false
+            },
+            "panoramaRecords": [],
+            "adopted": frames,
+            "bridgeFrames": []
+        })
+    };
+    task.actual_configuration = Some(json!({
+        "frame_plan":{"sampling_fps":0.0,"estimated_frames":180},
+        "inputs":{
+            "version":1,
+            "importedReconstruction":false,
+            "reshootEligible":true,
+            "bridgeUsed":true,
+            "expandedMatching":false,
+            "unused":[],
+            "referenceImage":null,
+            "sources":[source("first",6.0,60),source("second",12.0,120)]
+        }
+    }));
+
+    let multi = public_task(task.clone()).unwrap();
+    assert!(multi["actual_configuration"]["frame_plan"].is_null());
+    assert_eq!(
+        multi["actual_configuration"]["inputs"]["sources"][0]["frame_plan"]["sampling_fps"],
+        6.0
+    );
+    assert_eq!(
+        multi["actual_configuration"]["inputs"]["sources"][1]["frame_plan"]
+            ["initial_extracted_frames"],
+        120
+    );
+    assert!(
+        multi["actual_configuration"]["inputs"]["sources"][0]["frame_plan"]
+            .get("selected_frames")
+            .is_none()
+    );
+
+    task.actual_configuration.as_mut().unwrap()["inputs"]["sources"] =
+        json!([source("only", 8.0, 80)]);
+    let single = public_task(task.clone()).unwrap();
+    assert_eq!(
+        single["actual_configuration"]["frame_plan"]["sampling_fps"],
+        8.0
+    );
+    assert_eq!(
+        single["actual_configuration"]["frame_plan"]["rescue_max_frames"],
+        96
+    );
+
+    task.actual_configuration.as_mut().unwrap()["inputs"]["importedReconstruction"] = json!(true);
+    task.actual_configuration.as_mut().unwrap()["inputs"]["sources"] = json!([]);
+    let colmap = public_task(task).unwrap();
+    assert!(colmap["actual_configuration"]["frame_plan"].is_null());
 }

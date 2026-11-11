@@ -16,6 +16,9 @@ src-tauri/gen/
 # Downloaded archives, extraction caches, and local diagnostics are never committed.
 .cache/
 
+# Local documentation and analysis reports.
+/docs/
+
 # Native engines are restored from engines/manifest.json by npm run setup:engines.
 engines/ffmpeg/**
 !engines/ffmpeg/README.md

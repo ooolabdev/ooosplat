@@ -12,6 +12,72 @@ use crate::{
 
 const BRUSH_GPU_LOG_FILTER: &str =
     "brush_cli=info,brush_process=info,cubecl_wgpu=info,burn_wgpu=info";
+
+/// Capabilities verified against OOOBrush 866a7d65b4d6a591ba0d52a88f8b20ea3465c1e5.
+/// Its COLMAP reader and renderer both apply these distortion models. A matching
+/// name/version string is not sufficient: custom runtimes retain conversion.
+pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
+    if !matches!(model_id, 0 | 1 | 2 | 3 | 4 | 6) {
+        return false;
+    }
+    type Identity = (PathBuf, u64, std::time::SystemTime);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(Identity, bool)>>> =
+        std::sync::OnceLock::new();
+    let Ok(path) = std::fs::canonicalize(executable) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let identity = (path.clone(), metadata.len(), modified);
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some((previous, verified)) = cache.as_ref() {
+        if *previous == identity {
+            return *verified;
+        }
+    }
+    let verified = verified_native_binary(&path);
+    *cache = Some((identity, verified));
+    verified
+}
+
+fn verified_native_binary(path: &Path) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    // Do not automatically widen capability claims when runtime manifests are
+    // updated. Review the exact reader/renderer before adding another digest.
+    let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "f65bba1c7fcbdbb13e9299897ecb885f90f30555bee9452a526e372eacf338df"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "ca819f94716c04add531e69e5f6812a2d1e9a8cefbc2803da000d905d4fccb0a"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "da613b4ed1c551f41e448d8ab0dc9caf0f80bfd9f6943542e1b02c93d19ca74a"
+    } else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hash.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hash.finalize()) == expected
+}
 pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--total-train-iters",
     "--max-resolution",
@@ -36,6 +102,7 @@ pub struct BrushGpuLaunchPolicy {
 }
 
 pub struct BrushTrainingOptions<'a> {
+    pub init_sh_degree: Option<u32>,
     pub alpha_mode: Option<&'static str>,
     pub warm: Option<crate::pipeline::reshoot::WarmStartParameters>,
     pub preset: BrushTrainingPreset,
@@ -234,6 +301,19 @@ pub async fn train(
         options.preset,
         options.panorama && options.warm.is_none(),
     );
+    if let Some(degree) = options.init_sh_degree.filter(|_| options.warm.is_none()) {
+        if degree > 3 {
+            return Err(SplatError::Process(
+                "Unsupported initialization SH degree".into(),
+            ));
+        }
+        // Preserve the trusted initialization's SH without applying the legacy warm recipe.
+        if let Some(index) = args.iter().position(|a| a == "--sh-degree") {
+            args[index + 1] = degree.to_string().into();
+        } else {
+            args.extend(["--sh-degree".into(), degree.to_string().into()]);
+        }
+    }
     if let Some(mode) = options.alpha_mode {
         args.extend([OsString::from("--alpha-mode"), OsString::from(mode)]);
     }
@@ -329,6 +409,18 @@ mod tests {
         },
         presets::{resolve_brush_training_preset, Quality},
     };
+
+    #[test]
+    fn native_camera_capability_rejects_unknown_and_changed_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("brush_app.exe");
+        std::fs::write(&binary, b"brush-cli 1.0.0").unwrap();
+        assert!(!supports_native_colmap(&binary, 2));
+        std::fs::write(&binary, b"a replaced runtime with another identity").unwrap();
+        assert!(!supports_native_colmap(&binary, 1));
+        assert!(!supports_native_colmap(&binary, 17));
+        assert!(!supports_native_colmap(&temp.path().join("missing"), 1));
+    }
 
     fn args_as_strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()

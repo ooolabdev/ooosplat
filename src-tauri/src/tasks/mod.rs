@@ -1,4 +1,5 @@
 //! Application-owned task registry. Transports never own a generation future.
+pub mod cli_guard;
 pub mod logs;
 mod notifications;
 #[cfg(test)]
@@ -10,6 +11,9 @@ use crate::{
     engines::EnginePaths,
     pipeline::{
         effectiveness::PlannerEffectivenessTracker,
+        retry_preparation::{
+            PreparationContext, PreparationDiagnosticContext, RetryPreparationOperation,
+        },
         runner::{PipelineResult, PipelineRunner, ReshootInputType, RunnerUpdate},
         PipelineEvent, PipelineStage,
     },
@@ -53,6 +57,10 @@ impl TaskStatus {
     pub fn active(self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Cancelling)
     }
+
+    pub fn can_continue(self) -> bool {
+        matches!(self, Self::Failed | Self::Cancelled | Self::Interrupted)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +83,8 @@ pub struct TaskError {
 pub struct TaskRun {
     pub run_id: Uuid,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from_status: Option<TaskStatus>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub logs: BTreeMap<String, logs::RegisteredLog>,
@@ -137,6 +147,13 @@ impl TaskRun {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ba_policy_version: Option<u32>,
+    /// None on tasks created before common Alpha execution semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush_execution_options: Option<crate::project::metadata::BrushExecutionOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_intent: Option<crate::project::creation::ProjectCreationIntent>,
     pub schema_version: u32,
     pub task_id: Uuid,
     pub run_id: Option<Uuid>,
@@ -218,6 +235,8 @@ impl StartReceipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceError {
     pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::error::InputAdmissionReason>,
     pub message: String,
     pub task_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
@@ -228,9 +247,21 @@ impl ServiceError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
+            reason: None,
             message: message.into(),
             task_id: None,
             run_id: None,
+            details: None,
+        }
+    }
+
+    fn task_busy(active: &TaskRecord) -> Self {
+        Self {
+            code: "TASK_BUSY".into(),
+            reason: None,
+            message: "已有任务正在运行".into(),
+            task_id: Some(active.task_id),
+            run_id: active.run_id,
             details: None,
         }
     }
@@ -243,6 +274,18 @@ impl std::fmt::Display for ServiceError {
 impl std::error::Error for ServiceError {}
 impl From<crate::error::SplatError> for ServiceError {
     fn from(e: crate::error::SplatError) -> Self {
+        if let crate::error::SplatError::InputAdmission(reason) = &e {
+            let mut error = Self::new("UNSUPPORTED_INPUT", e.to_string());
+            error.reason = Some(*reason);
+            return error;
+        }
+        if let crate::error::SplatError::Process(message) = &e {
+            for code in ["INPUT_CHANGED", "CONFIRMATION_REQUIRED"] {
+                if message.starts_with(code) {
+                    return Self::new(code, message.clone());
+                }
+            }
+        }
         Self::new("TASK_ERROR", e.to_string())
     }
 }
@@ -280,7 +323,8 @@ pub(crate) fn generation_parameters(parameters: Option<Value>) -> Result<Value> 
             ..Default::default()
         });
     policy.validate()?;
-    // This function admits new tasks/manual retries, never interrupted resumes.
+    // This function admits new tasks. Every continuation retains its saved
+    // policy and must not be silently migrated to today's defaults.
     let policy = crate::pipeline::generation_policy::GenerationPolicy {
         version: crate::pipeline::generation_policy::VERSION,
         ..policy
@@ -299,6 +343,25 @@ pub(crate) fn generation_parameters(parameters: Option<Value>) -> Result<Value> 
         );
     }
     Ok(parameters)
+}
+
+fn sync_saved_generation_policy(
+    parameters: &mut Option<Value>,
+    policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+) -> Result<()> {
+    if parameters.is_none() && policy.is_none() {
+        return Ok(());
+    }
+    let value = parameters.get_or_insert_with(|| serde_json::json!({}));
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ServiceError::new("INVALID_DATA", "Invalid saved generation parameters"))?;
+    if let Some(policy) = policy {
+        object.insert("generationPolicy".into(), serde_json::to_value(policy)?);
+    } else {
+        object.remove("generationPolicy");
+    }
+    Ok(())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -321,15 +384,20 @@ pub(crate) type TestExecutor = Arc<
 type Emit = Arc<dyn Fn(TaskUpdate) + Send + Sync>;
 #[derive(Clone)]
 pub struct TaskService {
+    invocation_access: Option<crate::pipeline::access::InvocationAccess>,
     registry: Arc<SyncMutex<Registry>>,
     gate: Arc<Mutex<()>>,
     root: PathBuf,
+    run_lock_path: PathBuf,
+    run_lock: Arc<SyncMutex<Option<(Uuid, std::fs::File)>>>,
     pub(crate) active: Arc<Mutex<Option<Arc<PipelineRunner>>>>,
     pub(crate) diagnostics: Arc<crate::diagnostics::DiagnosticService>,
     emitter: Arc<SyncMutex<Option<Emit>>>,
     notifications: Arc<SyncMutex<notifications::PendingNotifications>>,
     #[cfg(test)]
     pub(crate) executor: Arc<SyncMutex<Option<TestExecutor>>>,
+    #[cfg(test)]
+    continuation_index_path: Option<PathBuf>,
 }
 impl Default for TaskService {
     fn default() -> Self {
@@ -337,8 +405,14 @@ impl Default for TaskService {
     }
 }
 impl TaskService {
+    pub fn desktop_execution_lock() -> crate::error::Result<PathBuf> {
+        Ok(catalog::app_data_root()?.join("generation.lock"))
+    }
     pub fn at(root: PathBuf) -> Self {
         Self {
+            invocation_access: None,
+            run_lock_path: root.join("generation.lock"),
+            run_lock: Arc::new(SyncMutex::new(None)),
             registry: Arc::new(SyncMutex::new(Registry::default())),
             gate: Arc::new(Mutex::new(())),
             root,
@@ -348,7 +422,31 @@ impl TaskService {
             notifications: Arc::new(SyncMutex::new(Default::default())),
             #[cfg(test)]
             executor: Arc::new(SyncMutex::new(None)),
+            #[cfg(test)]
+            continuation_index_path: None,
         }
+    }
+    /// CLI uses its own registry, but shares the desktop's OS-owned execution lock.
+    pub fn with_run_lock(mut self, path: PathBuf) -> Self {
+        self.run_lock_path = path;
+        self
+    }
+    /// A clone shares task ownership, but receives the current invocation's
+    /// permissions. Never persist or infer this grant from `TaskRecord.source`.
+    pub fn with_invocation_access(
+        mut self,
+        access: crate::pipeline::access::InvocationAccess,
+    ) -> Self {
+        self.invocation_access = Some(access);
+        self
+    }
+    pub fn execution_settled(&self, run: Option<Uuid>) -> bool {
+        !self
+            .run_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|(active, _)| Some(*active) == run)
     }
     pub fn attach(&self, app: tauri::AppHandle) {
         use tauri::Emitter;
@@ -455,6 +553,103 @@ impl TaskService {
         atomic_write_json(&self.root.join("tasks.json"), &snapshot).await?;
         Ok(())
     }
+
+    async fn reconcile_task_publication(task: &mut TaskRecord) -> Result<Option<(PathBuf, Uuid)>> {
+        let Some(project_root) = task.project_path.clone() else {
+            return Ok(None);
+        };
+        let transaction_path = project_root
+            .join("work")
+            .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
+        let Some(publication) =
+            crate::pipeline::publication::committed_publication(&project_root, &transaction_path)
+                .await?
+        else {
+            return Ok(None);
+        };
+        if publication.transaction.phase
+            == crate::pipeline::publication::PublicationPhase::Reconciled
+            && task.status == TaskStatus::Completed
+            && task
+                .result
+                .as_ref()
+                .and_then(|value| {
+                    serde_json::from_value::<crate::pipeline::runner::PipelineResult>(value.clone())
+                        .ok()
+                })
+                .is_some_and(|result| {
+                    result.final_ply == publication.output.final_ply
+                        && result.splat_count == publication.output.splat_count
+                        && result.file_size == publication.output.file_size
+                })
+        {
+            // The publication coordinator has already proved all three local
+            // views durable and the task contains the full public result.
+            // Avoid rewriting it and incrementing the revision on every app
+            // startup.
+            return Ok(None);
+        }
+        let metadata_path = project_root.join("project.json");
+        let mut metadata: crate::project::ProjectMetadata =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+        let state_path = project_root.join("state.json");
+        let mut state: crate::project::PipelineStateFile = match tokio::fs::read(&state_path).await
+        {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::project::PipelineStateFile::created_for(
+                    metadata.quality,
+                    metadata.input_type,
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let completed_at = publication
+            .transaction
+            .committed_at
+            .unwrap_or_else(Utc::now);
+        metadata.status = ProjectStatus::Completed;
+        metadata.project_path = project_root.clone();
+        metadata.output_path = Some(publication.output.final_ply.clone());
+        metadata.output = Some(publication.output.clone());
+        metadata.completed_at = Some(completed_at);
+        metadata.failure_message = None;
+        metadata.duration_ms = Some(metadata.duration_ms.unwrap_or(0).max(task.elapsed_ms));
+        state.brush_complete = true;
+        state.stage = PipelineStage::Completed;
+        atomic_write_json(&metadata_path, &metadata).await?;
+        atomic_write_json(&state_path, &state).await?;
+        crate::pipeline::publication::mark_project_views_reconciled(
+            &project_root,
+            &transaction_path,
+            publication.transaction.transaction_id,
+        )
+        .await?;
+
+        let result = crate::pipeline::runner::pipeline_result_from_publication(
+            &project_root,
+            &metadata,
+            &state,
+            &publication,
+        );
+        task.status = TaskStatus::Completed;
+        task.stage = Some(PipelineStage::Completed);
+        task.project_id = Some(metadata.id);
+        task.project_path = Some(project_root.clone());
+        task.result = Some(serde_json::to_value(result)?);
+        task.error = None;
+        task.progress = Some(100.0);
+        task.estimated_progress = Some(100.0);
+        task.eta_seconds = None;
+        task.updated_at = completed_at;
+        if let Some(run) = task.runs.last_mut() {
+            run.ended_at.get_or_insert(completed_at);
+            run.error = None;
+        }
+        task.revision += 1;
+        Ok(Some((project_root, publication.transaction.transaction_id)))
+    }
+
     async fn load_locked(&self) -> Result<()> {
         if self.records().loaded {
             return Ok(());
@@ -465,7 +660,12 @@ impl TaskService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Registry::default(),
             Err(e) => return Err(e.into()),
         };
+        let mut reconciled_publications = Vec::new();
         for task in registry.tasks.values_mut() {
+            if let Some(publication) = Self::reconcile_task_publication(task).await? {
+                reconciled_publications.push(publication);
+                continue;
+            }
             if task.status.active() {
                 task.status = TaskStatus::Interrupted;
                 task.revision += 1;
@@ -497,7 +697,25 @@ impl TaskService {
         }
         registry.loaded = true;
         *self.records() = registry;
-        self.persist().await
+        self.persist().await?;
+        for (project_root, transaction_id) in reconciled_publications {
+            let transaction_path = project_root
+                .join("work")
+                .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
+            if let Err(error) = crate::pipeline::publication::mark_reconciled(
+                &project_root,
+                &transaction_path,
+                transaction_id,
+            )
+            .await
+            {
+                // Project and task views are already durable. Leaving the
+                // transaction at ProjectViewsReconciled makes the final mark
+                // retryable on the next startup without reverting completion.
+                tracing::warn!(%error, "Could not finalize publication task view");
+            }
+        }
+        Ok(())
     }
     pub async fn initialize(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
@@ -569,7 +787,14 @@ impl TaskService {
         key: Option<String>,
         parameters: Option<Value>,
     ) -> Result<TaskRecord> {
-        let parameters = Some(generation_parameters(parameters)?);
+        let mut parameters = generation_parameters(parameters)?;
+        if let Some(value) = parameters.get_mut("inputs") {
+            let inputs =
+                serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(value.clone())?
+                    .canonicalized()?;
+            *value = serde_json::to_value(inputs)?;
+        }
+        let parameters = Some(parameters);
         let _legacy_planner_enabled = planner_enabled;
         let planner_enabled = true;
         let _gate = self.gate.lock().await;
@@ -603,9 +828,26 @@ impl TaskService {
                 return Ok(t);
             }
         }
+        if let Some(value) = parameters.as_ref().and_then(|p| p.get("inputs")) {
+            let inputs =
+                serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(value.clone())?;
+            crate::pipeline::input_admission::ensure_new_inputs_supported(&inputs)?;
+        } else if crate::pipeline::input_admission::path_contains_colmap_input(&input)? {
+            crate::pipeline::input_admission::ensure_colmap_import_enabled()?;
+        }
         let input = std::fs::canonicalize(input)
             .map_err(|_| ServiceError::new("INVALID_PATH", "本地输入不存在或不可访问"))?;
-        if !input.is_dir()
+        let inputs = parameters
+            .as_ref()
+            .and_then(|p| p.get("inputs"))
+            .cloned()
+            .map(serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>)
+            .transpose()?;
+        if let Some(inputs) = &inputs {
+            inputs.check_identities()?;
+        }
+        if inputs.is_none()
+            && !input.is_dir()
             && !matches!(
                 input
                     .extension()
@@ -637,12 +879,15 @@ impl TaskService {
             .transpose()?;
         let now = Utc::now();
         let task = TaskRecord {
+            ba_policy_version: Some(crate::pipeline::ba_policy::VERSION),
+            brush_execution_options: Some(Default::default()),
+            creation_intent: None,
             schema_version: 1,
             task_id: id.unwrap_or_else(Uuid::new_v4),
             run_id: None,
             project_id: None,
             project_path: None,
-            input_type: if input.is_dir() {
+            input_type: if inputs.as_ref().is_some_and(|i|!matches!(i,crate::pipeline::inputs::GenerationInputs::Materials{items} if items.len()==1&&matches!(items[0].source,crate::pipeline::inputs::InputSource::Video{..}))) || input.is_dir() {
                 crate::project::ProjectInputType::Images
             } else {
                 crate::project::ProjectInputType::Video
@@ -756,7 +1001,51 @@ impl TaskService {
             }
             let id = summary.workspace_task_id.unwrap_or_else(Uuid::new_v4);
             let run_id = Uuid::new_v4();
+            let mut result = metadata
+                .output
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
+            if let (Some(inputs), Some(result)) = (checkpoint.inputs.as_ref(), result.as_mut()) {
+                let mut unused = inputs.unused.clone();
+                for source in &inputs.source_adoption {
+                    if !source.adopted && !unused.contains(&source.source_id) {
+                        unused.push(source.source_id.clone());
+                    }
+                }
+                if !unused.is_empty() {
+                    let labels = unused
+                        .iter()
+                        .map(|source_id| match &inputs.request {
+                            crate::pipeline::inputs::GenerationInputs::Materials { items } => items
+                                .iter()
+                                .find(|item| &item.id == source_id)
+                                .and_then(|item| item.source.path().file_name())
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| source_id.clone()),
+                            _ => source_id.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "warning".into(),
+                            serde_json::Value::String(format!(
+                                "部分素材未能参与生成：{}。本次仅使用已连接到同一场景的素材。",
+                                labels.join("、")
+                            )),
+                        );
+                    }
+                }
+            }
+            if let (Some(inputs), Some(result)) = (checkpoint.inputs.as_ref(), result.as_mut()) {
+                if let Some(warning) = crate::pipeline::inputs::source_adoption_warning(inputs) {
+                    result["warning"] = Value::String(warning);
+                }
+            }
             let task = TaskRecord {
+                ba_policy_version: checkpoint.ba_policy_version,
+                brush_execution_options: checkpoint.brush_training.execution_options,
+                creation_intent: checkpoint.creation.as_ref().map(|c| c.intent.clone()),
                 schema_version: 1,
                 task_id: id,
                 run_id: Some(run_id),
@@ -814,14 +1103,11 @@ impl TaskService {
                     failure_id: None,
                     log_sources: registered.keys().cloned().collect(),
                 }),
-                result: metadata
-                    .output
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()?,
+                result,
                 runs: vec![TaskRun {
                     run_id,
                     kind: "legacy".into(),
+                    continued_from_status: None,
                     started_at: metadata.started_at.unwrap_or(metadata.created_at),
                     ended_at: Some(metadata.completed_at.unwrap_or(Utc::now())),
                     logs: registered,
@@ -847,7 +1133,9 @@ impl TaskService {
                     existing.stage = task.stage;
                     existing.actual_configuration = task.actual_configuration;
                     existing.generation_policy = task.generation_policy;
-                    existing.automatically_retried = task.automatically_retried;
+                    // A continuation retains controlled retries already spent
+                    // on this work order, even across process/run boundaries.
+                    existing.automatically_retried |= task.automatically_retried;
                     existing.result = task.result;
                     existing.revision += 1;
                     if let Some(run) = existing.runs.last_mut() {
@@ -906,6 +1194,161 @@ impl TaskService {
         error
     }
 
+    pub(crate) async fn capture_preparation_failure(
+        &self,
+        mut error: crate::commands::PipelineCommandError,
+        context: &PreparationDiagnosticContext,
+        paths: &[PathBuf],
+    ) -> crate::commands::PipelineCommandError {
+        if error.code != "cancelled" {
+            error.failed_stage = None;
+            error.engine = Some(crate::pipeline::PipelineEngine::System);
+            error.project_id = context.project_id.map(|id| id.to_string().into_boxed_str());
+            error.failure_id = Some(Box::new(
+                self.diagnostics
+                    .capture_preparation(&error.message, context, paths)
+                    .await,
+            ));
+            let mut private_paths = paths.to_vec();
+            private_paths.extend(context.project_root.iter().cloned());
+            error.message = context.redacted_message(
+                &error.message,
+                &crate::diagnostics::redact::private_values(&private_paths),
+            );
+        }
+        error
+    }
+
+    async fn preparation_service_error(
+        &self,
+        error: crate::error::SplatError,
+        context: &PreparationDiagnosticContext,
+        task_id: Option<Uuid>,
+        run_id: Option<Uuid>,
+        paths: &[PathBuf],
+    ) -> ServiceError {
+        // Preserve the typed primary error until classification and diagnostic
+        // capture finish. JSON is not turned into a synthetic I/O failure.
+        let code = if error.io_error().is_some() {
+            "IO_ERROR"
+        } else if matches!(&error, crate::error::SplatError::Json(_)) {
+            "INVALID_DATA"
+        } else {
+            "TASK_ERROR"
+        };
+        let command = self
+            .capture_preparation_failure(
+                crate::commands::PipelineCommandError::from(error),
+                context,
+                paths,
+            )
+            .await;
+        let mut safe_command = serde_json::to_value(&command).unwrap_or_else(|_| {
+            serde_json::json!({"code":command.code,"message":&command.message,
+                "failureId":&command.failure_id})
+        });
+        if let Some(object) = safe_command.as_object_mut() {
+            object.remove("projectPath");
+            object.remove("logsDirectory");
+        }
+        ServiceError {
+            code: code.into(),
+            reason: None,
+            message: command.message,
+            task_id,
+            run_id,
+            details: Some(serde_json::json!({
+                "pipelineError":safe_command,"preparation":context.safe_details(),
+            })),
+        }
+    }
+
+    async fn preflight_catalog_continuation(
+        &self,
+        project: Uuid,
+        expected_run: Option<Uuid>,
+    ) -> Result<()> {
+        let context = PreparationContext::new(Some(project), None);
+        #[cfg(test)]
+        let lookup = async {
+            if let Some(index) = &self.continuation_index_path {
+                catalog::registered_project_path_from(index, project).await
+            } else {
+                catalog::registered_project_path(project).await
+            }
+        };
+        #[cfg(not(test))]
+        let lookup = catalog::registered_project_path(project);
+        let root = context
+            .step(
+                RetryPreparationOperation::ReadRetryProject,
+                "project_index",
+                None,
+                lookup,
+            )
+            .await;
+        let root = match root {
+            Ok(root) => root,
+            Err(crate::error::SplatError::Process(message))
+                if message == "项目索引中不存在该项目" =>
+            {
+                return Err(ServiceError::new("TASK_NOT_FOUND", "项目任务不存在"));
+            }
+            Err(error) => {
+                return Err(self
+                    .preparation_service_error(error, &context.snapshot(), None, expected_run, &[])
+                    .await);
+            }
+        };
+        let context = context.with_project_root(root.clone());
+        let metadata = context
+            .step(
+                RetryPreparationOperation::ReadRetryProject,
+                "project_metadata",
+                None,
+                catalog::read_project_metadata_at(&root, project),
+            )
+            .await;
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(self
+                    .preparation_service_error(
+                        error,
+                        &context.snapshot(),
+                        None,
+                        expected_run,
+                        std::slice::from_ref(&root),
+                    )
+                    .await);
+            }
+        };
+        if let Err(error) = context
+            .step(
+                RetryPreparationOperation::ReadRetryState,
+                "project_state",
+                None,
+                async {
+                    let bytes = tokio::fs::read(root.join("state.json")).await?;
+                    serde_json::from_slice::<Box<crate::project::PipelineStateFile>>(&bytes)
+                        .map_err(crate::error::SplatError::from)
+                },
+            )
+            .await
+        {
+            return Err(self
+                .preparation_service_error(
+                    error,
+                    &context.snapshot(),
+                    metadata.workspace_task_id,
+                    expected_run,
+                    std::slice::from_ref(&root),
+                )
+                .await);
+        }
+        Ok(())
+    }
+
     /// Admission runs on the application's executor even if its caller disappears.
     pub async fn start(
         &self,
@@ -916,7 +1359,7 @@ impl TaskService {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .start_inner(id, engines, telemetry, false, None, None)
+                .start_inner(id, engines, telemetry, false, None)
                 .await
         })
         .await
@@ -929,14 +1372,10 @@ impl TaskService {
         engines: EnginePaths,
         telemetry: Option<TelemetryService>,
     ) -> Result<StartReceipt> {
-        let service = self.clone();
-        tokio::spawn(async move {
-            service
-                .start_inner(id, engines, telemetry, true, Some(failed_run), None)
-                .await
-        })
-        .await
-        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+        // Compatibility name only: failure, cancellation and interruption all
+        // continue the saved work order without resetting recipes or allowances.
+        self.continue_identified(id, failed_run, engines, telemetry)
+            .await
     }
 
     async fn start_inner(
@@ -944,9 +1383,8 @@ impl TaskService {
         id: Uuid,
         engines: EnginePaths,
         telemetry: Option<TelemetryService>,
-        resume: bool,
-        retry_failed_run: Option<Uuid>,
-        expected_resume_run: Option<Uuid>,
+        continuing: bool,
+        expected_run: Option<Uuid>,
     ) -> Result<StartReceipt> {
         let _gate = self.gate.lock().await;
         self.load_locked().await?;
@@ -956,70 +1394,123 @@ impl TaskService {
             .get(&id)
             .cloned()
             .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "任务不存在"))?;
-        if let Some(expected) = expected_resume_run {
+        let original_task = task.clone();
+        if let Some(expected) = expected_run {
             if task.run_id != Some(expected) {
                 return Err(ServiceError::new(
                     "STALE_RUN_ID",
                     "The task execution has changed",
                 ));
             }
-            if !matches!(task.status, TaskStatus::Cancelled | TaskStatus::Interrupted) {
-                return Err(ServiceError::new("TASK_NOT_RESUMABLE", "Only cancelled or interrupted tasks may resume; failed tasks require explicit retry"));
-            }
+        }
+        if continuing && !task.status.can_continue() {
+            return Err(ServiceError::new(
+                "TASK_NOT_RESUMABLE",
+                "Only failed, cancelled, or interrupted tasks may be continued",
+            ));
+        }
+        if task.status.active() || (!continuing && task.status != TaskStatus::Created) {
+            return Ok(StartReceipt::existing(&task));
+        }
+        // An execution conflict is not evidence that this stopped task's files
+        // are unreadable. Reject it before touching project preparation data.
+        if let Some(active) = self.records().tasks.values().find(|t| t.status.active()) {
+            return Err(ServiceError::task_busy(active));
+        }
+        let mut continuation_state: Option<Box<crate::project::PipelineStateFile>> = None;
+        if let Some(project_id) = task.project_id.filter(|_| continuing) {
+            // The project state is authoritative for all continuations. Read
+            // failures must not silently fall back to a stale task/default recipe.
             let root = task.project_path.as_ref().ok_or_else(|| {
-                ServiceError::new(
-                    "NO_RESUMABLE_CHECKPOINT",
-                    "No project checkpoint was created",
-                )
+                ServiceError::new("INVALID_DATA", "The saved project location is missing")
             })?;
-            let saved: crate::project::PipelineStateFile = tokio::fs::read(root.join("state.json"))
+            let preparation = PreparationContext::new(Some(project_id), Some(root.clone()));
+            let saved = preparation
+                .step(
+                    RetryPreparationOperation::ReadRetryState,
+                    "project_state",
+                    None,
+                    async {
+                        let bytes = tokio::fs::read(root.join("state.json")).await?;
+                        Ok(serde_json::from_slice::<
+                            Box<crate::project::PipelineStateFile>,
+                        >(&bytes)?)
+                    },
+                )
+                .await;
+            let saved = match saved {
+                Ok(saved) => saved,
+                Err(error) => {
+                    return Err(self
+                        .preparation_service_error(
+                            error,
+                            &preparation.snapshot(),
+                            Some(task.task_id),
+                            task.run_id,
+                            std::slice::from_ref(&task.input_path),
+                        )
+                        .await);
+                }
+            };
+            if let Err(error) = preparation
+                .step(
+                    RetryPreparationOperation::ReadRetryProject,
+                    "project_metadata",
+                    None,
+                    catalog::read_project_metadata_at(root, project_id),
+                )
                 .await
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .ok_or_else(|| {
-                    ServiceError::new(
-                        "NO_RESUMABLE_CHECKPOINT",
-                        "No readable checkpoint is available",
-                    )
-                })?;
-            if !saved.features_complete
-                && !saved.matching_complete
-                && !saved.reconstruction_complete
-                && !saved.brush_complete
-                && !saved
-                    .reshoot
-                    .as_ref()
-                    .is_some_and(|s| s.source_snapshot_complete)
-                && !saved
-                    .frames
-                    .as_ref()
-                    .is_some_and(|f| f.extracted_frames.is_some_and(|n| n > 0))
             {
-                return Err(ServiceError::new(
-                    "NO_RESUMABLE_CHECKPOINT",
-                    "No completed work is available to resume",
-                ));
+                return Err(self
+                    .preparation_service_error(
+                        error,
+                        &preparation.snapshot(),
+                        Some(task.task_id),
+                        task.run_id,
+                        std::slice::from_ref(&task.input_path),
+                    )
+                    .await);
             }
-            // A stale flag alone is not resumable work. The Runner still performs
-            // its full per-stage validation before reusing any of these images.
-            let images = crate::video::list_images(&root.join("work/frames")).unwrap_or_default();
-            if images.len() < 2 {
-                return Err(ServiceError::new(
-                    "NO_RESUMABLE_CHECKPOINT",
-                    "Saved working images are missing; no valid work can be resumed",
-                ));
+            task.quality = saved.preset;
+            task.ba_policy_version = saved.ba_policy_version;
+            task.planner_enabled = saved.planner_enabled;
+            if let Some(configuration) = saved.configuration.as_ref() {
+                task.configuration = configuration.clone();
             }
+            task.generation_policy = saved.generation_policy;
+            sync_saved_generation_policy(&mut task.request_parameters, saved.generation_policy)?;
+            task.automatically_retried |= saved.automatically_retried();
+            task.actual_configuration = Some(actual_snapshot(serde_json::to_value(&saved)?));
+            continuation_state = Some(saved);
         }
-        if retry_failed_run
-            .is_some_and(|run| task.run_id != Some(run) || task.status != TaskStatus::Failed)
-        {
-            return Ok(StartReceipt::existing(&task));
-        }
-        let failed_retry = task.status == TaskStatus::Failed && resume;
-        if task.status.active() || (!resume && task.status != TaskStatus::Created) {
-            return Ok(StartReceipt::existing(&task));
-        }
-        if !resume || task.project_id.is_none() {
+        if !continuing || task.project_id.is_none() {
+            if task
+                .request_parameters
+                .as_ref()
+                .and_then(|p| p.get("inputs"))
+                .is_none()
+            {
+                if let Some(access) = &self.invocation_access {
+                    if task.input_path.is_dir() {
+                        access.authorize_image_directory(&task.input_path)?;
+                    } else {
+                        access.authorize(&task.input_path)?;
+                    }
+                }
+            }
+            if let Some(inputs) = task
+                .request_parameters
+                .as_ref()
+                .and_then(|p| p.get("inputs"))
+            {
+                let inputs: crate::pipeline::inputs::GenerationInputs =
+                    serde_json::from_value(inputs.clone())?;
+                if let Some(access) = &self.invocation_access {
+                    access.authorize_inputs(&inputs)?;
+                }
+                let policy = task.generation_policy.unwrap_or_default();
+                crate::pipeline::inputs::validate(&engines, &inputs, task.quality, policy).await?;
+            }
             if task.source.as_deref() == Some("mcp") {
                 if let (Some(source), Some(expected)) = (
                     task.source_project_id,
@@ -1029,6 +1520,7 @@ impl TaskService {
                         .and_then(Value::as_str),
                 ) {
                     let current = PipelineRunner::new(engines.clone(), |_| {})
+                        .with_invocation_access(self.invocation_access.clone())
                         .inspect_reshoot_source_v2(source)
                         .await
                         .map_err(|e| ServiceError::new("INPUT_CHANGED", e.to_string()))?;
@@ -1046,6 +1538,9 @@ impl TaskService {
                 .and_then(|value| value.get("videoSourceIdentity"))
                 .and_then(Value::as_str)
             {
+                if let Some(access) = &self.invocation_access {
+                    access.authorize(&task.input_path)?;
+                }
                 let actual = crate::video::panorama::source_identity(&task.input_path)
                     .map_err(|e| ServiceError::new("INPUT_CHANGED", e.to_string()))?;
                 if actual != expected {
@@ -1056,36 +1551,89 @@ impl TaskService {
                 }
             }
         }
-        if resume && task.status == TaskStatus::Completed {
-            return Err(ServiceError::new(
-                "TASK_NOT_STARTABLE",
-                "已完成项目无需恢复",
-            ));
-        }
-        if let Some(active) = self.records().tasks.values().find(|t| t.status.active()) {
-            return Err(ServiceError {
-                code: "TASK_BUSY".into(),
-                message: "已有任务正在运行".into(),
-                task_id: Some(active.task_id),
-                run_id: active.run_id,
-                details: None,
-            });
-        }
-        let original_task = task.clone();
-        if failed_retry || (!resume && task.generation_policy.is_none()) {
+        if !continuing && task.generation_policy.is_none() {
             task.planner_enabled = true;
             task.configuration = (*crate::presets::pipeline_optimization_config()).clone();
             task.request_parameters = Some(generation_parameters(task.request_parameters.take())?);
         }
         let run_id = Uuid::new_v4();
+        if let Some(parent) = self.run_lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let run_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.run_lock_path)?;
+        run_lock.try_lock().map_err(|error| {
+            ServiceError::new(
+                "TASK_BUSY",
+                format!("Generation execution is locked: {error}"),
+            )
+        })?;
+        if task.project_id.is_none() {
+            let reserved = crate::project::creation::ProjectCreationIntent::reserve(&task, run_id)?;
+            if let Some(previous) = &task.creation_intent {
+                if previous.request_identity != reserved.request_identity
+                    || previous.task_id != task.task_id
+                {
+                    return Err(ServiceError::new(
+                        "INVALID_DATA",
+                        "Project creation intent does not match the saved request",
+                    ));
+                }
+            } else {
+                task.creation_intent = Some(reserved);
+            }
+        }
         let service = self.clone();
         let lifecycle = self.clone();
+        let ready_service = self.clone();
         let effectiveness = PlannerEffectivenessTracker::default();
-        let session = telemetry.map(|telemetry| {
+        let summary_supported = if let Some(value) = task
+            .request_parameters
+            .as_ref()
+            .and_then(|p| p.get("inputs"))
+        {
+            match serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(value.clone())
+            {
+                Ok(crate::pipeline::inputs::GenerationInputs::Materials { items })
+                    if items.len() == 1 =>
+                {
+                    matches!(
+                        items[0].source,
+                        crate::pipeline::inputs::InputSource::Video { .. }
+                    ) || if continuing && task.project_path.is_some() {
+                        // Statistics must not reopen originals before the work
+                        // order has decided whether any external read is needed.
+                        continuation_state
+                            .as_ref()
+                            .and_then(|saved| saved.inputs.as_ref())
+                            .is_some_and(|c| {
+                                c.sources.len() == 1 && c.sources[0].dimensions.len() == 1
+                            })
+                    } else {
+                        crate::pipeline::inputs::inspect_material(
+                            &engines,
+                            &items[0],
+                            task.quality,
+                            task.generation_policy.unwrap_or_default(),
+                        )
+                        .await
+                        .is_ok_and(|a| a.dimensions.len() == 1)
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            true
+        };
+        let session = telemetry.filter(|_| summary_supported).map(|telemetry| {
             Arc::new(PipelineTelemetrySession::new_with_planner_evaluation(
                 telemetry,
                 task.quality,
-                if task.input_path.is_dir() {
+                if task.input_type == crate::project::ProjectInputType::Images {
                     TelemetryInputType::Images
                 } else {
                     TelemetryInputType::Video
@@ -1107,13 +1655,13 @@ impl TaskService {
             .map(|v| serde_json::from_value::<crate::pipeline::reshoot::ReshootOptions>(v.clone()))
             .transpose()
             .map_err(|_| ServiceError::new("INVALID_ARGUMENT", "Invalid saved reshoot options"))?;
-        let policy = task
+        let policy = task.generation_policy.or(task
             .request_parameters
             .as_ref()
             .and_then(|p| p.get("generationPolicy"))
             .cloned()
             .map(serde_json::from_value::<crate::pipeline::generation_policy::GenerationPolicy>)
-            .transpose()?;
+            .transpose()?);
         let runner = Arc::new(
             PipelineRunner::new_with_planner(engines, task.planner_enabled, move |event| {
                 if let Some(s) = &observe {
@@ -1122,12 +1670,12 @@ impl TaskService {
                 service.on_event(id, run_id, event);
             })
             .with_effectiveness_tracker(effectiveness)
-            .with_generation_policy(if !resume || failed_retry {
-                Some(policy.unwrap_or_default())
+            .with_invocation_access(self.invocation_access.clone())
+            .with_generation_policy(if !continuing || task.project_id.is_none() {
+                policy
             } else {
                 None
             })
-            .with_failed_retry_policy(failed_retry.then(|| policy.unwrap_or_default()))
             .with_video_projection(
                 task.request_parameters
                     .as_ref()
@@ -1136,6 +1684,25 @@ impl TaskService {
                     .unwrap_or_default(),
             )
             .with_workspace_task_id(Some(id))
+            .with_creation_intent(task.creation_intent.clone())
+            .with_project_ready_observer(move |metadata| {
+                let service = ready_service.clone();
+                Box::pin(async move {
+                    service
+                        .bind_created_project(id, run_id, metadata)
+                        .await
+                        .map_err(|e| crate::error::SplatError::Process(e.to_string()))
+                })
+            })
+            .with_execution_run_id(Some(run_id))
+            .with_inputs(
+                task.request_parameters
+                    .as_ref()
+                    .and_then(|v| v.get("inputs"))
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?,
+            )
             .with_reshoot_options(reshoot_options)
             .with_image_matching_strategy(
                 task.request_parameters
@@ -1152,12 +1719,18 @@ impl TaskService {
         let starting = {
             let mut registry = self.records();
             let t = registry.tasks.get_mut(&id).expect("task");
+            t.quality = task.quality;
+            t.ba_policy_version = task.ba_policy_version;
+            t.creation_intent = task.creation_intent.clone();
             t.planner_enabled = task.planner_enabled;
             t.configuration = task.configuration.clone();
             t.request_parameters = task.request_parameters.clone();
-            if !resume || failed_retry {
-                t.generation_policy = policy;
+            t.generation_policy = policy;
+            t.actual_configuration = task.actual_configuration.clone();
+            if !continuing {
                 t.automatically_retried = false;
+            } else {
+                t.automatically_retried = task.automatically_retried;
             }
             t.run_id = Some(run_id);
             t.status = TaskStatus::Starting;
@@ -1185,14 +1758,13 @@ impl TaskService {
             t.updated_at = Utc::now();
             t.runs.push(TaskRun {
                 run_id,
-                kind: if failed_retry {
-                    "retry"
-                } else if task.project_id.is_some() {
-                    "resume"
+                kind: if continuing {
+                    "continue"
                 } else {
                     &task.task_kind
                 }
                 .into(),
+                continued_from_status: continuing.then_some(task.status),
                 started_at: Utc::now(),
                 ended_at: None,
                 logs: Default::default(),
@@ -1210,6 +1782,7 @@ impl TaskService {
             return Err(e);
         }
         *self.active.lock().await = Some(runner.clone());
+        *self.run_lock.lock().unwrap_or_else(|p| p.into_inner()) = Some((run_id, run_lock));
         self.notify(id);
         let service = self.clone();
         tokio::spawn(async move {
@@ -1226,7 +1799,7 @@ impl TaskService {
             let execution = task.clone();
             #[cfg(test)]
             let test_executor = service.executor.lock().unwrap().clone();
-            let worker = tokio::spawn(crate::presets::with_pipeline_config(
+            let worker = tokio::spawn(Box::pin(crate::presets::with_pipeline_config(
                 task.configuration.clone(),
                 async move {
                     #[cfg(test)]
@@ -1234,32 +1807,30 @@ impl TaskService {
                         return executor(execution, execute_runner).await;
                     }
                     if let Some(project) = execution.project_id {
-                        execute_runner.resume(project).await
+                        Box::pin(execute_runner.resume(project)).await
                     } else if let Some(source) = execution.source_project_id {
-                        execute_runner
-                            .generate_incremental_reshoot(
-                                source,
-                                &execution.input_path,
-                                if execution.input_path.is_dir() {
-                                    ReshootInputType::Images
-                                } else {
-                                    ReshootInputType::Video
-                                },
-                                &execution.projects_root,
-                                execution.quality,
-                            )
-                            .await
+                        Box::pin(execute_runner.generate_incremental_reshoot(
+                            source,
+                            &execution.input_path,
+                            if execution.input_path.is_dir() {
+                                ReshootInputType::Images
+                            } else {
+                                ReshootInputType::Video
+                            },
+                            &execution.projects_root,
+                            execution.quality,
+                        ))
+                        .await
                     } else {
-                        execute_runner
-                            .generate(
-                                &execution.input_path,
-                                execution.quality,
-                                &execution.projects_root,
-                            )
-                            .await
+                        Box::pin(execute_runner.generate(
+                            &execution.input_path,
+                            execution.quality,
+                            &execution.projects_root,
+                        ))
+                        .await
                     }
                 },
-            ));
+            )));
             let result = worker.await.unwrap_or_else(|e| {
                 runner.cancel();
                 Err(crate::error::SplatError::Process(format!(
@@ -1282,6 +1853,44 @@ impl TaskService {
         receipt.accepted = true;
         Ok(receipt)
     }
+    async fn bind_created_project(
+        &self,
+        id: Uuid,
+        run: Uuid,
+        metadata: crate::project::ProjectMetadata,
+    ) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        {
+            let mut records = self.records();
+            let task = records
+                .tasks
+                .get_mut(&id)
+                .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "Task not found"))?;
+            if task.run_id != Some(run) || !task.status.active() {
+                return Err(ServiceError::new(
+                    "STALE_RUN_ID",
+                    "The task execution has changed",
+                ));
+            }
+            if metadata.workspace_task_id != Some(id)
+                || task.creation_intent.as_ref().is_some_and(|intent| {
+                    intent.project_id != metadata.id || intent.project_path != metadata.project_path
+                })
+            {
+                return Err(ServiceError::new(
+                    "INVALID_DATA",
+                    "Project creation binding mismatch",
+                ));
+            }
+            task.project_id = Some(metadata.id);
+            task.project_path = Some(metadata.project_path);
+            task.revision += 1;
+        }
+        self.persist().await?;
+        self.notify(id);
+        Ok(())
+    }
+
     fn on_event(&self, id: Uuid, run: Uuid, mut event: PipelineEvent) {
         // A single lock orders record updates, queued events, and emitted snapshots.
         // In particular, an old run cannot enqueue after a new run's notification.
@@ -1424,16 +2033,15 @@ impl TaskService {
                         execution.current_brush_execution = None;
                     }
                 }
+                RunnerUpdate::AutomaticRetry => {
+                    t.automatically_retried = true;
+                }
                 RunnerUpdate::Configuration(configuration) => {
                     t.generation_policy = configuration
                         .get("generation_policy")
                         .filter(|p| !p.is_null())
                         .cloned()
                         .and_then(|v| serde_json::from_value(v).ok());
-                    t.automatically_retried = configuration
-                        .get("automatically_retried")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
                     t.actual_configuration = Some(configuration);
                 }
                 RunnerUpdate::Project(metadata) => {
@@ -1521,7 +2129,14 @@ impl TaskService {
             Ok(_) => None,
             Err(e) => {
                 let error = crate::commands::PipelineCommandError::from_runner(e, &runner);
-                Some(if executions.is_empty() {
+                let preparation = runner.preparation_diagnostic_context().filter(|context| {
+                    error.failed_stage.is_none()
+                        && context.safe_details().get("operation").is_some()
+                });
+                Some(if let Some(preparation) = preparation {
+                    self.capture_preparation_failure(error, &preparation, &[input])
+                        .await
+                } else if executions.is_empty() {
                     self.capture_failure(error, &[input]).await
                 } else {
                     self.capture_failure_with_executions(
@@ -1617,10 +2232,48 @@ impl TaskService {
             t.revision += 1;
             t.clone()
         };
-        if let Err(e) = self.persist().await {
-            tracing::error!(code=%e.code,"Could not persist task terminal state");
+        let terminal_persisted = match self.persist().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(code=%e.code,"Could not persist task terminal state");
+                false
+            }
+        };
+        if terminal_persisted && task.status == TaskStatus::Completed {
+            if let Some(project_root) = task.project_path.as_ref() {
+                let transaction_path = project_root
+                    .join("work")
+                    .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
+                match crate::pipeline::publication::committed_publication(
+                    project_root,
+                    &transaction_path,
+                )
+                .await
+                {
+                    Ok(Some(publication)) => {
+                        if let Err(error) = crate::pipeline::publication::mark_reconciled(
+                            project_root,
+                            &transaction_path,
+                            publication.transaction.transaction_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "Could not finalize publication task view");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not verify committed publication after task persistence");
+                    }
+                }
+            }
         }
         *self.active.lock().await = None;
+        let mut lock = self.run_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if lock.as_ref().is_some_and(|(id, _)| *id == run) {
+            lock.take();
+        }
+        drop(lock);
         self.notify(task.task_id);
     }
     pub async fn cancel(&self, id: Uuid, run: Uuid) -> Result<TaskRecord> {
@@ -1667,22 +2320,71 @@ impl TaskService {
         engines: EnginePaths,
         telemetry: Option<TelemetryService>,
     ) -> Result<StartReceipt> {
-        self.import_projects().await?;
-        let id = self
-            .all()
-            .await?
-            .into_iter()
+        let tasks = self.all().await?;
+        let mut task = tasks
+            .iter()
             .find(|t| t.project_id == Some(project))
-            .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "项目任务不存在"))?
-            .task_id;
-        let service = self.clone();
-        tokio::spawn(async move {
-            service
-                .start_inner(id, engines, telemetry, true, None, None)
-                .await
-        })
-        .await
-        .map_err(|e| ServiceError::new("START_FAILED", e.to_string()))?
+            .cloned();
+        if task.is_none() {
+            if let Some(active) = tasks.iter().find(|task| task.status.active()) {
+                return Err(ServiceError::task_busy(active));
+            }
+            self.preflight_catalog_continuation(project, None).await?;
+            self.import_projects().await?;
+            task = self
+                .all()
+                .await?
+                .into_iter()
+                .find(|t| t.project_id == Some(project));
+        }
+        let task = task.ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "项目任务不存在"))?;
+        let expected_run = task.run_id.ok_or_else(|| {
+            ServiceError::new(
+                "INVALID_DATA",
+                "The saved task execution identity is missing",
+            )
+        })?;
+        self.continue_identified(task.task_id, expected_run, engines, telemetry)
+            .await
+    }
+
+    /// Continue the saved work order associated with a project.
+    ///
+    /// GUI project actions use the same run identity guard as MCP actions. The
+    /// legacy project-only entry point remains available for old callers that
+    /// do not have a task/run identity.
+    pub async fn resume_project_identified(
+        &self,
+        project: Uuid,
+        expected_run: Uuid,
+        engines: EnginePaths,
+        telemetry: Option<TelemetryService>,
+    ) -> Result<StartReceipt> {
+        // A GUI action already carries the workspace task/run identity. Prefer
+        // that durable local record and consult the project catalog only when
+        // this registry does not know the project yet. This also preserves the
+        // stale-run response when an unrelated catalog entry is unreadable.
+        let tasks = self.all().await?;
+        let mut task = tasks
+            .iter()
+            .find(|task| task.project_id == Some(project))
+            .cloned();
+        if task.is_none() {
+            if let Some(active) = tasks.iter().find(|task| task.status.active()) {
+                return Err(ServiceError::task_busy(active));
+            }
+            self.preflight_catalog_continuation(project, Some(expected_run))
+                .await?;
+            self.import_projects().await?;
+            task = self
+                .all()
+                .await?
+                .into_iter()
+                .find(|task| task.project_id == Some(project));
+        }
+        let task = task.ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "项目任务不存在"))?;
+        self.continue_identified(task.task_id, expected_run, engines, telemetry)
+            .await
     }
 
     pub async fn resume_identified(
@@ -1692,10 +2394,23 @@ impl TaskService {
         engines: EnginePaths,
         telemetry: Option<TelemetryService>,
     ) -> Result<StartReceipt> {
+        self.continue_identified(id, expected_run, engines, telemetry)
+            .await
+    }
+
+    /// Every stopped task continues from the same persisted work order. A new
+    /// run isolates process evidence, not recipe versions or retry allowances.
+    pub async fn continue_identified(
+        &self,
+        id: Uuid,
+        expected_run: Uuid,
+        engines: EnginePaths,
+        telemetry: Option<TelemetryService>,
+    ) -> Result<StartReceipt> {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .start_inner(id, engines, telemetry, true, None, Some(expected_run))
+                .start_inner(id, engines, telemetry, true, Some(expected_run))
                 .await
         })
         .await
@@ -1868,16 +2583,62 @@ fn actual_snapshot(state: Value) -> Value {
 }
 
 fn extend_actual_summary(result: &mut Value, state: &Value) {
+    result["inputs"] = state.get("inputs").cloned().unwrap_or(Value::Null);
+    if let Some(inputs) = result.get_mut("inputs").and_then(Value::as_object_mut) {
+        // Recovery instructions and temporary patch audit records are local
+        // implementation details, not bounded GUI/MCP status summaries.
+        inputs.remove("recoverySources");
+        inputs.remove("temporaryPngFocalRecords");
+        inputs.remove("temporaryPngFocalPendingRecords");
+    }
+    if let Some(sources) = result
+        .pointer_mut("/inputs/sources")
+        .and_then(Value::as_array_mut)
+    {
+        for source in sources {
+            source["bridgeFrameCount"] =
+                serde_json::json!(source["bridgeFrames"].as_array().map(Vec::len));
+            if let Some(source) = source.as_object_mut() {
+                source.remove("originals");
+                source.remove("panoramaRecords");
+                source.remove("bridgeFrames");
+            }
+            if let Some(frames) = source.get_mut("frames").and_then(Value::as_object_mut) {
+                frames.remove("selectedFrames");
+                frames.remove("candidateFrames");
+            }
+        }
+    }
     let panorama = state.get("panorama").is_some_and(Value::is_object);
-    result["input_projection"] = if panorama {
-        Value::String("equirectangular".into())
-    } else {
-        state
-            .get("videoProjection")
-            .filter(|v| matches!(v.as_str(), Some("perspective" | "equirectangular")))
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
+    result["input_projection"] =
+        if let Some(sources) = state.pointer("/inputs/sources").and_then(Value::as_array) {
+            let adopted = sources
+                .iter()
+                .filter(|s| s["adopted"].as_u64().unwrap_or(0) > 0)
+                .collect::<Vec<_>>();
+            let projections = adopted
+                .iter()
+                .filter_map(|s| s["projection"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !adopted.is_empty()
+                && projections.len() == 1
+                && projections
+                    .iter()
+                    .all(|p| matches!(*p, "perspective" | "equirectangular"))
+            {
+                serde_json::json!(projections.first())
+            } else {
+                Value::Null
+            }
+        } else if panorama {
+            Value::String("equirectangular".into())
+        } else {
+            state
+                .get("videoProjection")
+                .filter(|v| matches!(v.as_str(), Some("perspective" | "equirectangular")))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
     result["image_matching_strategy"] =
         if state.get("inputType").and_then(Value::as_str) == Some("video") {
             Value::String("sequential".into())

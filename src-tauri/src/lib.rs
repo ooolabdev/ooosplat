@@ -108,6 +108,12 @@ pub fn run_app() {
         })
         .manage(mcp::McpController::default())
         .invoke_handler(tauri::generate_handler![
+            commands::classify_material_paths,
+            commands::classify_generation_paths,
+            commands::inspect_material_inputs,
+            commands::estimate_material_inputs,
+            commands::detect_material_gps,
+            commands::start_gui_inputs,
             updates::check_app_update,
             commands::check_engines,
             commands::check_colmap_acceleration,

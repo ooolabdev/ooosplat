@@ -18,6 +18,8 @@ pub(super) fn output(name: &str) -> Value {
     task["properties"]["error"]["properties"]["termination"] = json!({"type":["object","null"]});
     task["properties"]["runs"]["items"]["properties"]["brush_executions_truncated"] =
         json!({"type":"boolean"});
+    task["properties"]["runs"]["items"]["properties"]["continued_from_status"] =
+        json!({"type":["string","null"],"enum":["failed","cancelled","interrupted",null]});
     task["properties"]["runs"]["items"]["properties"]["brush_executions"] = json!({"type":"array","maxItems":8,"items":{"type":"object","properties":{
         "operation":{"type":["object","null"]},"started_at":{"type":"string"},"ended_at":{"type":["string","null"]},"exit_code":{"type":["integer","null"]},
         "backend":{"type":["string","null"]},"device":{"type":["object","null"],"properties":{"name":{"type":"string"},"total_memory_mb":{"type":["integer","null"]},"driver_version":{"type":["string","null"]}}},"configuration":{"type":["object","null"]}
@@ -63,7 +65,7 @@ pub(super) fn output(name: &str) -> Value {
     // MCP output schemas describe structured errors and pending questions too.
     let failure = json!({"type":"object","required":["error"],"properties":{
         "error":{"type":"object","required":["code","message"],"properties":{
-            "code":{"type":"string"},"message":{"type":"string"},"details":{"type":["object","null"]}
+            "code":{"type":"string"},"message":{"type":"string"},"reason":{"type":"string","enum":["colmap_disabled","unsupported_input"]},"details":{"type":["object","null"]}
         }}
     }});
     json!({"type":"object","anyOf":[success,failure]})

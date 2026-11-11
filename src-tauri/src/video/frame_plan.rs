@@ -157,6 +157,36 @@ impl FrameSelectionStrategy for QualityV2FrameSelection {
 }
 
 impl QualityV2FrameSelection {
+    /// Builds the exact keep-every-frame plan used by policy v6's upper
+    /// endpoint. This deliberately avoids deriving the count from
+    /// `duration * fps`: container duration and nominal FPS may disagree by a
+    /// few frames even when the decoded frame count is authoritative.
+    pub fn create_all_frames_plan(&self, video: &VideoInfo, manual_bridge: bool) -> FramePlan {
+        if video.total_frames == 0 || video.fps <= 0.0 || !video.fps.is_finite() {
+            return FramePlan::default();
+        }
+        let selected_frames: Vec<_> = (0..video.total_frames)
+            .map(|source_frame_index| PlannedFrame {
+                source_frame_index,
+                timestamp_seconds: source_frame_index as f64 / video.fps,
+            })
+            .collect();
+        let mut plan = FramePlan {
+            retention_ratio: 1.0,
+            sampling_fps: video.fps,
+            estimated_frames: video.total_frames,
+            candidate_frames: selected_frames.clone(),
+            selected_frames,
+            rescue_max_frames: video.total_frames,
+            bridge_source_frames: None,
+            minimum_frame_override_applied: false,
+        };
+        if manual_bridge {
+            plan.use_manual_bridge_budget(video.total_frames);
+        }
+        plan
+    }
+
     pub fn create_manual_bridge_plan(
         &self,
         video: &VideoInfo,

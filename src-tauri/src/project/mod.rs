@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod creation;
 pub mod manager;
 pub mod metadata;
 

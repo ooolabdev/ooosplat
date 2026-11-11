@@ -100,8 +100,14 @@ pub(super) fn reshoot_records(
 pub(super) fn model_identity(model: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-        hash.update(crate::video::panorama::fingerprint(&model.join(name))?);
+    let binary = ["cameras.bin", "images.bin", "points3D.bin"];
+    let files = if binary.iter().all(|name| model.join(name).is_file()) {
+        binary.iter().map(|name| model.join(name)).collect()
+    } else {
+        crate::reconstruction::colmap_model::reusable_model_files(model)?
+    };
+    for file in files {
+        hash.update(crate::video::panorama::fingerprint(&file)?);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -109,6 +115,64 @@ fn native_alignment_rejected(error: &SplatError) -> bool {
     matches!(error,SplatError::EngineProcess(f) if !f.termination.abnormal() && f.termination.exit_code==Some(1)
         && f.classification.kind!=Some("mapper_storage")
         && ["alignment failed","not enough","insufficient"].iter().any(|m|f.detail.to_ascii_lowercase().contains(m)))
+}
+
+struct GpsMapperOptions<'a> {
+    paths: &'a ProjectPaths,
+    visual: &'a Path,
+    base: Option<&'a Path>,
+    fixed: Option<&'a Path>,
+    georeference: bool,
+    allow_two_view_tracks: bool,
+}
+
+/// Keep the GPS reconstruction request independent of BA backend selection.
+/// Both initial execution and a Ceres compatibility retry use this same list.
+fn gps_mapper_args(options: GpsMapperOptions<'_>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        if options.georeference {
+            "pose_prior_mapper"
+        } else {
+            "mapper"
+        }
+        .into(),
+        "--database_path".into(),
+        "gps-v1/database.db".into(),
+        "--image_path".into(),
+        "../colmap_frames".into(),
+        "--input_path".into(),
+        options.base.unwrap_or(options.visual).into(),
+        "--output_path".into(),
+        "gps-v1/native".into(),
+        "--Mapper.ba_refine_principal_point".into(),
+        "0".into(),
+    ];
+    if options.allow_two_view_tracks {
+        args.extend(["--Mapper.tri_ignore_two_view_tracks".into(), "0".into()]);
+    }
+    if options.georeference {
+        args.extend([
+            "--use_robust_loss_on_prior_position".into(),
+            "1".into(),
+            "--prior_position_loss_scale".into(),
+            "7.815".into(),
+        ]);
+    }
+    if options.base.is_some() {
+        args.extend(["--Mapper.fix_existing_frames".into(), "1".into()]);
+    }
+    if let Some(fixed) = options.fixed {
+        args.extend(["--Mapper.constant_camera_list_path".into(), fixed.into()]);
+    }
+    if options.paths.colmap.join("panorama-camera.json").is_file() {
+        args.extend([
+            "--Mapper.init_min_tri_angle".into(),
+            "1".into(),
+            "--Mapper.init_max_forward_motion".into(),
+            "1".into(),
+        ]);
+    }
+    args
 }
 
 impl PipelineRunner {
@@ -202,7 +266,7 @@ impl PipelineRunner {
         std::fs::create_dir_all(&root)?;
         // Persist refusal to reuse old training before replacing any GPS output.
         state.brush_complete = false;
-        state.brush_training = Default::default();
+        state.validated_output = None;
         state.gps = Some(Checkpoint {
             fingerprint,
             input_identity,
@@ -261,6 +325,7 @@ impl PipelineRunner {
                 fixed_cameras,
                 georeference,
                 state.generation_policy.is_some() && state.actual_transparency == Some(true),
+                state.ba_policy_version,
             )
             .await?;
         let Some((model, transform)) = outcome else {
@@ -331,6 +396,7 @@ impl PipelineRunner {
         fixed: Option<&Path>,
         georeference: bool,
         allow_two_view_tracks: bool,
+        ba_policy_version: Option<u32>,
     ) -> Result<Option<(PathBuf, Option<Similarity>)>> {
         let cancel = self.process_manager.child_token();
         if cancel.is_cancelled() {
@@ -442,54 +508,47 @@ impl PipelineRunner {
         gps::install_priors(&db_path, &manifest.records, origin, false)?;
         let mut native = attempt.join("native");
         std::fs::create_dir_all(&native)?;
-        let mut args: Vec<OsString> = vec![
-            if georeference {
-                "pose_prior_mapper"
-            } else {
-                "mapper"
-            }
-            .into(),
-            "--database_path".into(),
-            "gps-v1/database.db".into(),
-            "--image_path".into(),
-            "../colmap_frames".into(),
-            "--input_path".into(),
-            base.unwrap_or(visual).into(),
-            "--output_path".into(),
-            "gps-v1/native".into(),
-            "--Mapper.ba_local_backend".into(),
-            "CERES".into(),
-            "--Mapper.ba_global_backend".into(),
-            "CERES".into(),
-            "--Mapper.ba_refine_principal_point".into(),
-            "0".into(),
-        ];
-        if allow_two_view_tracks {
-            args.extend(["--Mapper.tri_ignore_two_view_tracks".into(), "0".into()]);
-        }
-        if georeference {
-            args.extend([
-                "--use_robust_loss_on_prior_position".into(),
-                "1".into(),
-                "--prior_position_loss_scale".into(),
-                "7.815".into(),
-            ]);
-        }
-        if base.is_some() {
-            args.extend(["--Mapper.fix_existing_frames".into(), "1".into()]);
-        }
-        if let Some(fixed) = fixed {
-            args.extend(["--Mapper.constant_camera_list_path".into(), fixed.into()]);
-        }
-        if paths.colmap.join("panorama-camera.json").is_file() {
-            args.extend([
-                "--Mapper.init_min_tri_angle".into(),
-                "1".into(),
-                "--Mapper.init_max_forward_motion".into(),
-                "1".into(),
-            ]);
-        }
-        if let Err(error) = self.gps_command(paths, args).await {
+        let args = gps_mapper_args(GpsMapperOptions {
+            paths,
+            visual,
+            base,
+            fixed,
+            georeference,
+            allow_two_view_tracks,
+        });
+        // Only Mapper enters the common BA selector. The absolute database
+        // path is used for statistics; command arguments retain their existing
+        // relative paths and the same working directory. A compatibility
+        // retry may reset `native`, never the GPS database, priors or visual
+        // reconstruction in the rest of this attempt directory.
+        let result = colmap::run_mapper_with_ba(
+            &self.engines.colmap,
+            &db_path,
+            args,
+            &native,
+            &paths.colmap,
+            paths.logs.join("gps.log"),
+            &self.process_manager,
+            Some(self.process_observer(
+                PipelineStage::Reconstructing,
+                PipelineEngine::Colmap,
+                None,
+                ObserverMode::Mapper,
+            )),
+            colmap::MapperBaPolicy {
+                policy_version: ba_policy_version,
+                automatic_optimization: true,
+                gpu_index: self.current_acceleration().and_then(|a| a.gpu_index()),
+                panorama: paths.colmap.join("panorama-camera.json").is_file(),
+                pose_priors: georeference,
+                ..Default::default()
+            },
+        )
+        .await;
+        // Consider the GPS-to-visual fallback only after the shared executor
+        // has exhausted its one same-scheme Caspar-to-Ceres fallback. The
+        // final crash, I/O error or cancellation remains its true failure.
+        if let Err(error) = result {
             if native_alignment_rejected(&error) {
                 return Ok(None);
             }
@@ -671,6 +730,215 @@ impl PipelineRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gps_training_continuation_reuses_cache_after_json_reload_without_engines() {
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        let visual = paths.colmap.join("authoritative");
+        let output = paths.colmap.join("gps-v1/model");
+        for (directory, contents) in [
+            (&visual, b"visual".as_slice()),
+            (&output, b"GPS".as_slice()),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+            for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                std::fs::write(directory.join(name), contents).unwrap();
+            }
+        }
+        let record = Record {
+            name: "synthetic.png".into(),
+            source: paths.frames.join("synthetic.png"),
+            source_identity: "frozen-source".into(),
+            fix: crate::video::gps::GpsFix {
+                latitude: 51.248178375505404,
+                longitude: -93.31137037688033,
+                altitude: Some(52.314008204106244),
+                horizontal_std: 10.,
+                vertical_std: 20.,
+            },
+        };
+        let manifest = Manifest {
+            version: gps::POLICY_VERSION,
+            records: vec![record.clone()],
+            origin: Some(record.fix),
+        };
+        let mut state = PipelineStateFile::created_for(Quality::High, ProjectInputType::Images);
+        state.stage = PipelineStage::TrainingSplats;
+        state.brush_training.dataset_identity = Some("saved-training-data".into());
+        state.brush_training.oom_retry_started = true;
+        state.brush_training.oom_retry_used = true;
+        state.gps = Some(Checkpoint {
+            status: "complete".into(),
+            fingerprint: gps::fingerprint(&manifest.records).unwrap(),
+            manifest_identity: Some(gps::manifest_identity(&manifest).unwrap()),
+            input_identity: Some(format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(
+                        model_identity(&visual).unwrap(),
+                        Option::<crate::video::gps::GpsFix>::None,
+                    ))
+                    .unwrap()
+                )
+            )),
+            output_identity: Some(model_identity(&output).unwrap()),
+            reference_valid: true,
+            ..Checkpoint::pending()
+        });
+        let manager = ProjectManager::for_diagnostics(root.path().into());
+        let manifest_path = paths.work.join("gps/manifest.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        atomic_write_json(&manifest_path, &manifest).await.unwrap();
+        manager.write_state(&paths.state, &state).await.unwrap();
+        let expected = serde_json::to_value(&state).unwrap();
+        let expected_visual = model_identity(&visual).unwrap();
+        let expected_output = model_identity(&output).unwrap();
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("engines-must-not-run")),
+            |_| {},
+        );
+        for _ in 0..3 {
+            let mut saved = manager.read_state(&paths.state).await.unwrap();
+            let manifest: Manifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            let result = runner
+                .apply_gps(
+                    &manager,
+                    &paths,
+                    &mut saved,
+                    manifest.records,
+                    None,
+                    &visual,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.as_deref(), Some(output.as_path()));
+            assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
+            assert_eq!(model_identity(&visual).unwrap(), expected_visual);
+            assert_eq!(model_identity(&output).unwrap(), expected_output);
+            assert!(!paths.logs.join("gps.log").exists());
+            manager.write_state(&paths.state, &saved).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn gps_mapper_backend_selection_preserves_priors_and_frozen_camera_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        std::fs::create_dir_all(&paths.colmap).unwrap();
+        std::fs::write(paths.colmap.join("panorama-camera.json"), b"{}").unwrap();
+        let base = paths.colmap.join("base");
+        let visual = paths.colmap.join("visual");
+        let fixed = paths.colmap.join("fixed.txt");
+        let args = gps_mapper_args(GpsMapperOptions {
+            paths: &paths,
+            visual: &visual,
+            base: Some(&base),
+            fixed: Some(&fixed),
+            georeference: true,
+            allow_two_view_tracks: true,
+        });
+        assert_eq!(args[0], "pose_prior_mapper");
+        let has =
+            |name: &str, value: &OsString| args.windows(2).any(|v| v[0] == name && &v[1] == value);
+        for (name, value) in [
+            ("--database_path", OsString::from("gps-v1/database.db")),
+            ("--output_path", OsString::from("gps-v1/native")),
+            ("--input_path", base.into_os_string()),
+            ("--Mapper.constant_camera_list_path", fixed.into_os_string()),
+            ("--Mapper.fix_existing_frames", OsString::from("1")),
+            ("--Mapper.ba_refine_principal_point", OsString::from("0")),
+            ("--use_robust_loss_on_prior_position", OsString::from("1")),
+            ("--prior_position_loss_scale", OsString::from("7.815")),
+            ("--Mapper.tri_ignore_two_view_tracks", OsString::from("0")),
+            ("--Mapper.init_min_tri_angle", OsString::from("1")),
+            ("--Mapper.init_max_forward_motion", OsString::from("1")),
+        ] {
+            assert!(has(name, &value), "missing {name}");
+        }
+        assert!(!args
+            .iter()
+            .any(|v| v == "--Mapper.ba_global_backend" || v == "--Mapper.ba_local_backend"));
+
+        let ordinary = gps_mapper_args(GpsMapperOptions {
+            paths: &paths,
+            visual: &visual,
+            base: None,
+            fixed: None,
+            georeference: false,
+            allow_two_view_tracks: false,
+        });
+        assert_eq!(ordinary[0], "mapper");
+        assert!(!ordinary
+            .iter()
+            .any(|v| v == "--use_robust_loss_on_prior_position"
+                || v == "--Mapper.fix_existing_frames"));
+        assert!(ordinary
+            .windows(2)
+            .any(|v| v[0] == "--input_path" && v[1] == visual.as_os_str()));
+    }
+
+    #[test]
+    fn gps_visual_fallback_uses_only_the_final_normal_alignment_failure() {
+        use crate::failure::{EngineProcessFailure, FailureClassification};
+        use crate::process::ProcessTermination;
+        let failure = |termination, kind, detail: &str| EngineProcessFailure {
+            last_splat_count: None,
+            engine: PipelineEngine::Colmap,
+            operation: "mapper".into(),
+            termination,
+            detail: detail.into(),
+            classification: FailureClassification {
+                engine: Some(PipelineEngine::Colmap),
+                kind,
+                heuristic: false,
+            },
+            previous_attempts: vec![],
+        };
+        let normal = ProcessTermination {
+            exit_code: Some(1),
+            ..Default::default()
+        };
+        let mut final_failure = failure(normal.clone(), None, "insufficient visual matches");
+        final_failure.previous_attempts.push(failure(
+            ProcessTermination {
+                exit_code: Some(-1073740940),
+                windows_status: Some("0xC0000374".into()),
+                ..Default::default()
+            },
+            Some("colmap_crash"),
+            "prior Caspar crash",
+        ));
+        assert!(native_alignment_rejected(&SplatError::EngineProcess(
+            Box::new(final_failure)
+        )));
+        let crash = failure(
+            ProcessTermination {
+                exit_code: Some(-1073740940),
+                windows_status: Some("0xC0000374".into()),
+                ..Default::default()
+            },
+            Some("colmap_crash"),
+            "alignment failed before crash",
+        );
+        assert!(!native_alignment_rejected(&SplatError::EngineProcess(
+            Box::new(crash)
+        )));
+        let storage = failure(normal, Some("mapper_storage"), "insufficient disk space");
+        assert!(!native_alignment_rejected(&SplatError::EngineProcess(
+            Box::new(storage)
+        )));
+        assert!(!native_alignment_rejected(&SplatError::Cancelled));
+        assert!(!native_alignment_rejected(&SplatError::Io(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "alignment failed")
+        )));
+    }
+
     #[tokio::test]
     async fn gps_fallback_is_frozen_resumes_and_never_mutates_published_or_source_files() {
         let dir = tempfile::tempdir().unwrap();

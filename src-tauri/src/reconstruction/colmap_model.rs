@@ -122,7 +122,7 @@ pub fn read_cameras(model: &Path) -> Result<Vec<ColmapCamera>> {
     Ok(cameras)
 }
 
-fn read_cameras_text(path: &Path) -> Result<Vec<ColmapCamera>> {
+pub(super) fn read_cameras_text(path: &Path) -> Result<Vec<ColmapCamera>> {
     let text = std::fs::read_to_string(path)?;
     let rows = text
         .lines()

@@ -1,12 +1,13 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     fs::File,
     io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use image::{ColorType, DynamicImage, GrayImage, ImageDecoder, ImageReader, Luma};
+use image::{ColorType, DynamicImage, GrayImage, ImageReader, Luma};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -386,6 +387,74 @@ pub fn validate_prepared_image_sequence(
     )
 }
 
+/// Validate the complete frozen input set, including all historical reshoot
+/// batches. Unlike the prefix-based preparation helpers, no image is ignored.
+pub fn validate_prepared_image_names(
+    frames_dir: &Path,
+    colmap_frames_dir: &Path,
+    masks_dir: &Path,
+    expected_names: &[String],
+    has_alpha: bool,
+) -> Result<PreparedImageSequence> {
+    let mut expected = BTreeSet::new();
+    let mut portable_names = BTreeSet::new();
+    for name in expected_names {
+        let path = Path::new(name);
+        if name.is_empty()
+            || name.contains(['/', '\\', ':', '\0', '\n', '\r'])
+            || name.chars().any(char::is_control)
+            || path.file_name().and_then(|value| value.to_str()) != Some(name.as_str())
+            || !is_image_file(path)
+            || !expected.insert(name.as_str())
+            || !portable_names.insert(name.to_ascii_lowercase())
+        {
+            return Err(SplatError::Process(
+                "Prepared image names are unsafe or duplicated".into(),
+            ));
+        }
+    }
+    if expected.is_empty() {
+        return Err(SplatError::Process(
+            "Prepared image names must not be empty".into(),
+        ));
+    }
+
+    let read_exact_images = |directory: &Path| -> Result<Vec<PathBuf>> {
+        let mut images = Vec::new();
+        let mut actual = BTreeSet::new();
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_file() && is_image_file(&path) {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        SplatError::Process("Prepared image name cannot be read".into())
+                    })?;
+                actual.insert(name.to_owned());
+                images.push(path);
+            }
+        }
+        if actual.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+            return Err(SplatError::Process(
+                "Prepared image set does not match the saved image names".into(),
+            ));
+        }
+        images.sort_by(|left, right| natural_cmp(&file_name(left), &file_name(right)));
+        Ok(images)
+    };
+    let frames = read_exact_images(frames_dir)?;
+    let colmap_frames = read_exact_images(colmap_frames_dir)?;
+    validate_selected_sequence(
+        &frames,
+        &colmap_frames,
+        masks_dir,
+        expected_names.len() as u64,
+        has_alpha,
+        None,
+    )
+}
+
 fn validate_named_sequence_with_cancellation(
     frames_dir: &Path,
     colmap_frames_dir: &Path,
@@ -403,8 +472,34 @@ fn validate_named_sequence_with_cancellation(
                 .is_some_and(|name| name.starts_with(prefix))
         })
         .collect::<Vec<_>>();
+    let colmap_frames = list_images(colmap_frames_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    validate_selected_sequence(
+        &frames,
+        &colmap_frames,
+        masks_dir,
+        expected_count,
+        has_alpha,
+        cancellation,
+    )
+}
+
+fn validate_selected_sequence(
+    frames: &[PathBuf],
+    colmap_frames: &[PathBuf],
+    masks_dir: &Path,
+    expected_count: u64,
+    has_alpha: bool,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PreparedImageSequence> {
     let mut invalid_frame = false;
-    for path in &frames {
+    for path in frames {
         ensure_not_cancelled(cancellation)?;
         invalid_frame |= std::fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
     }
@@ -415,14 +510,6 @@ fn validate_named_sequence_with_cancellation(
         )));
     }
 
-    let colmap_frames = list_images(colmap_frames_dir)?
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(prefix))
-        })
-        .collect::<Vec<_>>();
     if colmap_frames.len() != frames.len() {
         return Err(SplatError::Process(format!(
             "COLMAP 图片检查点不完整：预期 {} 张，实际 {} 张",
@@ -430,7 +517,7 @@ fn validate_named_sequence_with_cancellation(
             colmap_frames.len()
         )));
     }
-    for (frame, colmap_frame) in frames.iter().zip(&colmap_frames) {
+    for (frame, colmap_frame) in frames.iter().zip(colmap_frames) {
         ensure_not_cancelled(cancellation)?;
         if frame.file_name() != colmap_frame.file_name()
             || std::fs::metadata(colmap_frame).map_or(true, |metadata| metadata.len() == 0)
@@ -444,7 +531,7 @@ fn validate_named_sequence_with_cancellation(
     }
 
     let mask_count = if has_alpha {
-        for frame in &frames {
+        for frame in frames {
             ensure_not_cancelled(cancellation)?;
             let name = frame
                 .file_name()
@@ -483,17 +570,19 @@ fn decode_image(path: &Path) -> Result<DynamicImage> {
 }
 
 fn read_image_header(path: &Path) -> Result<((u32, u32), bool)> {
-    let decoder = ImageReader::open(path)
-        .map_err(|error| SplatError::Process(format!("无法读取图片 {}：{error}", path.display())))?
-        .with_guessed_format()
-        .map_err(|error| {
-            SplatError::Process(format!("无法识别图片格式 {}：{error}", path.display()))
-        })?
-        .into_decoder()
-        .map_err(|error| {
-            SplatError::Process(format!("无法读取图片头 {}：{error}", path.display()))
-        })?;
-    Ok((decoder.dimensions(), decoder.color_type().has_alpha()))
+    // Constructing image's JPEG decoder reads the whole file even when only
+    // dimensions are requested. Share the bounded preflight reader instead.
+    let header = super::image_projection::inspect(path).map_err(|error| {
+        SplatError::Process(format!("无法读取图片头 {}：{error}", path.display()))
+    })?;
+    // Projection inspection reports EXIF-oriented dimensions. These callers
+    // compare the encoded pixels and masks; do not rotate their coordinate map.
+    let dimensions = if (5..=8).contains(&header.orientation) {
+        (header.height, header.width)
+    } else {
+        (header.width, header.height)
+    };
+    Ok((dimensions, header.alpha))
 }
 
 fn write_alpha_mask(image: &DynamicImage, destination: &Path) -> Result<()> {
@@ -707,7 +796,7 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn natural_cmp(left: &str, right: &str) -> Ordering {
+pub(crate) fn natural_cmp(left: &str, right: &str) -> Ordering {
     let left = left.as_bytes();
     let right = right.as_bytes();
     let (mut a, mut b) = (0, 0);
@@ -749,7 +838,7 @@ fn natural_cmp(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ColorType, ImageBuffer, Rgba, RgbaImage};
+    use image::{ColorType, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
 
     fn write_rgba(path: &Path, alpha: u8) {
         RgbaImage::from_pixel(2, 2, Rgba([10, 20, 30, alpha]))
@@ -782,6 +871,118 @@ mod tests {
 
         RgbaImage::new(3, 2).save(dir.path().join("2.png")).unwrap();
         assert!(analyze_image_sequence(dir.path()).is_err());
+    }
+
+    #[test]
+    fn jpeg_dimensions_use_the_bounded_metadata_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.jpg");
+        image::RgbImage::new(5, 3).save(&path).unwrap();
+        let before = super::super::image_projection::header_reads_for_test(dir.path());
+
+        assert_eq!(read_image_header(&path).unwrap(), ((5, 3), false));
+        assert_eq!(
+            super::super::image_projection::header_reads_for_test(dir.path()) - before,
+            1,
+        );
+    }
+
+    fn exif_orientation(orientation: u16) -> Vec<u8> {
+        let mut data = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        data.extend(orientation.to_le_bytes());
+        data.extend([0; 6]);
+        data
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        chunk.extend(kind);
+        chunk.extend(data);
+        let crc = crc32fast::hash(&chunk[4..]);
+        chunk.extend(crc.to_be_bytes());
+        chunk
+    }
+
+    #[test]
+    fn lightweight_dimensions_preserve_encoded_pixels_for_exif_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        for orientation in 1..=8 {
+            let tiff = exif_orientation(orientation);
+            for extension in ["jpg", "png"] {
+                let path = dir.path().join(format!("{orientation}.{extension}"));
+                image::RgbImage::new(5, 3).save(&path).unwrap();
+                let mut encoded = std::fs::read(&path).unwrap();
+                if extension == "jpg" {
+                    let mut data = b"Exif\0\0".to_vec();
+                    data.extend(&tiff);
+                    let mut segment = vec![0xff, 0xe1];
+                    segment.extend(((data.len() + 2) as u16).to_be_bytes());
+                    segment.extend(data);
+                    encoded.splice(2..2, segment);
+                } else {
+                    let end = encoded.len() - 12;
+                    encoded.splice(end..end, png_chunk(b"eXIf", &tiff));
+                }
+                std::fs::write(&path, encoded).unwrap();
+                let inspected = super::super::image_projection::inspect(&path).unwrap();
+                assert_eq!(inspected.orientation, orientation as u8);
+                assert_eq!(read_image_header(&path).unwrap(), ((5, 3), false));
+            }
+        }
+    }
+
+    #[test]
+    fn lightweight_header_keeps_palette_transparency() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("palette.png");
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.extend(png_chunk(b"IHDR", b"\0\0\0\x02\0\0\0\x01\x08\x03\0\0\0"));
+        data.extend(png_chunk(b"PLTE", &[12, 34, 56, 78, 90, 12]));
+        data.extend(png_chunk(b"tRNS", &[0, 255]));
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Default::default());
+        encoder.write_all(&[0, 0, 1]).unwrap();
+        data.extend(png_chunk(b"IDAT", &encoder.finish().unwrap()));
+        data.extend(png_chunk(b"IEND", &[]));
+        std::fs::write(&path, data).unwrap();
+
+        assert!(image::open(&path).unwrap().color().has_alpha());
+        assert_eq!(read_image_header(&path).unwrap(), ((2, 1), true));
+    }
+
+    #[test]
+    fn lightweight_header_errors_keep_the_input_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("invalid.jpg", &b"not an image"[..]),
+            ("truncated.png", &b"\x89PNG\r\n\x1a\n"[..]),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_image_header(&path)
+                .unwrap_err()
+                .to_string()
+                .contains(name));
+        }
+    }
+
+    #[test]
+    fn lightweight_dimensions_do_not_replace_full_copy_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("frame.jpg");
+        let counterpart = dir.path().join("colmap.jpg");
+        image::RgbImage::new(5, 3).save(&frame).unwrap();
+        std::fs::copy(&frame, &counterpart).unwrap();
+        validate_colmap_frame_copy(&frame, &counterpart).unwrap();
+        let mut bytes = std::fs::read(&counterpart).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&counterpart, bytes).unwrap();
+
+        assert_eq!(
+            read_image_header(&frame).unwrap(),
+            read_image_header(&counterpart).unwrap()
+        );
+        assert!(validate_colmap_frame_copy(&frame, &counterpart).is_err());
     }
 
     #[test]
@@ -1128,6 +1329,202 @@ mod tests {
             true,
         )
         .is_err());
+    }
+
+    fn prepared_name_fixture(has_alpha: bool) -> (tempfile::TempDir, Vec<String>) {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["frames", "colmap_frames", "masks"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let names = vec![
+            "frame_000001.png".to_owned(),
+            "reshoot_000001.png".to_owned(),
+            "reshoot_second_000001.png".to_owned(),
+        ];
+        for (name, (width, height)) in names.iter().zip([(2, 3), (5, 2), (3, 7)]) {
+            let frame = root.path().join("frames").join(name);
+            if has_alpha {
+                RgbaImage::from_pixel(width, height, Rgba([11, 22, 33, 64]))
+                    .save(&frame)
+                    .unwrap();
+                GrayImage::from_pixel(width, height, Luma([0]))
+                    .save(root.path().join("masks").join(format!("{name}.png")))
+                    .unwrap();
+            } else {
+                image::RgbImage::from_pixel(width, height, image::Rgb([11, 22, 33]))
+                    .save(&frame)
+                    .unwrap();
+            }
+            std::fs::copy(&frame, root.path().join("colmap_frames").join(name)).unwrap();
+        }
+        (root, names)
+    }
+
+    fn validate_name_fixture(
+        root: &Path,
+        names: &[String],
+        has_alpha: bool,
+    ) -> Result<PreparedImageSequence> {
+        validate_prepared_image_names(
+            &root.join("frames"),
+            &root.join("colmap_frames"),
+            &root.join("masks"),
+            names,
+            has_alpha,
+        )
+    }
+
+    #[test]
+    fn exact_prepared_names_accept_primary_and_multiple_reshoot_batches_with_mixed_dimensions() {
+        let (root, mut names) = prepared_name_fixture(false);
+        names.reverse();
+        assert_eq!(
+            validate_name_fixture(root.path(), &names, false).unwrap(),
+            PreparedImageSequence {
+                image_count: 3,
+                mask_count: 0,
+                has_alpha: false,
+            }
+        );
+        // These APIs intentionally validate just their own preparation prefix.
+        assert_eq!(
+            validate_prepared_image_sequence(
+                &root.path().join("frames"),
+                &root.path().join("colmap_frames"),
+                &root.path().join("masks"),
+                1,
+                false,
+            )
+            .unwrap()
+            .image_count,
+            1,
+        );
+        assert_eq!(
+            validate_reshoot_image_sequence(
+                &root.path().join("frames"),
+                &root.path().join("colmap_frames"),
+                &root.path().join("masks"),
+                2,
+                false,
+            )
+            .unwrap()
+            .image_count,
+            2,
+        );
+    }
+
+    #[test]
+    fn exact_prepared_names_reject_unsafe_empty_duplicate_or_unsupported_names() {
+        let (root, names) = prepared_name_fixture(false);
+        assert!(validate_name_fixture(root.path(), &[], false).is_err());
+        for invalid in [
+            "",
+            "../frame_000001.png",
+            "nested/frame_000001.png",
+            "nested\\frame_000001.png",
+            "/frame_000001.png",
+            "C:\\frame_000001.png",
+            "C:frame_000001.png",
+            "frame\0.png",
+            "frame\n.png",
+            "frame\r.png",
+            "frame\t.png",
+            "frame.webp",
+            "frame_000001.png",
+            "FRAME_000001.PNG",
+        ] {
+            let mut invalid_names = names.clone();
+            invalid_names.push(invalid.to_owned());
+            assert!(
+                validate_name_fixture(root.path(), &invalid_names, false).is_err(),
+                "accepted unsafe or duplicate name {invalid:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_prepared_names_reject_missing_extra_and_same_count_replacement_in_either_directory() {
+        for directory in ["frames", "colmap_frames"] {
+            for mutation in ["missing", "extra", "replacement"] {
+                let (root, names) = prepared_name_fixture(false);
+                let directory = root.path().join(directory);
+                match mutation {
+                    "missing" => std::fs::remove_file(directory.join(&names[1])).unwrap(),
+                    "extra" => {
+                        std::fs::copy(directory.join(&names[0]), directory.join("unexpected.png"))
+                            .unwrap();
+                    }
+                    "replacement" => {
+                        std::fs::rename(
+                            directory.join(&names[1]),
+                            directory.join("unexpected.png"),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    validate_name_fixture(root.path(), &names, false).is_err(),
+                    "accepted {mutation} image in {}",
+                    directory.display(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_prepared_names_reject_changed_colmap_pixels_dimensions_and_empty_frames() {
+        for mutation in ["pixels", "dimensions", "empty", "corrupt"] {
+            let (root, names) = prepared_name_fixture(false);
+            let changed = root.path().join("colmap_frames").join(&names[2]);
+            match mutation {
+                "pixels" => image::RgbImage::from_pixel(3, 7, image::Rgb([44, 55, 66]))
+                    .save(&changed)
+                    .unwrap(),
+                "dimensions" => image::RgbImage::new(4, 7).save(&changed).unwrap(),
+                "empty" => std::fs::write(&changed, []).unwrap(),
+                "corrupt" => std::fs::write(&changed, b"not a PNG").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_name_fixture(root.path(), &names, false).is_err(),
+                "accepted {mutation} COLMAP image",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_prepared_names_validate_alpha_masks_for_every_historical_batch() {
+        let (root, names) = prepared_name_fixture(true);
+        assert_eq!(
+            validate_name_fixture(root.path(), &names, true).unwrap(),
+            PreparedImageSequence {
+                image_count: 3,
+                mask_count: 3,
+                has_alpha: true,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_prepared_names_reject_missing_nonbinary_or_mismatched_alpha_masks() {
+        for mutation in ["missing", "nonbinary", "dimensions", "color"] {
+            let (root, names) = prepared_name_fixture(true);
+            let mask = root.path().join("masks").join(format!("{}.png", names[2]));
+            match mutation {
+                "missing" => std::fs::remove_file(&mask).unwrap(),
+                "nonbinary" => GrayImage::from_pixel(3, 7, Luma([1])).save(&mask).unwrap(),
+                "dimensions" => GrayImage::from_pixel(4, 7, Luma([255]))
+                    .save(&mask)
+                    .unwrap(),
+                "color" => image::RgbImage::new(3, 7).save(&mask).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_name_fixture(root.path(), &names, true).is_err(),
+                "accepted {mutation} mask",
+            );
+        }
     }
 
     #[test]

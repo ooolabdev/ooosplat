@@ -1,4 +1,4 @@
-//! Ordinary-image Detailed ceiling, adapted from TangoGS's static allowance.
+//! Ordinary-image Splat ceilings, adapted from TangoGS's static allowance.
 //! This does not implement TangoGS's growth/pruning controller or promise a
 //! final point count. ERP faces must not be paired with spherical tracks.
 use std::{
@@ -14,11 +14,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::{Result, SplatError},
+    presets::Quality,
     reconstruction::colmap_model::read_cameras,
 };
 
+/// Preserve the native-resolution Detailed snapshot format for saved tasks.
 pub const VERSION: u32 = 1;
 pub const COEFFICIENT: f64 = 0.5;
+pub const TIER_VERSION: u32 = 2;
 const TANGO_SCALE: f64 = 2_462_476.0 * 0.063_362_106;
 const DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 
@@ -34,13 +37,49 @@ pub struct FineSplatBudget {
     pub observations: u64,
     pub mean_track_length: f64,
     pub requested_max_splats: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<Quality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_max_resolution: Option<u32>,
 }
 
 impl FineSplatBudget {
     pub fn validated_ceiling(self, sparse_points: u64) -> Result<u32> {
         if self.version != VERSION
             || self.coefficient != COEFFICIENT
-            || self.sparse_points != sparse_points
+            || self.quality.is_some()
+            || self.training_max_resolution.is_some()
+        {
+            return Err(invalid());
+        }
+        self.validate_values(sparse_points)
+    }
+
+    /// The new tier budgets are bound to the actual Brush load resolution.
+    /// Legacy Detailed records remain byte-for-byte compatible and are not
+    /// reinterpreted at another quality or resolution.
+    pub fn validated_ceiling_for_quality(
+        self,
+        sparse_points: u64,
+        quality: Quality,
+        max_resolution: u32,
+    ) -> Result<u32> {
+        if quality == Quality::High {
+            return self.validated_ceiling(sparse_points);
+        }
+        if self.version != TIER_VERSION
+            || self.coefficient != coefficient(quality)
+            || self.quality != Some(quality)
+            || self.training_max_resolution != Some(max_resolution)
+            || max_resolution == 0
+        {
+            return Err(invalid());
+        }
+        self.validate_values(sparse_points)
+    }
+
+    fn validate_values(self, sparse_points: u64) -> Result<u32> {
+        if self.sparse_points != sparse_points
             || self.tracked_points > sparse_points
             || self.registered_images == 0
             || !self.mean_track_length.is_finite()
@@ -48,10 +87,11 @@ impl FineSplatBudget {
                 .abs()
                 > 1e-12 * self.mean_track_length.abs().max(1.)
             || self.requested_max_splats
-                != ceiling(
+                != ceiling_with_coefficient(
                     self.effective_pixels,
                     self.tracked_points,
                     self.observations,
+                    self.coefficient,
                 )?
         {
             return Err(invalid());
@@ -60,8 +100,16 @@ impl FineSplatBudget {
     }
 }
 
+pub const fn coefficient(quality: Quality) -> f64 {
+    match quality {
+        Quality::Fast => 0.2,
+        Quality::Balanced => 0.4,
+        Quality::High => COEFFICIENT,
+    }
+}
+
 fn invalid() -> SplatError {
-    SplatError::Process("Cannot calculate Detailed Splat budget from invalid training data".into())
+    SplatError::Process("Cannot calculate Splat budget from invalid training data".into())
 }
 
 fn check(cancel: &CancellationToken) -> Result<()> {
@@ -248,7 +296,11 @@ fn tracks(model: &Path, images: &[Image], cancel: &CancellationToken) -> Result<
 
 /// Count Alpha > 0, not COLMAP's Alpha >= 0.5 feature mask. The latter would
 /// incorrectly remove semi-transparent pixels that still participate in Brush.
-fn effective_pixels(path: &Path, cancel: &CancellationToken) -> Result<((u32, u32), u64)> {
+fn effective_pixels(
+    path: &Path,
+    max_resolution: Option<u32>,
+    cancel: &CancellationToken,
+) -> Result<((u32, u32), u64)> {
     check(cancel)?;
     let decoder = ImageReader::open(path)?
         .with_guessed_format()?
@@ -259,11 +311,39 @@ fn effective_pixels(path: &Path, cancel: &CancellationToken) -> Result<((u32, u3
     if total == 0 || decoder.total_bytes() > DECODE_LIMIT {
         return Err(invalid());
     }
+    let output_dimensions = if let Some(max) = max_resolution {
+        if max == 0 {
+            return Err(invalid());
+        }
+        let decoded_dimensions = jpeg_decode_dimensions(path, dimensions, max, cancel)?;
+        brush_output_dimensions(decoded_dimensions, max)
+    } else {
+        dimensions
+    };
     if !decoder.color_type().has_alpha() {
-        return Ok((dimensions, total));
+        return Ok((
+            dimensions,
+            u64::from(output_dimensions.0) * u64::from(output_dimensions.1),
+        ));
     }
-    let decoded =
+    let mut decoded =
         DynamicImage::from_decoder(decoder).map_err(|e| SplatError::Process(e.to_string()))?;
+    check(cancel)?;
+    if dimensions != output_dimensions {
+        // Match the pinned Brush LoadImage::load path, including f32 size
+        // truncation and Alpha support after Lanczos filtering.
+        decoded = decoded.resize_exact(
+            output_dimensions.0,
+            output_dimensions.1,
+            image::imageops::FilterType::Lanczos3,
+        );
+        check(cancel)?;
+    }
+    if max_resolution.is_some() {
+        // Brush's packed training tensor is RGBA8, including for 16-bit
+        // sources. Preserve the historical native-alpha rule only for v1.
+        decoded = DynamicImage::ImageRgba8(decoded.into_rgba8());
+    }
     let mut count = 0_u64;
     macro_rules! count {
         ($buffer:expr, $channels:expr, $alpha:expr) => {
@@ -286,11 +366,126 @@ fn effective_pixels(path: &Path, cancel: &CancellationToken) -> Result<((u32, u3
     Ok((dimensions, count))
 }
 
+/// Brush caps the long edge with an f32 scale, then truncates both dimensions.
+/// This intentionally does not use image::resize's aspect-ratio rounding.
+fn brush_output_dimensions((width, height): (u32, u32), max: u32) -> (u32, u32) {
+    let scale = max as f32 / width.max(height).max(max) as f32;
+    if scale < 1.0 {
+        (
+            (width as f32 * scale).max(1.0) as u32,
+            (height as f32 * scale).max(1.0) as u32,
+        )
+    } else {
+        (width, height)
+    }
+}
+
+/// Pinned Brush uses jpeg-decoder's IDCT thumbnail before its final resize for
+/// ordinary 8-bit JPEGs. Read only marker headers (at most 64 KiB), not pixels;
+/// unsupported/ambiguous JPEG metadata follows Brush's native decode fallback.
+fn jpeg_decode_dimensions(
+    path: &Path,
+    dimensions: (u32, u32),
+    max: u32,
+    cancel: &CancellationToken,
+) -> Result<(u32, u32)> {
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
+    {
+        return Ok(dimensions);
+    }
+    let mut reader = BufReader::new(File::open(path)?);
+    if bytes::<2>(&mut reader)? != [0xff, 0xd8] {
+        return Ok(dimensions);
+    }
+    let mut header_bytes = 2_u64;
+    while header_bytes < 64 * 1024 {
+        check(cancel)?;
+        if bytes::<1>(&mut reader)? != [0xff] {
+            return Ok(dimensions);
+        }
+        let mut marker = bytes::<1>(&mut reader)?[0];
+        header_bytes += 2;
+        while marker == 0xff && header_bytes < 64 * 1024 {
+            marker = bytes::<1>(&mut reader)?[0];
+            header_bytes += 1;
+        }
+        if matches!(marker, 0 | 0xd9 | 0xda) {
+            return Ok(dimensions);
+        }
+        if matches!(marker, 0x01 | 0xd0..=0xd8) {
+            continue;
+        }
+        let length = u16::from_be_bytes(bytes(&mut reader)?) as u64;
+        header_bytes += 2;
+        if length < 2 {
+            return Ok(dimensions);
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if length < 8 {
+                return Ok(dimensions);
+            }
+            let header = bytes::<6>(&mut reader)?;
+            let size = (
+                u16::from_be_bytes([header[3], header[4]]) as u32,
+                u16::from_be_bytes([header[1], header[2]]) as u32,
+            );
+            if !matches!(marker, 0xc0..=0xc2)
+                || header[0] != 8
+                || !matches!(header[5], 1 | 3)
+                || length != 8 + u64::from(header[5]) * 3
+                || size != dimensions
+            {
+                return Ok(dimensions);
+            }
+            let target = max.min(u32::from(u16::MAX));
+            for divisor in [8, 4, 2, 1] {
+                let scaled = (size.0.div_ceil(divisor), size.1.div_ceil(divisor));
+                if scaled.0 >= target || scaled.1 >= target || divisor == 1 {
+                    return Ok(scaled);
+                }
+            }
+        }
+        reader.seek(SeekFrom::Current((length - 2) as i64))?;
+    }
+    Ok(dimensions)
+}
+
 pub fn ceiling(effective_pixels: u64, tracked: u64, observations: u64) -> Result<u32> {
-    if effective_pixels == 0 || tracked == 0 || observations < tracked {
+    ceiling_with_coefficient(effective_pixels, tracked, observations, COEFFICIENT)
+}
+
+pub fn ceiling_for_quality(
+    effective_pixels: u64,
+    tracked: u64,
+    observations: u64,
+    quality: Quality,
+) -> Result<u32> {
+    ceiling_with_coefficient(
+        effective_pixels,
+        tracked,
+        observations,
+        coefficient(quality),
+    )
+}
+
+fn ceiling_with_coefficient(
+    effective_pixels: u64,
+    tracked: u64,
+    observations: u64,
+    coefficient: f64,
+) -> Result<u32> {
+    if effective_pixels == 0
+        || tracked == 0
+        || observations < tracked
+        || !coefficient.is_finite()
+        || coefficient <= 0.0
+    {
         return Err(invalid());
     }
-    let value = (COEFFICIENT
+    let value = (coefficient
         * (TANGO_SCALE * effective_pixels as f64 * tracked as f64 / observations as f64).sqrt())
     .round();
     if !value.is_finite() || value < 1.0 || value > f64::from(u32::MAX) {
@@ -304,6 +499,33 @@ pub fn ceiling(effective_pixels: u64, tracked: u64, observations: u64) -> Result
 pub fn calculate(
     model: &Path,
     image_root: &Path,
+    cancel: &CancellationToken,
+) -> Result<FineSplatBudget> {
+    calculate_internal(model, image_root, None, cancel)
+}
+
+pub fn calculate_for_quality(
+    model: &Path,
+    image_root: &Path,
+    quality: Quality,
+    max_resolution: u32,
+    cancel: &CancellationToken,
+) -> Result<FineSplatBudget> {
+    if max_resolution == 0 {
+        return Err(invalid());
+    }
+    if quality == Quality::High {
+        // Do not change the existing Detailed formula or snapshot identity.
+        calculate(model, image_root, cancel)
+    } else {
+        calculate_internal(model, image_root, Some((quality, max_resolution)), cancel)
+    }
+}
+
+fn calculate_internal(
+    model: &Path,
+    image_root: &Path,
+    tier: Option<(Quality, u32)>,
     cancel: &CancellationToken,
 ) -> Result<FineSplatBudget> {
     check(cancel)?;
@@ -328,7 +550,7 @@ pub fn calculate(
         if !path.starts_with(&root) || !path.is_file() {
             return Err(invalid());
         }
-        let (dimensions, valid) = effective_pixels(&path, cancel)?;
+        let (dimensions, valid) = effective_pixels(&path, tier.map(|(_, max)| max), cancel)?;
         let camera = cameras
             .iter()
             .find(|c| c.id == image.camera)
@@ -339,15 +561,25 @@ pub fn calculate(
         pixels = pixels.checked_add(valid).ok_or_else(invalid)?;
     }
     Ok(FineSplatBudget {
-        version: VERSION,
-        coefficient: COEFFICIENT,
+        version: if tier.is_some() {
+            TIER_VERSION
+        } else {
+            VERSION
+        },
+        coefficient: tier.map_or(COEFFICIENT, |(quality, _)| coefficient(quality)),
         registered_images: images.len() as u64,
         effective_pixels: pixels,
         sparse_points: points,
         tracked_points: tracked,
         observations,
         mean_track_length: observations as f64 / tracked as f64,
-        requested_max_splats: ceiling(pixels, tracked, observations)?,
+        requested_max_splats: if let Some((quality, _)) = tier {
+            ceiling_for_quality(pixels, tracked, observations, quality)?
+        } else {
+            ceiling(pixels, tracked, observations)?
+        },
+        quality: tier.map(|(quality, _)| quality),
+        training_max_resolution: tier.map(|(_, max)| max),
     })
 }
 
@@ -362,6 +594,166 @@ mod tests {
         assert_eq!(ceiling(56_578_232, 34_842, 202_872).unwrap(), 615_653);
         for inputs in [(0, 1, 1), (1, 0, 1), (1, 2, 1), (u64::MAX, 1, 1)] {
             assert!(ceiling(inputs.0, inputs.1, inputs.2).is_err());
+        }
+    }
+
+    #[test]
+    fn fast_and_balanced_use_the_confirmed_coefficients() {
+        let inputs = (364_993_345, 66_218, 191_175);
+        assert_eq!(
+            ceiling_for_quality(inputs.0, inputs.1, inputs.2, Quality::Fast).unwrap(),
+            888_272
+        );
+        assert_eq!(
+            ceiling_for_quality(inputs.0, inputs.1, inputs.2, Quality::Balanced).unwrap(),
+            1_776_543
+        );
+        assert_eq!(
+            ceiling_for_quality(inputs.0, inputs.1, inputs.2, Quality::High).unwrap(),
+            ceiling(inputs.0, inputs.1, inputs.2).unwrap()
+        );
+        for coefficient in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(ceiling_with_coefficient(1, 1, 1, coefficient).is_err());
+        }
+    }
+
+    #[test]
+    fn tier_snapshot_is_bound_to_quality_and_actual_training_resolution() {
+        let (_temp, model, root) = fixture();
+        let cancel = CancellationToken::new();
+        for quality in [Quality::Fast, Quality::Balanced] {
+            let budget = calculate_for_quality(&model, &root, quality, 2, &cancel).unwrap();
+            assert_eq!(budget.version, TIER_VERSION);
+            assert_eq!(budget.coefficient, coefficient(quality));
+            assert_eq!(budget.quality, Some(quality));
+            assert_eq!(budget.training_max_resolution, Some(2));
+            assert_eq!(
+                budget.validated_ceiling_for_quality(3, quality, 2).unwrap(),
+                budget.requested_max_splats
+            );
+            assert!(budget.validated_ceiling(3).is_err());
+            assert!(budget.validated_ceiling_for_quality(3, quality, 3).is_err());
+            assert!(budget.validated_ceiling_for_quality(4, quality, 2).is_err());
+            assert!(budget
+                .validated_ceiling_for_quality(3, Quality::High, 2)
+                .is_err());
+            let mut changed = budget;
+            changed.coefficient = 0.5;
+            assert!(changed
+                .validated_ceiling_for_quality(3, quality, 2)
+                .is_err());
+            changed = budget;
+            changed.version = VERSION;
+            assert!(changed
+                .validated_ceiling_for_quality(3, quality, 2)
+                .is_err());
+            changed = budget;
+            changed.requested_max_splats += 1;
+            assert!(changed
+                .validated_ceiling_for_quality(3, quality, 2)
+                .is_err());
+        }
+        assert!(calculate_for_quality(&model, &root, Quality::Fast, 0, &cancel).is_err());
+        let fast = calculate_for_quality(&model, &root, Quality::Fast, 2, &cancel).unwrap();
+        assert!(fast
+            .validated_ceiling_for_quality(3, Quality::Balanced, 2)
+            .is_err());
+    }
+
+    #[test]
+    fn detailed_snapshot_keeps_its_original_serialized_identity() {
+        let (_temp, model, root) = fixture();
+        let cancel = CancellationToken::new();
+        let legacy = calculate(&model, &root, &cancel).unwrap();
+        let new_entry = calculate_for_quality(&model, &root, Quality::High, 1, &cancel).unwrap();
+        assert_eq!(legacy, new_entry);
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        assert!(!encoded.contains("quality"));
+        assert!(!encoded.contains("trainingMaxResolution"));
+        let restored: FineSplatBudget = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), encoded);
+        assert_eq!(
+            restored.validated_ceiling(3).unwrap(),
+            legacy.requested_max_splats
+        );
+    }
+
+    #[test]
+    fn effective_pixels_follow_brush_resize_and_rgba8_alpha_without_writing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image.png");
+        let cancel = CancellationToken::new();
+        image::RgbImage::new(11, 7).save(&path).unwrap();
+        assert_eq!(
+            effective_pixels(&path, Some(5), &cancel).unwrap(),
+            ((11, 7), 15)
+        );
+        assert_eq!(effective_pixels(&path, Some(20), &cancel).unwrap().1, 77);
+        assert_eq!(brush_output_dimensions((2, 100), 1), (1, 1));
+        assert_eq!(brush_output_dimensions((100, 2), 1), (1, 1));
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(8, 4, |x, y| {
+            image::Rgba([10, 20, 30, if (x + y) % 4 == 0 { 65535 } else { 1 }])
+        })
+        .save(&path)
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let loaded = image::open(&path)
+            .unwrap()
+            .resize_exact(4, 2, image::imageops::FilterType::Lanczos3)
+            .into_rgba8();
+        let expected = loaded.pixels().filter(|pixel| pixel[3] > 0).count() as u64;
+        assert_eq!(
+            effective_pixels(&path, Some(4), &cancel).unwrap().1,
+            expected
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 1]),
+        )
+        .save(&path)
+        .unwrap();
+        assert_eq!(effective_pixels(&path, None, &cancel).unwrap().1, 4);
+        assert_eq!(effective_pixels(&path, Some(2), &cancel).unwrap().1, 0);
+    }
+
+    #[test]
+    fn jpeg_dimensions_match_idct_headers_and_unsupported_formats_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image.JPG");
+        let cancel = CancellationToken::new();
+        let write_header = |marker, precision, channels: u8, long_metadata: bool| {
+            let mut bytes = vec![0xff, 0xd8];
+            if long_metadata {
+                // Metadata payload can exceed the read budget without being
+                // read or decoded. Marker headers remain bounded.
+                bytes.extend([0xff, 0xe1, 0xff, 0xff]);
+                bytes.resize(bytes.len() + 65_533, 0);
+            }
+            bytes.extend([0xff, marker]);
+            bytes.extend((8_u16 + u16::from(channels) * 3).to_be_bytes());
+            bytes.push(precision);
+            bytes.extend(1001_u16.to_be_bytes());
+            bytes.extend(2001_u16.to_be_bytes());
+            bytes.push(channels);
+            for channel in 0..channels {
+                bytes.extend([channel + 1, 0x11, 0]);
+            }
+            std::fs::write(&path, bytes).unwrap();
+        };
+        for marker in [0xc0, 0xc1, 0xc2] {
+            write_header(marker, 8, 3, marker == 0xc2);
+            let decoded = jpeg_decode_dimensions(&path, (2001, 1001), 600, &cancel).unwrap();
+            assert_eq!(decoded, (1001, 501));
+            assert_eq!(brush_output_dimensions(decoded, 600), (600, 300));
+        }
+        for (marker, precision, channels) in [(0xc0, 8, 4), (0xc1, 12, 3), (0xc3, 16, 1)] {
+            write_header(marker, precision, channels, false);
+            assert_eq!(
+                jpeg_decode_dimensions(&path, (2001, 1001), 600, &cancel).unwrap(),
+                (2001, 1001)
+            );
         }
     }
 
@@ -483,12 +875,12 @@ mod tests {
         let path = temp.path().join("image.png");
         let cancel = CancellationToken::new();
         image::RgbImage::new(3, 2).save(&path).unwrap();
-        assert_eq!(effective_pixels(&path, &cancel).unwrap().1, 6);
+        assert_eq!(effective_pixels(&path, None, &cancel).unwrap().1, 6);
         image::ImageBuffer::<image::LumaA<u8>, Vec<u8>>::from_raw(3, 1, vec![0, 0, 0, 1, 0, 255])
             .unwrap()
             .save(&path)
             .unwrap();
-        assert_eq!(effective_pixels(&path, &cancel).unwrap().1, 2);
+        assert_eq!(effective_pixels(&path, None, &cancel).unwrap().1, 2);
         image::ImageBuffer::<image::LumaA<u16>, Vec<u16>>::from_raw(
             3,
             1,
@@ -497,10 +889,10 @@ mod tests {
         .unwrap()
         .save(&path)
         .unwrap();
-        assert_eq!(effective_pixels(&path, &cancel).unwrap().1, 2);
+        assert_eq!(effective_pixels(&path, None, &cancel).unwrap().1, 2);
         cancel.cancel();
         assert!(matches!(
-            effective_pixels(&path, &cancel),
+            effective_pixels(&path, None, &cancel),
             Err(SplatError::Cancelled)
         ));
     }
