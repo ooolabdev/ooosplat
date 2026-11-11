@@ -91,6 +91,34 @@ it('localizes the approved reshoot lifecycle logs without exposing Chinese cache
   }
 });
 
+it('localizes Brush training start and step progress messages', () => {
+  for (const [message, expected] of [
+    ['Brush 训练开始（使用可用图形后端）· 15000 iterations · 最大分辨率 1920 · 预计约 00:12:34', 'Brush training started (using an available graphics backend) · 15000 iterations · max resolution 1920 · estimated about 00:12:34'],
+    ['Brush 训练开始（使用可用图形后端）· 30000 iterations · 最大分辨率 3840 · 预计约 100:05:09', 'Brush training started (using an available graphics backend) · 30000 iterations · max resolution 3840 · estimated about 100:05:09'],
+    ['Brush 训练开始（使用可用图形后端）· 15,000 iterations · 最大分辨率 1,920 · 预计约 00:00:00', 'Brush training started (using an available graphics backend) · 15,000 iterations · max resolution 1,920 · estimated about 00:00:00'],
+    ['Brush 训练 · 1200/15000 步', 'Brush training · 1200/15000 steps'],
+    ['Brush 训练 · 1,200/15,000 步', 'Brush training · 1,200/15,000 steps'],
+    ['Brush 训练 · 0/15000 步', 'Brush training · 0/15000 steps'],
+    ['Brush 训练 · 15000/15000 步', 'Brush training · 15000/15000 steps'],
+  ]) {
+    expect(localizePipelineMessage('en', message)).toBe(expected);
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+  }
+});
+
+it('does not translate surrounding raw output or invent missing Brush training fields', () => {
+  for (const message of [
+    'RAW: Brush 训练 · 1200/15000 步',
+    'Brush 训练 · 1200/15000 步 (raw output)',
+    'Brush 训练 · 1200/? 步',
+    'Brush 训练开始（使用可用图形后端）· 15000 iterations · 最大分辨率 1920',
+    'Brush training · 1200/15000 steps',
+  ]) {
+    expect(localizePipelineMessage('en', message)).toBe(message);
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+  }
+});
+
 function Harness() {
   const { locale, t, toggleLocale, formatDuration } = useI18n();
   return <div>
