@@ -2,6 +2,12 @@ import type { PipelineEvent } from '../types/pipeline';
 
 export const isProgressEvent = (event: PipelineEvent) => !event.kind || event.kind === 'stage' || event.kind === 'progress';
 
+/** Preparing images is part of Splat training, not a Brush iteration phase. */
+export function isTrainingPreparation(substage: string | null | undefined) {
+  return substage === 'trainingPreparation' || substage === 'trainingValidation' || substage === 'trainingCheckpoint'
+    || substage === 'panoramaTrainingPreparation' || substage === 'panoramaTrainingValidation';
+}
+
 export function staleOperation(previous: PipelineEvent | null, event: PipelineEvent) {
   if (!previous?.operation || !event.operation) return false;
   return event.operation.id < previous.operation.id

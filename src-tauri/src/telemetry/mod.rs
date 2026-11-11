@@ -210,7 +210,9 @@ impl PipelineTelemetrySession {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        if matches!(error, SplatError::Cancelled) {
+        // An unsupported new selection never started a generation attempt.
+        // Do not turn its UI/MCP admission rejection into a failed-task event.
+        if matches!(error, SplatError::Cancelled | SplatError::InputAdmission(_)) {
             return;
         }
         let stage = self.current_stage();
@@ -319,9 +321,9 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::EngineMissing(_)
         | SplatError::EngineStart { .. }
         | SplatError::UnsupportedEngine(_) => TelemetryErrorCode::EngineUnavailable,
-        SplatError::InvalidVideo(_) | SplatError::InvalidPath(_) => {
-            TelemetryErrorCode::InvalidInput
-        }
+        SplatError::InputAdmission(_)
+        | SplatError::InvalidVideo(_)
+        | SplatError::InvalidPath(_) => TelemetryErrorCode::InvalidInput,
         SplatError::Io(io_error) => {
             if io_error.raw_os_error() == Some(112) {
                 TelemetryErrorCode::DiskSpaceLow
@@ -394,6 +396,43 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
 mod tests {
     use super::*;
     use crate::pipeline::{EventLevel, PipelineEngine};
+
+    #[tokio::test]
+    async fn input_admission_does_not_emit_generation_failure_or_planner_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, events) = TelemetryService::recording(root.path().join("telemetry.json"));
+        service.enable_for_test().await;
+        for reason in [
+            crate::error::InputAdmissionReason::ColmapDisabled,
+            crate::error::InputAdmissionReason::UnsupportedInput,
+        ] {
+            let session = PipelineTelemetrySession::new_with_planner_evaluation(
+                service.clone(),
+                Quality::Balanced,
+                TelemetryInputType::Images,
+                TelemetryRunKind::New,
+                true,
+                PlannerEffectivenessTracker::default(),
+            );
+            let error = SplatError::InputAdmission(reason);
+            assert_eq!(
+                safe_error_code(&error, None),
+                TelemetryErrorCode::InvalidInput
+            );
+            session.generation_failed(&error);
+            assert!(session.finished.load(Ordering::Acquire));
+            assert!(!session
+                .planner_run
+                .as_ref()
+                .unwrap()
+                .emitted
+                .load(Ordering::Acquire));
+            session.generation_failed(&SplatError::Process("late failure".into()));
+            session.generation_completed(1, 30, None);
+        }
+        tokio::task::yield_now().await;
+        assert!(events.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn engine_failure_telemetry_keeps_existing_codes_without_cross_engine_oom_guesses() {
@@ -469,6 +508,20 @@ mod tests {
         assert_eq!(
             safe_error_code(&error, Some(TelemetryStage::ExtractingFeatures)),
             TelemetryErrorCode::ColmapFeatureFailed
+        );
+    }
+
+    #[test]
+    fn retry_preparation_context_preserves_io_telemetry_codes() {
+        let denied = SplatError::Io(std::io::Error::from_raw_os_error(5))
+            .with_io_diagnostic("retry_preparation_operation=archive_retry_cache");
+        assert_eq!(safe_error_code(&denied, None), TelemetryErrorCode::IoFailed);
+
+        let full = SplatError::Io(std::io::Error::from_raw_os_error(112))
+            .with_io_diagnostic("retry_preparation_operation=write_retry_archive_progress");
+        assert_eq!(
+            safe_error_code(&full, None),
+            TelemetryErrorCode::DiskSpaceLow
         );
     }
 

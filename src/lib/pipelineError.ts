@@ -20,6 +20,9 @@ export interface PipelineCommandError extends FailureContext {
   engine?: "system" | "ffmpeg" | "colmap" | "brush";
   failureKind?: PipelineFailureKind;
   projectId?: string;
+  /** Local task-waiter identity; not part of the native error protocol. */
+  taskId?: string;
+  runId?: string;
   projectPath?: string;
   logsDirectory?: string;
   failureId?: string;
@@ -38,6 +41,25 @@ export function taskFailureContext(error: { classification_version?: number | nu
 export function pipelineCommandError(error: unknown): PipelineCommandError | null {
   if (typeof error !== "object" || error == null) return null;
   const candidate = error as Record<string, unknown>;
+  const details = candidate.details;
+  if (details && typeof details === 'object' && 'pipelineError' in details) {
+    const saved = details.pipelineError;
+    if (saved && typeof saved === 'object') {
+      const parsed = parsePipelineCommandError(saved as Record<string, unknown>);
+      if (parsed) return {
+        ...parsed,
+        taskId: parsed.taskId ?? (typeof candidate.task_id === 'string' ? candidate.task_id : undefined),
+        runId: parsed.runId ?? (typeof candidate.run_id === 'string' ? candidate.run_id : undefined),
+        // The service envelope carries diagnostics, not local path capabilities.
+        projectPath: undefined,
+        logsDirectory: undefined,
+      };
+    }
+  }
+  return parsePipelineCommandError(candidate);
+}
+
+function parsePipelineCommandError(candidate: Record<string, unknown>): PipelineCommandError | null {
   const code = candidate.code;
   const message = candidate.message;
   if ((code !== "cancelled" && code !== "pipeline_failed") || typeof message !== "string") return null;
@@ -57,6 +79,8 @@ export function pipelineCommandError(error: unknown): PipelineCommandError | nul
     classificationIsHeuristic: typeof candidate.classificationIsHeuristic === "boolean" ? candidate.classificationIsHeuristic : undefined,
     termination: parseTermination(candidate.termination),
     projectId: typeof candidate.projectId === "string" ? candidate.projectId : undefined,
+    taskId: typeof candidate.taskId === "string" ? candidate.taskId : undefined,
+    runId: typeof candidate.runId === "string" ? candidate.runId : undefined,
     projectPath: typeof candidate.projectPath === "string" ? candidate.projectPath : undefined,
     logsDirectory: typeof candidate.logsDirectory === "string" ? candidate.logsDirectory : undefined,
     failureId: typeof candidate.failureId === "string" ? candidate.failureId : undefined,
@@ -80,6 +104,8 @@ export function pipelineErrorCode(error: unknown): PipelineErrorCode | null {
 
 export function pipelineErrorMessage(error: unknown): string | null {
   if (typeof error === "string") return error;
+  const structured = pipelineCommandError(error);
+  if (structured) return structured.message;
   if (error instanceof Error) return error.message;
   if (typeof error === "object" && error != null && "message" in error) {
     const message = (error as { message?: unknown }).message;

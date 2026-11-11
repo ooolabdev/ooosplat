@@ -10,10 +10,19 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // Windows directory watchers can block cache-directory renames. These
+      // generated pipeline/validation assets never participate in HMR.
+      ignored: ["**/src-tauri/**", "**/.cache/**"],
     },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  optimizeDeps: {
+    // The repository also contains standalone experiment pages with their own
+    // dependencies. Only the desktop application's entry belongs to this dev
+    // server; scanning every HTML file produces unrelated missing-dependency
+    // errors (for example, optional Three.js experiments).
+    entries: ["index.html"],
+  },
   build: {
     // Phase one is Windows-only; WebView2 tracks Chromium.
     target: "chrome105",

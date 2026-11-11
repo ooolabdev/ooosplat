@@ -1,7 +1,361 @@
 use super::*;
 
 #[tokio::test]
-async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
+async fn new_colmap_tasks_are_rejected_without_registering_an_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("model");
+    let images = root.path().join("images");
+    std::fs::create_dir(&model).unwrap();
+    std::fs::create_dir(&images).unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let error = service.create(None, model.clone(), Quality::Balanced,
+        root.path().join("projects"), true, "gui", None,
+        Some(serde_json::json!({"inputs":{"mode":"colmap","input":{"model":model,"images":images}}})))
+        .await.unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_INPUT");
+    assert_eq!(
+        error.reason,
+        Some(crate::error::InputAdmissionReason::ColmapDisabled)
+    );
+    assert!(service.all().await.unwrap().is_empty());
+    assert!(!root.path().join("projects").exists());
+}
+
+#[tokio::test]
+async fn colmap_import_disable_does_not_block_saved_preproject_continuation_or_idempotency() {
+    let (root, service, task) = fixture().await;
+    let model = root.path().join("saved-model");
+    let images = root.path().join("saved-images");
+    std::fs::create_dir(&model).unwrap();
+    std::fs::create_dir(&images).unwrap();
+    std::fs::write(model.join("cameras.txt"), "1 PINHOLE 4 3 4 4 2 1.5\n").unwrap();
+    std::fs::write(
+        model.join("images.txt"),
+        "1 1 0 0 0 0 0 0 1 1.png\n1 1 1\n2 1 0 0 0 1 0 0 1 2.png\n1 1 1\n",
+    )
+    .unwrap();
+    std::fs::write(model.join("points3D.txt"), "1 0 0 3 12 34 56 0 1 0 2 0\n").unwrap();
+    for name in ["1.png", "2.png"] {
+        image::RgbImage::new(4, 3).save(images.join(name)).unwrap();
+    }
+    let run = notification_run(&service, task.task_id);
+    let parameters = {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.status = TaskStatus::Failed;
+        saved.input_path = std::fs::canonicalize(&model).unwrap();
+        saved.input_type = crate::project::ProjectInputType::Images;
+        saved.request_parameters.as_mut().unwrap()["inputs"] = serde_json::json!({
+            "mode":"colmap","input":{"model":std::fs::canonicalize(&model).unwrap(),
+                "images":std::fs::canonicalize(&images).unwrap()}});
+        saved.request_parameters.clone()
+    };
+    // An existing identity is not a request to import a new reconstruction.
+    let existing = service
+        .create(
+            Some(task.task_id),
+            model.clone(),
+            Quality::Balanced,
+            root.path().join("projects"),
+            true,
+            "gui",
+            None,
+            parameters,
+        )
+        .await
+        .unwrap();
+    assert_eq!(existing.task_id, task.task_id);
+    *service.executor.lock().unwrap() = Some(Arc::new(|execution, _| {
+        Box::pin(async move {
+            assert_eq!(
+                execution.request_parameters.as_ref().unwrap()["inputs"]["mode"],
+                "colmap"
+            );
+            assert!(execution.project_id.is_none());
+            Err(crate::error::SplatError::Cancelled)
+        })
+    }));
+    service
+        .continue_identified(task.task_id, run, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    let stopped = service.wait(task.task_id).await.unwrap();
+    assert_eq!(stopped.status, TaskStatus::Cancelled);
+    assert_eq!(stopped.runs[1].kind, "continue");
+}
+
+#[tokio::test]
+async fn ba_scope_is_frozen_before_project_creation_and_old_reservations_keep_their_identity() {
+    use sha2::{Digest, Sha256};
+    for version in [None, Some(crate::pipeline::ba_policy::VERSION)] {
+        let (root, service, task) = fixture().await;
+        assert_eq!(
+            task.ba_policy_version,
+            Some(crate::pipeline::ba_policy::VERSION)
+        );
+        service
+            .records()
+            .tasks
+            .get_mut(&task.task_id)
+            .unwrap()
+            .ba_policy_version = version;
+        *service.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+            Box::pin(async move {
+                assert_eq!(execution.ba_policy_version, version);
+                let intent = execution.creation_intent.as_ref().unwrap();
+                assert_eq!(intent.ba_policy_version, version);
+                if version.is_none() {
+                    let old_bytes = serde_json::to_vec(&serde_json::json!({
+                    "input":execution.input_path,"request":execution.request_parameters,
+                    "quality":execution.quality,"configuration":execution.configuration,
+                    "source":execution.source_project_id,"root":execution.projects_root,
+                    "planner":execution.planner_enabled,"brushExecutionOptions":execution.brush_execution_options,
+                })).unwrap();
+                    assert_eq!(
+                        intent.request_identity,
+                        format!("{:x}", Sha256::digest(old_bytes))
+                    );
+                }
+                Err(crate::error::SplatError::Process(
+                    "creation scope test failure".into(),
+                ))
+            })
+        }));
+        service
+            .start(task.task_id, default_engine_paths(None), None)
+            .await
+            .unwrap();
+        let stopped = service.wait(task.task_id).await.unwrap();
+        service.persist().await.unwrap();
+        let restored = TaskService::at(root.path().join("registry"));
+        let original_intent = stopped.creation_intent.clone();
+        let expected = original_intent.clone();
+        *restored.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+            let expected = expected.clone();
+            Box::pin(async move {
+                assert_eq!(execution.ba_policy_version, version);
+                assert_eq!(execution.creation_intent, expected);
+                Err(crate::error::SplatError::Cancelled)
+            })
+        }));
+        restored
+            .continue_identified(
+                task.task_id,
+                stopped.run_id.unwrap(),
+                default_engine_paths(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let stopped = restored.wait(task.task_id).await.unwrap();
+        assert_eq!(stopped.ba_policy_version, version);
+        assert_eq!(stopped.creation_intent, original_intent);
+    }
+}
+
+#[tokio::test]
+async fn creation_identity_is_durable_before_execution_and_reused_after_restart() {
+    let (root, service, task) = fixture().await;
+    *service.executor.lock().unwrap() = Some(Arc::new(|execution, _| {
+        Box::pin(async move {
+            assert!(execution.creation_intent.is_some());
+            Err(crate::error::SplatError::Process("creation fault".into()))
+        })
+    }));
+    service
+        .start(task.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    let failed = service.wait(task.task_id).await.unwrap();
+    let intent = failed.creation_intent.clone().unwrap();
+    assert_eq!(intent.task_id, task.task_id);
+    assert!(failed.project_id.is_none());
+    let restored = TaskService::at(root.path().join("registry"));
+    let expected = intent.clone();
+    *restored.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+        let expected = expected.clone();
+        Box::pin(async move {
+            assert_eq!(execution.creation_intent, Some(expected));
+            Err(crate::error::SplatError::Cancelled)
+        })
+    }));
+    restored
+        .continue_identified(
+            task.task_id,
+            failed.run_id.unwrap(),
+            default_engine_paths(None),
+            None,
+        )
+        .await
+        .unwrap();
+    let final_task = restored.wait(task.task_id).await.unwrap();
+    assert_eq!(final_task.creation_intent, Some(intent));
+    assert_eq!(final_task.status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn local_gps_summary_survives_bounded_task_view_without_coordinates() {
+    let summary = serde_json::json!({"detectedSourceIds":["images-2"],"status":"fallback"});
+    let snapshot = actual_snapshot(serde_json::json!({"inputs":{"gpsAssistance":summary}}));
+    assert_eq!(snapshot.pointer("/inputs/gpsAssistance").unwrap(), &summary);
+    let decoded: crate::pipeline::inputs::GpsAssistance =
+        serde_json::from_value(summary.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), summary);
+}
+
+#[tokio::test]
+async fn ready_project_binding_is_persisted_and_stale_runs_cannot_replace_it() {
+    let (root, service, task) = fixture().await;
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let stop = signal.clone();
+    *service.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
+        let stop = stop.clone();
+        Box::pin(async move {
+            stop.notified().await;
+            Err(crate::error::SplatError::Cancelled)
+        })
+    }));
+    let started = service
+        .start(task.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    let intent = service
+        .get(task.task_id)
+        .await
+        .unwrap()
+        .creation_intent
+        .unwrap();
+    let metadata = crate::project::ProjectMetadata {
+        id: intent.project_id,
+        workspace_task_id: Some(task.task_id),
+        project_path: intent.project_path.clone(),
+        ..Default::default()
+    };
+    service
+        .bind_created_project(task.task_id, started.run_id.unwrap(), metadata.clone())
+        .await
+        .unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("registry/tasks.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved["tasks"][task.task_id.to_string()]["project_id"],
+        intent.project_id.to_string()
+    );
+    let before = std::fs::read(root.path().join("registry/tasks.json")).unwrap();
+    assert_eq!(
+        service
+            .bind_created_project(task.task_id, Uuid::new_v4(), metadata)
+            .await
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("registry/tasks.json")).unwrap(),
+        before
+    );
+    signal.notify_one();
+    service.wait(task.task_id).await.unwrap();
+}
+
+#[test]
+fn status_summary_does_not_expose_internal_recovery_or_focal_audit_records() {
+    let value = actual_snapshot(serde_json::json!({
+        "inputs": {
+            "recoverySources": [{"originals":["private/source.mov"],"panoramaRecords":[{"pts":42}]}],
+            "temporaryPngFocalRecords": [{"checkpoint":"internal"}],
+            "temporaryPngFocalPendingRecords": [{"checkpoint":"pending"}],
+            "sources": [{"id":"video","originals":["private/source.mov"],"bridgeFrames":[]}]
+        }
+    }));
+    for field in [
+        "recoverySources",
+        "temporaryPngFocalRecords",
+        "temporaryPngFocalPendingRecords",
+    ] {
+        assert!(value["inputs"].get(field).is_none());
+    }
+    assert!(value["inputs"]["sources"][0].get("originals").is_none());
+}
+
+#[test]
+fn generation_entry_future_stays_heap_boxed() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let engines = default_engine_paths(None);
+    let start = service.start_inner(Uuid::nil(), engines.clone(), None, false, None);
+    assert!(std::mem::size_of_val(&start) < 64 * 1024);
+    let runner = PipelineRunner::new(engines, |_| {});
+    let input = root.path().join("input.mp4");
+    let projects = root.path().join("projects");
+    let generate = runner.generate(&input, Quality::Fast, &projects);
+    assert!(
+        std::mem::size_of_val(&generate) < 1024,
+        "the public generation entry must not embed the full pipeline future on a Tokio worker stack"
+    );
+}
+
+#[tokio::test]
+async fn cli_and_desktop_registries_share_one_os_execution_lock() {
+    let (root, first, task) = fixture().await;
+    let lock = root.path().join("shared-generation.lock");
+    let first = first.with_run_lock(lock.clone());
+    let second = TaskService::at(root.path().join("cli-records")).with_run_lock(lock);
+    let next = second
+        .create(
+            None,
+            root.path().join("input.mp4"),
+            Quality::Fast,
+            root.path().join("projects"),
+            true,
+            "cli",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let captured = signal.clone();
+    *first.executor.lock().unwrap() = Some(Arc::new(move |_, _| {
+        let signal = captured.clone();
+        Box::pin(async move {
+            signal.notified().await;
+            Err(crate::error::SplatError::Cancelled)
+        })
+    }));
+    *second.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async { Err(crate::error::SplatError::Cancelled) })
+    }));
+    let receipt = first
+        .start(task.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    assert!(!first.execution_settled(receipt.run_id));
+    assert_eq!(
+        second
+            .start(next.task_id, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "TASK_BUSY"
+    );
+    assert_eq!(
+        second.get(next.task_id).await.unwrap().status,
+        TaskStatus::Created
+    );
+    signal.notify_one();
+    first.wait(task.task_id).await.unwrap();
+    second
+        .start(next.task_id, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    second.wait(next.task_id).await.unwrap();
+    assert!(first.execution_settled(receipt.run_id));
+}
+
+#[tokio::test]
+async fn continue_requires_matching_stopped_run_and_readable_state_not_completed_work() {
     let root = tempfile::tempdir().unwrap();
     let input = root.path().join("clip.mp4");
     std::fs::write(&input, b"fixture").unwrap();
@@ -32,7 +386,7 @@ async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
         let mut records = service.records();
         let t = records.tasks.get_mut(&task.task_id).unwrap();
         t.run_id = Some(run);
-        t.status = TaskStatus::Failed;
+        t.status = TaskStatus::Created;
     }
     assert_eq!(
         service
@@ -50,42 +404,38 @@ async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
             .unwrap()
             .status = TaskStatus::Cancelled;
     }
-    assert_eq!(
-        service
-            .resume_identified(task.task_id, run, default_engine_paths(None), None)
-            .await
-            .unwrap_err()
-            .code,
-        "NO_RESUMABLE_CHECKPOINT"
-    );
     let project = root.path().join("checkpoint");
     std::fs::create_dir(&project).unwrap();
-    let mut state = crate::project::PipelineStateFile::created(Quality::High);
-    state.features_complete = true;
-    atomic_write_json(&project.join("state.json"), &state)
-        .await
-        .unwrap();
     {
         let mut records = service.records();
         let t = records.tasks.get_mut(&task.task_id).unwrap();
         t.project_path = Some(project.clone());
         t.project_id = Some(Uuid::new_v4());
     }
+    persist_bound_project_metadata(&service, task.task_id).await;
     assert_eq!(
         service
             .resume_identified(task.task_id, run, default_engine_paths(None), None)
             .await
             .unwrap_err()
             .code,
-        "NO_RESUMABLE_CHECKPOINT"
+        "IO_ERROR"
     );
-    let frames = project.join("work/frames");
-    std::fs::create_dir_all(&frames).unwrap();
-    for index in 0..2 {
-        image::RgbImage::new(3, 3)
-            .save(frames.join(format!("{index:03}.png")))
-            .unwrap();
-    }
+    std::fs::write(project.join("state.json"), b"not valid json").unwrap();
+    assert_eq!(
+        service
+            .continue_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err()
+            .code,
+        "INVALID_DATA"
+    );
+    let state = crate::project::PipelineStateFile::created(Quality::High);
+    atomic_write_json(&project.join("state.json"), &state)
+        .await
+        .unwrap();
+    // No completed stage or working images: the public executor decides to
+    // prepare them, rather than rejecting a valid saved work order up front.
     *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
         Box::pin(async { Err(crate::error::SplatError::Cancelled) })
     }));
@@ -95,7 +445,12 @@ async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
         .unwrap();
     assert!(resumed.accepted);
     assert_ne!(resumed.run_id, Some(run));
-    service.wait(task.task_id).await.unwrap();
+    let stopped = service.wait(task.task_id).await.unwrap();
+    assert_eq!(stopped.runs.last().unwrap().kind, "continue");
+    assert_eq!(
+        stopped.runs.last().unwrap().continued_from_status,
+        Some(TaskStatus::Cancelled)
+    );
     assert_eq!(
         service
             .resume_identified(task.task_id, run, default_engine_paths(None), None)
@@ -106,13 +461,153 @@ async fn mcp_resume_requires_matching_cancelled_run_and_saved_work() {
     );
 }
 
+#[tokio::test]
+async fn cancelled_reshoot_can_resume_from_verified_snapshot_before_work_frames_exist() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("clip.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let task = service
+        .create(
+            None,
+            input,
+            Quality::High,
+            root.path().join("projects"),
+            true,
+            "mcp",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let source_project = Uuid::new_v4();
+    let project = root.path().join("snapshot-checkpoint");
+    let source = root.path().join("snapshot-source");
+    let model = source.join("sparse");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(
+        model.join("cameras.txt"),
+        "1 PINHOLE 1000 500 1000 1000 500 250\n",
+    )
+    .unwrap();
+    std::fs::write(model.join("images.txt"), "1 1 0 0 0 0 0 0 1 frame.jpg\n\n").unwrap();
+    std::fs::write(model.join("points3D.txt"), "").unwrap();
+    let image = source.join("frame.jpg");
+    std::fs::write(&image, b"immutable image fixture").unwrap();
+    let snapshot_root = project.join("work/reshoot-snapshot-v3");
+    let snapshot = crate::pipeline::reshoot_snapshot::ReshootSnapshotBuilder::new(&snapshot_root)
+        .source_project_id(source_project)
+        .model(&model)
+        .image(&image, "frame.jpg")
+        .build(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let mut state = crate::project::PipelineStateFile::created(Quality::High);
+    state.inputs = Some(crate::pipeline::inputs::InputCheckpoint::new(
+        crate::pipeline::inputs::GenerationInputs::Materials { items: vec![] },
+    ));
+    state.reshoot = Some(crate::project::ReshootState {
+        snapshot_v3_identity: Some(snapshot.content_identity),
+        snapshot_v3_ready: true,
+        ..Default::default()
+    });
+    atomic_write_json(&project.join("state.json"), &state)
+        .await
+        .unwrap();
+    let run = Uuid::new_v4();
+    {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.project_id = Some(Uuid::new_v4());
+        saved.project_path = Some(project);
+        saved.source_project_id = Some(source_project);
+        saved.run_id = Some(run);
+        saved.status = TaskStatus::Cancelled;
+    }
+    persist_bound_project_metadata(&service, task.task_id).await;
+    *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async { Err(crate::error::SplatError::Cancelled) })
+    }));
+
+    let receipt = service
+        .resume_identified(task.task_id, run, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    assert!(receipt.accepted);
+    service.wait(task.task_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn gui_project_retry_requires_the_current_failed_run() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("clip.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let task = service
+        .create(
+            None,
+            input,
+            Quality::High,
+            root.path().join("projects"),
+            true,
+            "gui",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let project = Uuid::new_v4();
+    let project_root = root.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    atomic_write_json(
+        &project_root.join("state.json"),
+        &crate::project::PipelineStateFile::created(Quality::High),
+    )
+    .await
+    .unwrap();
+    let failed_run = Uuid::new_v4();
+    {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.project_id = Some(project);
+        saved.project_path = Some(project_root);
+        saved.run_id = Some(failed_run);
+        saved.status = TaskStatus::Failed;
+    }
+    persist_bound_project_metadata(&service, task.task_id).await;
+    assert_eq!(
+        service
+            .resume_project_identified(project, Uuid::new_v4(), default_engine_paths(None), None,)
+            .await
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
+    );
+    *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async { Err(crate::error::SplatError::Cancelled) })
+    }));
+    let retried = service
+        .resume_project_identified(project, failed_run, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    assert!(retried.accepted);
+    assert_ne!(retried.run_id, Some(failed_run));
+    service.wait(task.task_id).await.unwrap();
+}
+
 #[test]
 fn generation_defaults_are_not_retry_consent_and_invalid_ratios_are_rejected() {
     let defaults = generation_parameters(None).unwrap();
     assert_eq!(defaults["generationPolicy"]["autoRetryEnabled"], true);
-    assert_eq!(defaults["generationPolicy"]["version"], 3);
+    assert_eq!(
+        defaults["generationPolicy"]["version"],
+        crate::pipeline::generation_policy::VERSION
+    );
     let migrated = generation_parameters(Some(serde_json::json!({"generationPolicy":{"version":1,"autoRetryEnabled":false,"frameSamplingRatio":0.5}}))).unwrap();
-    assert_eq!(migrated["generationPolicy"]["version"], 3);
+    assert_eq!(
+        migrated["generationPolicy"]["version"],
+        crate::pipeline::generation_policy::VERSION
+    );
     assert_eq!(migrated["generationPolicy"]["autoRetryEnabled"], false);
     let off=generation_parameters(Some(serde_json::json!({"generationPolicy":{"autoRetryEnabled":false,"frameSamplingRatio":0.333},"reshootOptions":{"allowFallback":true}}))).unwrap();
     assert_eq!(off["generationPolicy"]["frameSamplingRatio"], 0.333);
@@ -139,10 +634,27 @@ async fn manual_retry_before_project_creation_starts_a_new_run_without_changing_
     std::fs::write(&input, b"fixture").unwrap();
     let service = TaskService::at(root.path().join("registry"));
     let task=service.create(None,input,Quality::Fast,root.path().join("projects"),false,"gui",None,Some(serde_json::json!({"generationPolicy":{"autoRetryEnabled":false,"frameSamplingRatio":0.5}}))).await.unwrap();
+    let preserved_policy = crate::pipeline::generation_policy::GenerationPolicy {
+        version: 5,
+        auto_retry_enabled: false,
+        frame_sampling_ratio: Some(0.5),
+        frame_sampling_fps: None,
+    };
+    {
+        let mut registry = service.records();
+        let saved = registry.tasks.get_mut(&task.task_id).unwrap();
+        saved.generation_policy = Some(preserved_policy);
+        saved.request_parameters.as_mut().unwrap()["generationPolicy"] =
+            serde_json::to_value(preserved_policy).unwrap();
+        saved.configuration.shared.minimum_selected_frames = 987;
+    }
     *service.executor.lock().unwrap() = Some(Arc::new(|task, _| {
         Box::pin(async move {
             assert!(task.planner_enabled);
-            assert!(!task.generation_policy.unwrap().auto_retry_enabled);
+            let policy = task.generation_policy.unwrap();
+            assert_eq!(policy.version, 5);
+            assert!(!policy.auto_retry_enabled);
+            assert_eq!(task.configuration.shared.minimum_selected_frames, 987);
             Err(crate::error::SplatError::Process(
                 "fixture fails before project creation".into(),
             ))
@@ -166,14 +678,20 @@ async fn manual_retry_before_project_creation_starts_a_new_run_without_changing_
     assert_ne!(first.run_id, second.run_id);
     let finished = service.wait(task.task_id).await.unwrap();
     assert_eq!(finished.runs.len(), 2);
-    assert_eq!(finished.runs[1].kind, "retry");
+    assert_eq!(finished.runs[1].kind, "continue");
+    assert_eq!(
+        finished.runs[1].continued_from_status,
+        Some(TaskStatus::Failed)
+    );
     assert_eq!(
         finished.generation_policy.unwrap().frame_sampling_ratio,
         Some(0.5)
     );
+    assert_eq!(finished.generation_policy.unwrap().version, 5);
+    assert_eq!(finished.configuration.shared.minimum_selected_frames, 987);
     assert!(!finished.automatically_retried);
-    assert!(
-        !service
+    assert_eq!(
+        service
             .retry_failed(
                 task.task_id,
                 first.run_id.unwrap(),
@@ -181,9 +699,291 @@ async fn manual_retry_before_project_creation_starts_a_new_run_without_changing_
                 None
             )
             .await
-            .unwrap()
-            .accepted
+            .unwrap_err()
+            .code,
+        "STALE_RUN_ID"
     );
+}
+
+#[tokio::test]
+async fn failed_retry_uses_the_saved_v5_checkpoint_policy_and_configuration() {
+    let (root, service, task) = fixture().await;
+    let project_id = Uuid::new_v4();
+    let project = root.path().join("saved-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let policy = crate::pipeline::generation_policy::GenerationPolicy {
+        version: 5,
+        auto_retry_enabled: false,
+        frame_sampling_ratio: Some(0.4),
+        frame_sampling_fps: None,
+    };
+    let video = crate::video::VideoInfo {
+        duration: 20.0,
+        fps: 30.0,
+        total_frames: 600,
+        width: 1920,
+        height: 1080,
+        codec: "h264".into(),
+        rotation: 0,
+        pixel_format: "yuv420p".into(),
+        has_alpha: false,
+    };
+    let mut configuration = (*crate::presets::pipeline_optimization_config()).clone();
+    configuration.shared.minimum_selected_frames = 432;
+    let mut state = crate::project::PipelineStateFile::created(Quality::Balanced);
+    state.generation_policy = Some(policy);
+    state.configuration = Some(configuration.clone());
+    state.planner_enabled = true;
+    state.video = Some(video.clone());
+    state.frames = Some(crate::project::FrameState::from(
+        &policy.frame_plan(&video, Quality::Balanced),
+    ));
+    std::fs::write(
+        project.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let failed_run = Uuid::new_v4();
+    {
+        let mut registry = service.records();
+        let saved = registry.tasks.get_mut(&task.task_id).unwrap();
+        saved.project_id = Some(project_id);
+        saved.project_path = Some(project);
+        saved.status = TaskStatus::Failed;
+        saved.run_id = Some(failed_run);
+        saved.generation_policy = Some(Default::default());
+        saved.request_parameters.as_mut().unwrap()["generationPolicy"] =
+            serde_json::to_value(crate::pipeline::generation_policy::GenerationPolicy::default())
+                .unwrap();
+    }
+    persist_bound_project_metadata(&service, task.task_id).await;
+    *service.executor.lock().unwrap() = Some(Arc::new(move |task, _| {
+        Box::pin(async move {
+            let actual = task.generation_policy.unwrap();
+            assert_eq!(actual, policy);
+            assert_eq!(task.configuration.shared.minimum_selected_frames, 432);
+            assert_eq!(
+                task.request_parameters.unwrap()["generationPolicy"]["version"],
+                5
+            );
+            Err(crate::error::SplatError::Process("fixture".into()))
+        })
+    }));
+    service
+        .retry_failed(task.task_id, failed_run, default_engine_paths(None), None)
+        .await
+        .unwrap();
+    let finished = service.wait(task.task_id).await.unwrap();
+    assert_eq!(finished.generation_policy, Some(policy));
+    assert_eq!(finished.configuration.shared.minimum_selected_frames, 432);
+}
+
+#[tokio::test]
+async fn all_stop_reasons_continue_with_saved_actual_recipe_and_spent_allowances() {
+    for status in [
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+        TaskStatus::Interrupted,
+    ] {
+        let (root, service, task) = fixture().await;
+        let previous_run = notification_run(&service, task.task_id);
+        let project = root.path().join("saved-work-order");
+        std::fs::create_dir_all(&project).unwrap();
+        let policy = crate::pipeline::generation_policy::GenerationPolicy {
+            version: 5,
+            auto_retry_enabled: true,
+            frame_sampling_ratio: Some(0.4),
+            frame_sampling_fps: None,
+        };
+        let initial = crate::presets::resolve_brush_training_preset(
+            Quality::High,
+            true,
+            Some(8192),
+            1920,
+            1000,
+        );
+        let mut actual = initial;
+        actual.preset.max_splats = Some(800_000);
+        let mut state = crate::project::PipelineStateFile::created(Quality::High);
+        state.generation_policy = Some(policy);
+        state.configuration = Some(task.configuration.clone());
+        state
+            .configuration
+            .as_mut()
+            .unwrap()
+            .shared
+            .minimum_selected_frames = 432;
+        state.planner_enabled = true;
+        state.brush_training.initial_resolved = Some(initial);
+        state.brush_training.resolved = Some(actual);
+        state.brush_training.oom_retry_used = true;
+        state.brush_training.oom_retry_started = true;
+        state.brush_training.oom_retry_source_count = Some(1_000_000);
+        atomic_write_json(&project.join("state.json"), &state)
+            .await
+            .unwrap();
+        let before = std::fs::read(project.join("state.json")).unwrap();
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.status = status;
+            saved.project_id = Some(Uuid::new_v4());
+            saved.project_path = Some(project.clone());
+            // A stale task-level recipe must not override the saved work order.
+            saved.generation_policy = Some(Default::default());
+            saved.error = Some(TaskError {
+                code: "pipeline_failed".into(),
+                message: "previous stop evidence".into(),
+                failed_stage: Some(PipelineStage::TrainingSplats),
+                engine: None,
+                exit_code: None,
+                classification: None,
+                classification_is_heuristic: false,
+                classification_version: None,
+                termination: None,
+                failure_id: None,
+                log_sources: vec![],
+            });
+        }
+        persist_bound_project_metadata(&service, task.task_id).await;
+        let observed_path = project.join("state.json");
+        let expected_bytes = before.clone();
+        *service.executor.lock().unwrap() = Some(Arc::new(move |task, _| {
+            let path = observed_path.clone();
+            let bytes = expected_bytes.clone();
+            Box::pin(async move {
+                assert_eq!(task.generation_policy, Some(policy));
+                assert_eq!(task.configuration.shared.minimum_selected_frames, 432);
+                assert!(task.automatically_retried);
+                let checkpoint: crate::project::metadata::BrushTrainingCheckpoint =
+                    serde_json::from_value(
+                        task.actual_configuration.as_ref().unwrap()["brush_training"].clone(),
+                    )
+                    .unwrap();
+                assert_eq!(checkpoint.initial_resolved, Some(initial));
+                assert_eq!(checkpoint.resolved, Some(actual));
+                assert!(checkpoint.oom_retry_used && checkpoint.oom_retry_started);
+                assert_eq!(checkpoint.oom_retry_source_count, Some(1_000_000));
+                // Admission never mutates a saved work order or clears spent OOM state.
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+                Err(crate::error::SplatError::Cancelled)
+            })
+        }));
+        let receipt = match status {
+            TaskStatus::Failed => {
+                service
+                    .resume_identified(task.task_id, previous_run, default_engine_paths(None), None)
+                    .await
+            }
+            TaskStatus::Cancelled => {
+                service
+                    .retry_failed(task.task_id, previous_run, default_engine_paths(None), None)
+                    .await
+            }
+            _ => {
+                service
+                    .continue_identified(
+                        task.task_id,
+                        previous_run,
+                        default_engine_paths(None),
+                        None,
+                    )
+                    .await
+            }
+        }
+        .unwrap();
+        assert!(receipt.accepted);
+        let finished = service.wait(task.task_id).await.unwrap();
+        assert_eq!(finished.status, TaskStatus::Cancelled);
+        assert!(finished.automatically_retried);
+        assert_eq!(
+            finished.runs[0].error.as_ref().unwrap().message,
+            "previous stop evidence"
+        );
+        assert_eq!(finished.runs[1].kind, "continue");
+        assert_eq!(finished.runs[1].continued_from_status, Some(status));
+        assert_eq!(std::fs::read(project.join("state.json")).unwrap(), before);
+        let restored = TaskService::at(root.path().join("registry"))
+            .get(task.task_id)
+            .await
+            .unwrap();
+        assert!(restored.automatically_retried);
+        assert_eq!(restored.runs[1].continued_from_status, Some(status));
+    }
+}
+
+#[tokio::test]
+async fn stopped_tasks_without_a_project_continue_the_original_request_even_without_work() {
+    for status in [
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+        TaskStatus::Interrupted,
+    ] {
+        let (_root, service, task) = fixture().await;
+        let previous_run = notification_run(&service, task.task_id);
+        let policy = crate::pipeline::generation_policy::GenerationPolicy {
+            version: 5,
+            auto_retry_enabled: false,
+            frame_sampling_ratio: Some(0.37),
+            frame_sampling_fps: None,
+        };
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.status = status;
+            saved.generation_policy = Some(policy);
+            saved.request_parameters.as_mut().unwrap()["generationPolicy"] =
+                serde_json::to_value(policy).unwrap();
+            saved.configuration.shared.minimum_selected_frames = 687;
+        }
+        *service.executor.lock().unwrap() = Some(Arc::new(move |task, _| {
+            Box::pin(async move {
+                assert_eq!(task.generation_policy, Some(policy));
+                assert_eq!(task.configuration.shared.minimum_selected_frames, 687);
+                assert!(task.project_id.is_none());
+                Err(crate::error::SplatError::Cancelled)
+            })
+        }));
+        service
+            .continue_identified(task.task_id, previous_run, default_engine_paths(None), None)
+            .await
+            .unwrap();
+        let finished = service.wait(task.task_id).await.unwrap();
+        assert_eq!(finished.status, TaskStatus::Cancelled);
+        assert_eq!(finished.runs[1].kind, "continue");
+        assert_eq!(finished.runs[1].continued_from_status, Some(status));
+        assert_eq!(finished.generation_policy, Some(policy));
+        assert!(!finished.automatically_retried);
+    }
+}
+
+#[tokio::test]
+async fn continuation_does_not_restart_created_active_or_completed_tasks() {
+    let (_root, service, task) = fixture().await;
+    let run = Uuid::new_v4();
+    for status in [
+        TaskStatus::Created,
+        TaskStatus::Starting,
+        TaskStatus::Running,
+        TaskStatus::Cancelling,
+        TaskStatus::Completed,
+    ] {
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.run_id = Some(run);
+            saved.status = status;
+        }
+        let error = service
+            .continue_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "TASK_NOT_RESUMABLE");
+        let unchanged = service.get(task.task_id).await.unwrap();
+        assert_eq!(unchanged.status, status);
+        assert_eq!(unchanged.run_id, Some(run));
+        assert!(unchanged.runs.is_empty());
+    }
 }
 use crate::pipeline::runner::default_engine_paths;
 
@@ -230,14 +1030,7 @@ async fn current_failure_status_and_classification_survive_task_restart() {
         })
     }));
     service
-        .start_inner(
-            task.task_id,
-            default_engine_paths(None),
-            None,
-            false,
-            None,
-            None,
-        )
+        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
         .await
         .unwrap();
     let finished = tokio::time::timeout(
@@ -292,6 +1085,7 @@ fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
     task.runs.push(TaskRun {
         run_id: run,
         kind: "generation".into(),
+        continued_from_status: None,
         started_at: Utc::now(),
         ended_at: None,
         logs: Default::default(),
@@ -336,7 +1130,11 @@ async fn brush_executions_survive_runtime_clear_and_are_isolated_per_attempt_and
     let mut event = PipelineEvent::mapped(PipelineStage::TrainingSplats, 0.0, "start");
     event.sequence = 1;
     event.engine = Some(PipelineEngine::Brush);
-    event.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    event.operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 1,
+        source_id: None,
+    });
     service.on_event(task.task_id, run, event.clone());
     let mut runtime = RuntimeTracker::new();
     runtime.snapshot.process_id = 100;
@@ -372,14 +1170,34 @@ async fn brush_executions_survive_runtime_clear_and_are_isolated_per_attempt_and
     retry.preset.max_splats = Some(800_000);
     checkpoint.brush_training.resolved = Some(retry);
     checkpoint.brush_training.oom_retry_used = true;
+    checkpoint.brush_training.oom_retry_started = true;
     service.on_runner_update(
         task.task_id,
         run,
         RunnerUpdate::Configuration(checkpoint_snapshot(&checkpoint)),
     );
+    assert!(
+        !service
+            .get(task.task_id)
+            .await
+            .unwrap()
+            .automatically_retried
+    );
+    service.on_runner_update(task.task_id, run, RunnerUpdate::AutomaticRetry);
+    assert!(
+        service
+            .get(task.task_id)
+            .await
+            .unwrap()
+            .automatically_retried
+    );
     event.sequence = 4;
     event.kind = EventKind::Stage;
-    event.operation = Some(PipelineOperation { id: 2, attempt: 2 });
+    event.operation = Some(PipelineOperation {
+        id: 2,
+        attempt: 2,
+        source_id: None,
+    });
     event.runtime = None;
     service.on_event(task.task_id, run, event.clone());
     let mut second = RuntimeTracker::new();
@@ -390,13 +1208,21 @@ async fn brush_executions_survive_runtime_clear_and_are_isolated_per_attempt_and
     service.on_event(task.task_id, run, event.clone());
     // A late first-attempt sample and a foreign run must not rewrite either record.
     event.sequence = 6;
-    event.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    event.operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 1,
+        source_id: None,
+    });
     event.runtime = Some(runtime.snapshot);
     service.on_event(task.task_id, run, event.clone());
     service.on_event(task.task_id, Uuid::new_v4(), event);
     let mut exporting = PipelineEvent::mapped(PipelineStage::Exporting, 0.0, "publish");
     exporting.sequence = 7;
-    exporting.operation = Some(PipelineOperation { id: 3, attempt: 0 });
+    exporting.operation = Some(PipelineOperation {
+        id: 3,
+        attempt: 0,
+        source_id: None,
+    });
     service.on_event(task.task_id, run, exporting);
     let saved = service.get(task.task_id).await.unwrap();
     assert!(saved.runtime.is_none());
@@ -484,7 +1310,11 @@ async fn panorama_monitor_survives_non_lifecycle_events_and_rejects_old_operatio
     let run = notification_run(&service, task.task_id);
     let mut stage = notification_event(1, EventKind::Stage);
     stage.substage = Some("panoramaReconstruction".into());
-    stage.operation = Some(PipelineOperation { id: 1, attempt: 1 });
+    stage.operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 1,
+        source_id: None,
+    });
     service.on_event(task.task_id, run, stage.clone());
     let snapshot: crate::pipeline::runtime::RuntimeSnapshot =
         serde_json::from_value(serde_json::json!({
@@ -511,7 +1341,11 @@ async fn panorama_monitor_survives_non_lifecycle_events_and_rejects_old_operatio
     }
     let mut retry = stage.clone();
     retry.sequence = 12;
-    retry.operation = Some(PipelineOperation { id: 2, attempt: 2 });
+    retry.operation = Some(PipelineOperation {
+        id: 2,
+        attempt: 2,
+        source_id: None,
+    });
     retry.stage_progress = None;
     retry.indeterminate = true;
     service.on_event(task.task_id, run, retry.clone());
@@ -1046,6 +1880,424 @@ async fn fixture() -> (tempfile::TempDir, TaskService, TaskRecord) {
     (root, service, task)
 }
 
+async fn persist_bound_project_metadata(service: &TaskService, id: Uuid) {
+    let task = service.records().tasks[&id].clone();
+    let root = task.project_path.as_ref().unwrap();
+    let metadata = crate::project::ProjectMetadata {
+        id: task.project_id.unwrap(),
+        app_id: crate::project::PROJECT_APP_ID.into(),
+        workspace_task_id: Some(id),
+        project_path: root.clone(),
+        source_path: task.input_path,
+        quality: task.quality,
+        status: task.status.project_status(),
+        created_at: Utc::now(),
+        ..Default::default()
+    };
+    atomic_write_json(&root.join("project.json"), &metadata)
+        .await
+        .unwrap();
+}
+
+fn assert_preparation_diagnostic(
+    service: &TaskService,
+    error: &ServiceError,
+    operation: &str,
+    role: &str,
+) -> crate::diagnostics::DiagnosticReport {
+    let details = error.details.as_ref().expect("safe preparation envelope");
+    assert_eq!(details["preparation"]["operation"], operation);
+    assert_eq!(details["preparation"]["pathRole"], role);
+    let pipeline = &details["pipelineError"];
+    assert_eq!(pipeline["engine"], "system");
+    assert!(pipeline.get("failedStage").is_none());
+    assert!(pipeline.get("projectPath").is_none());
+    assert!(pipeline.get("logsDirectory").is_none());
+    assert!(error.message.contains(operation));
+    let failure = Uuid::parse_str(pipeline["failureId"].as_str().unwrap()).unwrap();
+    let report = service
+        .diagnostics
+        .captured_report_for_test(failure)
+        .unwrap();
+    assert!(report.stage.is_none());
+    assert_eq!(report.engine, Some(crate::pipeline::PipelineEngine::System));
+    assert!(report.log_tail.contains(operation));
+    report
+}
+
+#[tokio::test]
+async fn continuation_preparation_read_errors_capture_diagnostics_without_changing_runs() {
+    for mutation in [
+        "state_missing",
+        "state_directory",
+        "state_json",
+        "project_missing",
+        "project_json",
+        "state_missing_log_blocked",
+    ] {
+        let (root, service, task) = fixture().await;
+        let project = root.path().join("private-checkpoint");
+        std::fs::create_dir_all(&project).unwrap();
+        let run = notification_run(&service, task.task_id);
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.status = TaskStatus::Failed;
+            saved.project_id = Some(Uuid::new_v4());
+            saved.project_path = Some(project.clone());
+        }
+        persist_bound_project_metadata(&service, task.task_id).await;
+        atomic_write_json(
+            &project.join("state.json"),
+            &crate::project::PipelineStateFile::created(Quality::High),
+        )
+        .await
+        .unwrap();
+        match mutation {
+            "state_missing" => std::fs::remove_file(project.join("state.json")).unwrap(),
+            "state_directory" => {
+                std::fs::remove_file(project.join("state.json")).unwrap();
+                std::fs::create_dir(project.join("state.json")).unwrap();
+            }
+            "state_json" => std::fs::write(project.join("state.json"), b"{").unwrap(),
+            "project_missing" => std::fs::remove_file(project.join("project.json")).unwrap(),
+            "project_json" => std::fs::write(project.join("project.json"), b"{").unwrap(),
+            "state_missing_log_blocked" => {
+                std::fs::remove_file(project.join("state.json")).unwrap();
+                std::fs::write(project.join("logs"), b"not a directory").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        service.persist().await.unwrap();
+        let before = serde_json::to_value(service.get(task.task_id).await.unwrap()).unwrap();
+        *service.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+            Box::pin(async { panic!("Preparation failure must not start an execution") })
+        }));
+        let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = events.clone();
+        *service.emitter.lock().unwrap() = Some(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let error = service
+            .continue_identified(task.task_id, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.task_id, Some(task.task_id));
+        assert_eq!(error.run_id, Some(run));
+        let project_read = mutation.starts_with("project");
+        let report = assert_preparation_diagnostic(
+            &service,
+            &error,
+            if project_read {
+                "read_retry_project"
+            } else {
+                "read_retry_state"
+            },
+            if project_read {
+                "project_metadata"
+            } else {
+                "project_state"
+            },
+        );
+        if mutation.ends_with("json") {
+            assert_eq!(error.code, "INVALID_DATA");
+            assert!(error.details.as_ref().unwrap()["preparation"]["errorKind"].is_null());
+            assert!(error.details.as_ref().unwrap()["preparation"]["osError"].is_null());
+        } else {
+            assert_eq!(error.code, "IO_ERROR");
+            assert!(error.details.as_ref().unwrap()["preparation"]["osError"].is_number());
+        }
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains(&project.to_string_lossy().to_string()));
+        assert!(!report
+            .detail
+            .contains(&project.to_string_lossy().to_string()));
+        assert_eq!(
+            serde_json::to_value(service.get(task.task_id).await.unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn catalog_only_continuation_reports_the_requested_project_read_instead_of_not_found() {
+    for mutation in [
+        "index_missing",
+        "missing_id",
+        "index_directory",
+        "index_json",
+        "project_missing",
+        "project_json",
+        "state_missing",
+        "state_json",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join("project-index.json");
+        let project_root = root.path().join("private-catalog-project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let mut service = TaskService::at(root.path().join("registry"));
+        service.continuation_index_path = Some(index.clone());
+        atomic_write_json(
+            &index,
+            &serde_json::json!({"schemaVersion":1,
+            "projects":[{"id":project,"path":project_root}]}),
+        )
+        .await
+        .unwrap();
+        let metadata = crate::project::ProjectMetadata {
+            id: project,
+            app_id: crate::project::PROJECT_APP_ID.into(),
+            workspace_task_id: Some(task),
+            project_path: project_root.clone(),
+            status: ProjectStatus::Failed,
+            ..Default::default()
+        };
+        atomic_write_json(&project_root.join("project.json"), &metadata)
+            .await
+            .unwrap();
+        atomic_write_json(
+            &project_root.join("state.json"),
+            &crate::project::PipelineStateFile::created(Quality::Balanced),
+        )
+        .await
+        .unwrap();
+        match mutation {
+            "index_missing" => std::fs::remove_file(&index).unwrap(),
+            "missing_id" => atomic_write_json(
+                &index,
+                &serde_json::json!({"schemaVersion":1,"projects":[]}),
+            )
+            .await
+            .unwrap(),
+            "index_directory" => {
+                std::fs::remove_file(&index).unwrap();
+                std::fs::create_dir(&index).unwrap();
+            }
+            "index_json" => std::fs::write(&index, b"{").unwrap(),
+            "project_missing" => std::fs::remove_file(project_root.join("project.json")).unwrap(),
+            "project_json" => std::fs::write(project_root.join("project.json"), b"{").unwrap(),
+            "state_missing" => std::fs::remove_file(project_root.join("state.json")).unwrap(),
+            "state_json" => std::fs::write(project_root.join("state.json"), b"{").unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(service.all().await.unwrap().is_empty());
+        let error = service
+            .resume_project_identified(project, run, default_engine_paths(None), None)
+            .await
+            .unwrap_err();
+        if matches!(mutation, "index_missing" | "missing_id") {
+            assert_eq!(error.code, "TASK_NOT_FOUND");
+            assert!(error.details.is_none());
+        } else {
+            assert_eq!(error.run_id, Some(run));
+            let role = if mutation.starts_with("index") {
+                "project_index"
+            } else if mutation.starts_with("project") {
+                "project_metadata"
+            } else {
+                "project_state"
+            };
+            assert_preparation_diagnostic(
+                &service,
+                &error,
+                if role == "project_state" {
+                    "read_retry_state"
+                } else {
+                    "read_retry_project"
+                },
+                role,
+            );
+            assert_eq!(
+                error.code,
+                if mutation.ends_with("json") {
+                    "INVALID_DATA"
+                } else {
+                    "IO_ERROR"
+                }
+            );
+        }
+        assert!(service.all().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn preparation_service_errors_redact_paths_after_preserving_the_primary_io_classification() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TaskService::at(root.path().join("registry"));
+    let private = root.path().join("secret-image.jpg");
+    let context = PreparationContext::new(Some(Uuid::new_v4()), Some(root.path().into()));
+    let error = context
+        .step(
+            RetryPreparationOperation::ReadRetryState,
+            "project_state",
+            None,
+            async {
+                Err::<(), _>(crate::error::SplatError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Cannot read {}", private.display()),
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+    let error = service
+        .preparation_service_error(
+            error,
+            &context.snapshot(),
+            None,
+            None,
+            std::slice::from_ref(&private),
+        )
+        .await;
+    assert_eq!(error.code, "IO_ERROR");
+    assert_eq!(
+        error.details.as_ref().unwrap()["preparation"]["errorKind"],
+        "PermissionDenied"
+    );
+    assert_preparation_diagnostic(&service, &error, "read_retry_state", "project_state");
+    let serialized = serde_json::to_string(&error).unwrap();
+    assert!(!serialized.contains("secret-image"));
+    assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+}
+
+#[tokio::test]
+async fn a_busy_task_prevents_preparation_reads_and_diagnostics_for_another_task() {
+    let (root, service, task) = fixture().await;
+    let stopped_run = notification_run(&service, task.task_id);
+    let project = root.path().join("unreadable-stopped-project");
+    std::fs::create_dir(&project).unwrap();
+    {
+        let mut records = service.records();
+        let stopped = records.tasks.get_mut(&task.task_id).unwrap();
+        stopped.status = TaskStatus::Failed;
+        stopped.project_id = Some(Uuid::new_v4());
+        stopped.project_path = Some(project.clone());
+    }
+    let input = root.path().join("another.mp4");
+    std::fs::write(&input, b"fixture").unwrap();
+    let active = service
+        .create(
+            None,
+            input,
+            Quality::Fast,
+            root.path().join("projects"),
+            true,
+            "gui",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let active_run = notification_run(&service, active.task_id);
+    service.persist().await.unwrap();
+    let before = serde_json::to_value(service.all().await.unwrap()).unwrap();
+    let error = service
+        .continue_identified(task.task_id, stopped_run, default_engine_paths(None), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "TASK_BUSY");
+    assert_eq!(error.task_id, Some(active.task_id));
+    assert_eq!(error.run_id, Some(active_run));
+    assert!(error.details.is_none());
+    assert!(!project.join("logs").exists());
+    assert_eq!(
+        serde_json::to_value(service.all().await.unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_busy_task_prevents_catalog_only_continuation_from_reading_a_broken_index() {
+    for identified in [false, true] {
+        let (root, mut service, active) = fixture().await;
+        let active_run = notification_run(&service, active.task_id);
+        let index = root.path().join("unreadable-project-index.json");
+        std::fs::write(&index, b"{").unwrap();
+        service.continuation_index_path = Some(index.clone());
+        service.persist().await.unwrap();
+        let before = serde_json::to_value(service.all().await.unwrap()).unwrap();
+        let project = Uuid::new_v4();
+        let result = if identified {
+            service
+                .resume_project_identified(
+                    project,
+                    Uuid::new_v4(),
+                    default_engine_paths(None),
+                    None,
+                )
+                .await
+        } else {
+            service
+                .resume(project, default_engine_paths(None), None)
+                .await
+        };
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "TASK_BUSY");
+        assert_eq!(error.task_id, Some(active.task_id));
+        assert_eq!(error.run_id, Some(active_run));
+        assert!(error.details.is_none());
+        assert_eq!(std::fs::read(&index).unwrap(), b"{");
+        assert_eq!(
+            serde_json::to_value(service.all().await.unwrap()).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn preparation_redaction_preserves_fixed_tags_when_private_basenames_collide() {
+    for name in ["state", "project", "brush"] {
+        let root = tempfile::tempdir().unwrap();
+        let private_root = root.path().join(name);
+        std::fs::create_dir(&private_root).unwrap();
+        let service = TaskService::at(root.path().join("registry"));
+        let context = PreparationContext::new(Some(Uuid::new_v4()), Some(private_root.clone()));
+        let error = context
+            .step(
+                RetryPreparationOperation::ReadRetryState,
+                "project_state",
+                Some("brush"),
+                async {
+                    Err::<(), _>(
+                        crate::error::SplatError::Io(std::io::Error::from_raw_os_error(5))
+                            .with_io_diagnostic(format!(
+                                "io_substep=replace_state; target={}",
+                                private_root.display()
+                            )),
+                    )
+                },
+            )
+            .await
+            .unwrap_err();
+        let error = service
+            .preparation_service_error(
+                error,
+                &context.snapshot(),
+                None,
+                None,
+                std::slice::from_ref(&private_root),
+            )
+            .await;
+        assert_eq!(error.code, "IO_ERROR");
+        assert!(error
+            .message
+            .contains("retry_preparation_operation=read_retry_state"));
+        assert!(error.message.contains("path_role=project_state"));
+        assert!(error.message.contains("cache=brush"));
+        assert!(error.message.contains("io_substep=replace_state"));
+        assert!(error.message.contains("os_error=5"));
+        assert!(!error
+            .message
+            .contains(&private_root.to_string_lossy().to_string()));
+        assert_preparation_diagnostic(&service, &error, "read_retry_state", "project_state");
+    }
+}
+
 #[tokio::test]
 async fn image_matching_request_survives_restart_and_cannot_change_on_retry() {
     use crate::project::ImageMatchingStrategy;
@@ -1119,14 +2371,7 @@ async fn changed_video_identity_is_rejected_before_starting_a_run() {
         .unwrap();
     std::fs::write(&input, b"changed input size").unwrap();
     let error = service
-        .start_inner(
-            task.task_id,
-            default_engine_paths(None),
-            None,
-            false,
-            None,
-            None,
-        )
+        .start_inner(task.task_id, default_engine_paths(None), None, false, None)
         .await
         .unwrap_err();
     assert_eq!(error.code, "INPUT_CHANGED");
@@ -1431,6 +2676,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
     task.runs.push(TaskRun {
         run_id: run,
         kind: "new".into(),
+        continued_from_status: None,
         started_at: Utc::now(),
         ended_at: None,
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
@@ -1515,6 +2761,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
     task.runs.push(TaskRun {
         run_id: run,
         kind: "new".into(),
+        continued_from_status: None,
         started_at: Utc::now(),
         ended_at: Some(Utc::now()),
         logs: BTreeMap::from([("brush".into(), logs::register(&logroot, &path, 0).unwrap())]),
@@ -1812,13 +3059,27 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
                 .unwrap();
         }
         if resume {
-            let mut records = service.records();
-            let task = records.tasks.get_mut(&task.task_id).unwrap();
-            task.project_id = Some(Uuid::new_v4());
-            // Model an interrupted legacy task, not a new-policy failed retry.
-            task.status = TaskStatus::Interrupted;
-            task.planner_enabled = enabled;
-            task.request_parameters = None;
+            let project = root.path().join(format!("saved-project-{index}"));
+            std::fs::create_dir_all(&project).unwrap();
+            let mut state = crate::project::PipelineStateFile::created(Quality::High);
+            state.planner_enabled = enabled;
+            state.configuration = Some(task.configuration.clone());
+            atomic_write_json(&project.join("state.json"), &state)
+                .await
+                .unwrap();
+            let task_id = {
+                let mut records = service.records();
+                let task = records.tasks.get_mut(&task.task_id).unwrap();
+                task.project_id = Some(Uuid::new_v4());
+                task.project_path = Some(project);
+                // Model a saved legacy work order; continuation must not add policy v6.
+                task.status = TaskStatus::Interrupted;
+                task.planner_enabled = enabled;
+                task.generation_policy = None;
+                task.request_parameters = None;
+                task.task_id
+            };
+            persist_bound_project_metadata(&service, task_id).await;
         }
         *service.executor.lock().unwrap() = Some(Arc::new(move |task, runner| {
             Box::pin(async move {
@@ -1850,7 +3111,6 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
                 default_engine_paths(None),
                 Some(telemetry.clone()),
                 resume,
-                None,
                 None,
             )
             .await
@@ -2018,6 +3278,7 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
     task.runs.push(TaskRun {
         run_id: run,
         kind: "generation".into(),
+        continued_from_status: None,
         started_at: Utc::now(),
         ended_at: None,
         logs: BTreeMap::from([

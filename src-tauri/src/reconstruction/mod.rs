@@ -1,4 +1,5 @@
 pub mod colmap_model;
+pub mod direct_input;
 pub mod edit_mask;
 pub mod gps;
 pub mod ply;

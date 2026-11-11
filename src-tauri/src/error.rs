@@ -1,7 +1,22 @@
 use std::path::PathBuf;
 
+pub(crate) const RETRY_PREPARATION_MARKER: &str = "retry_preparation_operation=";
+
+/// Typed rejection of a new input. Existing execution failures retain their
+/// historical string IPC representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAdmissionReason {
+    #[error("暂不支持导入 COLMAP 文件或文件夹。")]
+    ColmapDisabled,
+    #[error("不支持所选文件或文件夹，请选择当前入口支持的文件类型。")]
+    UnsupportedInput,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SplatError {
+    #[error("{0}")]
+    InputAdmission(InputAdmissionReason),
     #[error("{source}\n{detail}")]
     Diagnostic {
         source: Box<SplatError>,
@@ -36,6 +51,29 @@ pub enum SplatError {
 pub type Result<T> = std::result::Result<T, SplatError>;
 
 impl SplatError {
+    /// Returns the original I/O error through diagnostic wrappers. Callers use
+    /// this to add semantic context without losing `raw_os_error()`.
+    pub(crate) fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::Diagnostic { source, .. } => source.io_error(),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Adds detail only to I/O failures. Non-I/O failures retain their exact
+    /// type and presentation.
+    pub(crate) fn with_io_diagnostic(self, detail: impl Into<String>) -> Self {
+        if self.io_error().is_some() {
+            Self::Diagnostic {
+                source: Box::new(self),
+                detail: detail.into(),
+            }
+        } else {
+            self
+        }
+    }
+
     pub fn with_previous_attempt(self, previous: SplatError) -> Self {
         match (self, previous) {
             (Self::EngineProcess(mut current), Self::EngineProcess(previous)) => {
@@ -58,6 +96,59 @@ impl serde::Serialize for SplatError {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        if let Self::InputAdmission(reason) = self {
+            use serde::ser::SerializeStruct;
+            let mut value = serializer.serialize_struct("InputAdmissionError", 3)?;
+            value.serialize_field("code", "UNSUPPORTED_INPUT")?;
+            value.serialize_field("reason", reason)?;
+            value.serialize_field("message", &reason.to_string())?;
+            value.end()
+        } else {
+            serializer.serialize_str(&self.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_admission_has_typed_ipc_without_changing_other_errors() {
+        let error = SplatError::InputAdmission(InputAdmissionReason::ColmapDisabled);
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({"code":"UNSUPPORTED_INPUT","reason":"colmap_disabled",
+                "message":"暂不支持导入 COLMAP 文件或文件夹。"})
+        );
+        let existing = SplatError::Process("unchanged".into());
+        assert_eq!(
+            serde_json::to_value(&existing).unwrap(),
+            serde_json::json!(existing.to_string())
+        );
+        let ordinary = SplatError::InputAdmission(InputAdmissionReason::UnsupportedInput);
+        assert_eq!(
+            serde_json::to_value(ordinary).unwrap()["reason"],
+            "unsupported_input"
+        );
+    }
+
+    #[test]
+    fn io_diagnostic_retains_original_os_error() {
+        let error = SplatError::Io(std::io::Error::from_raw_os_error(5))
+            .with_io_diagnostic("retry_preparation_operation=write_retry_reuse_barrier");
+        assert_eq!(
+            error.io_error().and_then(std::io::Error::raw_os_error),
+            Some(5)
+        );
+        assert!(error
+            .to_string()
+            .contains("retry_preparation_operation=write_retry_reuse_barrier"));
+    }
+
+    #[test]
+    fn io_diagnostic_does_not_reclassify_non_io_errors() {
+        let error = SplatError::Process("original".into()).with_io_diagnostic("ignored");
+        assert!(matches!(error, SplatError::Process(message) if message == "original"));
     }
 }

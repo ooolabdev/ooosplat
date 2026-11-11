@@ -27,7 +27,7 @@ See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
 > 0.7.1 updates generation defaults, automatic retries, and Detailed splat budgets, adds stepped frame sampling and movement-speed controls, and improves reshoots, image GPS assistance, exports, and error diagnostics.
 
-The features below describe the current `main` source tree; consult each release's notes for installer contents.
+The features below describe the current `main` source tree. Source updates are not necessarily released features; consult each release's notes for installer contents.
 
 ## Why OOOSplat
 
@@ -52,24 +52,28 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## Key Features
 
-- **One-click generation**: Create a Gaussian Splat from MP4/MOV video or a JPG, JPEG, and PNG image folder. OOOSplat handles image preparation, camera reconstruction, training, and PLY publishing.
+- **Unified inputs**: Select or drop multiple MP4/MOV videos, image folders, or loose JPG/JPEG/PNG image sets. Inspect, confirm types, and remove sources in one input box, then reconstruct one connected scene.
 - **Panorama media**: Supports stitched, monoscopic, full 360°×180°, 2:1 ERP MP4 and image folders. Media types are detected automatically; ambiguous inputs require an inline choice.
-- **Image-order confirmation**: For ordinary or panorama folders with more than 100 images, confirm capture order before generation. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
+- **Image-order confirmation**: Choose capture order inside the input box for each image set above 100 images. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
 - **Image GPS**: Detect embedded location metadata and assist matching and reconstruction on the validated Windows x64 path. Reliable observations provide estimated north orientation and metric scale; otherwise the original workflow is used. [Scope and validation](docs/IMAGE_GPS.md)
-- **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically; eligible projects can be reshot after compatibility checks. External files remain read-only.
-- **Three quality presets**: Reconstruction optimizations and frame backfill are standard. Adjust video sampling in discrete steps, with at most 20% extra frames for manually sampled runs. Detailed preserves source training resolution and budgets ordinary-media splats from effective pixels and reconstruction tracks (coefficient 0.5). Panoramas retain a separate budget.
+- **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group for preview, editing, and export. New imports no longer attach accompanying COLMAP data. External files remain read-only.
+- **Three quality presets**: Optimizations and backfill are standard. Fast/Balanced/Detailed retain 6/8/12 FPS by default; advanced settings adjust each video's post-sampling rate. Manually changed clips allow at most 20% extra Bridge frames. Ordinary inputs use effective-pixel Splat budgets with coefficients 0.2/0.4/0.5. Panoramas retain separate budgets, with Detailed using 40× the authoritative sparse point count. Detailed preserves source training resolution.
 - **Automatic retry**: Enabled by default; permits a lower splat ceiling after GPU OOM or a reshoot-plan fallback. Completed details mark retries that actually ran.
 - **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
-- **Multi-task workspace**: Group tasks into New Tasks, Completed, and Unfinished. Keep multiple drafts, reorder them, and automatically run the next task. Only one generation task runs at a time; tasks can be cancelled or resumed.
-- **Reshoots**: Choose reconstruction mode and whether to reuse the original model, with the normal training recipe. Supports mixed-size ordinary inputs and full ERP reshoots in a separate derived project.
-- **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Static views stop redrawing; interactions run at up to 60 FPS. Use horizontal WASD at 0.1×–5.0× speed or return to the first training view.
+- **Multi-task workspace**: Keep and reorder drafts, then automatically run subsequent tasks, one generation at a time. Failed, cancelled and interrupted work uses Continue generation, reusing valid results and preserving its recipe, actual route and consumed allowances. Explicit continuation turns off the automatic queue and runs only that task.
+- **Reshoots**: Answer the model-condition question and each ordinary source's camera-setting question. Supports multiple sources, mixed sizes and ordinary/full-ERP combinations. A frozen source snapshot feeds the shared generation workflow, with normal full training recipes in an independent derived project.
+- **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Static views stop redrawing; interactions run at up to 60 FPS. Use WASD mouse-look at 0.1×–5.0× speed (W/S along the view direction, A/D horizontally) or return to the first training view.
 - **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML. Out-of-range SPZ coordinates can be adjusted on the export copy after confirmation.
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
 - **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
 
-Each panorama batch needs at least two same-sized images; a 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas, private originals, and mixed ordinary/panorama reshoots are unsupported. Panorama caches have no fixed 20 GiB cap; reserve enough disk space. The per-image decode limit remains 512 MiB. See the [video](docs/PANORAMA_VIDEO_V1.md), [image](docs/PANORAMA_IMAGES_V1.md), and [reshoot notes](docs/RESHOOT_V2.md) for verification limits.
+Each image set needs at least two images and one projection type. Ordinary sets may mix dimensions; ERP sets must remain same-sized and full monoscopic panoramas. A 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas and private originals are unsupported. Unconnected inputs are not forcibly merged. Panorama caches have no fixed 20 GiB cap; the 512 MiB per-image decode guard remains.
+
+New COLMAP file/folder imports are temporarily unavailable in the GUI, MCP, and CLI. The desktop app shows a dialog for unsupported inputs. Existing-task continuation, reshoots with previously verified COLMAP data, and normal reconstruction remain available.
 
 Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated memory, but actual RAM, disk space, and format constraints still apply. Removing these gates does not guarantee large-model exports will succeed. See [export notes and verification](docs/model-export-verification.md).
+
+Continuation does not restore optimizer state: unfinished training restarts from its saved initialization, while a valid candidate only needs publication recovery. Old tasks require verifiable parameters and initialization data. Preview and export remain available during training, but compete for GPU and system memory; resources are not isolated.
 
 ### Gaussian Editing Shortcuts
 
@@ -78,26 +82,28 @@ Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated 
 - In rectangle, sphere, or box selection, choose Invert selection or press `Ctrl + I` (`⌘ + I` on macOS) to switch which points are selected or retained.
 - Sphere and box selection enter an orthographic view automatically. Switch between side, front, and top views, then adjust the volume in the viewport or through numeric fields.
 - Use “Scene gizmo” in the Transform panel to switch between Move and Rotate; click the selected button again to turn the gizmo off. Left-drag an axis or ring to edit the model; drag empty space to orbit the camera. Both rings and numeric rotation pivot around the model center. Releasing commits one edit; `Esc` cancels the current gizmo drag. The gizmo mode is saved locally.
-- Use `WASD` to move on the horizontal plane and `Shift` for 3× speed. Completed edits return canvas focus; the bottom-right slider adjusts speed from 0.1× to 5.0× and remembers this device's preference. Speed follows zoom; perspective views only.
+- Hold `WASD` to navigate with mouse-look: `W/S` move along the view direction, so W ascends when looking up and descends when looking down; `A/D` stay horizontal. Release the keys to restore the cursor, press `Esc` to exit, or hold `Shift` for 3× speed. Drag navigation remains available if pointer locking is unsupported. The bottom-right slider remembers 0.1×–5.0× speed; movement follows zoom and works in perspective views only.
 - Use `Ctrl + Z` to undo and `Ctrl + Shift + Z` or `Ctrl + Y` to redo. Transform, crop, and deletion changes share one history; camera movement and temporary highlights are not recorded.
 
 ## Processing Pipeline
 
 ```text
-Input video or image sequence
+Videos or image sets
   │
-  ├─ Video: inspect with FFprobe and extract at the preset target FPS or manual ratio and working resolution; emit RGBA frames and masks for transparent media
-  ├─ Images: scan headers and naturally sort filenames, copy source media, prefer hard links for internal reuse, and create Alpha masks when needed
+  ├─ Video: inspect with FFprobe; sample each clip with its own retained target rate and working resolution, with RGBA frames and masks when needed
+  ├─ Images: inspect headers and naturally sort each set; normalize orientation as needed and align working RGB, Alpha and masks
   ├─ COLMAP: auto-select CPU/CUDA for features; sequential video matching, exhaustive images by default, ordered matching above 100 images, and preset loop detection
   ├─ COLMAP: incremental reconstruction and registration validation, with bridge-frame recovery; two-view triangulation only for actual transparent images
-  ├─ Panoramas: retain full ERP images for spherical reconstruction, then convert registered images to six-face training data
+  ├─ Panoramas: jointly reconstruct ordinary and ERP cameras; derive six faces only from registered ERP views
   ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed plans training at source resolution
   └─ Validate the PLY and atomically publish final.ply
 ```
 
-A normal generation task continues to Brush when COLMAP produces at least one registered image and valid 3D points. Registration below 80% produces a quality warning rather than stopping the task solely for low coverage. A reshoot also requires at least one newly added image to register.
+A normal generation task continues to Brush when COLMAP produces at least one registered image and valid 3D points. Registration below 80% produces a quality warning rather than stopping the task solely for low coverage. A reshoot also requires at least one new image to connect to the original scene. Zero new registrations fail; partial success can continue, with separate low-registration warnings for the new inputs overall and each source.
 
-Image-sequence preflight reads only JPG/PNG headers to check counts, dimensions, and Alpha channels, without decoding all pixels. An Alpha channel does not necessarily contain transparent pixels; generation checks actual transparency and enables masks only when needed. Projects still keep an independent source copy. Internal images use hard links when supported and fall back to copying, with progress and logs throughout import and preparation.
+Image preflight reads headers without decoding every pixel. Alpha channels do not necessarily contain transparent pixels. New projects save per-source mappings and prepared images while keeping originals read-only; derived images, COLMAP data and training outputs stay in the new project. Mixed reconstruction, cross-device quality and platform hardware require separate acceptance testing; small pipeline tests do not establish that all these cases work.
+
+Exact frame extraction uses passthrough output and validates source-frame mappings against the plan; missing frames or mismatched mappings still stop generation safely. Read, write or archive failures while preparing continuation retain their operation context and original OS error codes for diagnosis, rather than being reported as reconstruction or training failures.
 
 ## System Requirements
 
@@ -156,10 +162,10 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 
 1. On Windows, run `OOOSplat-0.7.1-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.7.1-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.7.1-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
-3. Select a draft under “Task List → New Tasks,” or choose Add, then select a video or image folder. Wait for detection; choose ordinary or panorama processing in the media box if the type is uncertain.
+3. Select a draft under “Task List → New Tasks,” or choose Add, then use Add files, Add folders, or drag and drop. Wait for each source's detection; choose ordinary or panorama processing inside that source if the type is uncertain.
 4. Choose the projects root; OOOSplat remembers the last location.
-5. Select the Fast, Balanced, or Detailed quality preset.
-6. Review COLMAP acceleration and select “Start Generation.” For more than 100 images, confirm whether filenames follow capture order; an answer is required before starting.
+5. Select the Fast, Balanced, or Detailed quality preset. Videos retain 6/8/12 FPS by default; expand More settings to adjust each clip's retained frame rate.
+6. Review COLMAP acceleration and select “Start Generation.” Each image set above 100 images requires an inline capture-order answer before starting. Choose Unordered for focus-stacked macro images.
 7. Follow the selected task's stages, progress, and logs on the left. Click any task on the right to switch details. Generated projects appear under Completed or Unfinished; completed projects offer Preview.
 8. Edit the model in “Preview → Adjust.” Transforms, crops, and deletions are saved automatically in the project; each project's view is stored locally on this device. “Save edits” confirms that the current edits and view have been saved. Choose standard PLY, compressed PLY, SPZ, or SOG directly from “Export,” with no second format confirmation. Both Adjust and Animation support model export.
 9. Switch to Animation, choose Portrait or Landscape, and use Export → Export video for a 30 FPS, 23-second MP4 at 1080×1920 or 1920×1080 respectively. Both Adjust and Animation can export offline HTML. Exports use the current edits, can be cancelled, and provide access to the output folder on completion.
@@ -167,11 +173,12 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 
 Usage notes:
 
+- Source information is kept inside the input box. An Alpha-channel hint belongs to the selected input; it does not prove transparent pixels or generated masks.
 - Drag the divider between the panels to resize them; double-click it to restore the default ratio.
 - Use the percentage button in the lower-right corner to reduce, reset, or increase the interface scale.
 - Drafts are saved locally and their media is rechecked after restart. Running-task parameters cannot be changed, but other drafts remain editable. A second task cannot run concurrently.
 - Drag new tasks to reorder them. Auto-run next task is off by default and never skips an unready task. Image-order questions pause startup; cancelling disables the queue.
-- New reshoots inherit source quality and default Automatic retry to enabled, editable before launch. Ordinary batches can differ in resolution, aspect ratio, device, and lens; full ERP batches can differ in size across batches. Original media cannot be submitted again. Missing trusted image/reconstruction snapshots prevent launch.
+- New reshoots inherit source quality and default Automatic retry to enabled, editable before launch. Sources can differ in resolution, aspect ratio, device and lens, and can mix ordinary/full-ERP inputs; each ERP image set must remain same-sized internally. Original media cannot be submitted again. Missing trusted image/reconstruction snapshots prevent launch. Once frozen, the derived project reads its own snapshot rather than the source project, leaving source files and edits unchanged.
 - Reusing the original model initializes from the unedited generated PLY and trains on old and new views with the normal full recipe, without shortened steps or reduced learning rates. Original intrinsics are reused only after confirmation and compatible single-camera dimensions/orientation checks. This is not an optimizer resume or a guarantee that only new regions change; deletion/crop edits are not inherited. Existing tasks keep their saved settings. See the [reshoot validation notes](docs/RESHOOT_V2.md).
 - Task pages keep the latest 500 log entries; complete engine logs remain in the project's `logs/` directory. The training runtime monitor is hidden by default and can be enabled under Settings → Interface.
 - Delete moves the complete project, including source copies and intermediate files, to the Recycle Bin. OOOSplat does not fall back to permanent deletion if that operation fails.
@@ -182,23 +189,23 @@ Sequential video and confirmed ordered-image matching use preset loop detection 
 
 For new manually sampled runs, initial registration below 80% with a valid initial model can trigger one targeted bridge attempt in unregistered intervals. It adds at most 20% of the actual initial frame count, capped by available source frames: 360 initial frames permit at most 72 extra; 100% sampling adds none. The 30-frame minimum still applies, or every available frame for shorter sources. Default sampling retains the candidate budgets below. Interrupted older runs retain their saved rules. The 1.2× ceiling controls frame counts, not time or success probability. See [bridge rules and validation](docs/MANUAL_BRIDGE_V3.md).
 
-Previous optimization behavior is now standard. Fast/Balanced retain working-resolution limits; Detailed uses source training resolution without upscaling. Images keep every valid input; video sampling uses discrete steps above the quality presets, including the exact source-FPS-derived default. See [generation defaults](docs/GENERATION_POLICY.md) and the [legacy configuration guide](docs/pipeline-optimization-config.en.md).
+Previous optimization behavior is now standard. Fast/Balanced retain working-resolution limits; Detailed uses source training resolution without upscaling. Images keep every valid input. Fast/Balanced/Detailed video sampling retains 6/8/12 FPS by default. Video controls select the post-sampling frame rate, from a dynamic minimum that preserves at least 1 FPS and 30 frames up to the full source rate. See [generation defaults](docs/GENERATION_POLICY.md) and the [legacy configuration guide](docs/pipeline-optimization-config.en.md).
 
-The table below describes ordinary inputs. Ordinary Detailed budgets splats from registered training views' effective pixels and mean reconstruction track length, with coefficient 0.5. Fully transparent pixels are excluded; initialization points are never silently removed. See the [Detailed budget formula and scope](docs/FINE_SPLAT_BUDGET.md).
+The table below describes ordinary inputs. New tasks budget splats from registered training views' effective pixels and mean reconstruction track length, with coefficients 0.2/0.4/0.5 for Fast/Balanced/Detailed. Pixels are counted at the actual training dimensions; fully transparent pixels are excluded and initialization points are never silently removed. Continue generation preserves the saved budget. See the [Splat budget formula and scope](docs/FINE_SPLAT_BUDGET.md).
 
 Panoramas use dedicated training recipes and point budgets. Detailed retains native ERP and derives faces at `floor(ERP width / 4)` without upscaling. Point budgets use the original spherical model and are not multiplied by six. Caps guarantee neither achieved counts, quality, nor sufficient memory.
 
 | Preset | Default initial / bridge-candidate target | Video working long edge | COLMAP long edge / maximum features | Brush training |
 | --- | ---: | ---: | ---: | --- |
-| Fast | 6 / 9 FPS | Up to 1,600 | 1,200 / 4,096 | 8,000 iterations, maximum resolution 1,600 |
-| Balanced | 8 / 12 FPS | Up to 1,920 | 1,600 / 8,192 | 15,000 iterations, maximum resolution 1,920 |
+| Fast | 6 / 9 FPS | Up to 1,600 | 1,200 / 4,096 | 8,000 iterations, effective-pixel/track budget (coefficient 0.2) |
+| Balanced | 8 / 12 FPS | Up to 1,920 | 1,600 / 8,192 | 15,000 iterations, effective-pixel/track budget (coefficient 0.4) |
 | Detailed | 12 / 15 FPS | Source resolution | 3,200 / 16,384 | 30,000 iterations, source training resolution, effective-pixel/track budget (coefficient 0.5) |
 
 Short videos target a minimum of 30 selected frames when the source provides enough frames. Initial and candidate sampling rates can therefore exceed the table's targets, but never exceed the source FPS or frame count.
 
 Detailed training resolution no longer uses VRAM tiers. With Automatic retry enabled, all three presets may retry once after explicit GPU OOM, at 80% of the failed process's last trustworthy splat count, without lowering resolution. Missing counts, no actual reduction, or budgets below initialization fail directly. Backend compatibility fallbacks and frame backfill remain enabled independently.
 
-Interrupted tasks retain frozen settings. Manually retrying a failed task uses the new policy and archives incompatible work caches, preserving source files, published models and edits.
+Failed, cancelled and interrupted tasks use the same Continue generation action. It validates and reuses completed work while preserving the saved policy, actual parameters, reshoot route and consumed automatic-remedy allowances. Continuing does not upgrade recipes or renew allowances. Valid training candidates only need publication recovery; unfinished training does not resume optimizer state. Source files, published models and edits remain protected.
 
 ## Project and File Locations
 
@@ -393,6 +400,8 @@ Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand`
 
 The repository also provides the `splatstudio` diagnostic CLI:
 
+Each CLI `generate` call creates a new task. Standalone query, cancel and continue commands are not available; continue existing tasks through the desktop app or MCP.
+
 ```powershell
 # Check all bundled engines
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- health
@@ -428,6 +437,8 @@ See the [MCP documentation](docs/mcp-v1.md) for connection and configuration exa
 ### Why is COLMAP using the CPU instead of the GPU?
 
 On Windows and Ubuntu, OOOSplat enables COLMAP GPU acceleration when the pinned CUDA runtime is healthy and NVIDIA driver 580.00 or newer and Compute Capability 7.5 or higher are confirmed. Caspar additionally requires a successful tiny BA probe; failure selects Ceres CPU without disabling otherwise available SIFT GPU acceleration. Configuration pages show detected capabilities; the running task's details and logs show its actual backend. A temporary background detection timeout does not switch an active task to CPU. macOS COLMAP uses the CPU, while Brush selects its graphics backend independently.
+
+New compatible ordinary-generation, reshoot and Bridge runs share BA selection: local Ceres and global Caspar require both keypoint and verified-match totals to meet the default two-million thresholds, plus a compatible GPU, cameras and constraints. ERP, mixed ERP and GPS position-prior reconstruction retain Ceres. Existing tasks retain their saved scope. Caspar-to-Ceres compatibility fallback is independent of Automatic retry; GPU execution is not a speed guarantee.
 
 ### How does OOOSplat handle different GPU combinations?
 
@@ -468,7 +479,7 @@ Each project keeps source copies, input images, COLMAP data, and Brush intermedi
 
 Yes. Select “Preview” on a completed project in the task list to open its `.ply` in the dedicated preview workspace. “Adjust” supports whole-model Transform plus rectangle, sphere, and box Gaussian selection, with non-destructive deletion, cropping, inversion, undo, and redo. Edits are saved automatically in the project; “Save edits” confirms that the current edits and view have been saved without creating a model file. Choosing a model format directly from “Export” creates or safely replaces the edited model, while the original `final.ply` remains unchanged. Reopening restores the edits and the view saved on this device; yellow selections and undo history do not persist between sessions. “Animation” adds a 5-second reveal, an 8-second shockwave, a continuous orbit, watermarked portrait/landscape MP4 export, and offline HTML export. External standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT files can be imported from “Completed → Import”; LCC/LCC2, Streamed SOG, 2DGS, and ordinary point-cloud PLY files are not supported.
 
-`WASD` moves on the horizontal plane, by default at 15% of the current visible height per second. The bottom-right slider applies a 0.1×–5.0× multiplier; `Shift` gives a further 3× speed. Auto locate view returns from any view to the first training camera, using the earliest registered panorama's front face for panorama projects. It is disabled without a reliable training camera. Opening a preview still restores the saved view first. See the [navigation notes](docs/PREVIEW_NAVIGATION.md).
+`W/S` move forward/backward along the current view direction, with S reversing W; `A/D` strafe horizontally with camera yaw, independently of pitch and roll. The default speed is 15% of the current visible height per second. The bottom-right slider applies a 0.1×–5.0× multiplier; `Shift` gives a further 3× speed. Auto locate view returns from any view to the first training camera, using the earliest registered panorama's front face for panorama projects. It is disabled without a reliable training camera. Opening a preview still restores the saved view first. See the [navigation notes](docs/PREVIEW_NAVIGATION.md).
 
 ### Can I preview very large PLY files?
 

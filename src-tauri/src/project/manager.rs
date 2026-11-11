@@ -67,6 +67,7 @@ pub type ProjectCheckpointObserver = Arc<dyn Fn(&PipelineStateFile) + Send + Syn
 
 #[derive(Clone)]
 pub struct ProjectManager {
+    creation_intent: Option<crate::project::creation::ProjectCreationIntent>,
     checkpoint_observer: Option<ProjectCheckpointObserver>,
     projects_root: PathBuf,
     input_boundary: Option<PathBuf>,
@@ -74,8 +75,117 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
+    /// Creates an owned workspace without copying or reinterpreting its heterogeneous inputs.
+    pub async fn create_collection(
+        &self,
+        quality: Quality,
+        inputs: crate::pipeline::inputs::GenerationInputs,
+    ) -> Result<(ProjectPaths, ProjectMetadata)> {
+        Self::validate_root(&self.projects_root).await?;
+        let id = self
+            .creation_intent
+            .as_ref()
+            .map_or_else(Uuid::new_v4, |i| i.project_id);
+        let stem = match &inputs {
+            crate::pipeline::inputs::GenerationInputs::Colmap { .. } => "colmap".into(),
+            crate::pipeline::inputs::GenerationInputs::Materials { items } if items.len() == 1 => {
+                match &items[0].source {
+                    crate::pipeline::inputs::InputSource::Images { .. } => "images".into(),
+                    source => source
+                        .path()
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                }
+            }
+            _ => "mixed".into(),
+        };
+        let base = format!(
+            "{}_{}",
+            Local::now().format("%Y%m%d-%H%M%S"),
+            sanitize_project_name(&stem)
+        );
+        let paths = ProjectPaths::existing(
+            id,
+            self.creation_intent
+                .as_ref()
+                .map(|i| i.project_path.clone())
+                .unwrap_or_else(|| unique_project_path(&self.projects_root, &base)),
+        );
+        let input_type = if matches!(&inputs,crate::pipeline::inputs::GenerationInputs::Materials{items} if items.len()==1&&matches!(items[0].source,crate::pipeline::inputs::InputSource::Video{..}))
+        {
+            ProjectInputType::Video
+        } else {
+            ProjectInputType::Images
+        };
+        if self
+            .begin_creation(&paths, quality, input_type)
+            .await?
+            .is_some_and(|s| s.creation.as_ref().is_some_and(|c| c.ready))
+        {
+            let metadata = serde_json::from_slice(&tokio::fs::read(&paths.metadata).await?)?;
+            return Ok((paths, metadata));
+        }
+        for dir in [
+            &paths.source,
+            &paths.frames,
+            &paths.colmap_frames,
+            &paths.masks,
+            &paths.colmap,
+            &paths.brush,
+            &paths.logs,
+        ] {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let input_type = if matches!(&inputs,crate::pipeline::inputs::GenerationInputs::Materials{items} if items.len()==1&&matches!(items[0].source,crate::pipeline::inputs::InputSource::Video{..}))
+        {
+            ProjectInputType::Video
+        } else {
+            ProjectInputType::Images
+        };
+        let metadata = ProjectMetadata {
+            id,
+            workspace_task_id: self.creation_intent.as_ref().map(|i| i.task_id),
+            app_id: PROJECT_APP_ID.into(),
+            schema_version: crate::project::metadata::schema_version(),
+            name: base,
+            created_at: Utc::now(),
+            source_path: paths.source.clone(),
+            input_type,
+            quality,
+            project_path: paths.project.clone(),
+            model: "final.ply".into(),
+            ..Default::default()
+        };
+        self.write_metadata(&paths.metadata, &metadata).await?;
+        let mut state = PipelineStateFile::created_for(quality, input_type);
+        state.ba_policy_version = self
+            .creation_intent
+            .as_ref()
+            .map_or(Some(crate::pipeline::ba_policy::VERSION), |i| {
+                i.ba_policy_version
+            });
+        state.brush_training.execution_options = self
+            .creation_intent
+            .as_ref()
+            .map_or_else(|| Some(Default::default()), |i| i.brush_execution_options);
+        state.creation = self.creation_intent.clone().map(|intent| {
+            crate::project::creation::ProjectCreationState {
+                intent,
+                ready: false,
+            }
+        });
+        state.inputs = Some(crate::pipeline::inputs::InputCheckpoint::new(inputs));
+        self.write_state(&paths.state, &state).await?;
+        if self.register_in_catalog && self.creation_intent.is_none() {
+            catalog::register_project(id, &paths.project).await?;
+        }
+        Ok((paths, metadata))
+    }
     pub fn system_default() -> Result<Self> {
         Ok(Self {
+            creation_intent: None,
             input_boundary: None,
             checkpoint_observer: None,
             projects_root: catalog::default_projects_root()?,
@@ -85,6 +195,7 @@ impl ProjectManager {
     pub fn with_root(projects_root: PathBuf) -> Self {
         Self {
             projects_root,
+            creation_intent: None,
             input_boundary: None,
             checkpoint_observer: None,
             register_in_catalog: true,
@@ -93,6 +204,7 @@ impl ProjectManager {
     pub fn for_diagnostics(projects_root: PathBuf) -> Self {
         Self {
             projects_root,
+            creation_intent: None,
             input_boundary: None,
             checkpoint_observer: None,
             register_in_catalog: false,
@@ -102,6 +214,145 @@ impl ProjectManager {
     pub fn with_checkpoint_observer(mut self, observer: ProjectCheckpointObserver) -> Self {
         self.checkpoint_observer = Some(observer);
         self
+    }
+
+    pub fn with_creation_intent(
+        mut self,
+        intent: Option<crate::project::creation::ProjectCreationIntent>,
+    ) -> Self {
+        self.creation_intent = intent;
+        self
+    }
+
+    async fn begin_creation(
+        &self,
+        paths: &ProjectPaths,
+        quality: Quality,
+        input_type: ProjectInputType,
+    ) -> Result<Option<PipelineStateFile>> {
+        let Some(intent) = &self.creation_intent else {
+            return Ok(None);
+        };
+        if intent.project_id != paths.id
+            || intent.project_path != paths.project
+            || paths.project.parent() != Some(self.projects_root.as_path())
+        {
+            return Err(SplatError::Process(
+                "Project creation intent does not match its destination".into(),
+            ));
+        }
+        if paths.project.exists() {
+            let root = std::fs::canonicalize(&self.projects_root)?;
+            let canonical = std::fs::canonicalize(&paths.project)?;
+            if canonical.parent() != Some(root.as_path()) {
+                return Err(SplatError::InvalidPath(paths.project.clone()));
+            }
+            if paths.state.exists() {
+                let saved = self.read_state(&paths.state).await?;
+                if saved.creation.as_ref().map(|s| &s.intent) != Some(intent) {
+                    return Err(SplatError::Process(
+                        "Project creation identity mismatch".into(),
+                    ));
+                }
+                if paths.metadata.exists() {
+                    let metadata: ProjectMetadata =
+                        serde_json::from_slice(&tokio::fs::read(&paths.metadata).await?)?;
+                    if metadata.id != intent.project_id
+                        || metadata.workspace_task_id != Some(intent.task_id)
+                    {
+                        return Err(SplatError::Process(
+                            "Project creation binding mismatch".into(),
+                        ));
+                    }
+                } else if saved.creation.as_ref().is_some_and(|c| c.ready) {
+                    return Err(SplatError::Process(
+                        "Completed creation is missing project metadata".into(),
+                    ));
+                }
+                return Ok(Some(saved));
+            }
+            if std::fs::read_dir(&paths.project)?.next().is_some() {
+                return Err(SplatError::Process(
+                    "Unidentified project directory cannot be adopted".into(),
+                ));
+            }
+        }
+        let mut state = PipelineStateFile::created_for(quality, input_type);
+        state.creation = Some(crate::project::creation::ProjectCreationState {
+            intent: intent.clone(),
+            ready: false,
+        });
+        // Publish the directory only after its first owner state is durable.
+        // A hard exit while writing that first JSON may leave a truncated temp
+        // file, but cannot strand an unidentified non-empty project directory.
+        let staging = self
+            .projects_root
+            .join(format!(".creation-{}", intent.intent_id));
+        tokio::fs::create_dir_all(&staging).await?;
+        let canonical_root = std::fs::canonicalize(&self.projects_root)?;
+        let canonical_stage = std::fs::canonicalize(&staging)?;
+        if canonical_stage.parent() != Some(canonical_root.as_path())
+            || canonical_stage.file_name() != staging.file_name()
+        {
+            return Err(SplatError::InvalidPath(staging));
+        }
+        for entry in std::fs::read_dir(&staging)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let temporary = name
+                .strip_prefix(".state.json.")
+                .and_then(|v| v.strip_suffix(".tmp"))
+                .is_some_and(|v| Uuid::parse_str(v).is_ok());
+            if !entry.file_type()?.is_file() || (name != "state.json" && !temporary) {
+                return Err(SplatError::Process(
+                    "Unidentified creation staging cannot be adopted".into(),
+                ));
+            }
+        }
+        if staging.join("state.json").exists() {
+            let saved = self.read_state(&staging.join("state.json")).await?;
+            if saved.creation.as_ref().map(|c| &c.intent) != Some(intent) {
+                return Err(SplatError::Process(
+                    "Project creation identity mismatch".into(),
+                ));
+            }
+        }
+        self.write_state(&staging.join("state.json"), &state)
+            .await?;
+        if paths.project.exists() {
+            // Only an empty, reserved directory reaches this branch. Keep it
+            // rather than deleting it; install the complete owner file first.
+            tokio::fs::rename(staging.join("state.json"), &paths.state).await?;
+        } else {
+            tokio::fs::rename(&staging, &paths.project).await?;
+        }
+        Ok(Some(state))
+    }
+
+    /// Ready is the durable barrier before catalog registration or engine work.
+    pub async fn finish_creation(
+        &self,
+        paths: &ProjectPaths,
+        metadata: &ProjectMetadata,
+        state: &mut PipelineStateFile,
+    ) -> Result<()> {
+        let Some(creation) = state.creation.as_mut() else {
+            return Ok(());
+        };
+        if creation.intent.project_id != paths.id
+            || metadata.workspace_task_id != Some(creation.intent.task_id)
+        {
+            return Err(SplatError::Process(
+                "Project creation binding mismatch".into(),
+            ));
+        }
+        self.write_metadata(&paths.metadata, metadata).await?;
+        creation.ready = true;
+        self.write_state(&paths.state, state).await?;
+        if self.register_in_catalog {
+            catalog::register_project(paths.id, &paths.project).await?;
+        }
+        Ok(())
     }
 
     pub fn with_input_boundary(mut self, boundary: Option<PathBuf>) -> Self {
@@ -211,7 +462,10 @@ impl ProjectManager {
             ProjectInputType::Video
         };
         Self::validate_root(&self.projects_root).await?;
-        let id = Uuid::new_v4();
+        let id = self
+            .creation_intent
+            .as_ref()
+            .map_or_else(Uuid::new_v4, |i| i.project_id);
         let stem = if input_type == ProjectInputType::Images {
             input
                 .file_name()
@@ -228,7 +482,21 @@ impl ProjectManager {
             Local::now().format("%Y%m%d-%H%M%S"),
             sanitize_project_name(stem)
         );
-        let project = unique_project_path(&self.projects_root, &base);
+        let project = self
+            .creation_intent
+            .as_ref()
+            .map(|i| i.project_path.clone())
+            .unwrap_or_else(|| unique_project_path(&self.projects_root, &base));
+        let reserved_paths = ProjectPaths::existing(id, project.clone());
+        if self
+            .begin_creation(&reserved_paths, quality, input_type)
+            .await?
+            .is_some_and(|s| s.creation.as_ref().is_some_and(|c| c.ready))
+        {
+            let metadata =
+                serde_json::from_slice(&tokio::fs::read(&reserved_paths.metadata).await?)?;
+            return Ok((reserved_paths, metadata));
+        }
         let source = project.join("source");
         let work = project.join("work");
         let frames = work.join("frames");
@@ -258,7 +526,9 @@ impl ProjectManager {
                     .as_ref()
                     .is_some_and(CancellationToken::is_cancelled)
                 {
-                    let _ = tokio::fs::remove_dir_all(&project).await;
+                    if self.creation_intent.is_none() {
+                        let _ = tokio::fs::remove_dir_all(&project).await;
+                    }
                     return Err(SplatError::Cancelled);
                 }
                 if let Some(boundary) = &self.input_boundary {
@@ -279,7 +549,9 @@ impl ProjectManager {
                         .to_string(),
                 };
                 if let Err(error) = tokio::fs::copy(&image.path, &dest).await {
-                    let _ = tokio::fs::remove_dir_all(&project).await;
+                    if self.creation_intent.is_none() {
+                        let _ = tokio::fs::remove_dir_all(&project).await;
+                    }
                     return Err(error.into());
                 }
                 origins.insert(
@@ -322,7 +594,7 @@ impl ProjectManager {
             schema_version: crate::project::metadata::schema_version(),
             app_id: PROJECT_APP_ID.into(),
             id,
-            workspace_task_id: None,
+            workspace_task_id: self.creation_intent.as_ref().map(|i| i.task_id),
             name: base,
             created_at: now,
             started_at: Some(now),
@@ -346,9 +618,25 @@ impl ProjectManager {
         atomic_write_json(&metadata_path, &metadata).await?;
         let state = project.join("state.json");
         let mut pipeline_state = PipelineStateFile::created_for(quality, input_type);
+        pipeline_state.ba_policy_version = self
+            .creation_intent
+            .as_ref()
+            .map_or(Some(crate::pipeline::ba_policy::VERSION), |i| {
+                i.ba_policy_version
+            });
+        pipeline_state.brush_training.execution_options = self
+            .creation_intent
+            .as_ref()
+            .map_or_else(|| Some(Default::default()), |i| i.brush_execution_options);
+        pipeline_state.creation = self.creation_intent.clone().map(|intent| {
+            crate::project::creation::ProjectCreationState {
+                intent,
+                ready: false,
+            }
+        });
         pipeline_state.image_sequence = image_scan.map(|scan| scan.info);
         atomic_write_json(&state, &pipeline_state).await?;
-        if self.register_in_catalog {
+        if self.register_in_catalog && self.creation_intent.is_none() {
             catalog::register_project(id, &project).await?;
         }
         Ok((
@@ -373,6 +661,19 @@ impl ProjectManager {
 
     pub async fn write_state(&self, path: &Path, state: &PipelineStateFile) -> Result<()> {
         atomic_write_json(path, state).await?;
+        if let Some(observer) = &self.checkpoint_observer {
+            observer(state);
+        }
+        Ok(())
+    }
+    /// Preparation saves retain their original I/O error while identifying the
+    /// failed atomic-write step. Normal checkpoint saves intentionally opt out.
+    pub(crate) async fn write_state_for_preparation(
+        &self,
+        path: &Path,
+        state: &PipelineStateFile,
+    ) -> Result<()> {
+        atomic_write_json_for_preparation(path, state).await?;
         if let Some(observer) = &self.checkpoint_observer {
             observer(state);
         }
@@ -435,6 +736,77 @@ fn validate_video_path(path: &Path) -> Result<()> {
 }
 
 pub async fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    atomic_write_json_with_context(path, value, &AtomicWriteContext::default()).await
+}
+
+pub(crate) async fn atomic_write_json_for_preparation<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<()> {
+    atomic_write_json_with_context(path, value, &AtomicWriteContext::preparation()).await
+}
+
+#[derive(Default)]
+struct AtomicWriteContext {
+    preparation: bool,
+    // Per-call injection avoids thread-local/global hooks leaking across async
+    // tests or unrelated checkpoint writes.
+    #[cfg(test)]
+    failures: Vec<(&'static str, i32)>,
+}
+
+impl AtomicWriteContext {
+    fn preparation() -> Self {
+        Self {
+            preparation: true,
+            #[cfg(test)]
+            failures: Vec::new(),
+        }
+    }
+
+    fn error(&self, step: &'static str, error: std::io::Error) -> SplatError {
+        let error = SplatError::Io(error);
+        if self.preparation {
+            error.with_io_diagnostic(format!("io_substep={step}"))
+        } else {
+            error
+        }
+    }
+
+    fn before(&self, step: &'static str) -> Result<()> {
+        #[cfg(test)]
+        if let Some((_, code)) = self.failures.iter().find(|(name, _)| *name == step) {
+            return Err(self.error(step, std::io::Error::from_raw_os_error(*code)));
+        }
+        let _ = step;
+        Ok(())
+    }
+
+    async fn io<T>(
+        &self,
+        step: &'static str,
+        operation: impl std::future::Future<Output = std::io::Result<T>>,
+    ) -> Result<T> {
+        self.before(step)?;
+        operation.await.map_err(|error| self.error(step, error))
+    }
+
+    #[cfg(windows)]
+    fn sync_io<T>(
+        &self,
+        step: &'static str,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> Result<T> {
+        self.before(step)?;
+        operation().map_err(|error| self.error(step, error))
+    }
+}
+
+async fn atomic_write_json_with_context<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    context: &AtomicWriteContext,
+) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -442,16 +814,22 @@ pub async fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> R
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)?;
     let result = async {
-        let mut file = tokio::fs::File::create(&temporary).await?;
+        let mut file = context
+            .io("create_state_temp", tokio::fs::File::create(&temporary))
+            .await?;
         use tokio::io::AsyncWriteExt;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
+        context
+            .io("write_state_temp", file.write_all(&bytes))
+            .await?;
+        context.io("sync_state_temp", file.sync_all()).await?;
         drop(file);
-        atomic_replace(&temporary, path)
+        atomic_replace_with_context(&temporary, path, context)
     }
     .await;
     if result.is_err() {
-        let _ = tokio::fs::remove_file(&temporary).await;
+        let _ = context
+            .io("cleanup_state_temp", tokio::fs::remove_file(&temporary))
+            .await;
     }
     result
 }
@@ -464,8 +842,16 @@ pub(crate) async fn atomic_replace_file(source: &Path, destination: &Path) -> Re
         .map_err(|error| SplatError::Process(format!("原子发布任务失败：{error}")))?
 }
 
-#[cfg(windows)]
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    atomic_replace_with_context(source, destination, &AtomicWriteContext::default())
+}
+
+#[cfg(windows)]
+fn atomic_replace_with_context(
+    source: &Path,
+    destination: &Path,
+    context: &AtomicWriteContext,
+) -> Result<()> {
     use std::{iter, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -480,6 +866,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
         .encode_wide()
         .chain(iter::once(0))
         .collect::<Vec<_>>();
+    context.before("replace_state")?;
     // SAFETY: Both paths are owned, NUL-terminated UTF-16 buffers that remain live for the call.
     let result = unsafe {
         MoveFileExW(
@@ -493,14 +880,27 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
     }
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::CrossesDevices {
-        copy_replace_for_encrypted_directory(source, destination)
+        copy_replace_for_encrypted_directory_with_context(source, destination, context)
     } else {
-        Err(error.into())
+        Err(context.error("replace_state", error))
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn copy_replace_for_encrypted_directory(source: &Path, destination: &Path) -> Result<()> {
+    copy_replace_for_encrypted_directory_with_context(
+        source,
+        destination,
+        &AtomicWriteContext::default(),
+    )
+}
+
+#[cfg(windows)]
+fn copy_replace_for_encrypted_directory_with_context(
+    source: &Path,
+    destination: &Path,
+    context: &AtomicWriteContext,
+) -> Result<()> {
     let backup_extension = destination
         .extension()
         .and_then(|extension| extension.to_str())
@@ -509,47 +909,224 @@ fn copy_replace_for_encrypted_directory(source: &Path, destination: &Path) -> Re
     let backup = destination.with_extension(backup_extension);
 
     if backup.exists() {
-        std::fs::remove_file(&backup)?;
+        context.sync_io("remove_state_backup", || std::fs::remove_file(&backup))?;
     }
     if destination.exists() {
-        std::fs::copy(destination, &backup)?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&backup)?
-            .sync_all()?;
+        context.sync_io("backup_state", || std::fs::copy(destination, &backup))?;
+        let file = context.sync_io("open_state_backup", || {
+            std::fs::OpenOptions::new().write(true).open(&backup)
+        })?;
+        context.sync_io("sync_state_backup", || file.sync_all())?;
     }
 
-    let replacement = (|| -> std::io::Result<()> {
-        std::fs::copy(source, destination)?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(destination)?
-            .sync_all()?;
-        std::fs::remove_file(source)?;
+    let replacement = (|| -> Result<()> {
+        context.sync_io("copy_state_replacement", || {
+            std::fs::copy(source, destination)
+        })?;
+        let file = context.sync_io("open_state_replacement", || {
+            std::fs::OpenOptions::new().write(true).open(destination)
+        })?;
+        context.sync_io("sync_state_replacement", || file.sync_all())?;
+        drop(file);
+        context.sync_io("remove_state_temp", || std::fs::remove_file(source))?;
         Ok(())
     })();
 
-    if let Err(error) = replacement {
+    if let Err(mut error) = replacement {
         if backup.is_file() {
-            let _ = std::fs::copy(&backup, destination);
+            if let Err(restore) = context.sync_io("restore_state_backup", || {
+                std::fs::copy(&backup, destination)
+            }) {
+                if context.preparation {
+                    let io = restore.io_error();
+                    error = error.with_io_diagnostic(format!(
+                        "io_substep=restore_state_backup; secondary_error_kind={:?}; secondary_os_error={}",
+                        io.map(std::io::Error::kind),
+                        io.and_then(std::io::Error::raw_os_error)
+                            .map_or_else(|| "none".into(), |value| value.to_string()),
+                    ));
+                }
+            }
         }
-        return Err(error.into());
+        return Err(error);
     }
     if backup.is_file() {
-        std::fs::remove_file(backup)?;
+        context.sync_io("cleanup_state_backup", || std::fs::remove_file(backup))?;
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::rename(source, destination)?;
-    Ok(())
+fn atomic_replace_with_context(
+    source: &Path,
+    destination: &Path,
+    context: &AtomicWriteContext,
+) -> Result<()> {
+    context.before("replace_state")?;
+    std::fs::rename(source, destination).map_err(|error| context.error("replace_state", error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reserved(root: &Path) -> crate::project::creation::ProjectCreationIntent {
+        crate::project::creation::ProjectCreationIntent {
+            ba_policy_version: Some(crate::pipeline::ba_policy::VERSION),
+            brush_execution_options: Some(Default::default()),
+            intent_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            creating_run_id: Uuid::new_v4(),
+            project_path: root.join("reserved"),
+            request_identity: "request-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_owner_state_hard_exit_does_not_strand_an_unidentified_project() {
+        let root = tempfile::tempdir().unwrap();
+        let intent = reserved(root.path());
+        let staging = root.path().join(format!(".creation-{}", intent.intent_id));
+        std::fs::create_dir(&staging).unwrap();
+        let interrupted = staging.join(format!(".state.json.{}.tmp", Uuid::new_v4()));
+        std::fs::write(interrupted, b"{ truncated first owner state").unwrap();
+        let paths = ProjectPaths::existing(intent.project_id, intent.project_path.clone());
+        let manager = ProjectManager::for_diagnostics(root.path().into())
+            .with_creation_intent(Some(intent.clone()));
+        manager
+            .begin_creation(&paths, Quality::Fast, ProjectInputType::Video)
+            .await
+            .unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            manager
+                .read_state(&paths.state)
+                .await
+                .unwrap()
+                .creation
+                .unwrap()
+                .intent,
+            intent
+        );
+        assert!(!paths.metadata.exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_creation_reuses_identity_and_waits_for_complete_configuration() {
+        use crate::pipeline::inputs::{GenerationInputs, InputSource, MaterialInput};
+        let root = tempfile::tempdir().unwrap();
+        let intent = reserved(root.path());
+        let manager = ProjectManager::for_diagnostics(root.path().into())
+            .with_creation_intent(Some(intent.clone()));
+        let inputs = GenerationInputs::Materials {
+            items: vec![MaterialInput {
+                id: "video".into(),
+                source: InputSource::Video {
+                    path: root.path().join("source.mp4"),
+                },
+                identity: None,
+                projection: crate::video::panorama::VideoProjection::Perspective,
+                image_matching_strategy: Default::default(),
+                camera_relation: None,
+                confirmed_small_images: false,
+                confirmed_image_order: false,
+                frame_removal_fps: None,
+            }],
+        };
+        let paths = ProjectPaths::existing(intent.project_id, intent.project_path.clone());
+        manager
+            .begin_creation(&paths, Quality::Fast, ProjectInputType::Video)
+            .await
+            .unwrap();
+        // Fault after the durable owner state, before metadata/configuration.
+        let (same, metadata) = manager
+            .create_collection(Quality::Fast, inputs.clone())
+            .await
+            .unwrap();
+        assert_eq!(same.id, intent.project_id);
+        assert_eq!(metadata.workspace_task_id, Some(intent.task_id));
+        let mut state = manager.read_state(&same.state).await.unwrap();
+        assert!(!state.creation.as_ref().unwrap().ready);
+        assert!(
+            catalog::summarize_project_metadata(&same.project, metadata.clone())
+                .await
+                .is_err()
+        );
+        state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+        state.generation_policy = Some(Default::default());
+        manager
+            .finish_creation(&same, &metadata, &mut state)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .read_state(&same.state)
+                .await
+                .unwrap()
+                .creation
+                .unwrap()
+                .ready
+        );
+        let (again, _) = manager
+            .create_collection(Quality::Fast, inputs)
+            .await
+            .unwrap();
+        assert_eq!(again.project, same.project);
+        assert_eq!(
+            serde_json::to_value(manager.read_state(&same.state).await.unwrap().configuration)
+                .unwrap(),
+            serde_json::to_value(&state.configuration).unwrap()
+        );
+        assert!(state.brush_training.execution_options.is_some());
+        assert_eq!(
+            state.ba_policy_version,
+            Some(crate::pipeline::ba_policy::VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_failure_preserves_barrier_and_rejects_unknown_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let intent = reserved(root.path());
+        let manager = ProjectManager::for_diagnostics(root.path().into())
+            .with_creation_intent(Some(intent.clone()));
+        let paths = ProjectPaths::existing(intent.project_id, intent.project_path.clone());
+        manager
+            .begin_creation(&paths, Quality::Fast, ProjectInputType::Video)
+            .await
+            .unwrap();
+        std::fs::create_dir(&paths.metadata).unwrap();
+        let mut state = manager.read_state(&paths.state).await.unwrap();
+        let metadata = ProjectMetadata {
+            id: intent.project_id,
+            workspace_task_id: Some(intent.task_id),
+            ..Default::default()
+        };
+        assert!(manager
+            .finish_creation(&paths, &metadata, &mut state)
+            .await
+            .is_err());
+        assert!(
+            !manager
+                .read_state(&paths.state)
+                .await
+                .unwrap()
+                .creation
+                .unwrap()
+                .ready
+        );
+        let other = reserved(root.path());
+        let other_manager = manager.clone().with_creation_intent(Some(other.clone()));
+        assert!(other_manager
+            .begin_creation(
+                &ProjectPaths::existing(other.project_id, other.project_path),
+                Quality::Fast,
+                ProjectInputType::Video
+            )
+            .await
+            .is_err());
+        assert!(paths.state.is_file());
+    }
     #[test]
     fn sanitizes_windows_names() {
         assert_eq!(sanitize_project_name("房子:轨迹?.mp4"), "房子_轨迹_.mp4");
@@ -581,6 +1158,198 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
         assert_eq!(value["value"], 2);
+    }
+
+    #[tokio::test]
+    async fn preparation_atomic_write_preserves_os_error_for_each_substep() {
+        for step in [
+            "create_state_temp",
+            "write_state_temp",
+            "sync_state_temp",
+            "replace_state",
+        ] {
+            for code in [5, 32, 33, 112] {
+                let temporary = tempfile::tempdir().unwrap();
+                let path = temporary.path().join("state.json");
+                let original = br#"{"preserved":true}"#;
+                std::fs::write(&path, original).unwrap();
+                let context = AtomicWriteContext {
+                    preparation: true,
+                    failures: vec![(step, code)],
+                };
+                let error = atomic_write_json_with_context(
+                    &path,
+                    &serde_json::json!({"replacement": true}),
+                    &context,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.io_error().and_then(std::io::Error::raw_os_error),
+                    Some(code),
+                    "{step}"
+                );
+                assert_eq!(
+                    error.io_error().unwrap().kind(),
+                    std::io::Error::from_raw_os_error(code).kind()
+                );
+                assert!(error.to_string().contains(&format!("io_substep={step}")));
+                assert!(!error
+                    .to_string()
+                    .contains(&path.to_string_lossy().to_string()));
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_atomic_write_is_opt_in_for_real_io_failures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("missing").join("state.json");
+        let value = serde_json::json!({"value": 1});
+        let ordinary = atomic_write_json(&path, &value).await.unwrap_err();
+        let preparation = atomic_write_json_for_preparation(&path, &value)
+            .await
+            .unwrap_err();
+        assert!(matches!(&ordinary, SplatError::Io(_)));
+        assert!(!ordinary.to_string().contains("io_substep="));
+        assert!(preparation
+            .to_string()
+            .contains("io_substep=create_state_temp"));
+        assert_eq!(
+            ordinary.io_error().unwrap().raw_os_error(),
+            preparation.io_error().unwrap().raw_os_error()
+        );
+        assert_eq!(
+            ordinary.io_error().unwrap().kind(),
+            preparation.io_error().unwrap().kind()
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn preparation_atomic_write_cleanup_keeps_the_primary_os_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.json");
+        let original = br#"{"preserved":true}"#;
+        std::fs::write(&path, original).unwrap();
+        let context = AtomicWriteContext {
+            preparation: true,
+            failures: vec![("write_state_temp", 112), ("cleanup_state_temp", 5)],
+        };
+        let error = atomic_write_json_with_context(
+            &path,
+            &serde_json::json!({"replacement": true}),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.io_error().and_then(std::io::Error::raw_os_error),
+            Some(112)
+        );
+        assert!(error.to_string().contains("io_substep=write_state_temp"));
+        assert!(!error.to_string().contains("io_substep=cleanup_state_temp"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        // The failed best-effort cleanup is confined to this temporary fixture.
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn preparation_state_write_observer_runs_only_after_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temporary = tempfile::tempdir().unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let captured = notifications.clone();
+        let manager = ProjectManager::for_diagnostics(temporary.path().into())
+            .with_checkpoint_observer(Arc::new(move |_| {
+                captured.fetch_add(1, Ordering::SeqCst);
+            }));
+        let state = PipelineStateFile::created(Quality::Balanced);
+        let missing = temporary.path().join("missing").join("state.json");
+        let error = manager
+            .write_state_for_preparation(&missing, &state)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("io_substep=create_state_temp"));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        let path = temporary.path().join("state.json");
+        manager
+            .write_state_for_preparation(&path, &state)
+            .await
+            .unwrap();
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparation_encrypted_replacement_identifies_backup_copy_and_sync_failures() {
+        for step in [
+            "remove_state_backup",
+            "backup_state",
+            "open_state_backup",
+            "sync_state_backup",
+            "copy_state_replacement",
+            "open_state_replacement",
+            "sync_state_replacement",
+            "remove_state_temp",
+            "cleanup_state_backup",
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("state.json.tmp");
+            let destination = temporary.path().join("state.json");
+            let backup = temporary.path().join("state.json.bak");
+            std::fs::write(&source, br#"{"value":2}"#).unwrap();
+            std::fs::write(&destination, br#"{"value":1}"#).unwrap();
+            std::fs::write(&backup, br#"{"older":true}"#).unwrap();
+            let context = AtomicWriteContext {
+                preparation: true,
+                failures: vec![(step, 32)],
+            };
+            let error =
+                copy_replace_for_encrypted_directory_with_context(&source, &destination, &context)
+                    .unwrap_err();
+            assert_eq!(
+                error.io_error().and_then(std::io::Error::raw_os_error),
+                Some(32),
+                "{step}"
+            );
+            assert!(error.to_string().contains(&format!("io_substep={step}")));
+            assert!(!error
+                .to_string()
+                .contains(&temporary.path().to_string_lossy().to_string()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparation_encrypted_restore_failure_does_not_replace_primary_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("state.json.tmp");
+        let destination = temporary.path().join("state.json");
+        std::fs::write(&source, br#"{"value":2}"#).unwrap();
+        std::fs::write(&destination, br#"{"value":1}"#).unwrap();
+        let context = AtomicWriteContext {
+            preparation: true,
+            failures: vec![("sync_state_replacement", 112), ("restore_state_backup", 5)],
+        };
+        let error =
+            copy_replace_for_encrypted_directory_with_context(&source, &destination, &context)
+                .unwrap_err();
+        assert_eq!(
+            error.io_error().and_then(std::io::Error::raw_os_error),
+            Some(112)
+        );
+        let detail = error.to_string();
+        assert!(detail.contains("io_substep=sync_state_replacement"));
+        assert!(detail.contains("io_substep=restore_state_backup"));
+        assert!(detail.contains("secondary_os_error=5"));
+        assert!(destination.with_extension("json.bak").is_file());
     }
 
     #[tokio::test]

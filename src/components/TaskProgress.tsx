@@ -5,10 +5,11 @@ import { taskStageLabels, taskStagePosition, taskStages } from '../app/taskPrese
 import { formatClockDuration } from '../lib/runtimeEstimate';
 import type { RuntimeSnapshot } from '../types/pipeline';
 import { RuntimePanel } from './RuntimePanel';
-import { nextOverallPercent } from '../lib/progressState';
+import { isTrainingPreparation, nextOverallPercent } from '../lib/progressState';
 
 export interface TaskLogLine { key: string; text: string; source: string | null; timestamp?: string; level?: string }
 interface Props {
+  importedReconstruction?: boolean;
   status: string; stage: string | null; progress: number | null; stageProgress?: number | null;
   substage?: string | null;
   operationAttempt?: number;
@@ -28,12 +29,15 @@ function ProgressPercentage({ progress, completed }: { progress: number | null; 
 }
 
 /** Original progress/timeline/log layout with task-local data and optional raw log columns. */
-export function TaskProgress({ status, stage, progress, stageProgress, substage, operationAttempt, progressKey, message, elapsedMs, remainingSeconds, runtime, showRuntimePanel = true, logs, historical, cancelling, onCancel, logRef, onLogScroll, logsTruncated }: Props) {
+export function TaskProgress({ importedReconstruction,status, stage, progress, stageProgress, substage, operationAttempt, progressKey, message, elapsedMs, remainingSeconds, runtime, showRuntimePanel = true, logs, historical, cancelling, onCancel, logRef, onLogScroll, logsTruncated }: Props) {
   const { locale, t, formatDuration } = useI18n();
   const active = ['starting', 'running', 'cancelling'].includes(status);
   const index = taskStagePosition(stage);
   const knownStage = stage != null;
-  const preparing = substage === 'panoramaTrainingPreparation' || substage === 'panoramaTrainingValidation';
+  const preparing = stage === 'trainingSplats' && isTrainingPreparation(substage);
+  // A cleared operation must not leak an old Brush monitor through a delayed
+  // snapshot. Fresh preparation-process snapshots have no training fields.
+  const currentRuntime = preparing && runtime?.training ? null : runtime;
   const stageLabel = stage && Object.hasOwn(taskStageLabels, stage) ? taskStageLabels[stage] : taskStages[index][1];
   const internalRef = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -48,11 +52,12 @@ export function TaskProgress({ status, stage, progress, stageProgress, substage,
     {!preparing && runtime?.training && remainingSeconds != null && <p className="training-remaining">{t('runtime.remaining')} {formatClockDuration(remainingSeconds)}</p>}
     {!historical && <div className="process-metrics"><span><small>{t('progress.stage')}</small><b>{stage ? t(stageLabel) : '—'}</b></span><span><small>{t('progress.elapsed')}</small><b>{elapsedMs == null ? '—' : formatDuration(elapsedMs)}</b></span></div>}
     <ol className="stage-timeline">{taskStages.map(([key, label], position) => {
+      if(importedReconstruction&&position>=2&&position<=4)return position===2?<li key="imported" className="imported-reconstruction" title={t('inputs.skip')}><span/><b>{t('inputs.imported')}</b></li>:null;
       const terminal = knownStage && position === index && ['failed', 'cancelled', 'interrupted'].includes(status) ? status : '';
       const className = (knownStage && position < index) || status === 'completed' ? 'done' : terminal || (knownStage && position === index && active ? 'active' : '');
       return <li key={key} className={className}><span /><b>{t(label)}</b>{position === index && active && <small>{stageProgress == null ? t('progress.processing') : `${Math.min(100, Math.max(0, stageProgress)).toFixed(1)}%`}</small>}</li>;
     })}</ol>
-    {showRuntimePanel && status !== 'completed' && (active || runtime) && <RuntimePanel snapshot={runtime ?? null} running={active} waitingMessage={message} />}
+    {showRuntimePanel && status !== 'completed' && (active || currentRuntime) && <RuntimePanel snapshot={currentRuntime ?? null} running={active} waitingMessage={message} />}
     <div className="log-toolbar"><span>{t('progress.log')}</span><small>{t('progress.logCount', { count: logs.length })}</small></div>
     {logsTruncated && <p className="runtime-note">{t('progress.logsTruncated')}</p>}
     <div className="live-log" aria-live="polite" role="log" ref={logRef ?? internalRef} onScroll={onLogScroll ?? (() => { const node = internalRef.current; if (node) follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24; })}>

@@ -4,6 +4,7 @@ use crate::{
     commands::InputAnalysis,
     pipeline::{
         generation_policy::GenerationPolicy,
+        inputs::{GenerationInputs, InputSource, MaterialInput},
         reshoot::{CameraRelation, ModelCondition, ReshootOptions},
         runner::ReshootSourceInfo,
     },
@@ -23,6 +24,47 @@ pub(super) struct Answers {
     pub image_order: Option<ImageMatchingStrategy>,
     pub model_condition: Option<ModelCondition>,
     pub camera_relation: Option<CameraRelation>,
+}
+
+/// The legacy single-path transport is only an admission adapter. Once its
+/// existing questions have been answered, execute the same material work order
+/// as GUI/multi-input requests; never send a new task to a legacy Runner.
+fn mapped_input(
+    inspection: &Inspection,
+    answers: &Answers,
+    projection: VideoProjection,
+    strategy: ImageMatchingStrategy,
+    identity: String,
+) -> GenerationInputs {
+    let source = if inspection.analysis.input_type == crate::project::ProjectInputType::Video {
+        InputSource::Video {
+            path: inspection.path.clone(),
+        }
+    } else {
+        InputSource::ImageFolder {
+            path: inspection.path.clone(),
+        }
+    };
+    GenerationInputs::Materials {
+        items: vec![MaterialInput {
+            id: "input".into(),
+            source,
+            identity: Some(identity),
+            projection,
+            image_matching_strategy: strategy,
+            camera_relation: if projection == VideoProjection::Equirectangular {
+                None
+            } else {
+                answers.camera_relation
+            },
+            // Reshoots never asked the small-sequence question in this transport;
+            // retain that already-validated admission rule, not a guessed answer.
+            confirmed_small_images: inspection.source.is_some()
+                || answers.small_images == Some(true),
+            confirmed_image_order: answers.image_order.is_some(),
+            frame_removal_fps: None,
+        }],
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,120 +109,9 @@ pub(super) fn text(key: &str, count: u64) -> Value {
     };
     json!({"zh-CN":read(zh),"en":read(en)})
 }
-fn question(
-    key: &str,
-    title: &str,
-    description: Option<&str>,
-    options: &[(&str, &str)],
-    count: u64,
-) -> Value {
-    json!({"key":key,"title":text(title,count),"description":description.map(|key|text(key,count)),
-        "options":options.iter().map(|(value,label)|json!({"value":if key=="small_images" {json!(true)}else{json!(value)},"label":text(label,count)})).collect::<Vec<_>>()})
-}
 impl Inspection {
     pub fn questions(&self) -> Vec<Value> {
-        let mut questions = Vec::new();
-        let images = self.analysis.image_sequence.as_ref();
-        let count = images.map_or(0, |i| i.image_count);
-        if self.analysis.projection_detection.requires_choice {
-            let image = images.is_some();
-            let mut options = vec![(
-                "perspective",
-                if image {
-                    "source.images"
-                } else {
-                    "panorama.ordinaryDetected"
-                },
-            )];
-            if self.analysis.projection_detection.supported_erp {
-                options.push((
-                    "equirectangular",
-                    if image {
-                        "source.panoramaImages"
-                    } else {
-                        "source.fullPanorama"
-                    },
-                ));
-            }
-            questions.push(question(
-                "input_projection",
-                if image {
-                    "source.chooseImageType"
-                } else {
-                    "source.chooseType"
-                },
-                Some(if image {
-                    "source.ambiguousImages"
-                } else {
-                    "panorama.ambiguous"
-                }),
-                &options,
-                count,
-            ));
-        }
-        if let Some(source) = &self.source {
-            questions.push(question(
-                "model_condition",
-                "reshoot.conditionTitle",
-                None,
-                &[
-                    ("good", "reshoot.condition.good"),
-                    ("appearance", "reshoot.condition.appearance"),
-                    ("geometry", "reshoot.condition.geometry"),
-                    ("unsure", "reshoot.condition.unsure"),
-                ],
-                count,
-            ));
-            // Keep the plain-language processing hints with each option.
-            if let Some(options) = questions
-                .last_mut()
-                .and_then(|q| q["options"].as_array_mut())
-            {
-                for option in options {
-                    option["description"] = text(
-                        &format!(
-                            "reshoot.condition.{}Hint",
-                            option["value"].as_str().unwrap()
-                        ),
-                        count,
-                    );
-                }
-            }
-            if source.projection != VideoProjection::Equirectangular {
-                questions.push(question(
-                    "camera_relation",
-                    "reshoot.cameraTitle",
-                    Some("reshoot.cameraDescription"),
-                    &[
-                        ("same", "reshoot.camera.same"),
-                        ("different", "reshoot.camera.different"),
-                        ("unsure", "reshoot.camera.unsure"),
-                    ],
-                    count,
-                ));
-            }
-        } else if images.is_some() && count < 30 {
-            questions.push(question(
-                "small_images",
-                "dialog.smallSequenceTitle",
-                Some("dialog.smallSequence"),
-                &[("accepted", "preflight.acceptWarning")],
-                count,
-            ));
-        }
-        if count > 100 {
-            questions.push(question(
-                "image_order",
-                "preflight.imageOrderTitle",
-                Some("preflight.imageOrderDescription"),
-                &[
-                    ("sequential", "preflight.ordered"),
-                    ("exhaustive", "preflight.unordered"),
-                ],
-                count,
-            ));
-        }
-        questions
+        materials::single_questions(self, None)
     }
     pub fn validate_answers(
         &self,
@@ -196,8 +127,7 @@ impl Inspection {
                 "Projection answers must be explicit",
             ));
         }
-        let missing: Vec<_> = self
-            .questions()
+        let missing: Vec<_> = materials::single_questions(self, Some(answers))
             .into_iter()
             .filter(|q| match q["key"].as_str().unwrap() {
                 "input_projection" => !matches!(
@@ -232,10 +162,6 @@ impl Inspection {
         if (projection == VideoProjection::Equirectangular && !detection.supported_erp)
             || (detection.confirmed_erp
                 && answers.input_projection == Some(VideoProjection::Perspective))
-            || self
-                .source
-                .as_ref()
-                .is_some_and(|s| s.projection != projection)
         {
             return Err(ServiceError::new(
                 "INVALID_PROJECTION",
@@ -254,7 +180,11 @@ impl Inspection {
         };
         let options = self.source.as_ref().map(|source| ReshootOptions {
             condition: answers.model_condition.expect("validated answer"),
-            camera_relation: answers.camera_relation,
+            camera_relation: if projection == VideoProjection::Equirectangular {
+                None
+            } else {
+                answers.camera_relation
+            },
             allow_fallback: self.policy.auto_retry_enabled,
             source_identity: source.source_identity.clone(),
             input_identity: self.identity.clone(),
@@ -266,6 +196,7 @@ impl Inspection {
 }
 pub(super) async fn inspect(tools: &McpTools, request: InspectRequest) -> Result<Inspection> {
     let path = authorize_input(Path::new(&request.input_path), &tools.settings.input_roots)?;
+    crate::pipeline::input_admission::ensure_new_paths_supported(std::slice::from_ref(&path))?;
     if path.is_dir() {
         // A directory authorization does not authorize symlink targets outside it.
         for image in crate::video::list_images(&path)? {
@@ -283,18 +214,18 @@ pub(super) async fn inspect(tools: &McpTools, request: InspectRequest) -> Result
         version: crate::pipeline::generation_policy::VERSION,
         ..policy
     };
-    let source = if let Some(id) = request.source_project_id {
-        Some(
-            crate::pipeline::runner::PipelineRunner::new(tools.engines.clone(), |_| {})
-                .inspect_reshoot_source_v2(id)
-                .await?,
-        )
-    } else {
-        None
-    };
+    let (core_id, material, source) = materials::inspect_single(
+        tools,
+        path.clone(),
+        request.quality,
+        policy,
+        request.source_project_id,
+    )
+    .await?;
     let mut cache = inspections().lock().await;
     if let Some(old) = cache.iter().find(|s| {
-        s.identity == identity
+        s.id == core_id
+            && s.identity == identity
             && s.quality == request.quality
             && s.policy == policy
             && s.source
@@ -304,30 +235,15 @@ pub(super) async fn inspect(tools: &McpTools, request: InspectRequest) -> Result
     }) {
         return Ok(old.clone());
     }
-    let analysis = if let Some(cached) = cache.iter().find(|s| {
-        s.identity == identity
-            && s.source.as_ref().map(|s| s.projection) == source.as_ref().map(|s| s.projection)
-    }) {
-        cached.analysis.clone()
-    } else if path.is_dir()
-        && source
-            .as_ref()
-            .is_some_and(|s| s.projection == VideoProjection::Perspective)
-    {
-        let directory = path.clone();
-        let scan = tokio::task::spawn_blocking(move || {
-            crate::video::image_projection::analyze_reshoot(&directory)
-        })
-        .await
-        .map_err(|e| ServiceError::new("ANALYSIS_FAILED", e.to_string()))??;
-        InputAnalysis {
-            input_type: crate::project::ProjectInputType::Images,
-            video: None,
-            image_sequence: Some(scan.info),
-            projection_detection: scan.detection,
-        }
-    } else {
-        crate::commands::analyze_media(&tools.engines, &path).await?
+    let analysis = InputAnalysis {
+        input_type: if material.video.is_some() {
+            crate::project::ProjectInputType::Video
+        } else {
+            crate::project::ProjectInputType::Images
+        },
+        video: material.video,
+        image_sequence: material.image_sequence,
+        projection_detection: material.projection_detection,
     };
     if source_identity(&path)? != identity {
         return Err(ServiceError::new(
@@ -336,7 +252,7 @@ pub(super) async fn inspect(tools: &McpTools, request: InspectRequest) -> Result
         ));
     }
     let result = Inspection {
-        id: Uuid::new_v4(),
+        id: core_id,
         path,
         identity,
         quality: request.quality,
@@ -369,7 +285,7 @@ fn gps_cache() -> &'static std::sync::Mutex<BTreeMap<String, GpsSummary>> {
     static CACHE: OnceLock<std::sync::Mutex<BTreeMap<String, GpsSummary>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
-fn gps_summary(inspection: &Inspection) -> Value {
+fn gps_summary(tools: &McpTools, inspection: &Inspection) -> Value {
     if !inspection.path.is_dir() {
         return json!({"detected":null,"status":"unavailable"});
     }
@@ -387,9 +303,12 @@ fn gps_summary(inspection: &Inspection) -> Value {
     cache.insert(inspection.identity.clone(), GpsSummary::Pending);
     let path = inspection.path.clone();
     let identity = inspection.identity.clone();
+    let access =
+        crate::pipeline::access::InvocationAccess::restricted(tools.settings.input_roots.clone());
     tokio::spawn(async move {
         let expected = identity.clone();
         let observed = tokio::task::spawn_blocking(move || {
+            access.authorize_image_directory(&path).ok()?;
             let images = crate::video::list_images(&path).ok()?;
             let detected = crate::video::gps::detect(&images);
             (source_identity(&path).ok().as_deref() == Some(&expected)).then_some(detected)
@@ -450,7 +369,7 @@ pub(super) async fn public_inspection(tools: &McpTools, inspection: Inspection) 
     Ok(
         json!({"preflight_id":inspection.id,"input_source_identity":inspection.identity,"input":input,
         "source":inspection.source.as_ref().map(|s|snake(serde_json::to_value(s).unwrap())),"generation_policy":snake(serde_json::to_value(inspection.policy)?),
-        "plan":plan,"plan_is_estimate":true,"max_splats":null,"questions":inspection.questions(),"gps":gps_summary(&inspection)}),
+        "plan":plan,"plan_is_estimate":true,"max_splats":null,"questions":inspection.questions(),"gps":gps_summary(tools,&inspection)}),
     )
 }
 
@@ -567,22 +486,33 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
         }
     }
     let (projection, strategy, options) = inspection.validate_answers(&answers)?;
-    if let (Some(id), Some(options)) = (request.source_project_id, &options) {
-        crate::pipeline::runner::PipelineRunner::new(tools.engines.clone(), |_| {})
-            .with_generation_policy(Some(policy))
-            .validate_reshoot_request_v2(
-                id,
-                &inspection.path,
-                if inspection.path.is_dir() {
-                    crate::pipeline::runner::ReshootInputType::Images
-                } else {
-                    crate::pipeline::runner::ReshootInputType::Video
-                },
-                request.quality,
-                options,
-            )
-            .await?;
+    if source_identity(&inspection.path)? != inspection.identity {
+        return Err(ServiceError::new(
+            "INPUT_CHANGED",
+            "Input changed during admission",
+        ));
     }
+    let input_source = if inspection.analysis.input_type == crate::project::ProjectInputType::Video
+    {
+        InputSource::Video {
+            path: inspection.path.clone(),
+        }
+    } else {
+        InputSource::ImageFolder {
+            path: inspection.path.clone(),
+        }
+    };
+    let material_identity = input_source.identity()?;
+    let inputs = mapped_input(
+        &inspection,
+        &answers,
+        projection,
+        strategy,
+        material_identity,
+    );
+    // Shared per-material validation, not the obsolete scalar source/input
+    // projection equality check. Mixed sources use their real camera models.
+    crate::pipeline::inputs::validate(&tools.engines, &inputs, request.quality, policy).await?;
     if source_identity(&inspection.path)? != inspection.identity {
         return Err(ServiceError::new(
             "INPUT_CHANGED",
@@ -590,7 +520,8 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
         ));
     }
     let mut parameters = json!({"input_path":request.input_path,"quality":request.quality,"generationPolicy":policy,
-        "videoProjection":projection,"videoSourceIdentity":inspection.identity,"imageMatchingStrategy":strategy,"mcp_intent":intent});
+        "videoProjection":projection,"videoSourceIdentity":inspection.identity,"imageMatchingStrategy":strategy,
+        "inputs":inputs,"mcp_intent":intent});
     if let Some(options) = options {
         parameters["reshootOptions"] = serde_json::to_value(options)?;
         parameters["source_project_id"] = json!(request.source_project_id);

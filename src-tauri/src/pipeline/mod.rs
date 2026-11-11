@@ -1,14 +1,28 @@
+pub mod access;
+pub mod artifacts;
+pub mod ba_policy;
 pub mod brush_execution;
 pub mod effectiveness;
 pub mod estimate;
 pub mod event;
+pub mod execution_plan;
+pub(crate) mod feature_input;
+pub(crate) mod focal_preflight;
 pub mod generation_policy;
+pub mod input_admission;
+pub mod input_discovery;
+pub mod inputs;
 pub mod progress;
+pub mod publication;
 pub mod reshoot;
+pub mod reshoot_connection;
+pub mod reshoot_snapshot;
+pub(crate) mod retry_preparation;
 pub mod runner;
 pub mod runtime;
 pub mod splat_budget;
 pub mod state;
+pub mod work_order;
 
 pub use event::{EventKind, EventLevel, PipelineEngine, PipelineEvent};
 pub use state::PipelineStage;

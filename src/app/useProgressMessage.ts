@@ -31,7 +31,7 @@ export function useProgressMessage(status: string, stage: string | null, events:
   const source = counters ?? latestPhaseEvent;
   const substage = source?.substage;
   const count = validCount(source?.current, source?.total);
-  if (substage === 'panoramaTimestamps') return t('progress.panoramaTimestamps');
+  if (substage === 'panoramaTimestamps' || substage === 'videoTimestamps') return t('progress.panoramaTimestamps');
   if (substage === 'panoramaImagesPreparation' && count) return t('progress.panoramaImagesPreparing', { current: formatNumber(count.current), total: formatNumber(count.total) });
   if (substage === 'panoramaImagesReconstruction' && count) return t('progress.panoramaImagesRegistered', { current: formatNumber(count.current), total: formatNumber(count.total) });
   if (stage === 'reconstructing') {
@@ -42,6 +42,11 @@ export function useProgressMessage(status: string, stage: string | null, events:
       : t(substage === 'panoramaReconstruction' ? 'progress.panoramaReconstruction' : 'progress.activeReconstruction');
     return t('progress.activeLongWait', { label });
   }
+  if (substage === 'trainingValidation') return t('progress.trainingValidating');
+  if (substage === 'trainingCheckpoint') return t('progress.trainingCheckpoint');
+  if (substage === 'trainingPreparation') return count
+    ? t('progress.trainingPreparingCount', { current: formatNumber(count.current), total: formatNumber(count.total) })
+    : t('stage.trainingPreparation');
   if (substage === 'panoramaTrainingValidation') return t('progress.panoramaValidating');
   if (substage === 'panoramaTrainingPreparation') {
     return count ? t(source?.unit === 'panoramaImageFaces' ? 'progress.panoramaImagesFaces' : 'progress.panoramaPreparing', { current: formatNumber(Math.floor(count.current / 6)), total: formatNumber(Math.floor(count.total / 6)), faces: formatNumber(count.current), totalFaces: formatNumber(count.total) }) : t('progress.panoramaChecking');

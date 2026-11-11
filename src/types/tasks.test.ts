@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { mergeTask, type SharedTask } from './tasks';
+import { mergeTask, taskCanContinue, type SharedTask, type TaskStatus } from './tasks';
 
 const task = (task_id: string, run_id: string, revision: number, estimated_progress: number | null, status = 'running') =>
   ({ task_id, run_id, revision, estimated_progress, status, recent_events: [] }) as unknown as SharedTask;
@@ -27,4 +27,13 @@ it('never turns invalid progress into NaN or an unknown display value', () => {
   expect(tasks.a.display_progress).toBe(0);
   tasks = mergeTask(tasks, task('a', 'run1', 2, Infinity));
   expect(tasks.a.display_progress).toBe(0);
+});
+
+it.each(['failed', 'cancelled', 'interrupted'] as const)('offers one continuation flow for %s, including before project creation', status => {
+  expect(taskCanContinue({ status })).toBe(true);
+  expect(taskCanContinue({ status, project_deleted: true })).toBe(false);
+});
+
+it.each(['created', 'starting', 'running', 'cancelling', 'completed'] satisfies TaskStatus[])('does not continue a %s task', status => {
+  expect(taskCanContinue({ status })).toBe(false);
 });

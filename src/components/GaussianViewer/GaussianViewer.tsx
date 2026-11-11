@@ -166,6 +166,7 @@ interface SplatSceneApi {
   alignView: (view: GaussianOrthographicView) => void;
   locateView: () => void;
   stopNavigation: () => void;
+  isMouseLookActive: () => boolean;
   initializeCrop: (kind: "sphere" | "box", previous: GaussianCrop) => Exclude<GaussianCrop, null> | null;
   snapshotView: () => GaussianHtmlView;
   saveView: () => boolean;
@@ -179,6 +180,29 @@ interface SplatSceneApi {
     captureRegion: NormalizedCaptureRegion;
     orientation: VideoOrientation;
   }) => Promise<Uint8Array>;
+}
+
+/** Capture before rectangle selection and the canvas' native gizmo handlers. */
+export function consumeMouseLookPointer(
+  event: Pick<ReactPointerEvent, "preventDefault" | "stopPropagation">,
+  navigation: Pick<SplatSceneApi, "isMouseLookActive"> | null,
+): boolean {
+  if (!navigation?.isMouseLookActive()) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  return true;
+}
+
+/** Releasing the cursor must not also clear an existing rectangle selection. */
+export function consumeMouseLookEscape(
+  event: KeyboardEvent,
+  navigation: Pick<SplatSceneApi, "isMouseLookActive" | "stopNavigation"> | null,
+): boolean {
+  if (event.key !== "Escape" || !navigation?.isMouseLookActive()) return false;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  navigation.stopNavigation();
+  return true;
 }
 
 const INITIAL_VIEWPORT: ViewportStatus = {
@@ -969,13 +993,14 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const modelPivot = useCallback(() => robustLocalBoundsRef.current ? modelPivotFromPly(robustLocalBoundsRef.current.center) : null, []);
   const finishGizmo = useCallback((cancel = false) => gizmoRef.current?.finish(cancel), []);
   const stopNavigation = useCallback(() => controlsRef.current?.stopNavigation(), []);
+  const isMouseLookActive = useCallback(() => controlsRef.current?.isMouseLookActive() ?? false, []);
   const focusCanvas = useCallback(() => {
     const state = gizmoStateRef.current;
     if (state.mode !== "adjust" || state.interactionBlocked || gizmoDraggingRef.current
       || !sceneReadyRef.current || appDestroyedRef.current || contextLostRef.current || exportingRef.current) return false;
     return controlsRef.current?.focus() ?? false;
   }, []);
-  useImperativeHandle(ref, () => ({ focusCanvas, replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, locateView, stopNavigation, initializeCrop }), [focusCanvas, alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, locateView, modelPivot, replay, saveView, selectRectangle, snapshotView, stopNavigation]);
+  useImperativeHandle(ref, () => ({ focusCanvas, replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, locateView, stopNavigation, isMouseLookActive, initializeCrop }), [focusCanvas, alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, locateView, isMouseLookActive, modelPivot, replay, saveView, selectRectangle, snapshotView, stopNavigation]);
 
   return <>
     <PreviewCamera ref={cameraRef} />
@@ -1574,7 +1599,11 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   }, [beginFocusReturn, busy, navigationSaving, pendingNavigation, viewport.phase, store.tool, store.descriptor?.projectId]);
 
   useEffect(() => {
+    const mouseLookEscape = (event: KeyboardEvent) => {
+      consumeMouseLookEscape(event, sceneApiRef.current);
+    };
     const keyDown = (event: KeyboardEvent) => {
+      if (sceneApiRef.current?.isMouseLookActive()) return;
       if (mode !== "adjust" || !store.descriptor || busy) return;
       if (store.tool !== "transform" && viewport.phase === "ready" && isInvertSelectionShortcut(event)) {
         event.preventDefault();
@@ -1606,11 +1635,16 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       }
       focus();
     };
+    window.addEventListener("keydown", mouseLookEscape, true);
     window.addEventListener("keydown", keyDown);
-    return () => window.removeEventListener("keydown", keyDown);
+    return () => {
+      window.removeEventListener("keydown", mouseLookEscape, true);
+      window.removeEventListener("keydown", keyDown);
+    };
   }, [beginFocusReturn, returnCanvasFocus, busy, invertSelection, mode, store.descriptor?.projectId, store.tool, viewport.phase]);
 
   const rectanglePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (consumeMouseLookPointer(event, sceneApiRef.current)) return;
     if (mode !== "adjust" || store.tool !== "rectangle" || event.button !== 0 || busy || viewport.phase !== "ready") return;
     if ((event.target as Element).closest("button,input,aside")) return;
     sceneApiRef.current?.stopNavigation();
@@ -1620,11 +1654,13 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     setSelectionDrag({ pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, selectionMode: event.ctrlKey ? "remove" : event.shiftKey ? "add" : "replace" });
   };
   const rectanglePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (consumeMouseLookPointer(event, sceneApiRef.current)) return;
     if (!selectionDrag || event.pointerId !== selectionDrag.pointerId) return;
     event.preventDefault(); event.stopPropagation();
     setSelectionDrag((current) => current ? { ...current, x: event.clientX, y: event.clientY } : null);
   };
   const rectanglePointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (consumeMouseLookPointer(event, sceneApiRef.current)) return;
     const drag = selectionDrag;
     if (!drag || event.pointerId !== drag.pointerId) return;
     event.preventDefault(); event.stopPropagation();

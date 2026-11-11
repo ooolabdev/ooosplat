@@ -395,7 +395,7 @@ fn apply_frame_times(plan: &mut FramePlan, times: &[FrameTime]) -> Result<Vec<Fr
     {
         frame.timestamp_seconds = times
             .get(frame.source_frame_index as usize)
-            .ok_or_else(|| process_error("全景视频帧数量与抽帧计划不一致"))?
+            .ok_or_else(|| process_error("视频帧数量与抽帧计划不一致"))?
             .timestamp_seconds;
     }
     plan.estimated_frames = plan.selected_frames.len() as u64;
@@ -431,7 +431,7 @@ fn validate_frame_times(times: &[FrameTime]) -> Result<()> {
             .any(|p| p[1].timestamp_seconds < p[0].timestamp_seconds)
     {
         return Err(process_error(
-            "全景视频帧时间戳不可用、非单调或超出首版 100 万帧限制",
+            "视频帧时间戳不可用、非单调或超出 100 万帧限制",
         ));
     }
     Ok(())
@@ -554,7 +554,7 @@ pub fn erp_pixel(q: M3, x: u32, y: u32, size: u32, width: u32, height: u32) -> (
     let v = (ray[1].atan2(ray[0].hypot(ray[2])) / std::f64::consts::PI + 0.5) * height as f64 - 0.5;
     (u.rem_euclid(width as f64), v.clamp(0., height as f64 - 1.))
 }
-fn render_face(
+pub(crate) fn render_face(
     source: &image::RgbaImage,
     mask: Option<&image::GrayImage>,
     q: M3,

@@ -565,19 +565,19 @@ describe("focused perspective WASD flight", () => {
     return { ...state, key, advance, frames, done };
   }
 
-  it("moves horizontally at 15% speed, preserves orientation/distance and saves only when released", () => {
+  it("moves along the viewing direction at 15% speed, preserves orientation/distance and saves only when released", () => {
     const s = flight();
     try {
       const before = s.controls.snapshot();
-      const forward = s.entity.forward.clone(); forward.y = 0; forward.normalize();
+      const forward = s.entity.forward.clone().normalize();
       const position = s.entity.getPosition().clone();
       s.key("keydown", "KeyW");
       s.advance(16); s.advance(32);
       const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...before.target));
       expect(moved.clone().normalize().dot(forward)).toBeCloseTo(1);
-      expect(moved.y).toBe(0);
-      expect(s.entity.getPosition().y).toBeCloseTo(position.y, 7);
-      expect(s.entity.forward.dot(forward)).toBeCloseTo(Math.cos(before.pitch * Math.PI / 180));
+      expect(moved.y).toBeLessThan(0);
+      expect(s.entity.getPosition().clone().sub(position).distance(moved)).toBeLessThan(1e-6);
+      expect(s.entity.forward.dot(forward)).toBeCloseTo(1);
       expect(moved.length()).toBeCloseTo(0.15 * 2 * before.distance * Math.tan(52 * Math.PI / 360) * 0.032);
       expect(s.controls.snapshot().distance).toBe(before.distance);
       expect(s.onViewChange).not.toHaveBeenCalled();
@@ -591,12 +591,15 @@ describe("focused perspective WASD flight", () => {
     const s = flight();
     try {
       const before = s.controls.snapshot();
+      const yaw = before.yaw * Math.PI / 180;
+      const direction = s.entity.forward.clone().add(new Vec3(Math.cos(yaw), 0, -Math.sin(yaw))).normalize();
       s.key("keydown", "KeyW", { shiftKey: true });
       s.key("keydown", "KeyD", { shiftKey: true });
       s.advance(5000);
       const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...before.target));
       expect(moved.length()).toBeCloseTo(0.15 * 2 * before.distance * Math.tan(52 * Math.PI / 360) * 0.05 * 3);
-      expect(moved.y).toBe(0);
+      expect(moved.clone().normalize().dot(direction)).toBeCloseTo(1, 7);
+      expect(moved.y).toBeLessThan(0);
     } finally { s.done(); }
   });
 
@@ -634,12 +637,13 @@ describe("focused perspective WASD flight", () => {
   it.each([
     [0, 0, 0], [47, 70, 90], [-135, -70, -90],
     [90, 89.999, 180], [47, 90, 90], [-135, -90, -90],
-  ])("keeps all keys horizontal at full ground speed with yaw %s, pitch %s, roll %s", (yaw, pitch, roll) => {
+  ])("flies W/S along sight and keeps A/D horizontal at yaw %s, pitch %s, roll %s", (yaw, pitch, roll) => {
     const s = flight();
     try {
       const initial = { ...s.controls.snapshot(), yaw, pitch, roll };
       const angle = yaw * Math.PI / 180;
-      const front = new Vec3(-Math.sin(angle), 0, -Math.cos(angle));
+      const elevation = pitch * Math.PI / 180;
+      const front = new Vec3(-Math.sin(angle) * Math.cos(elevation), -Math.sin(elevation), -Math.cos(angle) * Math.cos(elevation));
       const right = new Vec3(Math.cos(angle), 0, -Math.sin(angle));
       let time = 0;
       for (const [code, direction] of [
@@ -651,10 +655,11 @@ describe("focused perspective WASD flight", () => {
         const orientation = s.entity.getRotation().clone();
         s.key('keydown', code); s.advance(time += 16); s.key('keyup', code);
         const moved = new Vec3(...s.controls.snapshot().target).sub(new Vec3(...initial.target));
-        expect(moved.y).toBe(0);
+        if (code === 'KeyA' || code === 'KeyD') expect(moved.y).toBe(0);
+        else expect(moved.y).toBeCloseTo(direction.y * moved.length(), 7);
         expect(moved.clone().normalize().dot(direction)).toBeCloseTo(1, 7);
         expect(moved.length()).toBeCloseTo(0.15 * 2 * initial.distance * Math.tan(initial.fov! * Math.PI / 360) * 0.016, 7);
-        expect(s.entity.getPosition().y).toBeCloseTo(before.y, 6);
+        expect(s.entity.getPosition().clone().sub(before).distance(moved)).toBeLessThan(1e-6);
         expect(s.entity.getRotation().equalsApprox(orientation)).toBe(true);
       }
     } finally { s.done(); }
@@ -809,12 +814,12 @@ describe("focused perspective WASD flight", () => {
       if (animate) s.advance(100);
       const before = s.entity.getPosition().clone();
       const zoom = s.controls.snapshot();
-      const forward = s.entity.forward.clone(); forward.y = 0; forward.normalize();
+      const forward = s.entity.forward.clone().normalize();
       s.key("keydown", "KeyW");
       s.advance(animate ? 116 : 16);
       const movement = s.entity.getPosition().clone().sub(before);
       expect(movement.clone().normalize().dot(forward)).toBeCloseTo(1, 5);
-      expect(movement.y).toBeCloseTo(0, 7);
+      expect(movement.y).toBeCloseTo(forward.y * movement.length(), 6);
       expect(movement.length()).toBeCloseTo(0.15 * 2 * zoom.distance * Math.tan(zoom.fov! * Math.PI / 360) * 0.016, 5);
       s.key("keyup", "KeyW");
       expect(s.frames.size).toBe(0);

@@ -172,6 +172,8 @@ pub struct ProjectOverview {
 }
 
 struct CompletionSnapshot {
+    creation_ready: bool,
+    inputs_reshoot_eligible: Option<bool>,
     path: Option<PathBuf>,
     info: Option<crate::reconstruction::ply::PlyInfo>,
     marked_complete: bool,
@@ -205,13 +207,23 @@ async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> Complet
             }
             _ => true,
         });
-    let state_completed = match tokio::fs::read(root.join("state.json")).await {
-        Ok(bytes) => serde_json::from_slice::<crate::project::PipelineStateFile>(&bytes)
-            .is_ok_and(|state| state.stage == PipelineStage::Completed),
-        Err(_) => false,
-    };
+    let state = tokio::fs::read(root.join("state.json"))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::project::PipelineStateFile>(&bytes).ok());
+    let state_completed = state
+        .as_ref()
+        .is_some_and(|state| state.stage == PipelineStage::Completed);
+    let inputs_reshoot_eligible = state
+        .as_ref()
+        .and_then(|s| s.inputs.as_ref())
+        .map(|i| i.reshoot_eligible);
+    let creation_ready = state
+        .as_ref()
+        .and_then(|s| s.creation.as_ref())
+        .is_none_or(|c| c.ready);
     let marked_complete = metadata.status == ProjectStatus::Completed || state_completed;
-    let info = if let Some(path) = path.clone() {
+    let info = if let Some(path) = path.clone().filter(|_| creation_ready) {
         tokio::task::spawn_blocking(move || inspect_gaussian_ply(&path).ok())
             .await
             .ok()
@@ -220,6 +232,8 @@ async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> Complet
         None
     };
     CompletionSnapshot {
+        creation_ready,
+        inputs_reshoot_eligible,
         path,
         info,
         marked_complete,
@@ -243,6 +257,14 @@ pub fn project_model_path(root: &Path, metadata: &ProjectMetadata) -> Option<Pat
 }
 
 pub(crate) async fn project_is_durably_completed(root: &Path, metadata: &ProjectMetadata) -> bool {
+    let transaction = root
+        .join("work")
+        .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
+    if transaction.is_file() {
+        return crate::pipeline::publication::committed_publication(root, &transaction)
+            .await
+            .is_ok_and(|publication| publication.is_some());
+    }
     let snapshot = completion_snapshot(root, metadata).await;
     snapshot.marked_complete && snapshot.info.is_some()
 }
@@ -386,14 +408,47 @@ async fn load_registered_project_from(
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| SplatError::Process("项目索引中不存在该项目".into()))?;
-    let bytes = tokio::fs::read(item.path.join("project.json")).await?;
+    let metadata = read_project_metadata_at(&item.path, id).await?;
+    Ok((item.path, metadata))
+}
+
+/// Resolve a requested project before reading metadata, so continuation errors
+/// can retain their project identity even when project.json cannot be read.
+pub(crate) async fn registered_project_path(id: Uuid) -> Result<PathBuf> {
+    registered_project_path_from(&index_path()?, id).await
+}
+
+pub(crate) async fn registered_project_path_from(index_path: &Path, id: Uuid) -> Result<PathBuf> {
+    let _guard = PROJECT_INDEX_LOCK.lock().await;
+    // Unlike background catalog scans, an explicit continuation must surface a
+    // broken/unreadable index instead of treating it as an empty registry.
+    let bytes = match tokio::fs::read(index_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SplatError::Process("项目索引中不存在该项目".into()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let index: ProjectIndex = serde_json::from_slice(&bytes)?;
+    index
+        .projects
+        .into_iter()
+        .find(|item| item.id == id)
+        .map(|item| item.path)
+        .ok_or_else(|| SplatError::Process("项目索引中不存在该项目".into()))
+}
+
+/// Identical metadata/ownership validation for already-bound tasks and catalog
+/// continuations. Callers attach preparation diagnostics around this read.
+pub(crate) async fn read_project_metadata_at(path: &Path, id: Uuid) -> Result<ProjectMetadata> {
+    let bytes = tokio::fs::read(path.join("project.json")).await?;
     let metadata: ProjectMetadata = serde_json::from_slice(&bytes)?;
-    if !has_project_ownership(&metadata, &item.path, id) {
+    if !has_project_ownership(&metadata, path, id) {
         return Err(SplatError::Process(
             "项目身份校验失败，拒绝访问预览文件".into(),
         ));
     }
-    Ok((item.path, metadata))
+    Ok(metadata)
 }
 
 pub async fn load_registered_project(id: Uuid) -> Result<(PathBuf, ProjectMetadata)> {
@@ -528,6 +583,9 @@ pub(crate) async fn summarize_project_metadata(
     mut metadata: ProjectMetadata,
 ) -> Result<ProjectSummary> {
     let completion = completion_snapshot(project, &metadata).await;
+    if !completion.creation_ready {
+        return Err(SplatError::Process("Project creation is not ready".into()));
+    }
     let final_ply = completion.path;
     let imported_project = metadata.imported.is_some();
     let completion_inconsistent =
@@ -594,11 +652,13 @@ pub(crate) async fn summarize_project_metadata(
         source_name,
         model_format: metadata.imported.as_ref().map(|value| value.source_format),
         source_available,
-        reshoot_eligible: metadata.imported.as_ref().map(|value| {
-            value
-                .colmap
-                .as_ref()
-                .is_some_and(|colmap| colmap.reshoot_eligible)
+        reshoot_eligible: completion.inputs_reshoot_eligible.or_else(|| {
+            metadata.imported.as_ref().map(|value| {
+                value
+                    .colmap
+                    .as_ref()
+                    .is_some_and(|colmap| colmap.reshoot_eligible)
+            })
         }),
         reshoot_reason: metadata
             .imported
@@ -667,6 +727,72 @@ fn has_project_ownership(metadata: &ProjectMetadata, path: &Path, id: Uuid) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn targeted_continuation_index_reads_are_strict_but_background_scans_stay_tolerant() {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join("index.json");
+        let id = Uuid::new_v4();
+        assert!(matches!(registered_project_path_from(&index, id).await,
+            Err(SplatError::Process(message)) if message == "项目索引中不存在该项目"));
+        std::fs::write(&index, b"{").unwrap();
+        assert!(load_index_from(&index).await.unwrap().projects.is_empty());
+        assert!(matches!(
+            registered_project_path_from(&index, id).await,
+            Err(SplatError::Json(_))
+        ));
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir(&index).unwrap();
+        let error = registered_project_path_from(&index, id).await.unwrap_err();
+        assert!(error.io_error().is_some());
+        std::fs::remove_dir(&index).unwrap();
+        let project = root.path().join("project");
+        atomic_write_json(
+            &index,
+            &ProjectIndex {
+                schema_version: 1,
+                projects: vec![IndexedProject {
+                    id,
+                    path: project.clone(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registered_project_path_from(&index, id).await.unwrap(),
+            project
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_metadata_reader_preserves_json_io_and_ownership_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        assert!(read_project_metadata_at(root.path(), id)
+            .await
+            .unwrap_err()
+            .io_error()
+            .is_some());
+        let metadata_path = root.path().join("project.json");
+        std::fs::write(&metadata_path, b"{").unwrap();
+        assert!(matches!(
+            read_project_metadata_at(root.path(), id).await,
+            Err(SplatError::Json(_))
+        ));
+        let mut metadata = test_metadata(root.path(), ProjectStatus::Interrupted);
+        atomic_write_json(&metadata_path, &metadata).await.unwrap();
+        assert!(matches!(
+            read_project_metadata_at(root.path(), id).await,
+            Err(SplatError::Process(_))
+        ));
+        metadata.id = id;
+        atomic_write_json(&metadata_path, &metadata).await.unwrap();
+        assert_eq!(
+            read_project_metadata_at(root.path(), id).await.unwrap().id,
+            id
+        );
+    }
 
     fn test_metadata(root: &Path, status: ProjectStatus) -> ProjectMetadata {
         ProjectMetadata {
