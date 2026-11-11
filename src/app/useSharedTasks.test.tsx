@@ -113,4 +113,30 @@ describe('shared task synchronization', () => {
     await act(async () => root.render(<Harness />));
     expect(useAppStore.getState()).toMatchObject({ phase: 'idle', liveTask: null });
   });
+
+  it('shares an in-flight refresh and returns the active state including newer events', async () => {
+    mocks.get.mockResolvedValue([]);
+    await act(async () => root.render(<Harness />));
+    let finish!: (tasks: SharedTask[]) => void;
+    mocks.get.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = latest.refreshTasks();
+    const second = latest.refreshTasks();
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      handler({ task: task(10, 'running', 'new-run'), events: [], dropped_event_count: 0 });
+      finish([task(9, 'failed', 'old-run')]);
+      await expect(first).resolves.toEqual({ hasActiveTask: true });
+      await expect(second).resolves.toEqual({ hasActiveTask: true });
+    });
+    expect(useAppStore.getState().liveTask?.run_id).toBe('new-run');
+  });
+
+  it('distinguishes an authoritative empty snapshot from a failed refresh', async () => {
+    mocks.get.mockResolvedValue([]);
+    await act(async () => root.render(<Harness />));
+    await act(async () => expect(latest.refreshTasks()).resolves.toEqual({ hasActiveTask: false }));
+    mocks.get.mockRejectedValueOnce(new Error('registry unavailable'));
+    await act(async () => expect(latest.refreshTasks()).resolves.toBeNull());
+    expect(latest.syncError).toBe('registry unavailable');
+  });
 });

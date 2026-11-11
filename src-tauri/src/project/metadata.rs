@@ -362,6 +362,19 @@ pub struct FrameState {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrushTrainingCheckpoint {
+    /// Absent in existing projects: keep their historical ordinary/reshoot
+    /// command-line semantics rather than silently changing Alpha handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_options: Option<BrushExecutionOptions>,
+    /// Content identity of an already prepared, strictly validated legacy
+    /// training set. Kept separate from the modern derivation signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_dataset_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_initialization_sha256: Option<String>,
+    /// Frozen input/coordinate/preparation identity for the saved actual recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fine_splat_budget: Option<crate::pipeline::splat_budget::FineSplatBudget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +387,55 @@ pub struct BrushTrainingCheckpoint {
     pub oom_retry_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom_retry_source_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AlphaInterpretation {
+    #[default]
+    RuntimeDefault,
+    Masked,
+    Transparent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrushExecutionOptions {
+    pub version: u32,
+    pub alpha: AlphaInterpretation,
+}
+
+impl Default for BrushExecutionOptions {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            alpha: AlphaInterpretation::RuntimeDefault,
+        }
+    }
+}
+
+impl BrushExecutionOptions {
+    pub fn alpha_mode(self) -> crate::error::Result<Option<&'static str>> {
+        if self.version != 1 {
+            return Err(crate::error::SplatError::Process(
+                "Unsupported saved Brush execution options".into(),
+            ));
+        }
+        Ok(match self.alpha {
+            AlphaInterpretation::RuntimeDefault => None,
+            AlphaInterpretation::Masked => Some("masked"),
+            AlphaInterpretation::Transparent => Some("transparent"),
+        })
+    }
+}
+
+impl BrushTrainingCheckpoint {
+    pub fn alpha_mode(&self, legacy_reshoot: bool) -> crate::error::Result<Option<&'static str>> {
+        match self.execution_options {
+            Some(options) => options.alpha_mode(),
+            None => Ok(legacy_reshoot.then_some("transparent")),
+        }
+    }
 }
 
 impl From<&FramePlan> for FrameState {
@@ -400,6 +462,19 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    /// Missing on historical tasks; never expand their BA scope on continue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ba_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<crate::project::creation::ProjectCreationState>,
+    /// Validated reconstruction/output facts for a completed Brush candidate.
+    /// Allows publication recovery without rebuilding disposable training data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_output: Option<ProjectOutput>,
+    #[serde(default)]
+    pub artifact_manifests: crate::pipeline::artifacts::ArtifactManifestSet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<crate::pipeline::inputs::InputCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -454,6 +529,10 @@ pub struct PipelineStateFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReshootState {
+    /// Local evidence tying registered old/new views to the final model and,
+    /// once validated, its immutable Gaussian candidate. Missing on old tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_proof: Option<crate::pipeline::reshoot_connection::ConnectionProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
     pub source_snapshot_complete: bool,
@@ -473,6 +552,12 @@ pub struct ReshootState {
     pub colmap_input_version: Option<u32>,
     #[serde(default)]
     pub registered_reshoot_count: u64,
+    /// Content identity of the immutable source snapshot owned by this derived
+    /// project. Missing on legacy/V2 checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_v3_identity: Option<String>,
+    #[serde(default)]
+    pub snapshot_v3_ready: bool,
 }
 
 fn legacy_video_projection() -> crate::video::panorama::VideoProjection {
@@ -495,11 +580,16 @@ impl PipelineStateFile {
 
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
+            validated_output: None,
+            ba_policy_version: None,
+            artifact_manifests: Default::default(),
+            inputs: None,
             // Older projects were always perspective. Never reinterpret their caches.
             generation_policy: None,
             retry_cache_pending: vec![],
             actual_transparency: None,
             gps: None,
+            creation: None,
             temporary_png_focal: None,
             image_matching_strategy: ImageMatchingStrategy::default(),
             video_projection: crate::video::panorama::VideoProjection::Perspective,
@@ -527,7 +617,66 @@ impl PipelineStateFile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_ba_scope_remains_legacy_without_a_schema_migration() {
+        let state = super::PipelineStateFile::created(crate::presets::Quality::Balanced);
+        let old = serde_json::to_value(&state).unwrap();
+        assert!(old.get("baPolicyVersion").is_none());
+        let restored: super::PipelineStateFile = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.ba_policy_version, None);
+        let mut state = restored;
+        state.ba_policy_version = Some(crate::pipeline::ba_policy::VERSION);
+        let restored: super::PipelineStateFile =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            restored.ba_policy_version,
+            Some(crate::pipeline::ba_policy::VERSION)
+        );
+    }
     use super::*;
+    #[test]
+    fn execution_options_are_explicit_for_new_tasks_and_absent_for_legacy_checkpoints() {
+        let old: BrushTrainingCheckpoint =
+            serde_json::from_value(serde_json::json!({"oomRetryUsed":true})).unwrap();
+        assert_eq!(old.execution_options, None);
+        assert!(old.oom_retry_used);
+        assert_eq!(old.alpha_mode(false).unwrap(), None);
+        assert_eq!(old.alpha_mode(true).unwrap(), Some("transparent"));
+        let new = BrushTrainingCheckpoint {
+            execution_options: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            new.alpha_mode(false).unwrap(),
+            new.alpha_mode(true).unwrap()
+        );
+        assert_eq!(new.alpha_mode(true).unwrap(), None);
+        assert_eq!(BrushExecutionOptions::default().alpha_mode().unwrap(), None);
+        assert_eq!(
+            BrushExecutionOptions {
+                version: 1,
+                alpha: AlphaInterpretation::Masked
+            }
+            .alpha_mode()
+            .unwrap(),
+            Some("masked")
+        );
+        assert_eq!(
+            BrushExecutionOptions {
+                version: 1,
+                alpha: AlphaInterpretation::Transparent
+            }
+            .alpha_mode()
+            .unwrap(),
+            Some("transparent")
+        );
+        assert!(BrushExecutionOptions {
+            version: 2,
+            ..Default::default()
+        }
+        .alpha_mode()
+        .is_err());
+    }
     #[test]
     fn retry_badge_requires_a_started_controlled_retry_and_stays_legacy_safe() {
         let mut state = PipelineStateFile::created(Quality::High);

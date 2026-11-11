@@ -216,6 +216,21 @@ pub fn analyze_reshoot(dir: &Path) -> Result<ImageFolderAnalysis> {
 fn analyze_impl(dir: &Path, mixed_sizes: bool) -> Result<ImageFolderAnalysis> {
     let identity = source_identity(dir)?;
     let files = list_images(dir)?;
+    let result = analyze_files(&files, identity.clone(), mixed_sizes)?;
+    if source_identity(dir)? != identity {
+        return Err(SplatError::Process(
+            "素材文件已发生变化，请重新分析后再生成".into(),
+        ));
+    }
+    Ok(result)
+}
+
+/// Shared bounded inspection for explicitly selected image sets. No staging or pixel reads.
+pub fn analyze_files(
+    files: &[PathBuf],
+    identity: String,
+    mixed_sizes: bool,
+) -> Result<ImageFolderAnalysis> {
     if files.len() < 2 {
         return Err(SplatError::InvalidVideo(
             "图片序列文件夹中至少需要 2 张 JPG、JPEG 或 PNG 图片".into(),
@@ -249,11 +264,15 @@ fn analyze_impl(dir: &Path, mixed_sizes: bool) -> Result<ImageFolderAnalysis> {
             first.height
         )));
     }
+    let same_dimensions = images
+        .iter()
+        .all(|p| (p.width, p.height) == (first.width, first.height));
     let ratio = images
         .iter()
         .all(|p| p.width >= 64 && p.width == p.height.saturating_mul(2));
     let unsupported = images.iter().any(|p| p.unsupported);
-    let confirmed = ratio && !unsupported && images.iter().all(|p| p.complete_erp);
+    let confirmed =
+        same_dimensions && ratio && !unsupported && images.iter().all(|p| p.complete_erp);
     let info = ImageSequenceInfo {
         image_count: images.len() as u64,
         width: images.iter().map(|p| p.width).max().unwrap_or(first.width),
@@ -265,11 +284,6 @@ fn analyze_impl(dir: &Path, mixed_sizes: bool) -> Result<ImageFolderAnalysis> {
         has_alpha: images.iter().any(|p| p.alpha),
         requires_large_sequence_confirmation: images.len() as u64 > LARGE_SEQUENCE_WARNING_COUNT,
     };
-    if source_identity(dir)? != identity {
-        return Err(SplatError::Process(
-            "素材文件已发生变化，请重新分析后再生成".into(),
-        ));
-    }
     Ok(ImageFolderAnalysis {
         info,
         detection: ProjectionDetection {
@@ -277,7 +291,7 @@ fn analyze_impl(dir: &Path, mixed_sizes: bool) -> Result<ImageFolderAnalysis> {
             unsupported,
             confirmed_erp: confirmed,
             requires_choice: ratio && !confirmed,
-            supported_erp: ratio && !unsupported,
+            supported_erp: same_dimensions && ratio && !unsupported,
             reason: String::new(),
             preview_jpeg: Vec::new(),
         },

@@ -152,8 +152,44 @@ fn cameras(model: &Path) -> Result<HashMap<u32, Camera>> {
     Ok(result)
 }
 
+/// Matches focal_to_fov/with_pinhole in bundled Brush 866a7d65. This is a
+/// pinhole preview of that field of view, not lens undistortion of an image.
+fn reference_fov(focal: f64, pixels: u64, radial: [f64; 6]) -> Option<f64> {
+    let target = pixels as f64 / (2.0 * focal);
+    let mut radius = target;
+    for _ in 0..30 {
+        let r2 = radius * radius;
+        let r4 = r2 * r2;
+        let r6 = r4 * r2;
+        let factor = (1.0 + radial[0] * r2 + radial[1] * r4 + radial[2] * r6)
+            / (1.0 + radial[3] * r2 + radial[4] * r4 + radial[5] * r6);
+        if !factor.is_finite() || factor.abs() < 1e-12 {
+            return None;
+        }
+        let next = target / factor;
+        if !next.is_finite() || next <= 0.0 {
+            return None;
+        }
+        let converged = (next - radius).abs() < 1e-12;
+        radius = next;
+        if converged {
+            break;
+        }
+    }
+    // Brush's fixed-point loop can fail to converge on non-physical fits.
+    // Do not publish an unverifiable locator camera for those inputs.
+    let r2 = radius * radius;
+    let factor = (1.0 + radial[0] * r2 + radial[1] * r2 * r2 + radial[2] * r2 * r2 * r2)
+        / (1.0 + radial[3] * r2 + radial[4] * r2 * r2 + radial[5] * r2 * r2 * r2);
+    if !(radius * factor).is_finite() || (radius * factor - target).abs() > 1e-6 * target.max(1.0) {
+        return None;
+    }
+    Some(2.0 * radius.atan())
+}
+
 fn view(name: String, q: [f64; 4], t: [f64; 3], camera: &Camera) -> Option<TrainingReferenceView> {
-    if camera.model == 17
+    if !matches!(camera.model, 0 | 1 | 2 | 3 | 4 | 6)
+        || camera.params.len() != super::colmap_model::camera_model(camera.model)?.1 as usize
         || camera.width == 0
         || camera.height == 0
         || q.iter()
@@ -182,6 +218,19 @@ fn view(name: String, q: [f64; 4], t: [f64; 3], camera: &Camera) -> Option<Train
     if !norm.is_finite() || norm < 1e-8 || fx <= 0.0 || fy <= 0.0 {
         return None;
     }
+    let p = &camera.params;
+    let radial = match camera.model {
+        2 => [p[3], 0., 0., 0., 0., 0.],
+        3 => [p[3], p[4], 0., 0., 0., 0.],
+        4 => [p[4], p[5], 0., 0., 0., 0.],
+        6 => [p[4], p[5], p[8], p[9], p[10], p[11]],
+        _ => [0.; 6],
+    }
+    .map(|value| (value as f32) as f64);
+    let fov_x = reference_fov(fx, camera.width, radial)?;
+    let fov_y = reference_fov(fy, camera.height, radial)?;
+    let virtual_fx = camera.width as f64 / (2.0 * (fov_x / 2.0).tan());
+    let virtual_fy = camera.height as f64 / (2.0 * (fov_y / 2.0).tan());
     let [w, x, y, z] = q.map(|v| v / norm);
     let r = [
         [
@@ -207,9 +256,9 @@ fn view(name: String, q: [f64; 4], t: [f64; 3], camera: &Camera) -> Option<Train
         position,
         forward: r[2],
         up: r[1].map(|v| -v),
-        fov: 2. * (h / (2. * fy)).atan().to_degrees(),
+        fov: fov_y.to_degrees(),
         projection_offset: [(cx - camera.width as f64 / 2.) / h, (cy - h / 2.) / h],
-        projection_scale_x: fx / fy,
+        projection_scale_x: virtual_fx / virtual_fy,
     };
     if !view
         .position
@@ -359,6 +408,16 @@ struct PanoramaFace {
 }
 
 fn load(root: &Path) -> Result<TrainingReferenceView> {
+    if root.join("state.json").is_file() {
+        let state: serde_json::Value =
+            serde_json::from_reader(bounded_file(&root.join("state.json"), 16 * 1024 * 1024)?)?;
+        if let Some(reference) = state
+            .pointer("/inputs/referenceImage")
+            .and_then(|v| v.as_str())
+        {
+            return read_view(&root.join("work/brush/dataset"), Some(reference));
+        }
+    }
     // Projection is persisted in state.json, never re-detected from mutable source media.
     let panorama = if root.join("state.json").is_file() {
         let state: serde_json::Value =
@@ -430,6 +489,58 @@ pub fn training_reference_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn radial_reference_matches_pinned_brush_pinhole_projection() {
+        // Fixed output from Brush 866a7d65 focal_to_fov (RT8, k1 as f32).
+        let camera = Camera {
+            width: 800,
+            height: 600,
+            model: 2,
+            params: vec![400., 400., 300., 0.1],
+        };
+        let v = view("first.png".into(), [1., 0., 0., 0.], [0.; 3], &camera).unwrap();
+        assert!((v.fov - 71.0274).abs() < 0.0001);
+        assert!((v.projection_scale_x - 1.03237).abs() < 0.00001);
+        for model in [3, 4, 6] {
+            let params = match model {
+                3 => vec![400., 400., 300., 0.1, 0.],
+                4 => vec![400., 400., 400., 300., 0.1, 0., 0.01, -0.02],
+                _ => vec![400., 400., 400., 300., 0.1, 0., 0.01, -0.02, 0., 0., 0., 0.],
+            };
+            let other = view(
+                "first.png".into(),
+                [1., 0., 0., 0.],
+                [0.; 3],
+                &Camera {
+                    model,
+                    params,
+                    ..camera.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(other.fov, v.fov);
+            assert_eq!(other.projection_scale_x, v.projection_scale_x);
+        }
+    }
+
+    #[test]
+    fn zero_radial_is_unchanged_and_unsafe_solutions_are_unavailable() {
+        let zero = Camera {
+            width: 800,
+            height: 600,
+            model: 4,
+            params: vec![400., 300., 450., 250., 0., 0., 0., 0.],
+        };
+        let v = view("a.png".into(), [1., 0., 0., 0.], [0.; 3], &zero).unwrap();
+        assert!((v.fov - 90.).abs() < 1e-10);
+        assert!((v.projection_scale_x - 4. / 3.).abs() < 1e-10);
+        assert_eq!(v.projection_offset, [50. / 600., -50. / 600.]);
+        let mut bad = zero;
+        bad.params[4] = f64::INFINITY;
+        assert!(view("a.png".into(), [1., 0., 0., 0.], [0.; 3], &bad).is_none());
+        assert!(reference_fov(400., 800, [-1., 0., 0., 0., 0., 0.]).is_none());
+        assert!(reference_fov(400., 800, [-0.01, 0., 0., 0., 0., 0.]).is_some());
+    }
     fn dataset(root: &Path, subdir: &str) -> std::path::PathBuf {
         let d = root.join(subdir);
         std::fs::create_dir_all(d.join("sparse/0")).unwrap();

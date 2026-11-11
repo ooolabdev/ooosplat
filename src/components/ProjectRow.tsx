@@ -1,13 +1,13 @@
 import { CircleAlert, Eye, Film, LoaderCircle, MapPin, Play, Trash2 } from 'lucide-react';
 import { localizePipelineMessage, useI18n } from '../i18n';
 import { taskBasename, taskFormatBytes, taskStatusLabel } from '../app/taskPresentation';
-import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useTaskElapsed } from '../app/useTaskElapsed';
 import { displayPath } from '../lib/displayPath';
 import { taskFailureContext } from '../lib/pipelineError';
 import type { ProjectSummary } from '../types/pipeline';
-import { taskIsActive, type SharedTask } from '../types/tasks';
+import { taskCanContinue, taskIsActive, type SharedTask } from '../types/tasks';
 import { CompactError } from './CompactError';
+import { InputAdoptionWarning } from './InputAdoptionWarning';
 
 interface Props {
   project: ProjectSummary | null;
@@ -22,7 +22,7 @@ interface Props {
   onSelectTask?: () => void;
   onPreview: (project: ProjectSummary) => void;
   onReshoot: (project: ProjectSummary) => void;
-  onResume: (project: ProjectSummary) => void;
+  onResume: (project: ProjectSummary, expectedRunId?: string) => void;
   onReveal: (project: ProjectSummary) => void;
   onDelete: (project: ProjectSummary) => void;
 }
@@ -32,11 +32,9 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
   const { locale, t, formatDate, formatDuration } = useI18n();
   const status = task?.status ?? project?.status ?? 'created';
   const active = task ? taskIsActive(task) : status === 'running';
-  const unfinishedTask = task && !active && ['failed', 'cancelled', 'interrupted'].includes(status) ? task : null;
-  // A successful detail read confirms that a registered checkpoint can be decoded.
-  const checkpoint = useTaskProjectDetail(unfinishedTask);
   const taskElapsed = useTaskElapsed(task);
-  const canResume = project && status !== 'completed' && status !== 'created' && !active && (!task || checkpoint != null);
+  // A detail read is presentation only; continuation validates the project in the shared service.
+  const canResume = project && taskCanContinue(task ?? { status: project.status });
   const select = () => { if (onSelectTask) onSelectTask(); else if (project) onSelect(project); };
   const path = task?.project_path ?? project?.projectPath ?? task?.input_path ?? '';
   const visiblePath = displayPath(path);
@@ -54,6 +52,7 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
       {task?.source === 'mcp' && <p className="task-origin">{locale === 'zh-CN' ? '由 AI Agent 创建' : 'Created by AI Agent'}</p>}
       {failure && <p className="project-failure"><CompactError message={failure} context={taskFailureContext(task?.error)} /></p>}
       {project?.taskKind !== "import" && project?.registeredRatio != null && project.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t('result.lowRegistration', { value: (project.registeredRatio * 100).toFixed(1) })}</p>}
+      <InputAdoptionWarning warning={task?.result?.warning} />
     </div>
     <dl className="project-stats">
       <div><dt>PLY</dt><dd>{project?.fileSize == null ? missingValue : taskFormatBytes(project.fileSize, locale)}</dd></div>
@@ -63,8 +62,8 @@ export function ProjectRow({ project, task, selected, busy, previewing, previewD
     </dl>
     {project && <div className="project-actions">
       {status === 'completed' && <button className="preview-link" type="button" disabled={previewDisabled || !project.finalPly} onClick={event => { event.stopPropagation(); select(); onPreview(project); }}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Eye size={14} />}{t(previewing ? 'project.opening' : 'project.preview')}</button>}
-      {status === 'completed' && <button className="reshoot-link" type="button" title={project.taskKind === 'import' && !project.reshootEligible ? project.reshootReason ? localizePipelineMessage(locale, project.reshootReason) : t('reshoot.ineligible') : undefined} disabled={previewDisabled || !project.finalPly || (project.taskKind === 'import' && !project.reshootEligible)} onClick={event => { event.stopPropagation(); select(); onReshoot(project); }}><Film size={14} />{t('project.reshoot')}</button>}
-      {canResume && <button className="resume-link" type="button" disabled={busy} onClick={event => { event.stopPropagation(); select(); onResume(project); }}><Play size={14} fill="currentColor" />{t('project.resume')}</button>}
+      {status === 'completed' && <button className="reshoot-link" type="button" title={project.reshootEligible===false ? project.reshootReason ? localizePipelineMessage(locale, project.reshootReason) : t('reshoot.ineligible') : undefined} disabled={previewDisabled || !project.finalPly || (project.reshootEligible===false)} onClick={event => { event.stopPropagation(); select(); onReshoot(project); }}><Film size={14} />{t('project.reshoot')}</button>}
+      {canResume && <button className="resume-link" type="button" disabled={busy} onClick={event => { event.stopPropagation(); select(); onResume(project, task?.run_id ?? undefined); }}><Play size={14} fill="currentColor" />{t('project.continue')}</button>}
       <button type="button" disabled={revealing} onClick={event => { event.stopPropagation(); select(); onReveal(project); }}>{revealing ? <LoaderCircle className="spin" size={14} /> : <MapPin size={14} />}{t('project.reveal')}</button>
       <button className="danger-link" type="button" disabled={busy || active || deleting} onClick={event => { event.stopPropagation(); onDelete(project); }}>{deleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}{t('project.delete')}</button>
     </div>}

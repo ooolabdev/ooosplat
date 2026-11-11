@@ -24,17 +24,93 @@ it('distinguishes retry permission, an executed retry, and legacy optimization i
   expect(container.textContent).not.toContain('已自动重试');
 });
 
-it.each(['zh-CN', 'en'] as const)('shows only the approved GPS hint, never coordinates, counts, historical or video claims (%s)', async locale => {
+it('uses the saved initial sampling plan in readonly task details', async () => {
+  const video = { duration: 60, width: 1920, height: 1080, fps: 30, totalFrames: 1800, codec: 'h264', rotation: 0, pixelFormat: 'yuv420p', hasAlpha: false };
+  const inputs = {
+    request: { mode: 'materials' as const, items: [{ id: 'clip', source: { kind: 'video' as const, path: 'E:/clip.mp4' }, projection: 'perspective' as const, imageMatchingStrategy: 'sequential' as const }] },
+    sources: [{ id: 'clip', identity: 'clip-id', projection: 'perspective' as const, names: ['clip.mp4'], video, adopted: 900, frames: { retentionRatio: .5, samplingFps: 15, estimatedFrames: 900, initialExtractedFrames: 900, extractedFrames: 1080 } }],
+    importedReconstruction: false,
+    unused: [],
+  };
+  await act(async () => root.render(<LanguageProvider><TaskConfiguration sourcePath="E:/clip.mp4" projectsRoot="E:/projects" inputType="video" quality="balanced" plannerEnabled completed acceleration={null} inputs={inputs} generationPolicy={{ version: 6, autoRetryEnabled: true, frameSamplingRatio: null, frameSamplingFps: null }} /></LanguageProvider>));
+  const toggle = container.querySelector<HTMLButtonElement>('.more-settings-button')!;
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  await act(async () => toggle.click());
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('15 FPS');
+  expect(container.querySelector('.frame-sampling-foot > span')?.textContent).toContain('50');
+
+  await act(async () => root.render(<LanguageProvider><TaskConfiguration sourcePath="E:/clip.mp4" projectsRoot="E:/projects" inputType="video" quality="balanced" plannerEnabled completed acceleration={null} inputs={inputs} /></LanguageProvider>));
+  expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('15 FPS');
+
+  const missingPlanInputs = {
+    ...inputs,
+    sources: inputs.sources.map(source => ({ ...source, frames: { ...source.frames, samplingFps: 0, retentionRatio: 0 } })),
+  };
+  await act(async () => root.render(<LanguageProvider><TaskConfiguration sourcePath="E:/clip.mp4" projectsRoot="E:/projects" inputType="video" quality="balanced" plannerEnabled completed acceleration={null} inputs={missingPlanInputs} /></LanguageProvider>));
+  expect(container.querySelector('.frame-sampling-control output')?.textContent).toBe('-');
+});
+
+it.each(['zh-CN', 'en'] as const)('keeps media type on the left and GPS in a compact right-side tag without coordinates or false history claims (%s)', async locale => {
   localStorage.setItem('ooo-splat-language', locale);
   await render({ inputType: 'images', gpsDetected: true });
-  expect(container.querySelector('.gps-source-hint strong')?.textContent).toBe(locale === 'zh-CN' ? '已识别图片中的 GPS 信息' : 'GPS information detected in images');
-  expect(container.querySelector('.gps-source-hint p')?.textContent).toBe(locale === 'zh-CN' ? '将使用有效位置信息辅助生成' : 'Valid location information will be used to assist generation.');
+  expect(container.querySelectorAll('.media-source-status')).toHaveLength(1);
+  const typeRow = container.querySelector('.media-source-status > .media-source-heading.source-status-hint');
+  const tags = typeRow?.querySelector('.source-attribute-tags');
+  const gps = tags?.querySelector<HTMLElement>('.gps-source-hint.source-attribute-tag');
+  expect(typeRow?.querySelector('.source-status-hint-copy strong')?.textContent).toBe(locale === 'zh-CN' ? '普通图片' : 'Ordinary images');
+  expect(typeRow?.querySelector('.source-status-hint-copy p')?.textContent).toBe(locale === 'zh-CN' ? '将按普通图片处理' : 'These images will use ordinary-image processing.');
+  expect(typeRow?.querySelector('svg.lucide-images')?.getAttribute('aria-hidden')).toBe('true');
+  expect(typeRow?.lastElementChild).toBe(tags);
+  expect(gps?.textContent).toBe('GPS');
+  expect(gps?.title).toContain(locale === 'zh-CN' ? '已识别图片中的 GPS 信息' : 'GPS information detected in images');
+  expect(gps?.title).toContain(locale === 'zh-CN' ? '将使用有效位置信息辅助生成' : 'Valid location information will be used to assist generation.');
+  expect(gps?.getAttribute('aria-label')).toBe(gps?.title);
+  expect(gps?.tabIndex).toBe(0);
+  expect(gps?.querySelector('svg.lucide-map-pin')?.getAttribute('aria-hidden')).toBe('true');
+  expect(gps?.querySelector('p')).toBeNull();
+  expect(container.querySelector('.media-source-status > .gps-source-hint')).toBeNull();
+  expect(container.textContent).not.toContain(locale === 'zh-CN' ? '将使用有效位置信息辅助生成' : 'Valid location information will be used to assist generation.');
   await render({ inputType: 'images', gpsDetected: true, gpsFallback: true });
-  expect(container.querySelector('.gps-source-hint p')?.textContent).toBe(locale === 'zh-CN' ? 'GPS 辅助未启用，已切换为不使用 GPS 的生成方式。' : 'GPS assistance is unavailable. Generation will continue without GPS.');
-  expect(container.querySelector('.gps-source-hint')?.textContent).not.toMatch(/[0-9]/);
+  const fallback = container.querySelector<HTMLElement>('.gps-source-hint')!;
+  expect(fallback.textContent).toBe('GPS');
+  expect(fallback.title).toContain(locale === 'zh-CN' ? 'GPS 辅助未启用，已切换为不使用 GPS 的生成方式。' : 'GPS assistance is unavailable. Generation will continue without GPS.');
+  expect(container.querySelectorAll('.source-attribute-tag')).toHaveLength(1);
   for (const props of [{ inputType: 'images' as const, historical: true }, { inputType: 'video' as const }, { inputType: 'images' as const, gpsDetected: false }]) {
     await render({ gpsDetected: true, ...props }); expect(container.querySelector('.gps-source-hint')).toBeNull();
   }
+  for (const props of [{ checking: true }, { error: '读取失败' }]) {
+    await render({ inputType: 'images', gpsDetected: true, ...props });
+    expect(container.querySelector('.gps-source-hint')).toBeNull();
+    expect(container.querySelector('.media-source-type-icon')).toBeNull();
+  }
+});
+
+it.each(['zh-CN', 'en'] as const)('renders only the two approved metadata tag types without changing the media description (%s)', async locale => {
+  localStorage.setItem('ooo-splat-language', locale);
+  await render({ inputType: 'images', projection: 'perspective', gpsDetected: true, alphaDetected: true });
+  const heading = container.querySelector('.media-source-heading')!;
+  const copy = heading.querySelector('.media-source-copy')!;
+  const tags = heading.querySelector('.source-attribute-tags')!;
+  expect(copy.nextElementSibling).toBe(tags);
+  expect([...tags.querySelectorAll('.source-attribute-tag')].map(tag => tag.textContent)).toEqual(['GPS', locale === 'zh-CN' ? '透明通道' : 'Alpha channel']);
+  const alpha = tags.querySelector<HTMLElement>('.alpha-source-status')!;
+  expect(alpha.title).toBe(locale === 'zh-CN' ? '检测到 Alpha 通道' : 'Alpha channel detected');
+  expect(alpha.getAttribute('aria-label')).toBe(alpha.title);
+  expect(alpha.tabIndex).toBe(0);
+  expect(alpha.querySelector('.lucide-blend')?.getAttribute('aria-hidden')).toBe('true');
+  expect(alpha.querySelector('small,p')).toBeNull();
+  for (const props of [{ checking: true }, { error: '读取失败' }]) {
+    await render({ inputType: 'images', gpsDetected: true, alphaDetected: true, ...props });
+    expect(container.querySelector('.source-attribute-tags')).toBeNull();
+  }
+  await render({ inputType: 'video', projection: 'perspective', alphaDetected: true, gpsDetected: true });
+  expect(container.querySelectorAll('.source-attribute-tag')).toHaveLength(1);
+  expect(container.querySelector('.alpha-source-status')).not.toBeNull();
+  await render({ inputType: 'images', historical: true, projection: 'perspective', alphaDetected: true, gpsDetected: true, gpsFallback: true });
+  expect(container.querySelectorAll('.source-attribute-tag')).toHaveLength(2);
+  expect(container.querySelector('.alpha-source-status.readonly')).not.toBeNull();
+  expect(container.querySelector('.media-source-status.readonly')).not.toBeNull();
 });
 
 it('shows loading instead of an old projection result and offers retry only for analysis errors', async () => {
@@ -104,18 +180,58 @@ it.each([
     expect(typeIcon?.getAttribute('aria-hidden')).toBe('true');
   }
   await render({ inputType: 'images' });
-  expect(container.querySelector('.media-source-type-icon')).toBeNull();
+  expect(container.querySelector('.media-source-type-icon.lucide-images')?.getAttribute('aria-hidden')).toBe('true');
 });
 
-it.each([true, false])('uses the same readonly saved-type explanation with completed=%s', async completed => {
+it('keeps type-icon suppression explicit without suppressing the GPS meaning', async () => {
+  await render({ inputType: 'images', showTypeIcon: false, gpsDetected: true });
+  expect(container.querySelector('.media-source-type-icon')).toBeNull();
+  expect(container.querySelector('.gps-source-hint .lucide-map-pin')?.getAttribute('aria-hidden')).toBe('true');
+  await render({ inputType: 'images', historical: true, projection: 'perspective', gpsDetected: true, gpsFallback: false });
+  expect(container.querySelector('.media-source-type-icon.lucide-images')).not.toBeNull();
+  expect(container.querySelector('.gps-source-hint .lucide-map-pin')).not.toBeNull();
+  expect(container.textContent).toContain('本任务按普通图片处理');
+});
+
+it.each([true, false])('keeps the readonly saved type without routine copy or invented metadata with completed=%s', async completed => {
   const props = { sourcePath: 'E:/old.mp4', projectsRoot: 'E:/projects', inputType: 'video' as const, quality: 'fast' as const, plannerEnabled: false, completed, acceleration: null };
   await act(async () => root.render(<LanguageProvider><TaskConfiguration {...props} videoProjection="equirectangular" /></LanguageProvider>));
-  expect(container.querySelector('.source-input-card.readonly')?.textContent).toContain('本任务按全景视频处理');
+  expect(container.querySelector('.source-input-card.readonly .media-source-copy strong')?.textContent).toBe('全景视频');
+  expect(container.querySelector('.source-input-card.readonly .media-source-copy p')).toBeNull();
   expect(container.querySelector('select')).toBeNull();
   expect(container.querySelector('.source-input-card .media-path svg')).toBeNull();
   expect(container.querySelector('.source-input-card .media-path strong')?.textContent).toBe('old.mp4');
   await act(async () => root.render(<LanguageProvider><TaskConfiguration {...props} videoProjection="perspective" /></LanguageProvider>));
-  expect(container.querySelector('.media-source-status')?.textContent).toContain('本任务按普通视频处理');
+  expect(container.querySelector('.media-source-status .media-source-copy strong')?.textContent).toBe('普通视频');
+  expect(container.querySelector('.media-source-status .media-source-copy p')).toBeNull();
+});
+
+it.each(['zh-CN', 'en'] as const)('replaces routine processing copy with supplied source metadata without changing the type or tags (%s)', async locale => {
+  localStorage.setItem('ooo-splat-language', locale);
+  for (const historical of [false, true]) {
+    await render({ inputType: 'images', projection: 'perspective', historical,
+      metadataSummary: '2 images · 800 × 600', alphaDetected: true, gpsDetected: true, gpsFallback: false });
+    expect(container.querySelector('.media-source-copy strong')?.textContent).toBe(locale === 'zh-CN' ? '普通图片' : 'Ordinary images');
+    expect(container.querySelector('.media-source-copy > p')?.textContent).toBe('2 images · 800 × 600');
+    expect(container.querySelector('.media-source-copy')?.textContent).not.toContain(locale === 'zh-CN' ? '按普通图片处理' : 'ordinary-image processing');
+    expect(container.querySelectorAll('.source-attribute-tag')).toHaveLength(2);
+    await render({ inputType: 'images', projection: 'perspective', historical, metadataSummary: null });
+    expect(container.querySelector('.media-source-copy > p')).toBeNull();
+    expect(container.querySelector('.media-source-copy strong')).not.toBeNull();
+  }
+});
+
+it('retains required projection questions and unknown-history explanations separately from source metadata', async () => {
+  await render({ inputType: 'video', projection: 'auto', detection, metadataSummary: '1920 × 1080 · 29.97 FPS' });
+  const select = container.querySelector<HTMLSelectElement>('select')!;
+  const hintId = select.getAttribute('aria-describedby')!;
+  expect(document.getElementById(hintId)?.textContent).toContain('无法判断视频类型');
+  expect(container.querySelector('.media-source-metadata')?.textContent).toBe('1920 × 1080 · 29.97 FPS');
+  expect(select.value).toBe('');
+  await render({ inputType: 'video', historical: true, projection: null, metadataSummary: '1920 × 1080 · 30 FPS' });
+  expect(container.querySelector('.media-source-copy strong')?.textContent).toBe('未记录视频类型');
+  expect(container.querySelector('.media-source-copy')?.textContent).toContain('此任务没有可用的视频类型记录');
+  expect(container.querySelector('.media-source-metadata')?.textContent).toBe('1920 × 1080 · 30 FPS');
 });
 
 it('does not guess a historical type from dimensions and distinguishes image sequences', async () => {

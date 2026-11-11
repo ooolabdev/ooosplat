@@ -82,6 +82,27 @@ pub(crate) async fn detect(
     manager: &ProcessManager,
     request: Request<'_>,
 ) -> Option<FocalOverride> {
+    detect_selected(executable, manager, request, None).await
+}
+
+/// Inspect the same in-memory image group that will become COLMAP's
+/// `image_list`. This keeps recovery preflight read-only even when the list
+/// file has not been emitted yet. It never searches unrelated directory files.
+pub(crate) async fn detect_image_names(
+    executable: &Path,
+    manager: &ProcessManager,
+    request: Request<'_>,
+    image_names: &[String],
+) -> Option<FocalOverride> {
+    detect_selected(executable, manager, request, Some(image_names.to_vec())).await
+}
+
+async fn detect_selected(
+    executable: &Path,
+    manager: &ProcessManager,
+    request: Request<'_>,
+    image_names: Option<Vec<String>>,
+) -> Option<FocalOverride> {
     if !ENABLED || !request.eligible() {
         return None;
     }
@@ -89,7 +110,10 @@ pub(crate) async fn detect(
     let list = request.image_list.map(Path::to_path_buf);
     let binary = executable.to_path_buf();
     let (name, path) = tokio::task::spawn_blocking(move || {
-        let (name, path) = first_image(&images, list.as_deref())?;
+        let (name, path) = match image_names {
+            Some(names) => first_named_image(&images, &names),
+            None => first_image(&images, list.as_deref()),
+        }?;
         if !path.extension()?.eq_ignore_ascii_case("png") {
             return None;
         }
@@ -213,10 +237,30 @@ fn first_image(images: &Path, image_list: Option<&Path>) -> Option<(String, Path
         }
         walk(images, images, &mut names)?;
     }
+    first_named_image(images, &names)
+}
+
+fn first_named_image(images: &Path, names: &[String]) -> Option<(String, PathBuf)> {
+    let mut names = names.to_vec();
+    for name in &mut names {
+        if name.is_empty()
+            || name.trim() != name.as_str()
+            || name.contains(['\n', '\r', '\0', ':'])
+            || Path::new(name.as_str()).is_absolute()
+            || Path::new(name.as_str())
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        *name = name.replace('\\', "/");
+    }
     names.sort();
     let name = names.into_iter().next()?;
     let path = images.join(&name);
-    path.is_file().then_some((name, path))
+    let root = std::fs::canonicalize(images).ok()?;
+    let canonical = std::fs::canonicalize(&path).ok()?;
+    (canonical.starts_with(root) && canonical.is_file()).then_some((name, path))
 }
 
 fn field(namespace: ResolveResult<'_>, local: &[u8]) -> Option<&'static str> {
@@ -732,6 +776,27 @@ mod tests {
             first_image(temp.path(), Some(&list)).unwrap().0,
             "frame_10.png"
         );
+        assert_eq!(
+            first_named_image(temp.path(), &["frame_2.png".into(), "frame_10.png".into()])
+                .unwrap()
+                .0,
+            "frame_10.png",
+            "preflight and the later image_list must choose the same dictionary order"
+        );
+        assert_eq!(
+            first_named_image(temp.path(), &["frame_2.png".into()])
+                .unwrap()
+                .0,
+            "frame_2.png",
+            "unlisted directory images must not initialize this camera"
+        );
+        for name in [
+            "../outside.png",
+            " frame_2.png",
+            "frame_2.png\nframe_10.png",
+        ] {
+            assert!(first_named_image(temp.path(), &[name.into()]).is_none());
+        }
         std::fs::write(&list, "../outside.png\n").unwrap();
         assert!(first_image(temp.path(), Some(&list)).is_none());
     }

@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{Result, SplatError},
     presets::{self, PlannerResolutionPlan, Quality, ResolvedBrushTrainingPreset},
-    video::{FramePlan, FrameSelectionStrategy, QualityV2FrameSelection, VideoInfo},
+    video::{
+        minimum_selected_frames, FramePlan, FrameSelectionStrategy, QualityV2FrameSelection,
+        VideoInfo,
+    },
 };
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -16,6 +19,8 @@ pub struct GenerationPolicy {
     pub auto_retry_enabled: bool,
     /// None retains the exact tier FPS default, without UI rounding.
     pub frame_sampling_ratio: Option<f64>,
+    /// Version 4 shared target. None retains the exact per-tier FPS default.
+    pub frame_sampling_fps: Option<f64>,
 }
 
 impl Default for GenerationPolicy {
@@ -24,11 +29,55 @@ impl Default for GenerationPolicy {
             version: VERSION,
             auto_retry_enabled: true,
             frame_sampling_ratio: None,
+            frame_sampling_fps: None,
         }
     }
 }
 
 impl GenerationPolicy {
+    fn default_tier_fps(quality: Quality) -> f64 {
+        match quality {
+            Quality::Fast => 6.0,
+            Quality::Balanced => 8.0,
+            Quality::High => 12.0,
+        }
+    }
+
+    fn removal_frame_plan(
+        self,
+        video: &VideoInfo,
+        quality: Quality,
+        removal_fps: Option<f64>,
+    ) -> FramePlan {
+        let mut preset = quality.preset();
+        let minimum_target = if self.version >= 6 {
+            self.frame_sampling_bounds(video)
+                .map(|(minimum, _)| minimum)
+                .unwrap_or(video.fps)
+        } else {
+            0.1
+        };
+        let maximum_removal = (video.fps - minimum_target).max(0.0);
+        let removal = removal_fps
+            .unwrap_or_else(|| {
+                if self.version >= 6 {
+                    video.fps - Self::default_tier_fps(quality).min(video.fps)
+                } else {
+                    Self::default_tier_fps(quality)
+                }
+            })
+            .clamp(0.0, maximum_removal);
+        if self.version >= 6 && removal <= f64::EPSILON * video.fps.max(1.0) {
+            return QualityV2FrameSelection.create_all_frames_plan(video, removal_fps.is_some());
+        }
+        preset.initial_fps = Some((video.fps - removal).max(minimum_target).min(video.fps));
+        if removal_fps.is_some() {
+            QualityV2FrameSelection.create_manual_bridge_plan(video, &preset)
+        } else {
+            QualityV2FrameSelection.create_plan(video, &preset)
+        }
+    }
+
     pub fn oom_retry(
         self,
         resolved: ResolvedBrushTrainingPreset,
@@ -43,6 +92,11 @@ impl GenerationPolicy {
     }
     pub fn validate(self) -> Result<Self> {
         if !(1..=VERSION).contains(&self.version)
+            || (self.frame_sampling_fps.is_some()
+                && (self.version < 4 || self.frame_sampling_ratio.is_some()))
+            || self
+                .frame_sampling_fps
+                .is_some_and(|fps| !fps.is_finite() || fps < 0.1)
             || self
                 .frame_sampling_ratio
                 .is_some_and(|r| !r.is_finite() || !(0.001..=1.0).contains(&r))
@@ -53,15 +107,78 @@ impl GenerationPolicy {
     }
 
     pub fn frame_plan(self, video: &VideoInfo, quality: Quality) -> FramePlan {
+        if self.version >= 5
+            && self.frame_sampling_ratio.is_none()
+            && self.frame_sampling_fps.is_none()
+        {
+            return self.removal_frame_plan(video, quality, None);
+        }
         let mut preset = quality.preset();
         if let Some(ratio) = self.frame_sampling_ratio {
             preset.initial_fps = Some(video.fps * ratio);
         }
-        if self.version >= 3 && self.frame_sampling_ratio.is_some() {
+        if let Some(fps) = self.frame_sampling_fps {
+            preset.initial_fps = Some(fps.min(video.fps));
+        }
+        if self.version >= 3
+            && (self.frame_sampling_ratio.is_some() || self.frame_sampling_fps.is_some())
+        {
             QualityV2FrameSelection.create_manual_bridge_plan(video, &preset)
         } else {
             QualityV2FrameSelection.create_plan(video, &preset)
         }
+    }
+
+    pub fn frame_plan_for_material(
+        self,
+        video: &VideoInfo,
+        quality: Quality,
+        removal_fps: Option<f64>,
+    ) -> Result<FramePlan> {
+        if self.version < 5 {
+            return Ok(self.frame_plan(video, quality));
+        }
+        if self.frame_sampling_ratio.is_some() || self.frame_sampling_fps.is_some() {
+            if removal_fps.is_some() {
+                return Err(SplatError::Process(
+                    "Per-material removal FPS conflicts with the legacy sampling setting".into(),
+                ));
+            }
+            return Ok(self.frame_plan(video, quality));
+        }
+        let invalid_removal = if self.version >= 6 {
+            let maximum = self
+                .frame_sampling_bounds(video)
+                .map(|(minimum, _)| (video.fps - minimum).max(0.0))
+                .unwrap_or(0.0);
+            removal_fps.is_some_and(|fps| !fps.is_finite() || fps < 0.0 || fps > maximum)
+        } else {
+            removal_fps.is_some_and(|fps| {
+                !fps.is_finite() || fps < 0.1 || fps > (video.fps - 0.1).max(0.1)
+            })
+        };
+        if invalid_removal {
+            return Err(SplatError::Process("Invalid frame removal FPS".into()));
+        }
+        Ok(self.removal_frame_plan(video, quality, removal_fps))
+    }
+
+    /// Returns the requested sampling-FPS interval for the version-6 removal
+    /// control. Actual displayed endpoints still come from `FramePlan`, since
+    /// frame counts, VFR timing and rounding can make the effective FPS differ.
+    pub fn frame_sampling_bounds(self, video: &VideoInfo) -> Option<(f64, f64)> {
+        if self.version < 6
+            || !video.fps.is_finite()
+            || video.fps <= 0.0
+            || !video.duration.is_finite()
+            || video.duration <= 0.0
+        {
+            return None;
+        }
+        let minimum = (minimum_selected_frames() as f64 / video.duration)
+            .max(1.0)
+            .min(video.fps);
+        Some((minimum, video.fps))
     }
 
     pub fn resolution(
@@ -96,6 +213,36 @@ impl GenerationPolicy {
         initial_points: u64,
         fine_budget: Option<&super::splat_budget::FineSplatBudget>,
     ) -> Result<ResolvedBrushTrainingPreset> {
+        let max_resolution = if quality == Quality::High {
+            resolution.working_long_edge()
+        } else {
+            resolution.brush_initial_max_resolution.max(1)
+        };
+        self.training_with_max_resolution(
+            quality,
+            memory,
+            resolution,
+            sparse_points,
+            initial_points,
+            fine_budget,
+            max_resolution,
+        )
+    }
+
+    /// The shared dataset runner may retain larger prepared views than the
+    /// legacy recipe. Budget the pixels Brush will actually load, without
+    /// changing either path's existing resolution policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn training_with_max_resolution(
+        self,
+        quality: Quality,
+        memory: Option<u64>,
+        resolution: &PlannerResolutionPlan,
+        sparse_points: u64,
+        initial_points: u64,
+        fine_budget: Option<&super::splat_budget::FineSplatBudget>,
+        max_resolution: u32,
+    ) -> Result<ResolvedBrushTrainingPreset> {
         u32::try_from(initial_points).map_err(|_| {
             SplatError::Process("Initialization exceeds the supported Splat count range".into())
         })?;
@@ -106,6 +253,7 @@ impl GenerationPolicy {
             initial_points,
             resolution,
         );
+        resolved.preset.max_resolution = max_resolution.max(1);
         if quality == Quality::High {
             if self.version >= 2 {
                 let budget = fine_budget.ok_or_else(|| {
@@ -119,9 +267,25 @@ impl GenerationPolicy {
             } else {
                 apply_sparse_budget(&mut resolved, sparse_points, initial_points)?;
             }
-            resolved.preset.max_resolution = resolution.working_long_edge();
+        } else if self.requires_pixel_budget(quality) {
+            let budget = fine_budget
+                .ok_or_else(|| SplatError::Process("Splat budget is missing or stale".into()))?;
+            let requested = budget.validated_ceiling_for_quality(
+                sparse_points,
+                quality,
+                resolved.preset.max_resolution,
+            )?;
+            apply_budget(&mut resolved, requested, initial_points)?;
         }
         Ok(resolved)
+    }
+
+    pub fn requires_pixel_budget(self, quality: Quality) -> bool {
+        if quality == Quality::High {
+            self.version >= 2
+        } else {
+            self.version >= 7
+        }
     }
 
     pub fn panorama_training(
@@ -223,7 +387,30 @@ mod tests {
                 points * 5,
             )
             .unwrap(),
+            quality: None,
+            training_max_resolution: None,
         }
+    }
+    fn budget_for(
+        quality: Quality,
+        points: u64,
+        max_resolution: u32,
+    ) -> super::super::splat_budget::FineSplatBudget {
+        let mut value = budget(points);
+        if quality != Quality::High {
+            value.version = super::super::splat_budget::TIER_VERSION;
+            value.coefficient = super::super::splat_budget::coefficient(quality);
+            value.quality = Some(quality);
+            value.training_max_resolution = Some(max_resolution);
+            value.requested_max_splats = super::super::splat_budget::ceiling_for_quality(
+                value.effective_pixels,
+                value.tracked_points,
+                value.observations,
+                quality,
+            )
+            .unwrap();
+        }
+        value
     }
     fn video(frames: u64, fps: f64) -> VideoInfo {
         VideoInfo {
@@ -239,13 +426,203 @@ mod tests {
         }
     }
     #[test]
+    fn version_five_uses_tier_removal_defaults_and_keeps_legacy_targets() {
+        let policy = GenerationPolicy {
+            version: 5,
+            ..GenerationPolicy::default()
+        };
+        for (quality, selected) in [
+            (Quality::Fast, 1440),
+            (Quality::Balanced, 1320),
+            (Quality::High, 1080),
+        ] {
+            assert_eq!(
+                policy
+                    .frame_plan(&video(1800, 30.), quality)
+                    .estimated_frames,
+                selected
+            );
+            let previous = GenerationPolicy {
+                version: 4,
+                ..policy
+            };
+            assert_eq!(
+                previous
+                    .frame_plan(&video(1800, 30.), quality)
+                    .estimated_frames,
+                match quality {
+                    Quality::Fast => 360,
+                    Quality::Balanced => 480,
+                    Quality::High => 720,
+                }
+            );
+        }
+        let manual = GenerationPolicy {
+            frame_sampling_fps: Some(6.),
+            ..policy
+        };
+        let a = manual.frame_plan(&video(1800, 30.), Quality::High);
+        assert_eq!(a.selected_frames.len(), 360);
+        assert_eq!(a.rescue_max_frames, 432);
+        let b = manual.frame_plan(&video(40, 2.), Quality::High);
+        assert_eq!(b.selected_frames.len(), 40);
+        assert_eq!(b.rescue_max_frames, 40);
+        let short = manual.frame_plan(&video(20, 30.), Quality::Fast);
+        assert_eq!(short.selected_frames.len(), 20);
+        assert!(GenerationPolicy {
+            frame_sampling_fps: Some(8.),
+            frame_sampling_ratio: Some(0.5),
+            ..policy
+        }
+        .validate()
+        .is_err());
+        for fps in [0., 0.01, f64::NAN, f64::INFINITY] {
+            assert!(GenerationPolicy {
+                frame_sampling_fps: Some(fps),
+                ..policy
+            }
+            .validate()
+            .is_err());
+        }
+    }
+    #[test]
+    fn per_material_removal_uses_manual_bridge_budget_and_validates_range() {
+        let policy = GenerationPolicy::default();
+        let clip = video(1800, 30.);
+        let plan = policy
+            .frame_plan_for_material(&clip, Quality::Balanced, Some(8.))
+            .unwrap();
+        assert_eq!(plan.estimated_frames, 1320);
+        assert_eq!(plan.rescue_max_frames, 1584);
+        assert_eq!(plan.bridge_source_frames, Some(1800));
+        assert!(policy
+            .frame_plan_for_material(&clip, Quality::Balanced, Some(30.))
+            .is_err());
+        let legacy = GenerationPolicy {
+            version: 4,
+            ..policy
+        };
+        assert_eq!(
+            legacy
+                .frame_plan_for_material(&clip, Quality::Balanced, Some(8.))
+                .unwrap(),
+            legacy.frame_plan(&clip, Quality::Balanced)
+        );
+    }
+
+    #[test]
+    fn current_policy_keeps_version_six_sampling_bounds_and_can_keep_every_frame() {
+        let policy = GenerationPolicy::default();
+        assert_eq!(policy.version, VERSION);
+        assert!(policy.validate().is_ok());
+        assert!(GenerationPolicy {
+            version: VERSION + 1,
+            ..policy
+        }
+        .validate()
+        .is_err());
+
+        let long = video(1800, 30.);
+        for (quality, expected_fps, expected_frames) in [
+            (Quality::Fast, 6., 360),
+            (Quality::Balanced, 8., 480),
+            (Quality::High, 12., 720),
+        ] {
+            let plan = policy.frame_plan(&long, quality);
+            assert_eq!(plan.sampling_fps, expected_fps);
+            assert_eq!(plan.estimated_frames, expected_frames);
+            assert_eq!(
+                plan,
+                GenerationPolicy {
+                    version: 6,
+                    ..policy
+                }
+                .frame_plan(&long, quality)
+            );
+        }
+        let (minimum, maximum) = policy.frame_sampling_bounds(&long).unwrap();
+        assert_eq!((minimum, maximum), (1., 30.));
+        let low = policy
+            .frame_plan_for_material(&long, Quality::Balanced, Some(long.fps - minimum))
+            .unwrap();
+        assert_eq!(low.estimated_frames, 60);
+        assert_eq!(low.sampling_fps, 1.);
+        let all = policy
+            .frame_plan_for_material(&long, Quality::Balanced, Some(0.))
+            .unwrap();
+        assert_eq!(all.estimated_frames, 1800);
+        assert_eq!(all.sampling_fps, 30.);
+        assert_eq!(all.retention_ratio, 1.);
+        assert_eq!(all.rescue_max_frames, 1800);
+        assert_eq!(all.bridge_source_frames, Some(1800));
+
+        let inconsistent_container_timing = VideoInfo {
+            duration: 60.2,
+            ..long.clone()
+        };
+        let all = policy
+            .frame_plan_for_material(&inconsistent_container_timing, Quality::Balanced, Some(0.))
+            .unwrap();
+        assert_eq!(all.estimated_frames, 1800);
+        assert_eq!(all.sampling_fps, 30.);
+        assert_eq!(all.retention_ratio, 1.);
+        assert_eq!(all.rescue_max_frames, 1800);
+
+        let ten_seconds = video(300, 30.);
+        let (minimum, maximum) = policy.frame_sampling_bounds(&ten_seconds).unwrap();
+        assert_eq!((minimum, maximum), (3., 30.));
+        assert_eq!(
+            policy
+                .frame_plan_for_material(
+                    &ten_seconds,
+                    Quality::Fast,
+                    Some(ten_seconds.fps - minimum),
+                )
+                .unwrap()
+                .estimated_frames,
+            30
+        );
+
+        let fewer_than_minimum = video(20, 30.);
+        let (minimum, maximum) = policy.frame_sampling_bounds(&fewer_than_minimum).unwrap();
+        assert_eq!((minimum, maximum), (30., 30.));
+        let only = policy
+            .frame_plan_for_material(&fewer_than_minimum, Quality::High, Some(0.))
+            .unwrap();
+        assert_eq!(only.estimated_frames, 20);
+        assert_eq!(only.retention_ratio, 1.);
+    }
+
+    #[test]
+    fn version_five_keeps_the_legacy_removal_range() {
+        let current = GenerationPolicy::default();
+        let legacy = GenerationPolicy {
+            version: 5,
+            ..current
+        };
+        let clip = video(1800, 30.);
+        assert!(legacy.frame_sampling_bounds(&clip).is_none());
+        assert!(legacy
+            .frame_plan_for_material(&clip, Quality::Balanced, Some(0.))
+            .is_err());
+        let plan = legacy
+            .frame_plan_for_material(&clip, Quality::Balanced, Some(0.1))
+            .unwrap();
+        assert_eq!(plan.estimated_frames, 1794);
+        assert_eq!(plan.sampling_fps, 29.9);
+    }
+    #[test]
     fn base_sampling_is_separate_from_backfill_and_manual_selection_is_never_capped() {
         for (quality, count, candidates) in [
             (Quality::Fast, 360, 540),
             (Quality::Balanced, 480, 720),
             (Quality::High, 720, 900),
         ] {
-            let p = GenerationPolicy::default().frame_plan(&video(1800, 30.), quality);
+            let p = GenerationPolicy {
+                version: 4,
+                ..Default::default()
+            }
+            .frame_plan(&video(1800, 30.), quality);
             assert_eq!(p.estimated_frames, count);
             assert_eq!(p.rescue_max_frames, candidates);
             for ratio in [0.001, 0.1, 0.333, 0.9, 1.0] {
@@ -307,7 +684,11 @@ mod tests {
                     .frame_plan(&video(1800, 30.), quality)
                 );
             }
-            let default_plan = GenerationPolicy::default().frame_plan(&video(1800, 30.), quality);
+            let default_plan = GenerationPolicy {
+                version: 2,
+                ..Default::default()
+            }
+            .frame_plan(&video(1800, 30.), quality);
             for version in [1, 2] {
                 assert_eq!(
                     default_plan,
@@ -357,7 +738,10 @@ mod tests {
             version: 2,
             ..Default::default()
         };
-        let new = GenerationPolicy::default();
+        let new = GenerationPolicy {
+            version: 3,
+            ..Default::default()
+        };
         for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
             for memory in [None, Some(8192), Some(24576)] {
                 let resolution = new.resolution(quality, memory, 4096, 2048, true);
@@ -408,10 +792,11 @@ mod tests {
         );
         for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
             let r = on.resolution(quality, None, 3840, 2160, true);
+            let budget = budget_for(quality, 10_000, r.brush_initial_max_resolution);
             assert_eq!(
-                on.training(quality, None, &r, 10_000, 10_000, Some(&budget(10_000)))
+                on.training(quality, None, &r, 10_000, 10_000, Some(&budget))
                     .unwrap(),
-                off.training(quality, None, &r, 10_000, 10_000, Some(&budget(10_000)))
+                off.training(quality, None, &r, 10_000, 10_000, Some(&budget))
                     .unwrap()
             );
         }
@@ -459,7 +844,10 @@ mod tests {
     }
     #[test]
     fn old_policy_keeps_sparse_budget_and_new_policy_changes_only_ordinary_high_ceiling() {
-        let current = GenerationPolicy::default();
+        let current = GenerationPolicy {
+            version: 2,
+            ..Default::default()
+        };
         let old = GenerationPolicy {
             version: 1,
             ..current
@@ -509,6 +897,105 @@ mod tests {
             legacy
         );
     }
+
+    #[test]
+    fn v7_changes_only_fast_balanced_ceiling_and_keeps_saved_recipes() {
+        let current = GenerationPolicy::default();
+        for quality in [Quality::Fast, Quality::Balanced] {
+            for memory in [None, Some(8192), Some(24576)] {
+                let r = current.resolution(quality, memory, 4096, 2160, false);
+                let snapshot = budget_for(quality, 10_000, r.brush_initial_max_resolution);
+                let modern = current
+                    .training(quality, memory, &r, 10_000, 10_000, Some(&snapshot))
+                    .unwrap();
+                assert_eq!(
+                    modern.configured_max_splats,
+                    Some(snapshot.requested_max_splats)
+                );
+                assert_eq!(
+                    modern.preset.max_splats,
+                    Some(snapshot.requested_max_splats)
+                );
+                assert!(current
+                    .training(quality, memory, &r, 10_000, 10_000, None)
+                    .is_err());
+                for version in 1..=6 {
+                    let old = GenerationPolicy { version, ..current };
+                    assert!(!old.requires_pixel_budget(quality));
+                    let legacy = old
+                        .training(quality, memory, &r, 10_000, 10_000, None)
+                        .unwrap();
+                    let mut same_recipe = modern;
+                    same_recipe.configured_max_splats = legacy.configured_max_splats;
+                    same_recipe.preset.max_splats = legacy.preset.max_splats;
+                    assert_eq!(same_recipe, legacy);
+                    assert_eq!(
+                        current.resolution(quality, memory, 4096, 2160, false),
+                        old.resolution(quality, memory, 4096, 2160, false)
+                    );
+                    assert_eq!(
+                        current.frame_plan(&video(1800, 30.), quality),
+                        GenerationPolicy { version: 6, ..old }
+                            .frame_plan(&video(1800, 30.), quality)
+                    );
+                    assert_eq!(
+                        current
+                            .panorama_training(quality, memory, 512, 10_000, 10_000)
+                            .unwrap(),
+                        old.panorama_training(quality, memory, 512, 10_000, 10_000)
+                            .unwrap()
+                    );
+                }
+                let restored: super::super::splat_budget::FineSplatBudget =
+                    serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+                let initialized = current
+                    .training(quality, memory, &r, 10_000, 8_000_000, Some(&restored))
+                    .unwrap();
+                assert_eq!(
+                    initialized.configured_max_splats,
+                    Some(snapshot.requested_max_splats)
+                );
+                assert_eq!(initialized.preset.max_splats, Some(8_000_000));
+
+                // The unified path can keep native prepared views. It must use
+                // a budget bound to that actual cap, not the legacy cap.
+                assert!(current
+                    .training_with_max_resolution(
+                        quality,
+                        memory,
+                        &r,
+                        10_000,
+                        10_000,
+                        Some(&snapshot),
+                        r.working_long_edge()
+                    )
+                    .is_err());
+                let native = budget_for(quality, 10_000, r.working_long_edge());
+                let native_recipe = current
+                    .training_with_max_resolution(
+                        quality,
+                        memory,
+                        &r,
+                        10_000,
+                        10_000,
+                        Some(&native),
+                        r.working_long_edge(),
+                    )
+                    .unwrap();
+                assert_eq!(native_recipe.preset.max_resolution, r.working_long_edge());
+                assert_eq!(
+                    native_recipe.preset.densification,
+                    modern.preset.densification
+                );
+            }
+        }
+        assert_eq!(super::super::splat_budget::coefficient(Quality::Fast), 0.2);
+        assert_eq!(
+            super::super::splat_budget::coefficient(Quality::Balanced),
+            0.4
+        );
+        assert_eq!(super::super::splat_budget::coefficient(Quality::High), 0.5);
+    }
     #[test]
     fn oom_changes_only_ceiling_and_never_discards_initial_points() {
         let p = GenerationPolicy::default();
@@ -541,15 +1028,9 @@ mod tests {
                 ..on
             };
             let resolution = on.resolution(quality, None, 8192, 4096, false);
+            let budget = budget_for(quality, 10_000, resolution.brush_initial_max_resolution);
             let ordinary = on
-                .training(
-                    quality,
-                    None,
-                    &resolution,
-                    10_000,
-                    10_000,
-                    Some(&budget(10_000)),
-                )
+                .training(quality, None, &resolution, 10_000, 10_000, Some(&budget))
                 .unwrap();
             let panorama = on
                 .panorama_training(quality, None, 512, 10_000, 10_000)

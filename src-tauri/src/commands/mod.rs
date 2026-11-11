@@ -232,6 +232,7 @@ pub struct ProjectTaskLogLine {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTaskDetail {
+    inputs: Option<crate::pipeline::inputs::InputCheckpoint>,
     generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
     automatically_retried: bool,
     reshoot_recipe: Option<crate::pipeline::reshoot::ReshootRecipe>,
@@ -417,6 +418,201 @@ pub struct InputAnalysis {
     pub(crate) video: Option<VideoInfo>,
     pub(crate) image_sequence: Option<ImageSequenceInfo>,
     pub(crate) projection_detection: crate::video::panorama::ProjectionDetection,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputsInspection {
+    pub materials: Vec<crate::pipeline::inputs::MaterialAnalysis>,
+    pub colmap: Option<crate::reconstruction::direct_input::Inspection>,
+    pub errors: std::collections::BTreeMap<String, String>,
+}
+
+#[tauri::command]
+pub async fn classify_material_paths(
+    paths: Vec<PathBuf>,
+) -> Result<Vec<crate::pipeline::inputs::MaterialInput>> {
+    let paths = paths
+        .into_iter()
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    crate::pipeline::input_admission::ensure_new_paths_supported(&paths)?;
+    crate::pipeline::input_discovery::classify_media_paths(paths)
+}
+
+#[tauri::command]
+pub async fn classify_generation_paths(
+    paths: Vec<PathBuf>,
+) -> Result<crate::pipeline::input_discovery::GenerationPathSelection> {
+    crate::pipeline::input_discovery::classify(paths)
+}
+#[tauri::command]
+pub async fn inspect_material_inputs(
+    app: tauri::AppHandle,
+    inputs: crate::pipeline::inputs::GenerationInputs,
+    quality: Quality,
+    generation_policy: crate::pipeline::generation_policy::GenerationPolicy,
+) -> Result<InputsInspection> {
+    crate::pipeline::input_admission::ensure_new_inputs_supported(&inputs)?;
+    inputs.authorized_paths()?;
+    let engines = paths_for_app(&app);
+    let policy = generation_policy.validate()?;
+    let mut materials = vec![];
+    let mut colmap = None;
+    let mut errors = std::collections::BTreeMap::new();
+    match inputs {
+        crate::pipeline::inputs::GenerationInputs::Materials { items } => {
+            for item in items {
+                match crate::pipeline::inputs::inspect_material(&engines, &item, quality, policy)
+                    .await
+                {
+                    Ok(a) => materials.push(a),
+                    Err(e) => {
+                        errors.insert(item.id, e.to_string());
+                    }
+                }
+            }
+        }
+        crate::pipeline::inputs::GenerationInputs::Colmap { input } => {
+            colmap = Some(
+                crate::presets::spawn_pipeline_blocking(move || {
+                    crate::reconstruction::direct_input::inspect(&input)
+                })
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??,
+            );
+        }
+    }
+    Ok(InputsInspection {
+        materials,
+        colmap,
+        errors,
+    })
+}
+
+#[tauri::command]
+pub async fn detect_material_gps(
+    item: crate::pipeline::inputs::MaterialInput,
+    identity: String,
+) -> Result<bool> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::Mutex<std::collections::VecDeque<(String, bool)>>,
+    > = std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().await;
+    if let Some((_, v)) = cache.iter().find(|(key, _)| key == &identity) {
+        return Ok(*v);
+    }
+    let key = identity.clone();
+    let detected = crate::presets::spawn_pipeline_blocking(move || {
+        if item.source.identity()? != identity {
+            return Err(SplatError::Process("INPUT_CHANGED".into()));
+        }
+        let detected = crate::video::gps::detect(&item.source.members()?);
+        if item.source.identity()? != identity {
+            return Err(SplatError::Process("INPUT_CHANGED".into()));
+        }
+        Ok(detected)
+    })
+    .await
+    .map_err(|e| SplatError::Process(e.to_string()))??;
+    if cache.len() >= 64 {
+        cache.pop_front();
+    }
+    cache.push_back((key, detected));
+    Ok(detected)
+}
+
+#[tauri::command]
+pub async fn estimate_material_inputs(
+    app: tauri::AppHandle,
+    inputs: crate::pipeline::inputs::GenerationInputs,
+    quality: Quality,
+    generation_policy: crate::pipeline::generation_policy::GenerationPolicy,
+) -> Result<Option<RuntimeEstimate>> {
+    let crate::pipeline::inputs::GenerationInputs::Materials { items } = &inputs else {
+        return Ok(None);
+    };
+    inputs.authorized_paths()?;
+    let engines = paths_for_app(&app);
+    let policy = generation_policy.validate()?;
+    let mut analyses = vec![];
+    for item in items {
+        analyses.push(
+            crate::pipeline::inputs::inspect_material(&engines, item, quality, policy).await?,
+        );
+    }
+    Ok(crate::pipeline::inputs::estimate(
+        &analyses,
+        quality,
+        &catalog::runtime_samples().await,
+    ))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn start_gui_inputs(
+    app: tauri::AppHandle,
+    state: State<'_, PipelineController>,
+    telemetry: State<'_, TelemetryService>,
+    imports: State<'_, crate::imports::ImportController>,
+    inputs: crate::pipeline::inputs::GenerationInputs,
+    quality: Quality,
+    projects_root: PathBuf,
+    workspace_task_id: Uuid,
+    generation_policy: crate::pipeline::generation_policy::GenerationPolicy,
+    source_project_id: Option<Uuid>,
+    reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
+) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
+    crate::pipeline::input_admission::ensure_new_inputs_supported(&inputs)?;
+    let _admission = imports.admission().await;
+    if imports.is_active().await {
+        return Err(crate::tasks::ServiceError::new(
+            "TASK_BUSY",
+            "已有 Gaussian 导入正在进行，请等待完成后再启动任务",
+        ));
+    }
+    let engines = paths_for_app(&app);
+    crate::pipeline::inputs::validate(&engines, &inputs, quality, generation_policy.validate()?)
+        .await?;
+    if let Some(id) = source_project_id {
+        if matches!(
+            inputs,
+            crate::pipeline::inputs::GenerationInputs::Colmap { .. }
+        ) {
+            return Err(crate::tasks::ServiceError::new(
+                "INVALID_ARGUMENT",
+                crate::pipeline::inputs::INVALID_COLMAP,
+            ));
+        }
+        let source = PipelineRunner::new(engines.clone(), |_| {})
+            .inspect_reshoot_source_v2(id)
+            .await?;
+        if reshoot_options
+            .as_ref()
+            .is_none_or(|o| o.source_identity != source.source_identity)
+        {
+            return Err(crate::tasks::ServiceError::new(
+                "INPUT_CHANGED",
+                "原项目已发生变化，请重新分析后再生成",
+            ));
+        }
+    }
+    let params = serde_json::json!({"inputs":inputs,"generationPolicy":generation_policy,"source_project_id":source_project_id,"reshootOptions":reshoot_options});
+    state
+        .create(
+            Some(workspace_task_id),
+            inputs.primary_path().to_path_buf(),
+            quality,
+            projects_root,
+            true,
+            "gui",
+            None,
+            Some(params),
+        )
+        .await?;
+    state
+        .start(workspace_task_id, engines, Some(telemetry.inner().clone()))
+        .await
 }
 
 pub(crate) async fn analyze_media(
@@ -833,9 +1029,7 @@ fn resolve_checkpoint_brush(
                 false,
             )
         });
-        if policy.version >= 2
-            && quality == Quality::High
-            && state.brush_training.fine_splat_budget.is_none()
+        if policy.requires_pixel_budget(quality) && state.brush_training.fine_splat_budget.is_none()
         {
             // Duration estimation must not scan training pixels, invent a cap,
             // or prevent resuming before the final model has been inspected.
@@ -850,13 +1044,28 @@ fn resolve_checkpoint_brush(
             estimate.preset.max_splats = None;
             return Ok(estimate);
         }
-        return policy.training(
+        // This is an estimate only; a saved budget records the actual load
+        // limit used by that execution path, which can differ from legacy.
+        let max_resolution = state
+            .brush_training
+            .fine_splat_budget
+            .as_ref()
+            .and_then(|budget| budget.training_max_resolution)
+            .unwrap_or_else(|| {
+                if quality == Quality::High {
+                    resolution.working_long_edge()
+                } else {
+                    resolution.brush_initial_max_resolution.max(1)
+                }
+            });
+        return policy.training_with_max_resolution(
             quality,
             detected_total_memory_mb,
             &resolution,
             initial_sfm_points,
             initial_sfm_points,
             state.brush_training.fine_splat_budget.as_ref(),
+            max_resolution,
         );
     }
     if let Some(panorama) = &state.panorama {
@@ -1196,6 +1405,7 @@ pub async fn get_project_task_detail(
         .as_ref()
         .map(|output| output.registered_images);
     Ok(ProjectTaskDetail {
+        inputs: state.as_ref().and_then(|s| s.inputs.clone()),
         generation_policy: state.as_ref().and_then(|s| s.generation_policy),
         automatically_retried: state
             .as_ref()
@@ -1302,9 +1512,68 @@ async fn record_command_failure(
 }
 
 fn service_command_error(error: crate::tasks::ServiceError) -> PipelineCommandError {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SafePipelineError {
+        code: String,
+        message: String,
+        failed_stage: Option<PipelineStage>,
+        engine: Option<PipelineEngine>,
+        failure_kind: Option<String>,
+        classification_version: Option<u32>,
+        #[serde(default)]
+        classification_is_heuristic: bool,
+        termination: Option<crate::process::ProcessTermination>,
+        project_id: Option<String>,
+        failure_id: Option<Uuid>,
+    }
+    // The preparation service already classified the original typed error.
+    // Preserve that result instead of classifying ServiceError's display text.
+    if let Some(saved) = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("pipelineError"))
+        .and_then(|value| serde_json::from_value::<SafePipelineError>(value.clone()).ok())
+    {
+        let code = match saved.code.as_str() {
+            "cancelled" => Some("cancelled"),
+            "pipeline_failed" => Some("pipeline_failed"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            let failure_kind = match saved.failure_kind.as_deref() {
+                Some("mapper_source") => Some("mapper_source"),
+                Some("mapper_storage") => Some("mapper_storage"),
+                Some("brush_gpu") => Some("brush_gpu"),
+                Some("brush_device_lost") => Some("brush_device_lost"),
+                Some("brush_dataset") => Some("brush_dataset"),
+                Some("brush_out_of_memory") => Some("brush_out_of_memory"),
+                Some("brush_resource_limit") => Some("brush_resource_limit"),
+                Some("colmap_crash") => Some("colmap_crash"),
+                _ => None,
+            };
+            return PipelineCommandError {
+                code,
+                message: saved.message,
+                failed_stage: saved.failed_stage,
+                engine: saved.engine,
+                failure_kind,
+                classification_version: saved.classification_version,
+                classification_is_heuristic: saved.classification_is_heuristic,
+                termination: saved.termination.map(Box::new),
+                project_id: saved.project_id.map(String::into_boxed_str),
+                // Safe envelopes never supply local path capabilities.
+                project_path: None,
+                logs_directory: None,
+                failure_id: saved.failure_id.map(Box::new),
+            };
+        }
+    }
     let mut command = PipelineCommandError::from(SplatError::Process(error.to_string()));
-    if error.code == "TASK_BUSY" {
-        command.code = "TASK_BUSY";
+    match error.code.as_str() {
+        "TASK_BUSY" => command.code = "TASK_BUSY",
+        "STALE_RUN_ID" => command.code = "STALE_RUN_ID",
+        _ => (),
     }
     command
 }
@@ -1406,7 +1675,7 @@ pub async fn start_gui_task(
     }
     if let Some(failed_run) = retry_failed_run_id {
         return state
-            .retry_failed(
+            .continue_identified(
                 task_id,
                 failed_run,
                 paths_for_app(&app),
@@ -1460,6 +1729,7 @@ pub async fn resume_gui_task(
     telemetry: State<'_, TelemetryService>,
     imports: State<'_, crate::imports::ImportController>,
     project_id: Uuid,
+    expected_run_id: Option<Uuid>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
     let _admission = imports.admission().await;
     if imports.is_active().await {
@@ -1468,13 +1738,15 @@ pub async fn resume_gui_task(
             "已有 Gaussian 导入正在进行，请等待完成后再继续任务",
         ));
     }
-    state
-        .resume(
-            project_id,
-            paths_for_app(&app),
-            Some(telemetry.inner().clone()),
-        )
-        .await
+    let engines = paths_for_app(&app);
+    let telemetry = Some(telemetry.inner().clone());
+    if let Some(expected_run) = expected_run_id {
+        state
+            .resume_project_identified(project_id, expected_run, engines, telemetry)
+            .await
+    } else {
+        state.resume(project_id, engines, telemetry).await
+    }
 }
 
 #[tauri::command]
@@ -2460,6 +2732,34 @@ pub async fn export_ply(source_path: String, destination_path: String) -> Result
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tier_budget_estimates_stay_unknown_until_training_pixels_are_available() {
+        use super::*;
+        for quality in [Quality::Fast, Quality::Balanced] {
+            let mut state = PipelineStateFile::created(quality);
+            state.generation_policy = Some(Default::default());
+            let estimated = resolve_checkpoint_brush(&state, quality, None, 3840, 66_218).unwrap();
+            assert_eq!(estimated.preset.max_splats, None);
+            assert_eq!(estimated.configured_max_splats, None);
+            state.generation_policy.as_mut().unwrap().version = 6;
+            let old = resolve_checkpoint_brush(&state, quality, None, 3840, 66_218).unwrap();
+            assert_eq!(
+                old.preset.max_splats,
+                Some(if quality == Quality::Fast {
+                    500_000
+                } else {
+                    1_000_000
+                })
+            );
+            state.brush_training.resolved = Some(old);
+            state.generation_policy.as_mut().unwrap().version = 7;
+            assert_eq!(
+                resolve_checkpoint_brush(&state, quality, None, 3840, 66_218).unwrap(),
+                old
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_high_resume_estimate_does_not_require_a_pixel_scan_or_invent_a_budget() {
         use super::*;
         let mut state = PipelineStateFile::created(Quality::High);
@@ -2758,6 +3058,67 @@ mod tests {
     use std::{fs, path::Path};
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn retry_preparation_io_keeps_system_engine_and_no_failure_stage() {
+        let error = SplatError::Io(std::io::Error::from_raw_os_error(5)).with_io_diagnostic(
+            "重试准备上下文：retry_preparation_operation=read_retry_state; path_role=project_state",
+        );
+        let command = PipelineCommandError::from(error);
+        assert_eq!(command.failed_stage, None);
+        assert_eq!(command.engine, Some(PipelineEngine::System));
+        assert_eq!(command.failure_kind, None);
+        assert!(!command.classification_is_heuristic);
+    }
+
+    #[test]
+    fn service_preparation_envelope_preserves_classification_and_failure_id_without_paths() {
+        let project_id = Uuid::new_v4();
+        let failure_id = Uuid::new_v4();
+        let mut command = PipelineCommandError::from(
+            SplatError::Io(std::io::Error::from_raw_os_error(5)).with_io_diagnostic(
+                "retry_preparation_operation=write_retry_reuse_barrier; path_role=project_state; io_substep=replace_state",
+            ),
+        );
+        command.project_id = Some(project_id.to_string().into_boxed_str());
+        command.failure_id = Some(Box::new(failure_id));
+        let message = command.message.clone();
+        let mut pipeline = serde_json::to_value(command).unwrap();
+        pipeline["projectPath"] = serde_json::json!(r"C:\private\project");
+        pipeline["logsDirectory"] = serde_json::json!(r"C:\private\project\logs");
+        let mut service = crate::tasks::ServiceError::new(
+            "IO_ERROR",
+            "COLMAP source text is not classification evidence",
+        );
+        service.details = Some(serde_json::json!({"pipelineError":pipeline,
+            "preparation":{"operation":"write_retry_reuse_barrier","pathRole":"project_state","osError":5}}));
+        let restored = super::service_command_error(service);
+        assert_eq!(restored.message, message);
+        assert_eq!(restored.failed_stage, None);
+        assert_eq!(restored.engine, Some(PipelineEngine::System));
+        assert_eq!(restored.failure_kind, None);
+        assert_eq!(
+            restored.classification_version,
+            Some(crate::failure::CLASSIFICATION_VERSION)
+        );
+        assert!(!restored.classification_is_heuristic);
+        assert_eq!(
+            restored.project_id.as_deref(),
+            Some(project_id.to_string().as_str())
+        );
+        assert_eq!(restored.failure_id.as_deref(), Some(&failure_id));
+        assert!(restored.project_path.is_none());
+        assert!(restored.logs_directory.is_none());
+    }
+
+    #[test]
+    fn legacy_command_adapter_preserves_admission_conflict_codes() {
+        for code in ["TASK_BUSY", "STALE_RUN_ID"] {
+            let restored =
+                super::service_command_error(crate::tasks::ServiceError::new(code, "changed"));
+            assert_eq!(restored.code, code);
+        }
+    }
 
     #[tokio::test]
     async fn dropped_input_classification_accepts_video_and_directories() {

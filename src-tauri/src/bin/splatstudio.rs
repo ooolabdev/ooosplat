@@ -27,12 +27,16 @@ struct PolicyArgs {
     /// Fraction of source frames for the first extraction (0.001..=1).
     #[arg(long)]
     frame_sampling_ratio: Option<f64>,
+    /// Shared video target FPS. Mutually exclusive with the legacy ratio.
+    #[arg(long, conflicts_with = "frame_sampling_ratio")]
+    frame_sampling_fps: Option<f64>,
 }
 impl PolicyArgs {
     fn policy(&self) -> Result<ooo_splat::pipeline::generation_policy::GenerationPolicy> {
         ooo_splat::pipeline::generation_policy::GenerationPolicy {
             auto_retry_enabled: self.auto_retry,
             frame_sampling_ratio: self.frame_sampling_ratio,
+            frame_sampling_fps: self.frame_sampling_fps,
             ..Default::default()
         }
         .validate()
@@ -40,6 +44,8 @@ impl PolicyArgs {
 }
 
 #[derive(Debug, Subcommand)]
+// Clap constructs this one command value once; boxing its path flags is not useful.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Validate FFmpeg, FFprobe, CPU COLMAP and Brush.
     Health,
@@ -66,7 +72,30 @@ enum Commands {
     Generate {
         #[command(flatten)]
         policy: PolicyArgs,
-        input: PathBuf,
+        input: Vec<PathBuf>,
+        /// Ordered shared input JSON, including per-set projections and confirmed answers.
+        #[arg(long,conflicts_with_all=["input","colmap_model"])]
+        input_manifest: Option<PathBuf>,
+        #[arg(long, requires = "images", conflicts_with = "input")]
+        /// Temporarily unavailable: direct COLMAP imports are disabled.
+        colmap_model: Option<PathBuf>,
+        #[arg(long, requires = "colmap_model")]
+        images: Option<PathBuf>,
+        #[arg(long, requires = "colmap_model")]
+        database: Option<PathBuf>,
+        #[arg(long,value_parser=["sequential","exhaustive"])]
+        image_order: Option<String>,
+        #[arg(long)]
+        accept_small_image_warning: bool,
+        #[arg(long)]
+        source_project: Option<uuid::Uuid>,
+        #[arg(long,value_parser=["good","appearance","geometry","unsure"])]
+        model_condition: Option<String>,
+        #[arg(long,value_parser=["same","different","unsure"])]
+        camera_relation: Option<String>,
+        /// Print metadata/plans only; no task or generation process is created.
+        #[arg(long)]
+        inspect: bool,
         /// Override the remembered projects root (useful for diagnostics).
         #[arg(long)]
         projects_root: Option<PathBuf>,
@@ -197,29 +226,193 @@ async fn execute(cli: Cli) -> Result<()> {
             projects_root,
             quality,
             video_projection,
+            input_manifest,
+            colmap_model,
+            images,
+            database,
+            image_order,
+            accept_small_image_warning,
+            source_project,
+            model_condition,
+            camera_relation,
+            inspect,
         } => {
-            let runner = PipelineRunner::new(engines, |event| {
-                eprintln!(
-                    "{:>6.2}% {:?}: {}",
-                    event.progress, event.stage, event.message
-                );
-            })
-            .with_video_projection(video_projection)
-            .with_generation_policy(Some(policy.policy()?));
-            let result = match projects_root {
-                Some(root) => {
-                    runner
-                        .generate_for_diagnostics(&input, quality, &root)
-                        .await?
+            use ooo_splat::pipeline::{inputs::*, reshoot::ReshootOptions};
+            let policy = policy.policy()?;
+            let mut inputs = if let Some(manifest) = input_manifest {
+                serde_json::from_slice::<GenerationInputs>(&tokio::fs::read(manifest).await?)?
+            } else if let Some(model) = colmap_model {
+                GenerationInputs::Colmap {
+                    input: ColmapInput {
+                        model,
+                        images: images.unwrap(),
+                        database,
+                        identity: None,
+                    },
                 }
-                None => {
-                    let root = ooo_splat::project::catalog::load_settings()
-                        .await?
-                        .projects_root;
-                    runner.generate(&input, quality, &root).await?
+            } else {
+                GenerationInputs::Materials {
+                    items: ooo_splat::commands::classify_material_paths(input).await?,
                 }
             };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            ooo_splat::pipeline::input_admission::ensure_new_inputs_supported(&inputs)?;
+            inputs = inputs.canonicalized()?;
+            inputs.authorized_paths()?;
+            if source_project.is_some() && matches!(inputs, GenerationInputs::Colmap { .. }) {
+                return Err(SplatError::Process(
+                    "COLMAP direct training cannot append inputs".into(),
+                ));
+            }
+            let mut analyses = vec![];
+            if let GenerationInputs::Materials { items } = &mut inputs {
+                for item in items.iter_mut() {
+                    if video_projection != ooo_splat::video::panorama::VideoProjection::Auto {
+                        item.projection = video_projection;
+                    }
+                    let a = inspect_material(&engines, item, quality, policy).await?;
+                    item.identity = Some(a.identity.clone());
+                    if !a.projection_detection.requires_choice
+                        && item.projection == ooo_splat::video::panorama::VideoProjection::Auto
+                    {
+                        item.projection = if a.projection_detection.confirmed_erp {
+                            ooo_splat::video::panorama::VideoProjection::Equirectangular
+                        } else {
+                            ooo_splat::video::panorama::VideoProjection::Perspective
+                        };
+                    }
+                    if let Some(order) = &image_order {
+                        item.image_matching_strategy =
+                            serde_json::from_value(serde_json::json!(order))?;
+                        item.confirmed_image_order = true;
+                    }
+                    item.confirmed_small_images |=
+                        accept_small_image_warning || source_project.is_some();
+                    if let Some(relation) = &camera_relation {
+                        item.camera_relation =
+                            Some(serde_json::from_value(serde_json::json!(relation))?);
+                    }
+                    analyses.push(a);
+                }
+            }
+            if inspect {
+                let mut summaries = serde_json::to_value(&analyses)?;
+                for analysis in summaries.as_array_mut().into_iter().flatten() {
+                    if let Some(plan) = analysis
+                        .get_mut("plan")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        plan.remove("selectedFrames");
+                        plan.remove("candidateFrames");
+                    }
+                }
+                let colmap = match &inputs {
+                    GenerationInputs::Colmap { input } => {
+                        Some(ooo_splat::reconstruction::direct_input::inspect(input)?)
+                    }
+                    _ => None,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"inputs":inputs,"materials":summaries,"colmap":colmap,"generationPolicy":policy,"planIsEstimate":true})
+                    )?
+                );
+                return Ok(());
+            }
+            validate(&engines, &inputs, quality, policy).await?;
+            if source_project.is_some() {
+                let GenerationInputs::Materials { items } = &inputs else {
+                    return Err(SplatError::Process(
+                        "COLMAP direct training cannot append inputs".into(),
+                    ));
+                };
+                if items.iter().any(|i| {
+                    i.projection != ooo_splat::video::panorama::VideoProjection::Equirectangular
+                        && i.camera_relation.is_none()
+                }) {
+                    return Err(SplatError::Process("CONFIRMATION_REQUIRED: --camera-relation is required for every ordinary source".into()));
+                }
+            }
+            let options = if let Some(id) = source_project {
+                let source = PipelineRunner::new(engines.clone(), |_| {})
+                    .inspect_reshoot_source_v2(id)
+                    .await?;
+                let condition = model_condition.ok_or_else(|| {
+                    SplatError::Process(
+                        "CONFIRMATION_REQUIRED: --model-condition is required".into(),
+                    )
+                })?;
+                Some(ReshootOptions {
+                    condition: serde_json::from_value(serde_json::json!(condition))?,
+                    camera_relation: None,
+                    allow_fallback: policy.auto_retry_enabled,
+                    source_identity: source.source_identity,
+                    input_identity: serde_json::to_string(
+                        &analyses.iter().map(|a| &a.identity).collect::<Vec<_>>(),
+                    )?,
+                    projection: ooo_splat::video::panorama::VideoProjection::Perspective,
+                    image_matching_strategy: Default::default(),
+                })
+            } else {
+                None
+            };
+            let root = match projects_root {
+                Some(root) => root,
+                None => {
+                    ooo_splat::project::catalog::load_settings()
+                        .await?
+                        .projects_root
+                }
+            };
+            let registry = root.join(".cli-task-records");
+            let _registry_owner = ooo_splat::tasks::cli_guard::claim(&registry)
+                .map_err(|e| SplatError::Process(e.to_string()))?;
+            let service = ooo_splat::tasks::TaskService::at(registry)
+                .with_run_lock(ooo_splat::tasks::TaskService::desktop_execution_lock()?);
+            let request = serde_json::json!({"inputs":inputs,"generationPolicy":policy,"source_project_id":source_project,"reshootOptions":options});
+            let task = service
+                .create(
+                    None,
+                    inputs.primary_path().to_path_buf(),
+                    quality,
+                    root,
+                    true,
+                    "cli",
+                    None,
+                    Some(request),
+                )
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))?;
+            service
+                .start(task.task_id, engines, None)
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))?;
+            let mut sequence = 0;
+            loop {
+                let task = service
+                    .get(task.task_id)
+                    .await
+                    .map_err(|e| SplatError::Process(e.to_string()))?;
+                for event in task.recent_events.iter().filter(|e| e.sequence > sequence) {
+                    eprintln!(
+                        "{:>6.2}% {:?}: {}",
+                        event.progress, event.stage, event.message
+                    );
+                }
+                sequence = task.sequence;
+                if !task.status.active() && service.execution_settled(task.run_id) {
+                    if task.status == ooo_splat::tasks::TaskStatus::Completed {
+                        println!("{}", serde_json::to_string_pretty(&task.result)?);
+                        break;
+                    }
+                    return Err(SplatError::Process(
+                        task.error
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| format!("Task {:?}", task.status)),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
         }
     }
     Ok(())
@@ -230,5 +423,56 @@ fn ensure_engine(path: &std::path::Path) -> Result<()> {
         Ok(())
     } else {
         Err(SplatError::EngineMissing(path.display().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod input_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_colmap_flags_and_manifest_are_rejected_before_engine_or_task_work() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("missing-model");
+        let images = root.path().join("missing-images");
+        let manifest = root.path().join("input.json");
+        let inputs = ooo_splat::pipeline::inputs::GenerationInputs::Colmap {
+            input: ooo_splat::pipeline::inputs::ColmapInput {
+                model: model.clone(),
+                images: images.clone(),
+                database: None,
+                identity: None,
+            },
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&inputs).unwrap()).unwrap();
+        let cases = [
+            vec![
+                "splatstudio".to_owned(),
+                "generate".to_owned(),
+                "--colmap-model".to_owned(),
+                model.to_string_lossy().into_owned(),
+                "--images".to_owned(),
+                images.to_string_lossy().into_owned(),
+                "--inspect".to_owned(),
+            ],
+            vec![
+                "splatstudio".to_owned(),
+                "generate".to_owned(),
+                "--input-manifest".to_owned(),
+                manifest.to_string_lossy().into_owned(),
+                "--inspect".to_owned(),
+            ],
+        ];
+        for args in cases {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                execute(cli).await,
+                Err(SplatError::InputAdmission(
+                    ooo_splat::error::InputAdmissionReason::ColmapDisabled
+                ))
+            ));
+        }
+        assert!(!model.exists() && !images.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

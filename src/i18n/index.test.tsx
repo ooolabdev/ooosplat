@@ -5,11 +5,70 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { detectSystemLocale, LanguageProvider, localizePipelineMessage, readInitialLocale, translate, useI18n } from ".";
 
+it('localizes the confirmed disconnected-reshoot stop without inventing a successful result', () => {
+  const message = '补拍素材未能与原场景建立联系，已停止生成。';
+  const english = 'The reshoot inputs could not be connected to the original scene. Generation has stopped.';
+  expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+  expect(localizePipelineMessage('en', message)).toBe(english);
+  expect(localizePipelineMessage('en', `外部进程执行失败：${message}`)).toBe(english);
+});
+
+it("describes sight-line movement and horizontal strafing without changing the compact label", () => {
+  expect(translate("zh-CN", "viewer.roamHint")).toBe("点击画布或自动定位视角后，按住 W/S 沿视线前后移动，A/D 水平侧移，鼠标转向；松开按键恢复光标，Esc 退出。");
+  expect(translate("en", "viewer.roamHint")).toBe("Click the canvas or Auto locate view, then hold W/S to move along your view and A/D to strafe horizontally. Use the mouse to look around. Release WASD to restore the cursor; Esc exits.");
+  expect(translate("zh-CN", "viewer.roam")).toBe("漫游");
+  expect(translate("en", "viewer.roam")).toBe("Fly");
+});
+
+it.each(['zh-CN', 'en'] as const)('uses the approved unified generation continuation caption in %s', locale => {
+  const caption = locale === 'zh-CN' ? '继续生成' : 'Continue generation';
+  for (const key of ['project.continue', 'project.resume', 'failure.retry'] as const) {
+    expect(translate(locale, key)).toBe(caption);
+  }
+});
+
 it("panorama initialization limit uses approved English copy", () => {
   const message = "初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。";
   expect(localizePipelineMessage("en", message)).toBe("Initial point count exceeds the current panorama training budget. Training stopped to avoid dropping initial points.");
   expect(localizePipelineMessage("en", `外部进程执行失败：${message}`)).toBe(localizePipelineMessage("en", message));
   expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+});
+
+it('localizes the approved legacy, COLMAP-reshoot and registration diagnostics', () => {
+  for (const message of [
+    '旧任务的历史参数或初始化数据不完整，无法安全继续。原项目和已有结果保持不变。',
+    '补拍暂不支持导入 COLMAP 重建结果，请添加视频或图片。',
+    '补拍画面没有成功加入原项目。请确保新旧素材有足够重叠。',
+    'capture.mov：补拍画面已加入 2/40 张，部分新增画面未能找到与原场景的联系，效果可能受影响。',
+  ]) {
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+    expect(localizePipelineMessage('en', message)).not.toMatch(/[\u3400-\u9fff]/);
+  }
+});
+
+it("localizes retry preparation I/O context without changing operation identifiers", () => {
+  const message = "文件读写失败：拒绝访问。 (os error 5)\n重试准备上下文：retry_preparation_operation=archive_retry_cache; path_role=cache_entry; cache=brush";
+  expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+  expect(localizePipelineMessage("en", message)).toBe(
+    "File I/O failed: 拒绝访问。 (os error 5)\nRetry preparation context: retry_preparation_operation=archive_retry_cache; path_role=cache_entry; cache=brush",
+  );
+});
+
+it('localizes approved ordinary training preparation logs without panorama wording', () => {
+  for (const [message, expected] of [
+    ['正在准备训练图片 12/251', 'Preparing training images 12/251'],
+    ['正在准备训练图片', 'Preparing training images'],
+    ['正在校验训练图片和相机数据', 'Validating training images and cameras'],
+    ['正在保存生成检查点', 'Saving generation checkpoint'],
+    ['训练图片准备完成，即将启动训练', 'Training images are ready. Starting training.'],
+    ['已校验并复用训练缓存', 'Verified and reused training caches'],
+    ['视频帧数量与抽帧计划不一致', 'The video frame count does not match the frame sampling plan'],
+    ['视频帧时间戳不可用、非单调或超出 100 万帧限制', 'Video frame timestamps are unavailable, non-monotonic, or exceed the one-million-frame limit'],
+  ]) {
+    expect(localizePipelineMessage('zh-CN', message)).toBe(message);
+    expect(localizePipelineMessage('en', message)).toBe(expected);
+    expect(expected).not.toMatch(/panorama/i);
+  }
 });
 
 it('localizes the approved reshoot lifecycle logs without exposing Chinese cache labels', () => {

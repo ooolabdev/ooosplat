@@ -1,6 +1,7 @@
 import { BoundingBox, Entity, Mat4, PROJECTION_ORTHOGRAPHIC, PROJECTION_PERSPECTIVE, Quat, Vec3, type CameraComponent } from "playcanvas";
 import type { GaussianOrthographicView } from "../../types/pipeline";
 import { DEFAULT_ROAM_SPEED, validRoamSpeed } from "./RoamPreferences";
+import { ViewerPointerLock } from "./ViewerPointerLock";
 
 const DEFAULT_YAW = 35;
 const DEFAULT_PITCH = 22;
@@ -67,6 +68,9 @@ export class ViewerControls {
   private roamFrame = 0;
   private roamLastAt = 0;
   private roamMoved = false;
+  private lookX = 0;
+  private lookY = 0;
+  private readonly mouseLook: ViewerPointerLock;
   private shifted = false;
   private readonly previousTabIndex: number;
   private sceneBounds: BoundingBox | null = null;
@@ -99,6 +103,7 @@ export class ViewerControls {
     this.canvas = canvas;
     this.cameraEntity = cameraEntity;
     this.camera = cameraEntity.camera;
+    this.mouseLook = new ViewerPointerLock(canvas, this.stopRoaming);
     this.previousTabIndex = canvas.tabIndex;
     canvas.tabIndex = 0;
     canvas.addEventListener("pointerdown", this.focusCanvas, true);
@@ -108,6 +113,7 @@ export class ViewerControls {
     window.addEventListener("keyup", this.onKeyUp);
     window.addEventListener("blur", this.stopRoaming);
     document.addEventListener("visibilitychange", this.stopRoaming);
+    document.addEventListener("mousemove", this.onMouseLook);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerup", this.onPointerUp);
@@ -119,8 +125,9 @@ export class ViewerControls {
 
   destroy() {
     if (this.destroyed) return;
-    this.destroyed = true;
     this.stopRoaming();
+    this.destroyed = true;
+    this.mouseLook.destroy();
     this.cancelViewTransition();
     this.cancelGesture();
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -136,6 +143,7 @@ export class ViewerControls {
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("blur", this.stopRoaming);
     document.removeEventListener("visibilitychange", this.stopRoaming);
+    document.removeEventListener("mousemove", this.onMouseLook);
     this.canvas.tabIndex = this.previousTabIndex;
     this.camera.calculateProjection = null!;
   }
@@ -159,6 +167,10 @@ export class ViewerControls {
 
   setRoamSpeed(value: number) {
     this.roamSpeed = validRoamSpeed(value) ? value : DEFAULT_ROAM_SPEED;
+  }
+
+  isMouseLookActive() {
+    return this.mouseLook.ownsLock();
   }
 
   focus(): boolean {
@@ -391,6 +403,7 @@ export class ViewerControls {
   }
 
   usePerspective() {
+    this.stopRoaming();
     this.cancelViewTransition();
     this.orthographicView = null;
     this.onOrthographicViewChange?.(null, false);
@@ -535,13 +548,22 @@ export class ViewerControls {
 
   private focusCanvas = () => { if (this.enabled) this.canvas.focus({ preventScroll: true }); };
   private stopRoaming = () => {
+    this.applyMouseLook();
     if (this.roamFrame) cancelAnimationFrame(this.roamFrame);
     this.roamFrame = 0;
     this.keys.clear();
+    this.shifted = false;
+    this.mouseLook.release();
     if (this.roamMoved) { this.roamMoved = false; this.onViewChange?.(); }
   };
 
   private onKeyDown = (event: KeyboardEvent) => {
+    if (event.code === "Escape" && (this.keys.size || this.isMouseLookActive())) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.stopRoaming();
+      return;
+    }
     if (event.ctrlKey || event.metaKey || event.altKey) { this.stopRoaming(); return; }
     if (this.destroyed || !this.enabled || !this.roamingEnabled || this.camera.projection !== PROJECTION_PERSPECTIVE
       || document.activeElement !== this.canvas || event.target !== this.canvas || this.pointerId !== null) return;
@@ -550,7 +572,9 @@ export class ViewerControls {
     if (event.repeat && !this.keys.has(event.code)) return;
     event.preventDefault();
     this.cancelViewTransition(true);
+    const entering = this.keys.size === 0;
     this.keys.add(event.code);
+    if (entering) this.mouseLook.request();
     if (!this.roamFrame) { this.roamLastAt = performance.now(); this.roamFrame = requestAnimationFrame(this.roam); }
   };
 
@@ -559,6 +583,31 @@ export class ViewerControls {
     this.keys.delete(event.code);
     if (!this.keys.size) this.stopRoaming();
   };
+
+  private onMouseLook = (event: MouseEvent) => {
+    if (!this.isMouseLookActive() || this.destroyed || !this.enabled || !this.roamingEnabled
+      || document.activeElement !== this.canvas || !this.keys.size || this.camera.projection !== PROJECTION_PERSPECTIVE) return;
+    if (Number.isFinite(event.movementX)) this.lookX += event.movementX;
+    if (Number.isFinite(event.movementY)) this.lookY += event.movementY;
+  };
+
+  private applyMouseLook() {
+    const dx = this.lookX, dy = this.lookY;
+    this.lookX = 0; this.lookY = 0;
+    if ((!dx && !dy) || this.destroyed) return;
+    const position = this.cameraEntity.getPosition().clone();
+    this.yaw -= dx * 0.3;
+    this.pitch = Math.max(-MAX_ORBIT_PITCH, Math.min(MAX_ORBIT_PITCH, this.pitch + dy * 0.3));
+    const { forward, right } = this.cameraBasis();
+    const aspect = this.canvas.clientWidth / Math.max(this.canvas.clientHeight, 1)
+      || Math.max(this.camera.aspectRatio || 16 / 9, 0.01);
+    const shift = this.distance * Math.tan(this.camera.fov * Math.PI / 360) * aspect * this.horizontalFrameOffset;
+    // Reconstruct the orbit target around an unchanged eye, including the
+    // sidebar framing offset. Ordinary orbit would move the eye around target.
+    this.target.copy(position).add(forward.mulScalar(this.distance)).sub(right.mulScalar(shift));
+    this.updateCamera();
+    this.roamMoved = true;
+  }
 
   private roam = (now: number) => {
     this.roamFrame = 0;
@@ -569,16 +618,14 @@ export class ViewerControls {
     const sampleAt = Math.max(this.roamLastAt, now);
     const dt = Math.min(0.05, (sampleAt - this.roamLastAt) / 1000);
     this.roamLastAt = sampleAt;
+    this.applyMouseLook();
     const forward = Number(this.keys.has("KeyW")) - Number(this.keys.has("KeyS"));
     const right = Number(this.keys.has("KeyD")) - Number(this.keys.has("KeyA"));
-    // Ground-plane navigation follows yaw only: pitch/roll must never change
-    // elevation, reduce horizontal speed, or make movement unstable at a pole.
+    // Forward/backward follows the current sight line, including pitch. Strafe
+    // stays world-horizontal and roll-independent, even at a vertical view.
     const yaw = this.yaw * Math.PI / 180;
-    const movement = new Vec3(
-      -Math.sin(yaw) * forward + Math.cos(yaw) * right,
-      0,
-      -Math.cos(yaw) * forward - Math.sin(yaw) * right,
-    );
+    const movement = this.cameraBasis().forward.mulScalar(forward)
+      .add(new Vec3(Math.cos(yaw) * right, 0, -Math.sin(yaw) * right));
     if (movement.lengthSq() > 0) {
       movement.normalize().mulScalar(ROAM_VISIBLE_HEIGHT_PER_SECOND * this.roamSpeed * this.visibleHeight() * dt * (this.shifted ? 3 : 1));
       this.target.add(movement);
@@ -686,6 +733,7 @@ export class ViewerControls {
   }
 
   private onPointerDown = (event: PointerEvent) => {
+    if (this.isMouseLookActive()) { event.preventDefault(); return; }
     this.stopRoaming();
     if (this.destroyed || !this.enabled || (event.button !== this.orbitButton && event.button !== 2)) return;
     this.cancelViewTransition(true);
@@ -700,6 +748,7 @@ export class ViewerControls {
   };
 
   private onPointerMove = (event: PointerEvent) => {
+    if (this.isMouseLookActive()) return;
     if (this.destroyed || !this.enabled || this.pointerId !== event.pointerId || !this.mode) return;
     if (!this.dragging) {
       const distance = Math.hypot(event.clientX - this.startX, event.clientY - this.startY);
@@ -746,6 +795,7 @@ export class ViewerControls {
   };
 
   private onWheel = (event: WheelEvent) => {
+    if (this.isMouseLookActive()) { event.preventDefault(); return; }
     if (this.destroyed || !this.enabled) return;
     this.cancelViewTransition(true);
     event.preventDefault();

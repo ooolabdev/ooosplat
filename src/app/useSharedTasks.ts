@@ -4,15 +4,17 @@ import { mergeTask, taskIsActive, type SharedTask } from '../types/tasks';
 import { useAppStore } from '../stores/appStore';
 import type { PipelineEvent } from '../types/pipeline';
 
+interface TaskRefreshSummary { hasActiveTask: boolean }
+
 export function useSharedTasks() {
   const [tasks, setTasks] = useState<Record<string, SharedTask>>({});
   const [syncError, setSyncError] = useState<string | null>(null);
-  const refreshRef = useRef<() => Promise<void>>(async () => {});
+  const refreshRef = useRef<() => Promise<TaskRefreshSummary | null>>(async () => null);
   const refreshTasks = useCallback(() => refreshRef.current(), []);
   useEffect(() => {
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
-    let refreshing = false;
+    let refreshing: Promise<TaskRefreshSummary | null> | null = null;
     let cache: Record<string, SharedTask> = {};
     let tracked: { task: string; run: string | null; revision: number } | undefined;
     const phase = (task: SharedTask, events: PipelineEvent[]) => {
@@ -50,30 +52,38 @@ export function useSharedTasks() {
       phase(task, events);
     };
     const refresh = async () => {
-      if (disposed || refreshing) return;
-      refreshing = true;
-      try {
-        const snapshot = await getSharedTasks();
-        if (disposed) return;
-        const before = cache;
-        for (const task of snapshot) cache = mergeTask(cache, task);
-        if (before !== cache) setTasks(cache);
-        const active = Object.values(cache).find(taskIsActive);
-        if (active) {
-          phase(active, active.recent_events);
-        } else {
-          const live = useAppStore.getState().liveTask;
-          const previous = tracked ? cache[tracked.task] : live ? cache[live.task_id] : undefined;
-          const run = tracked?.run ?? live?.run_id;
-          if (previous && previous.run_id === run) phase(previous, previous.recent_events);
-          else if (tracked || live) {
-            useAppStore.setState({ phase: 'idle', liveTask: null });
-            tracked = undefined;
+      if (disposed) return null;
+      if (refreshing) return refreshing;
+      const pending = (async (): Promise<TaskRefreshSummary | null> => {
+        try {
+          const snapshot = await getSharedTasks();
+          if (disposed) return null;
+          const before = cache;
+          for (const task of snapshot) cache = mergeTask(cache, task);
+          if (before !== cache) setTasks(cache);
+          const active = Object.values(cache).find(taskIsActive);
+          if (active) {
+            phase(active, active.recent_events);
+          } else {
+            const live = useAppStore.getState().liveTask;
+            const previous = tracked ? cache[tracked.task] : live ? cache[live.task_id] : undefined;
+            const run = tracked?.run ?? live?.run_id;
+            if (previous && previous.run_id === run) phase(previous, previous.recent_events);
+            else if (tracked || live) {
+              useAppStore.setState({ phase: 'idle', liveTask: null });
+              tracked = undefined;
+            }
           }
+          if (!disposed) setSyncError(null);
+          return { hasActiveTask: Boolean(active) };
+        } catch (error) {
+          if (!disposed) setSyncError(error instanceof Error ? error.message : '无法同步任务状态');
+          return null;
         }
-        if (!disposed) setSyncError(null);
-      } catch (error) { if (!disposed) setSyncError(error instanceof Error ? error.message : '无法同步任务状态'); }
-      finally { refreshing = false; }
+      })();
+      refreshing = pending;
+      try { return await pending; }
+      finally { if (refreshing === pending) refreshing = null; }
     };
     refreshRef.current = refresh;
     void (async () => {

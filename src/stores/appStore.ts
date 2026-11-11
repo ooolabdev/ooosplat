@@ -24,7 +24,7 @@ interface AppState {
   latestRuntime: RuntimeSnapshot | null;
   lastEventSequence: number;
   events: PipelineEvent[];
-  liveTask: Pick<SharedTask, "task_id" | "run_id" | "status" | "elapsed_ms" | "updated_at"> | null;
+  liveTask: (Pick<SharedTask, "task_id" | "run_id" | "status" | "elapsed_ms" | "updated_at" | "imported_reconstruction" | "gps_assistance"> & Partial<Pick<SharedTask, "project_id">>) | null;
   result: PipelineResult | null;
   error: string | null;
   errorAt: number | null;
@@ -166,7 +166,7 @@ export const useAppStore = create<AppState>((set) => ({
       result: task.result ?? next.result,
       // Advance the snapshot watermark only after its earlier log entries are merged.
       lastEventSequence: Math.max(next.lastEventSequence, task.sequence ?? 0),
-      liveTask: { task_id: task.task_id, run_id: task.run_id, status: task.status, elapsed_ms: task.elapsed_ms, updated_at: task.updated_at },
+      liveTask: { task_id: task.task_id, run_id: task.run_id, project_id: task.project_id, status: task.status, elapsed_ms: task.elapsed_ms, updated_at: task.updated_at, imported_reconstruction:task.imported_reconstruction, gps_assistance: task.gps_assistance },
     };
   }),
   setResult: (result) => set({ result }),

@@ -46,6 +46,31 @@ it('shows new retry consent without waiting for a project detail and marks only 
 });
 
 describe('restored shared task detail', () => {
+  it('allows a continuation without globally ready engines and closes the queue before starting', async () => {
+    const before = vi.fn();
+    await act(async () => root.render(<LanguageProvider><SharedTaskDetail task={task({ status: 'failed' })}
+      canStart={false} canContinue onBeforeContinue={before} /></LanguageProvider>));
+    expect(button('继续生成')!.disabled).toBe(false);
+    await act(async () => button('继续生成')!.click());
+    expect(before).toHaveBeenCalledOnce();
+    expect(mocks.start).toHaveBeenCalledWith('agent-1', 'run-1');
+    expect(before.mock.invocationCallOrder[0]).toBeLessThan(mocks.start.mock.invocationCallOrder[0]);
+  });
+  it('shows persisted GPS fallback only for sources included in the structured summary', async () => {
+    const inputs: import('../types/inputs').SavedInputs = {
+      request: { mode: 'materials', items: ['gps', 'other'].map(id => ({ id, source: { kind: 'imageFolder', path: `E:/${id}` }, projection: 'perspective', imageMatchingStrategy: 'exhaustive' })) },
+      sources: ['gps', 'other'].map(id => ({ id, identity: id, projection: 'perspective', names: [], video: null, imageSequence: { imageCount: 40, width: 800, height: 600 } as import('../types/pipeline').ImageSequenceInfo, adopted: 40 })),
+      unused: [], importedReconstruction: false,
+    };
+    mocks.detail.mockResolvedValue({ project, inputs, inputType: 'images' });
+    await render(task({ project_id: project.id, status: 'completed', input_type: 'images', gps_assistance: { status: 'fallback', detectedSourceIds: ['gps'] } }));
+    expect(container.querySelector('.gps-source-hint')?.textContent).toBe('GPS');
+    expect(container.querySelector('.gps-source-hint')?.getAttribute('title')).toContain('GPS 辅助未启用');
+    const rows = container.querySelectorAll<HTMLButtonElement>('.material-row-main');
+    await act(async () => rows[1].click());
+    expect(container.querySelector('.gps-source-hint')).toBeNull();
+    expect(container.querySelector('.material-inspector select')).toBeNull();
+  });
   it('shows localized quiet notices as system logs without inventing counts', async () => {
     localStorage.setItem('ooo-splat-language', 'en');
     const notice = { kind: 'log', engine: 'system', stage: 'matching', sequence: 1,
@@ -66,10 +91,29 @@ describe('restored shared task detail', () => {
     expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('处理中');
     expect(container.textContent).toContain('本阶段第 2 次执行');
   });
+  it('uses the same generic training preparation and checkpoint captions as the main task', async () => {
+    const old = { sequence: 1, timestamp: '2026-10-09T00:00:00Z', kind: 'progress', stage: 'trainingSplats', message: '',
+      substage: 'training', current: 8000, total: 8000, unit: 'iterations', operation: { id: 1, attempt: 1 } } as import('../types/pipeline').PipelineEvent;
+    for (const [substage, caption] of [
+      ['trainingPreparation', '正在准备训练图片 12/251'],
+      ['trainingValidation', '正在校验训练图片和相机数据'],
+      ['trainingCheckpoint', '正在保存生成检查点'],
+    ]) {
+      await render(task({ substage, current: 12, total: 251, unit: 'images', runtime: null,
+        operation: { id: 2, attempt: 0 }, recent_events: [old] }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(caption);
+      expect(container.querySelector('.stage-timeline li.active b')?.textContent).toBe('Splat 训练');
+      expect(container.querySelector('.training-remaining')).toBeNull();
+      expect(container.querySelector('.runtime-step-heading')).toBeNull();
+      expect(container.querySelector('.current-message')?.textContent).not.toMatch(/全景|8,000/);
+    }
+  });
   it('shows the saved projection in the readonly media box without re-detecting input', async () => {
     mocks.detail.mockResolvedValue({ project, inputType: 'video', videoProjection: 'equirectangular', video: null, imageSequence: null });
     await render(task({ project_id: project.id, status: 'cancelled' }));
-    expect(container.querySelector('.source-input-card .media-source-status')?.textContent).toContain('本任务按全景视频处理');
+    expect(container.querySelector('.source-input-card .media-source-copy > strong')?.textContent).toBe('全景视频');
+    expect(container.querySelector('.source-input-card .media-source-status')?.textContent).not.toContain('本任务按');
+    expect(container.querySelector('.source-input-card .media-source-metadata')).toBeNull();
     expect(container.querySelector('.source-input-card select')).toBeNull();
   });
   it.each(['zh-CN', 'en'])('uses only preset progress captions for every stage in %s', async locale => {
@@ -150,17 +194,17 @@ describe('restored shared task detail', () => {
     expect(container.querySelector<HTMLButtonElement>('.cancel-action')!.disabled).toBe(true);
   });
 
-  it('explicitly retries a failed pre-project run using its run ID rather than pretending to resume a checkpoint', async () => {
-    await render(task({status:'failed',project_id:null,stage:null}));
+  it.each(['failed', 'cancelled', 'interrupted'] as const)('continues a %s pre-project run through the compatible task/run entry point', async status => {
+    await render(task({status,project_id:null,stage:null}));
     expect(button('继续生成')).toBeDefined();
     await act(async () => button('继续生成')!.click());
     expect(mocks.start).toHaveBeenCalledWith('agent-1','run-1');
     expect(resume).not.toHaveBeenCalled();
   });
 
-  it.each(['cancelled', 'interrupted'] as const)('shows %s consistently without offering resume before a project/checkpoint exists', async status => {
+  it.each(['cancelled', 'interrupted'] as const)('shows %s consistently while allowing the backend to validate continuation', async status => {
     await render(task({ status, stage: null, estimated_progress: null }));
-    expect(button('继续生成')).toBeUndefined();
+    expect(button('继续生成')).toBeDefined();
     expect(container.querySelector('.cancel-action')).toBeNull();
     expect(container.querySelector('.live-heading .mono')?.textContent).toBe('0.0%');
     expect(container.querySelectorAll('.stage-timeline .failed, .stage-timeline .cancelled, .stage-timeline .interrupted')).toHaveLength(0);
@@ -174,12 +218,49 @@ describe('restored shared task detail', () => {
     expect(container.textContent).toContain('启发式判断');
   });
 
-  it('offers explicit GUI resume only after an existing checkpoint can be read', async () => {
-    mocks.detail.mockResolvedValue({ project, stage: 'trainingSplats', inputType: 'video', video: null, imageSequence: null });
-    await render(task({ project_id: project.id, project_path: project.projectPath, status: 'interrupted' }));
+  it.each(['failed', 'cancelled', 'interrupted'] as const)('offers GUI continuation for %s without depending on a successful detail read', async status => {
+    await render(task({ project_id: project.id, project_path: project.projectPath, status }));
     await act(async () => button('继续生成')!.click());
-    expect(resume).toHaveBeenCalledWith(expect.objectContaining({ id: project.id, status: 'interrupted' }));
+    expect(resume).toHaveBeenCalledWith(expect.objectContaining({ id: project.id, status }), 'run-1');
     expect(mocks.start).not.toHaveBeenCalled();
+  });
+
+  it.each(['zh-CN', 'en'] as const)('uses one continuation caption and blocks deleted/busy tasks (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    const caption = locale === 'zh-CN' ? '继续生成' : 'Continue generation';
+    await render(task({ status: 'failed', project_id: project.id, project_path: project.projectPath }));
+    expect(button(caption)).toBeDefined();
+    await render(task({ status: 'failed', project_id: project.id, project_path: project.projectPath, project_deleted: true }));
+    expect(button(caption)).toBeUndefined();
+    await render(task({ status: 'running' }));
+    expect(button(caption)).toBeUndefined();
+  });
+
+  it('shows persisted per-input adoption warnings after completion', async () => {
+    mocks.detail.mockResolvedValue({
+      project,
+      inputType: 'images',
+      inputs: {
+        request: { mode: 'materials', items: [
+          { id: 'used', source: { kind: 'imageFolder', path: 'E:\\Media\\used' }, projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+          { id: 'unused', source: { kind: 'imageFolder', path: 'E:\\Media\\detail-set' }, projection: 'perspective', imageMatchingStrategy: 'exhaustive' },
+        ] },
+        sources: [
+          { id: 'used', identity: 'one', projection: 'perspective', names: ['0001.jpg'], video: null, adopted: 12 },
+          { id: 'unused', identity: 'two', projection: 'perspective', names: ['0002.jpg'], video: null, adopted: 0 },
+        ],
+        importedReconstruction: false,
+        unused: [],
+        sourceAdoption: [
+          { sourceId: 'used', plannedFrames: 12, preparedFrames: 12, registeredFrames: 12, adopted: true },
+          { sourceId: 'unused', plannedFrames: 10, preparedFrames: 10, registeredFrames: 0, adopted: false, omittedReason: 'not_connected' },
+        ],
+      },
+    });
+    await render(task({ project_id: project.id, project_path: project.projectPath, status: 'completed', stage: 'completed' }));
+    const warning = container.querySelector('.input-adoption-warning');
+    expect(warning?.textContent).toContain('detail-set');
+    expect(warning?.textContent).toContain('部分素材未能参与生成');
   });
 
   it('restores result statistics without adding a detail action bar', async () => {
@@ -190,9 +271,11 @@ describe('restored shared task detail', () => {
     expect(container.querySelectorAll('.stage-timeline .done')).toHaveLength(7);
   });
 
-  it('keeps inherited configuration for inactive resume or reshoot records', async () => {
-    await render(task({ status: 'interrupted', runs: [{ run_id: 'run-1', kind: 'resume' }] }));
-    expect(container.querySelector('.locked-setting')?.textContent).toContain('沿用原任务');
+  it('keeps inherited configuration for continuation and historical resume/retry records', async () => {
+    for (const kind of ['continue', 'resume', 'retry']) {
+      await render(task({ status: 'interrupted', runs: [{ run_id: 'run-1', kind }] }));
+      expect(container.querySelector('.locked-setting')?.textContent).toContain('沿用原任务');
+    }
     await render(task({ status: 'interrupted', task_kind: 'reshoot' }));
     expect(container.querySelector('.locked-setting')?.textContent).toContain('继承源任务');
   });

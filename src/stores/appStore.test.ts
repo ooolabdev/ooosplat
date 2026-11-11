@@ -22,6 +22,24 @@ const event = (sequence: number, progress: number): PipelineEvent => ({
 });
 
 describe("app store", () => {
+  it('isolates preparation, validation and checkpoint operations from late Brush runtime', () => {
+    useAppStore.getState().beginRun();
+    const base = { ...event(1, 60), kind: 'stage' as const, stage: 'trainingSplats', substage: 'training',
+      operation: { id: 1, attempt: 1 }, unit: 'iterations' };
+    const snapshot: RuntimeSnapshot = { processId: 42, phase: 'training', updatedAt: new Date().toISOString(),
+      lastOutputAgeMs: 0, training: { iteration: 99, total: 100, startIter: 0, lod: 0, stepsPerSecond: 10,
+        remainingSeconds: 1, splatCount: 500, psnr: null, ssim: null }, device: 'GPU', backend: 'Vulkan', config: {}, resources: null };
+    useAppStore.getState().receiveEvent(base);
+    useAppStore.getState().receiveEvent({ ...base, sequence: 2, kind: 'runtime', runtime: snapshot });
+    let sequence = 3;
+    for (const [index, substage] of ['trainingPreparation', 'trainingValidation', 'trainingCheckpoint'].entries()) {
+      useAppStore.getState().receiveEvent({ ...base, sequence: sequence++, substage, operation: { id: index + 2, attempt: 0 }, current: null, total: null, unit: null });
+      useAppStore.getState().receiveEvent({ ...base, sequence: sequence++, kind: 'runtime', runtime: snapshot });
+      expect(useAppStore.getState().latestRuntime).toBeNull();
+      expect(useAppStore.getState().latestEvent?.substage).toBe(substage);
+      expect(useAppStore.getState().latestEvent?.current).toBeNull();
+    }
+  });
   it('keeps panorama monitor data through logs and heartbeats, but isolates a new process execution', () => {
     useAppStore.getState().beginRun();
     const base = { ...event(1, 50), kind: 'stage' as const, stage: 'reconstructing', substage: 'panoramaReconstruction', operation: { id: 1, attempt: 1 }, stageProgress: null, indeterminate: true };
@@ -51,6 +69,16 @@ describe("app store", () => {
 
   it("uses Balanced by default", () => {
     expect(useAppStore.getState().quality).toBe("balanced");
+  });
+
+  it('keeps the structured GPS summary bound to the current task run instead of inferring it from logs', () => {
+    const task = { task_id: 'gps-task', run_id: 'gps-run', project_id: 'gps-project', status: 'running',
+      estimated_progress: 1, elapsed_ms: 1, updated_at: new Date().toISOString(), result: null,
+      gps_assistance: { status: 'fallback', detectedSourceIds: ['photos'] } } as SharedTask;
+    useAppStore.getState().receiveTaskBatch(task, [], true);
+    expect(useAppStore.getState().liveTask).toMatchObject({ project_id: 'gps-project', gps_assistance: task.gps_assistance });
+    useAppStore.getState().receiveTaskBatch({ ...task, task_id: 'next-task', run_id: 'next-run', gps_assistance: undefined }, [], true);
+    expect(useAppStore.getState().liveTask?.gps_assistance).toBeUndefined();
   });
 
   it("commits a whole ordered task batch once without losing logs before the latest runtime", () => {

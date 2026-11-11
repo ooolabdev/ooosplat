@@ -44,8 +44,23 @@ describe("task workspace persistence", () => {
   it("creates a standby generation draft by default", () => {
     const workspace = loadTaskWorkspace();
     expect(workspace.drafts).toHaveLength(1);
-    expect(workspace.drafts[0]).toMatchObject({ kind: "generation", running: false });
+    expect(workspace.drafts[0]).toMatchObject({ kind: "generation", running: false, generationPolicyVersion: 7 });
     expect(workspace.drafts[0].id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it('preserves saved v6 and v7 policies instead of upgrading created tasks on restart', () => {
+    const inputs = { mode: 'materials' as const, items: [{
+      id: 'clip', source: { kind: 'video' as const, path: 'C:/clip.mp4' },
+      projection: 'perspective' as const, imageMatchingStrategy: 'sequential' as const,
+      frameRemovalFps: 0,
+    }] };
+    const previous = { ...createGenerationDraft(1), inputs, generationPolicyVersion: 6 as const, linkedProjectId: 'saved-v6' };
+    const current = { ...createGenerationDraft(2), inputs, linkedProjectId: 'saved-v7' };
+    saveTaskWorkspace([previous, current], { kind: 'draft', id: current.id }, 3);
+    const restored = loadTaskWorkspace().drafts;
+    expect(restored.find(draft => draft.id === previous.id)).toMatchObject({ generationPolicyVersion: 6, inputs });
+    expect(restored.find(draft => draft.id === current.id)).toMatchObject({ generationPolicyVersion: 7, inputs });
+    expect(draftGenerationPolicy(restored.find(draft => draft.id === current.id)!)).toMatchObject({ version: 7 });
   });
 
   it("persists source choices but discards stale analysis", () => {
@@ -58,6 +73,24 @@ describe("task workspace persistence", () => {
     expect(restored.plannerEnabled).toBe(false);
     expect(restored.plannerDefaultPending).toBe(false);
     expect(restored).toMatchObject({ error: null, errorAt: null });
+  });
+
+  it('upgrades only unsubmitted v5 drafts to the corrected v6 frame planner', () => {
+    const input = { mode: 'materials' as const, items: [{
+      id: 'clip', source: { kind: 'video' as const, path: 'C:/clip.mp4' },
+      projection: 'perspective' as const, imageMatchingStrategy: 'sequential' as const,
+      frameRemovalFps: 7,
+    }] };
+    const standby = { ...createGenerationDraft(1), inputs: input, generationPolicyVersion: 5 as const };
+    const submitted = { ...createGenerationDraft(2), inputs: input, generationPolicyVersion: 5 as const, linkedProjectId: 'project-2' };
+    saveTaskWorkspace([standby, submitted], { kind: 'draft', id: standby.id }, 3);
+
+    const restored = loadTaskWorkspace().drafts;
+    expect(restored.find(draft => draft.id === standby.id)).toMatchObject({
+      generationPolicyVersion: 6,
+      inputs: { mode: 'materials', items: [expect.objectContaining({ frameRemovalFps: 7 })] },
+    });
+    expect(restored.find(draft => draft.id === submitted.id)?.generationPolicyVersion).toBe(5);
   });
   it("persists the confirmed projection but not detection or preview data", () => {
     const draft = { ...createGenerationDraft(1), videoProjection: "equirectangular" as const, inputPath: "capture.mp4", projectionDetection: { confirmedErp: false, requiresChoice: true, supportedErp: true, reason: "ERP", previewJpeg: [1,2,3] } };

@@ -36,6 +36,8 @@ pub enum PipelineEngine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub id: u64,
     /// Actual process execution number within this stage; zero for in-process preparation.
     pub attempt: u32,

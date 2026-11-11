@@ -1,5 +1,5 @@
 export type Quality = "fast" | "balanced" | "high";
-export interface GenerationPolicy { version: 1 | 2 | 3; autoRetryEnabled: boolean; frameSamplingRatio: number | null; }
+export interface GenerationPolicy { version: 1 | 2 | 3 | 4 | 5 | 6 | 7; autoRetryEnabled: boolean; frameSamplingRatio: number | null; frameSamplingFps?:number|null; }
 export type EngineKind = "ffmpeg" | "ffprobe" | "colmap" | "brush";
 export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed" | "cancelled";
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
@@ -79,7 +79,7 @@ export interface InputAnalysis {
   imageSequence: ImageSequenceInfo | null;
   projectionDetection: ProjectionDetection;
 }
-export interface PipelineOperation { id: number; attempt: number; }
+export interface PipelineOperation { id: number; attempt: number; sourceId?:string|null; }
 export type VideoProjection = "auto" | "perspective" | "equirectangular";
 export type ImageMatchingStrategy = "sequential" | "exhaustive";
 export interface ProjectionDetection { sourceIdentity?: string; unsupported?: boolean; confirmedErp: boolean; requiresChoice: boolean; supportedErp: boolean; reason: string; previewJpeg: number[]; }
@@ -242,6 +242,7 @@ export interface AppRuntimeStatus {
 
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
+  inputs?:import('./inputs').SavedInputs|null;
   generationPolicy?: GenerationPolicy | null;
   automaticallyRetried?: boolean;
   reshootRecipe?: ReshootRecipeSummary | null;

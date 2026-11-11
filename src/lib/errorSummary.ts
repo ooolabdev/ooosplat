@@ -4,6 +4,9 @@ import { classifiedSummary } from "./failureGuidance";
 
 // Keep operational details in the tooltip, not in the task-card layout.
 export function errorSummaryKey(message: string, context?: FailureContext): TranslationKey | null {
+  // Admission explanations mention COLMAP but are not engine failures.
+  if (message === '补拍暂不支持导入 COLMAP 重建结果，请添加视频或图片。') return 'reshoot.colmapUnsupported';
+  if (message === '旧任务的历史参数或初始化数据不完整，无法安全继续。原项目和已有结果保持不变。') return 'project.legacyCannotContinue';
   if (context?.classificationVersion != null) return classifiedSummary(context);
   if (/early eof|failed to load dataset|i\/?o error while loading dataset|图片读取不完整/i.test(message)) return "error.summaryDataset";
   if (/device.?lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡.*连接中断/i.test(message)) return "error.summaryDevice";

@@ -2,6 +2,8 @@ import type { PipelineEvent, PipelineResult, Quality } from './pipeline';
 import { nextOverallPercent } from '../lib/progressState';
 export type TaskStatus = 'created' | 'starting' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export interface SharedTask {
+  gps_assistance?: import('./inputs').GpsAssistanceSummary | null;
+  imported_reconstruction?:boolean;
   generation_policy?: import('./pipeline').GenerationPolicy | null;
   automatically_retried?: boolean;
   operation?: import('./pipeline').PipelineOperation | null;
@@ -27,6 +29,9 @@ export interface StartReceipt { accepted: boolean; task_id: string; run_id: stri
 export interface McpSettings { enabled: boolean; port: number; inputRoots: string[] }
 export interface McpConnection { settings: McpSettings; listening: boolean; address: string | null; defaultInputRoot?: string | null; error: string | null }
 export const taskIsActive = (task: Pick<SharedTask, 'status'>) => ['starting', 'running', 'cancelling'].includes(task.status);
+/** Stop reasons do not select a different continuation flow; the backend validates saved work. */
+export const taskCanContinue = (task: Pick<SharedTask, 'status' | 'project_deleted'>) =>
+  !task.project_deleted && ['failed', 'cancelled', 'interrupted'].includes(task.status);
 
 /** Revisions are monotonic across executions; a delayed snapshot cannot undo a newer event. */
 export function mergeTask(tasks: Record<string, SharedTask>, incoming: SharedTask): Record<string, SharedTask> {

@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { LanguageProvider } from '../i18n';
 import { FrameSamplingControl } from './FrameSamplingControl';
+import { FrameFpsControl } from './FrameFpsControl';
 import type { Quality, VideoInfo } from '../types/pipeline';
 
 let container: HTMLDivElement, root: Root;
@@ -17,6 +18,37 @@ afterEach(async () => { await act(async () => root.unmount()); container.remove(
 async function render(quality: Quality, value: number | null = null, onChange = vi.fn(), source: VideoInfo | null = video) {
   await act(async () => root.render(<LanguageProvider><FrameSamplingControl quality={quality} value={value} video={source} disabled={false} onChange={onChange} /></LanguageProvider>));
 }
+
+it('sizes the native material picker from the current label instead of a longer unselected option', async () => {
+  const changed = vi.fn();
+  const shortName = '10月30日(3).mp4';
+  const longName = 'VID_20200408_184530_00_001_a-much-longer-unselected-original-video-filename.mp4';
+  const materials = [
+    { id: 'short', name: shortName, video, removalFps: null },
+    { id: 'long', name: longName, video: { ...video, fps: 60 }, removalFps: null },
+  ];
+  await act(async () => root.render(<LanguageProvider><FrameFpsControl materials={materials} quality="high" disabled={false} onChange={changed} /></LanguageProvider>));
+  const picker = container.querySelector('.frame-sampling-material-picker')!;
+  const mirror = picker.querySelector('.frame-sampling-material-measure')!;
+  const select = picker.querySelector('select')!;
+  const arrow = picker.querySelector('.frame-sampling-material-arrow')!;
+  expect(arrow.getAttribute('aria-hidden')).toBe('true');
+  expect(arrow.getAttribute('width')).toBe('12');
+  expect(mirror.getAttribute('aria-hidden')).toBe('true');
+  expect(mirror.textContent).toBe(`${shortName} · 30 FPS`);
+  expect(mirror.textContent).toBe(select.selectedOptions[0].textContent);
+  expect(mirror.textContent).not.toContain(longName);
+  expect(select.title).toBe(`${shortName} · 30 FPS`);
+  expect(select.getAttribute('aria-label')).toBe('选择视频素材');
+  await act(async () => { select.value = 'long'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+  expect(mirror.textContent).toBe(`${longName} · 60 FPS`);
+  expect(select.value).toBe('long');
+  expect(select.title).toBe(mirror.textContent);
+  await act(async () => { select.value = 'short'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+  expect(mirror.textContent).toBe(`${shortName} · 30 FPS`);
+  expect(select.title).toBe(mirror.textContent);
+  expect(changed).not.toHaveBeenCalled();
+});
 it.each([['fast','20.0%'],['balanced','26.7%'],['high','40.0%']] as const)('shows the %s base ratio, never the rescue ratio', async (quality, percent) => {
   await render(quality);
   expect(container.querySelector('output')?.textContent).toBe(percent);

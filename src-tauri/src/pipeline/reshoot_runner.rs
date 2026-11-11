@@ -1,4 +1,5 @@
-//! New reshoot execution is intentionally separate from the legacy runner.
+//! Reshoot admission, source snapshots and legacy reconstruction adapters.
+//! Training, continuation and publication are owned by the shared work order.
 use super::*;
 use crate::pipeline::reshoot::*;
 use crate::reconstruction::colmap_model::read_cameras;
@@ -29,7 +30,7 @@ impl PreparationClock {
     }
 }
 
-struct ReshootProgress {
+pub(super) struct ReshootProgress {
     events: EventSink,
     stage: PipelineStage,
     label: &'static str,
@@ -39,7 +40,7 @@ struct ReshootProgress {
 }
 
 impl ReshootProgress {
-    fn new(
+    pub(super) fn new(
         events: &EventSink,
         stage: PipelineStage,
         cancel: &tokio_util::sync::CancellationToken,
@@ -93,7 +94,7 @@ impl ReshootProgress {
         }
     }
 
-    fn update(&self, current: u64, total: u64) {
+    pub(super) fn update(&self, current: u64, total: u64) {
         let now = Instant::now();
         let mut clock = self.clock.lock().unwrap_or_else(|p| p.into_inner());
         clock.activity = now;
@@ -115,7 +116,7 @@ impl Drop for ReshootProgress {
     }
 }
 
-async fn copy_reshoot_file(
+pub(super) async fn copy_reshoot_file(
     source: &Path,
     target: &Path,
     cancel: &tokio_util::sync::CancellationToken,
@@ -192,6 +193,7 @@ fn reusable_camera(
     .then_some(camera.id)
 }
 
+#[cfg(test)]
 fn normal_training_preset(
     quality: Quality,
     automatic: bool,
@@ -229,7 +231,7 @@ fn invalid(detail: &str) -> SplatError {
     SplatError::Process(detail.into())
 }
 
-async fn validate_ply(
+pub(super) async fn validate_ply(
     path: &Path,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(crate::reconstruction::ply::PlyInfo, u32, String)> {
@@ -242,30 +244,146 @@ async fn validate_ply(
     .map_err(|e| invalid(&format!("Gaussian validation worker: {e}")))?
 }
 
-struct SourceAssets {
-    root: PathBuf,
-    metadata: ProjectMetadata,
-    state: PipelineStateFile,
-    images: PathBuf,
-    colmap_images: PathBuf,
-    masks: PathBuf,
-    database: PathBuf,
-    model: PathBuf,
+pub(super) struct SourceAssets {
+    pub(super) root: PathBuf,
+    pub(super) metadata: ProjectMetadata,
+    /// External Gaussian imports have no generation checkpoint. Never invent
+    /// one: attached COLMAP data does not prove the Gaussian coordinate frame.
+    pub(super) state: Option<PipelineStateFile>,
+    pub(super) names: Vec<String>,
+    pub(super) images: PathBuf,
+    pub(super) colmap_images: PathBuf,
+    pub(super) masks: PathBuf,
+    pub(super) database: PathBuf,
+    pub(super) model: PathBuf,
+    pub(super) colmap_input_mode: ReshootColmapInputMode,
+    pub(super) legacy_content_identity: Option<[u8; 32]>,
 }
 
-async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
+/// Read exactly the database image set, including unregistered images whose
+/// features will be reused. Extra photographs in the directory are not input.
+fn imported_source_names(colmap: &crate::project::ImportedColmapProvenance) -> Result<Vec<String>> {
+    use crate::reconstruction::direct_input;
+    let database = colmap
+        .database_path
+        .as_ref()
+        .ok_or_else(|| invalid("Missing database"))?;
+    let images = colmap
+        .images_path
+        .as_ref()
+        .ok_or_else(|| invalid("Missing images"))?;
+    let model = direct_input::read_model(&colmap.sparse_model_path)?;
+    let db = direct_input::open_immutable_database(database)?;
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check(1)", [], |r| r.get(0))
+        .map_err(direct_input::database_read_error)?;
+    if integrity != "ok" {
+        return Err(invalid("Invalid source database"));
+    }
+    let mut statement = db
+        .prepare("SELECT image_id,name,camera_id FROM images ORDER BY name")
+        .map_err(direct_input::database_read_error)?;
+    let records = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u32>(2)?,
+            ))
+        })
+        .map_err(direct_input::database_read_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(direct_input::database_read_error)?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for (id, name, camera_id) in &records {
+        let camera = model
+            .cameras
+            .iter()
+            .find(|c| c.id == *camera_id)
+            .ok_or_else(|| invalid("Source image has no camera"))?;
+        let image = direct_input::image_path(images, name)?;
+        let header = crate::video::image_projection::inspect(&image)?;
+        if *id == 0
+            || !ids.insert(*id)
+            || !names.insert(name.clone())
+            || header.orientation != 1
+            || (u64::from(header.width), u64::from(header.height)) != (camera.width, camera.height)
+        {
+            return Err(invalid("Source image/camera dimensions differ"));
+        }
+        let (rows, columns, bytes): (usize, usize, Option<Vec<u8>>) = db
+            .query_row(
+                "SELECT rows,cols,data FROM keypoints WHERE image_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(direct_input::database_read_error)?;
+        let bytes = bytes.unwrap_or_default();
+        let (descriptor_rows, descriptor_columns, descriptor_bytes): (usize, usize, Option<usize>) =
+            db.query_row(
+                "SELECT rows,cols,length(data) FROM descriptors WHERE image_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(direct_input::database_read_error)?;
+        if !matches!(columns, 2 | 4 | 6)
+            || rows.checked_mul(columns).and_then(|n| n.checked_mul(4)) != Some(bytes.len())
+            || descriptor_rows != rows
+            || descriptor_columns != 128
+            || rows.checked_mul(128) != Some(descriptor_bytes.unwrap_or(0))
+        {
+            return Err(invalid("Source feature rows are inconsistent"));
+        }
+        if let Some(image) = model.images.iter().find(|i| i.pose.name == *name) {
+            if image.pose.id != *id
+                || image.pose.camera_id != *camera_id
+                || image.observations.len() != rows
+            {
+                return Err(invalid("Source database/model image identity differs"));
+            }
+            for (point, data) in image
+                .observations
+                .iter()
+                .zip(bytes.chunks_exact(columns * 4))
+            {
+                let x = f64::from(f32::from_le_bytes(data[..4].try_into().unwrap()));
+                let y = f64::from(f32::from_le_bytes(data[4..8].try_into().unwrap()));
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || (x - point.x).abs() > 0.001
+                    || (y - point.y).abs() > 0.001
+                {
+                    return Err(invalid("Source sparse observations differ from keypoints"));
+                }
+            }
+        }
+    }
+    if names.is_empty() || model.images.iter().any(|i| !names.contains(&i.pose.name)) {
+        return Err(invalid("Source database/model image identity differs"));
+    }
+    Ok(names.into_iter().collect())
+}
+
+pub(super) async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
     let (root, metadata) = catalog::load_registered_project(id).await?;
     if !catalog::project_is_durably_completed(&root, &metadata).await {
         return Err(invalid("只有已完成且结果完整的项目可以进行高清补拍"));
     }
-    let state: PipelineStateFile =
-        serde_json::from_slice(&tokio::fs::read(root.join("state.json")).await?)?;
+    if metadata.imported.is_some() {
+        return imported_source_assets(root, metadata);
+    }
+    internal_source_assets(root, metadata).await
+}
+
+fn imported_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Result<SourceAssets> {
     if let Some(imported) = &metadata.imported {
         let colmap = imported
             .colmap
             .as_ref()
             .ok_or_else(|| invalid("外部项目没有可复用的 COLMAP 数据"))?;
         crate::imports::revalidate_imported_colmap(colmap)?;
+        let names = imported_source_names(colmap)?;
         let images = colmap
             .images_path
             .clone()
@@ -279,13 +397,24 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
                 .clone()
                 .ok_or_else(|| invalid("外部 COLMAP 项目缺少 database.db"))?,
             model: colmap.sparse_model_path.clone(),
+            colmap_input_mode: ReshootColmapInputMode::CurrentV2,
+            legacy_content_identity: None,
             root,
             metadata,
-            state,
+            state: None,
+            names,
         });
     }
+    Err(invalid("外部项目没有可复用的 COLMAP 数据"))
+}
+
+async fn internal_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Result<SourceAssets> {
+    let state: PipelineStateFile =
+        serde_json::from_slice(&tokio::fs::read(root.join("state.json")).await?)?;
+    if state.inputs.as_ref().is_some_and(|i| !i.reshoot_eligible) {
+        return Err(invalid("外部项目没有可复用的 COLMAP 数据"));
+    }
     let images = root.join("work/frames");
-    let colmap_images = root.join("work/colmap_frames");
     let database = root.join("work/colmap/database.db");
     let masks = root.join("work/masks");
     let expected = state
@@ -293,27 +422,19 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
         .as_ref()
         .and_then(|f| f.extracted_frames)
         .ok_or_else(|| invalid("项目缺少已准备图片数量"))?;
-    let names = crate::video::list_images(&images)?;
-    if names.len() as u64 != expected
-        || state.frames.as_ref().and_then(|f| f.colmap_input_version) != Some(COLMAP_INPUT_VERSION)
-    {
+    let names = if let Some(inputs) = &state.inputs {
+        inputs
+            .sources
+            .iter()
+            .flat_map(|s| s.names.iter().map(|name| images.join(name)))
+            .collect()
+    } else {
+        crate::video::list_images(&images)?
+    };
+    if names.len() as u64 != expected {
         return Err(invalid(
             "原项目的 COLMAP 专用图片不完整或与原始帧不一致，无法安全进行增量补拍",
         ));
-    }
-    for image in names {
-        let counterpart = colmap_images.join(
-            image
-                .file_name()
-                .ok_or_else(|| invalid("Invalid image name"))?,
-        );
-        let header = crate::video::image_projection::inspect(&image)?;
-        let counterpart_header = crate::video::image_projection::inspect(&counterpart)?;
-        if (header.width, header.height) != (counterpart_header.width, counterpart_header.height) {
-            return Err(invalid(
-                "原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。",
-            ));
-        }
     }
     let full = state
         .reshoot
@@ -333,6 +454,8 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
         }
         ReconstructionValidator::validate(&images, &model)?;
         model
+    } else if state.inputs.is_some() {
+        root.join("work/colmap/authoritative")
     } else if full {
         best_sparse_model(&images, &root.join("work/colmap/sparse-full"))
             .await?
@@ -342,6 +465,24 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
             .await?
             .model
     };
+    let resolved = resolve_reshoot_colmap_input(&root, &metadata, &state, &model, &database)
+        .await
+        .map_err(|error| invalid(&error.to_string()))?;
+    let colmap_images = resolved.colmap_images;
+    for image in &names {
+        let counterpart = colmap_images.join(
+            image
+                .strip_prefix(&images)
+                .map_err(|_| invalid("Invalid image name"))?,
+        );
+        let header = crate::video::image_projection::inspect(image)?;
+        let counterpart_header = crate::video::image_projection::inspect(&counterpart)?;
+        if (header.width, header.height) != (counterpart_header.width, counterpart_header.height) {
+            return Err(invalid(
+                "原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。",
+            ));
+        }
+    }
     let cameras = read_cameras(&model)?;
     for image in read_registered_images(&model)? {
         let camera = cameras
@@ -353,11 +494,8 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
             return Err(invalid("Source image/camera dimensions differ"));
         }
     }
-    let db = rusqlite::Connection::open_with_flags(
-        &database,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| invalid(&e.to_string()))?;
+    let db = crate::reconstruction::direct_input::open_immutable_database(&database)
+        .map_err(|e| invalid(&e.to_string()))?;
     for camera in &cameras {
         // BA legitimately refines intrinsics only in the sparse model. Verify
         // identity/geometry here; copy refined values into the DERIVED DB later.
@@ -372,31 +510,50 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
             return Err(invalid("Source database/model camera identity differs"));
         }
     }
-    if cameras
-        .iter()
-        .any(|c| (c.model_id == 17) != state.panorama.is_some())
+    if state.inputs.is_none()
+        && cameras
+            .iter()
+            .any(|c| (c.model_id == 17) != state.panorama.is_some())
     {
         return Err(invalid("Invalid source projection/camera mapping"));
     }
     Ok(SourceAssets {
         root,
         metadata,
-        state,
+        state: Some(state),
+        names: names
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&images)
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| invalid("Invalid image name"))?,
         images,
         colmap_images,
         masks,
         database,
         model,
+        colmap_input_mode: resolved.mode,
+        legacy_content_identity: resolved.legacy_content_identity,
     })
 }
 
-fn source_identity(source: &SourceAssets) -> Result<String> {
+pub(super) fn source_identity(source: &SourceAssets) -> Result<String> {
     let mut hash = Sha256::new();
-    for path in [
-        source.root.join("project.json"),
-        source.root.join("state.json"),
-    ] {
-        hash.update(std::fs::read(path)?);
+    hash.update(std::fs::read(source.root.join("project.json"))?);
+    if source.state.is_some() {
+        hash.update(std::fs::read(source.root.join("state.json"))?);
+    } else {
+        hash.update(b"external-colmap-source-v1");
+    }
+    if source.colmap_input_mode == ReshootColmapInputMode::LegacySharedFrames {
+        hash.update(source.colmap_input_mode.identity_tag());
+        hash.update(
+            source
+                .legacy_content_identity
+                .ok_or_else(|| invalid("Missing legacy COLMAP content identity"))?,
+        );
     }
     let mut paths = reusable_model_files(&source.model)?;
     paths.push(source.database.clone());
@@ -418,7 +575,43 @@ fn source_identity(source: &SourceAssets) -> Result<String> {
     }
     // Cheap per-member identity, including already-prepared supplemental images.
     for dir in [&source.images, &source.colmap_images] {
-        hash.update(panorama::source_identity(dir)?.as_bytes());
+        if source
+            .state
+            .as_ref()
+            .is_some_and(|state| state.inputs.is_some())
+            || source.state.is_none()
+        {
+            let mut names = source.names.iter().collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            for name in names {
+                let path = crate::reconstruction::direct_input::image_path(dir, name)?;
+                let stat = path.metadata()?;
+                hash.update(name.as_bytes());
+                hash.update(stat.len().to_le_bytes());
+                hash.update(
+                    stat.modified()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| changed())?
+                        .as_nanos()
+                        .to_le_bytes(),
+                );
+                let mask = source.masks.join(format!("{name}.png"));
+                if mask.is_file() {
+                    let stat = mask.metadata()?;
+                    hash.update(stat.len().to_le_bytes());
+                    hash.update(
+                        stat.modified()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|_| changed())?
+                            .as_nanos()
+                            .to_le_bytes(),
+                    );
+                }
+            }
+        } else {
+            hash.update(panorama::source_identity(dir)?.as_bytes());
+        }
     }
     if source.masks.is_dir() {
         hash.update(panorama::source_identity(&source.masks)?.as_bytes());
@@ -479,6 +672,7 @@ impl PipelineRunner {
         &self,
         project: uuid::Uuid,
     ) -> Result<ReshootSourceInfo> {
+        self.authorize_reshoot_source(project).await?;
         let source = source_assets(project).await?;
         let cameras = read_cameras(&source.model)?;
         let first = cameras.first().ok_or_else(|| invalid("Missing cameras"))?;
@@ -489,7 +683,7 @@ impl PipelineRunner {
                 .is_some_and(|p| inspect_gaussian_ply(p).is_ok());
         Ok(ReshootSourceInfo {
             source_identity: source_identity(&source)?,
-            projection: if source.state.panorama.is_some() {
+            projection: if cameras.iter().all(|c| c.model_id == 17) {
                 VideoProjection::Equirectangular
             } else {
                 VideoProjection::Perspective
@@ -498,12 +692,15 @@ impl PipelineRunner {
             project_id: project.to_string(),
             project_name: source.metadata.name,
             quality: source.metadata.quality,
-            planner_enabled: source.state.planner_enabled,
+            planner_enabled: source
+                .state
+                .as_ref()
+                .is_some_and(|state| state.planner_enabled),
             camera_id: first.id,
             camera_model: first.model.clone(),
             width: first.width,
             height: first.height,
-            source_image_count: crate::video::list_images(&source.images)?.len() as u64,
+            source_image_count: source.names.len() as u64,
             eligible: true,
             reason: None,
             imported: source.metadata.imported.is_some(),
@@ -682,8 +879,9 @@ impl PipelineRunner {
         )
         .await?;
         let acceleration = self.verify_pipeline_engines().await?;
-        let manager =
-            ProjectManager::with_root(root.into()).with_input_boundary(self.input_boundary.clone());
+        let manager = ProjectManager::with_root(root.into())
+            .with_input_boundary(self.input_boundary.clone())
+            .with_creation_intent(self.creation_intent.clone());
         let (paths, mut metadata) = manager
             .create_reshoot_v2(input, quality, self.process_manager.child_token())
             .await?;
@@ -750,12 +948,11 @@ impl PipelineRunner {
             ..Default::default()
         });
         manager.write_state(&paths.state, &state).await?;
-        self.execute_project(manager, paths, &mut metadata, state, &acceleration)
-            .await
+        Box::pin(self.execute_project(manager, paths, &mut metadata, state, &acceleration)).await
     }
 }
 
-fn normalize_image(
+pub(super) fn normalize_image(
     source: &Path,
     frames: &Path,
     colmap: &Path,
@@ -873,16 +1070,18 @@ async fn save_recipe(
 }
 
 fn source_panorama_records(source: &SourceAssets) -> Result<Vec<PanoramaFrameRecord>> {
-    if let Some(recipe) = source
+    let source_state = source
         .state
+        .as_ref()
+        .ok_or_else(|| invalid("Missing panorama source mapping"))?;
+    if let Some(recipe) = source_state
         .reshoot
         .as_ref()
         .and_then(|s| s.recipe.as_ref())
     {
         return Ok(recipe.panorama_frames.clone());
     }
-    let config = source
-        .state
+    let config = source_state
         .panorama
         .as_ref()
         .ok_or_else(|| invalid("Missing panorama source mapping"))?;
@@ -945,12 +1144,63 @@ impl PipelineRunner {
         state: PipelineStateFile,
         acceleration: &crate::engines::ColmapAccelerationStatus,
     ) -> Result<PipelineResult> {
+        // A completed derived reconstruction and an actual saved training
+        // recipe no longer need the live source project. Preserve old pixels
+        // and initialization through the common saved-training adapter.
+        if !state.brush_complete
+            && state.brush_training.resolved.is_some()
+            && state
+                .reshoot
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.incremental_reconstruction_complete)
+        {
+            let recipe = state
+                .reshoot
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.recipe.as_ref())
+                .ok_or_else(|| invalid(super::legacy_work_order::UNRESTORABLE_RECIPE))?;
+            let model = if let Some(gps) = state.gps.as_ref().filter(|gps| gps.status == "complete")
+            {
+                let model = paths.colmap.join("gps-v1/model");
+                if super::gps_runner::model_identity(&model).ok() != gps.output_identity {
+                    return Err(invalid(super::legacy_work_order::UNRESTORABLE_RECIPE));
+                }
+                model
+            } else {
+                best_sparse_model(
+                    &paths.frames,
+                    &paths.colmap.join(match recipe.actual.reconstruction {
+                        ReconstructionMode::Full => "sparse-full",
+                        ReconstructionMode::Incremental => "sparse",
+                    }),
+                )
+                .await?
+                .0
+            };
+            if let Some(result) = Box::pin(self.handoff_legacy_training(
+                manager,
+                paths,
+                metadata,
+                state.clone(),
+                &model,
+                acceleration,
+            ))
+            .await?
+            {
+                return Ok(result);
+            }
+            return Err(invalid(super::legacy_work_order::UNRESTORABLE_RECIPE));
+        }
         let source_id = metadata
             .reshoot
             .as_ref()
             .ok_or_else(|| invalid("Missing reshoot provenance"))?
             .source_project_id;
-        let source = source_assets(source_id).await?;
+        self.authorize_reshoot_source(source_id).await?;
+        let source = source_assets(source_id).await.map_err(|error| {
+            tracing::warn!(%source_id, %error, "Reshoot source changed after preflight");
+            changed()
+        })?;
         self.execute_reshoot_v2(manager, paths, metadata, state, acceleration, source)
             .await
     }
@@ -982,10 +1232,6 @@ impl PipelineRunner {
         {
             return Err(invalid("Unsupported reshoot recipe"));
         }
-        let provenance = metadata
-            .reshoot
-            .clone()
-            .ok_or_else(|| invalid("Missing reshoot provenance"))?;
         if source_identity(&source)? != recipe.options.source_identity
             || recipe.stored_input_identity.as_deref()
                 != Some(&panorama::source_identity(&metadata.source_path)?)
@@ -1017,13 +1263,25 @@ impl PipelineRunner {
             for (from, to) in [
                 (&source.images, &paths.frames),
                 (&source.colmap_images, &paths.colmap_frames),
-                (&source.masks, &paths.masks),
             ] {
-                if from.is_dir() {
-                    for file in crate::video::list_images(from)? {
-                        let target = to.join(file.file_name().unwrap());
-                        files.push((file, target));
+                for name in &source.names {
+                    let file = crate::reconstruction::direct_input::image_path(from, name)?;
+                    let target = to.join(name);
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
                     }
+                    files.push((file, target));
+                }
+            }
+            for name in &source.names {
+                let mask_name = format!("{name}.png");
+                let mask = source.masks.join(&mask_name);
+                if mask.is_file() {
+                    let target = paths.masks.join(&mask_name);
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    files.push((mask, target));
                 }
             }
             files.push((source.database.clone(), database.clone()));
@@ -1045,10 +1303,7 @@ impl PipelineRunner {
             }
             drop(progress);
             sync_refined_cameras(&database, &source.model)?;
-            recipe.source_names = crate::video::list_images(&paths.frames)?
-                .into_iter()
-                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-                .collect();
+            recipe.source_names = source.names.clone();
             if is_panorama {
                 recipe.panorama_frames = source_panorama_records(&source)?;
             }
@@ -1225,6 +1480,7 @@ impl PipelineRunner {
                         Some(video),
                         dimensions,
                         is_panorama,
+                        None,
                     )
                     .await?;
                 state.video = prepared.video;
@@ -1472,6 +1728,9 @@ impl PipelineRunner {
                         masks: Some(&paths.masks),
                         panorama_dimensions: dims,
                         existing_camera_id: reused_camera_id,
+                        camera_params: None,
+                        ordinary_images: metadata.input_type == ProjectInputType::Images
+                            && !is_panorama,
                         max_size: if state.planner_enabled {
                             state
                                 .resolution_plan
@@ -1564,6 +1823,13 @@ impl PipelineRunner {
                             .then_some(fixed.as_path()),
                         panorama: is_panorama,
                     },
+                    colmap::MapperBaPolicy {
+                        policy_version: state.ba_policy_version,
+                        automatic_optimization: state.planner_enabled,
+                        gpu_index: acceleration.gpu_index(),
+                        panorama: is_panorama,
+                        ..Default::default()
+                    },
                     paths.logs.join("colmap.log"),
                     &self.process_manager,
                     Some(self.process_observer(
@@ -1604,6 +1870,7 @@ impl PipelineRunner {
                     checkpoint.incremental_reconstruction_complete = false;
                     state.brush_complete = false;
                     save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
+                    self.mark_automatic_retry();
                     self.events.stage(
                         PipelineStage::Reconstructing,
                         0.,
@@ -1624,6 +1891,7 @@ impl PipelineRunner {
             break model;
         };
         let model = if state.gps.is_some() && metadata.input_type == ProjectInputType::Images {
+            self.authorize_external_images(&metadata.source_path)?;
             let snapshot = metadata.clone();
             let current_paths = paths.clone();
             let current_recipe = recipe.clone();
@@ -1656,6 +1924,10 @@ impl PipelineRunner {
         } else {
             model
         };
+        // Retained V2 tasks share the same final-model success condition as
+        // the unified executor. Persist completed SfM before this guard.
+        self.record_reshoot_connection_model(manager, paths, &mut state, &model)
+            .await?;
         let report = ReconstructionValidator::validate(&paths.frames, &model)?;
         self.record_reconstruction_metrics(
             &report,
@@ -1674,402 +1946,39 @@ impl PipelineRunner {
         // The published sparse model contains refined new intrinsics. Record
         // them in this derived project's DB, never in the source project's DB.
         sync_refined_cameras(&database, &model)?;
-        if !is_panorama {
-            self.events
-                .stage(PipelineStage::TrainingSplats, 0., "正在准备训练图片");
-        }
-        let dataset = if is_panorama {
-            self.events.panorama_phase.store(2, Ordering::Relaxed);
-            self.events
-                .stage(PipelineStage::TrainingSplats, 0., "正在准备训练图片");
-            let root = paths.work.join("panorama-training");
-            let frames = paths.frames.clone();
-            let model = model.clone();
-            let records = recipe.panorama_frames.clone();
-            let quality = metadata.quality;
-            let native = state.generation_policy.is_some();
-            let cancel = cancel.clone();
-            let events = self.events.clone();
-            crate::presets::spawn_pipeline_blocking(move || {
-                panorama::prepare_reshoot_training_cache_for_policy(
-                    &frames,
-                    &model,
-                    &root,
-                    &records,
-                    quality,
-                    native,
-                    &cancel,
-                    |update| match update {
-                        panorama::TrainingCacheUpdate::Faces {
-                            completed, total, ..
-                        } => events.send(
-                            PipelineStage::TrainingSplats,
-                            Some(PipelineEngine::System),
-                            EventKind::Progress,
-                            EventLevel::Info,
-                            Some(completed as f32 / total.max(1) as f32),
-                            false,
-                            "正在准备训练图片",
-                            Some(completed),
-                            Some(total),
-                            Some("faces"),
-                        ),
-                        panorama::TrainingCacheUpdate::Validating => {
-                            events.panorama_phase.store(3, Ordering::Relaxed);
-                            events.stage(
-                                PipelineStage::TrainingSplats,
-                                0.,
-                                "正在校验训练图片和相机数据",
-                            );
-                        }
-                    },
-                )
-            })
-            .await
-            .map_err(|e| invalid(&format!("Panorama conversion worker: {e}")))??
-        } else {
-            let dataset = paths.brush.join("dataset");
-            if !state.brush_complete {
-                let _progress = ReshootProgress::new(
-                    &self.events,
-                    PipelineStage::TrainingSplats,
-                    &cancel,
-                    "正在准备训练图片",
-                    None,
-                );
-                reset_directory(&dataset).await?;
-                prepare_brush_dataset(&paths.brush, &paths.frames, &model).await?
-            } else {
-                dataset
-            }
-        };
-        self.events
-            .panorama_phase
-            .store(u64::from(is_panorama), Ordering::Relaxed);
-        let mut previous_training_failure = None;
-        let candidate = loop {
-            self.prepare_brush_observation(&state);
-            let mut attempt = paths.clone();
-            let name = format!(
+        // Publication recovery takes precedence over any dataset migration.
+        // A completed legacy candidate is not a reason to train it again.
+        if state.brush_complete {
+            let attempt = paths.brush.join(format!(
                 "attempt-{}-{}",
                 recipe.reconstruction_fallbacks, recipe.training_fallbacks
-            );
-            attempt.brush = paths.brush.join(&name);
-            attempt.logs = paths.logs.join(&name);
-            tokio::fs::create_dir_all(&attempt.logs).await?;
-            if state.brush_complete {
-                if let Some(candidate) = brush_candidate(&attempt.brush) {
-                    let _progress = ReshootProgress::new(
-                        &self.events,
-                        PipelineStage::TrainingSplats,
-                        &cancel,
-                        "正在校验并发布 final.ply",
-                        None,
-                    );
-                    validate_ply(&candidate, &cancel).await?;
-                    reshoot_log(
-                        &self.events,
-                        PipelineStage::TrainingSplats,
-                        "复用已完成的补拍缓存：Splat 训练",
-                    );
-                    break candidate;
-                }
-                state.brush_complete = false;
+            ));
+            if let Some(candidate) = brush_candidate(&attempt) {
+                validate_ply(&candidate, &cancel).await?;
+                return self
+                    .publish_reshoot_v2(
+                        manager,
+                        paths,
+                        metadata,
+                        &mut state,
+                        &checkpoint,
+                        &report,
+                        &candidate,
+                    )
+                    .await;
             }
-            let policy = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
-            let max_edge = recipe
-                .source_names
-                .iter()
-                .chain(&recipe.new_names)
-                .filter_map(|n| crate::video::image_projection::inspect(&paths.frames.join(n)).ok())
-                .map(|i| i.width.max(i.height))
-                .max()
-                .unwrap_or(1);
-            let face_size = if state.generation_policy.is_some()
-                && metadata.quality == Quality::High
-                && is_panorama
-            {
-                // Faces live in per-source subdirectories. Their validated
-                // training cameras, not a shallow image listing, define size.
-                read_cameras(&dataset.join("sparse/0"))?
-                    .iter()
-                    .map(|c| c.width.max(c.height))
-                    .max()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| invalid("Invalid panorama training camera dimensions"))?
-            } else {
-                match metadata.quality {
-                    Quality::Fast => 512,
-                    Quality::Balanced => 768,
-                    Quality::High => 1024,
-                }
-            };
-            let mut initial_points = report.points_3d;
-            let mut initial_sh = 3;
-            if recipe.actual.training == TrainingMode::Warm {
-                let _progress = ReshootProgress::new(
-                    &self.events,
-                    PipelineStage::TrainingSplats,
-                    &cancel,
-                    "正在准备原模型训练副本",
-                    None,
-                );
-                let init = dataset.join("init.ply");
-                let model = provenance.source_final_ply.clone();
-                let (original_info, original_sh, original_hash) =
-                    validate_ply(&model, &cancel).await?;
-                let gps_transform = state
-                    .gps
-                    .as_ref()
-                    .filter(|g| g.status == "complete")
-                    .and_then(|g| g.transform);
-                let gps_key = gps_transform
-                    .map(|t| serde_json::to_string(&t))
-                    .transpose()?;
-                if !init.is_file()
-                    || recipe.init_sha256.as_deref() != Some(&original_hash)
-                    || recipe.init_georeference != gps_key
-                {
-                    let pending = dataset.join("init.ply.partial");
-                    if let Some(transform) = gps_transform {
-                        let source = model.clone();
-                        let output = pending.clone();
-                        let cancellation = cancel.clone();
-                        tokio::task::spawn_blocking(move || {
-                            crate::reconstruction::splat_transform::export_transformed_ply_to(
-                                &source,
-                                &output,
-                                transform.engine_transform(),
-                                Default::default(),
-                                |_, _| {},
-                                || {
-                                    if cancellation.is_cancelled() {
-                                        Err(SplatError::Cancelled)
-                                    } else {
-                                        Ok(())
-                                    }
-                                },
-                            )
-                        })
-                        .await
-                        .map_err(|e| invalid(&e.to_string()))??;
-                    } else {
-                        copy_reshoot_file(&model, &pending, &cancel).await?;
-                    }
-                    let (snapshot_info, snapshot_sh, snapshot_hash) =
-                        validate_ply(&pending, &cancel).await?;
-                    if snapshot_info.splat_count != original_info.splat_count
-                        || snapshot_sh != original_sh
-                        || (gps_transform.is_none() && snapshot_hash != original_hash)
-                    {
-                        return Err(changed());
-                    }
-                    atomic_replace_file(&pending, &init).await?;
-                    recipe.init_sha256 = Some(original_hash);
-                    recipe.init_georeference = gps_key;
-                }
-                let (info, sh, _) = validate_ply(&init, &cancel).await?;
-                initial_points = info.splat_count;
-                initial_sh = sh;
-                if is_panorama
-                    && !(state.generation_policy.is_some() && metadata.quality == Quality::High)
-                    && initial_points > crate::presets::MAX_PANORAMA_SPLATS as u64
-                {
-                    return Err(invalid(
-                        "初始化点数超出当前全景训练预算，已停止训练以避免丢弃初始点。",
-                    ));
-                }
-            } else {
-                let init = dataset.join("init.ply");
-                if init.is_file() {
-                    tokio::fs::rename(init, dataset.join("init.previous")).await?;
-                }
-                recipe.warm_parameters = None;
-            }
-            self.prepare_fine_splat_budget(
-                &mut state,
-                metadata.quality,
-                &model,
-                &dataset.join("images"),
-                is_panorama,
-            )
-            .await?;
-            // Resolve after validating initialization, using the normal budget
-            // protection. Existing jobs retain their saved warm-start recipe.
-            let budget_points = if recipe.uses_normal_parameters() {
-                initial_points
-            } else {
-                report.points_3d
-            };
-            let mut resolved = if let Some(saved) = state.brush_training.resolved {
-                saved
-            } else if let Some(generation) = state.generation_policy {
-                let memory = if is_panorama {
-                    policy.known_training_memory_mb(acceleration)
-                } else {
-                    acceleration.usable_gpu_total_memory_mb()
-                };
-                if is_panorama {
-                    generation.panorama_training(
-                        metadata.quality,
-                        memory,
-                        face_size,
-                        report.points_3d,
-                        initial_points,
-                    )?
-                } else {
-                    let resolution = state.resolution_plan.unwrap_or_else(|| {
-                        generation.resolution(metadata.quality, memory, max_edge, max_edge, false)
-                    });
-                    generation.training(
-                        metadata.quality,
-                        memory,
-                        &resolution,
-                        report.points_3d,
-                        initial_points,
-                        state.brush_training.fine_splat_budget.as_ref(),
-                    )?
-                }
-            } else {
-                normal_training_preset(
-                    metadata.quality,
-                    state.planner_enabled,
-                    if is_panorama {
-                        policy.known_training_memory_mb(acceleration)
-                    } else {
-                        acceleration.usable_gpu_total_memory_mb()
-                    },
-                    max_edge,
-                    is_panorama.then_some(face_size),
-                    budget_points,
-                    state
-                        .resolution_plan
-                        .filter(|_| recipe.uses_normal_parameters()),
-                )?
-            };
-            if recipe.uses_normal_parameters() {
-                recipe.warm_parameters = None;
-            } else if recipe.actual.training == TrainingMode::Warm {
-                let views = read_registered_images(&dataset.join("sparse/0"))?.len() as u64;
-                if recipe.warm_parameters.is_none() {
-                    let (preset, warm) = warm_training(
-                        resolved.preset,
-                        metadata.quality,
-                        views,
-                        initial_points,
-                        initial_sh,
-                    )?;
-                    resolved.preset = preset;
-                    recipe.warm_parameters = Some(warm);
-                }
-                if let Some(snapshot) = resolved.panorama.as_mut() {
-                    snapshot.initial_points = initial_points;
-                    snapshot.initial_points_override = resolved
-                        .configured_max_splats
-                        .is_some_and(|cap| initial_points > cap as u64)
-                        || snapshot
-                            .memory_max_splats
-                            .is_some_and(|cap| initial_points > cap as u64);
-                }
-            }
-            if !state.brush_training.oom_retry_used && state.brush_training.resolved.is_none() {
-                state
-                    .brush_training
-                    .initial_resolved
-                    .get_or_insert(resolved);
-            }
-            state.brush_training.resolved = Some(resolved);
-            if let Some(tracker) = &self.effectiveness {
-                tracker.prepare_brush(
-                    state.brush_training.initial_resolved,
-                    Some(resolved),
-                    state.brush_training.oom_retry_used,
-                );
-            }
+            state.brush_complete = false;
             save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
-            self.events
-                .stage(PipelineStage::TrainingSplats, 0., "正在生成高斯泼溅");
-            let outcome = self
-                .train_brush_with_oom_retry(
-                    manager,
-                    &attempt,
-                    &mut state,
-                    metadata.quality,
-                    acceleration,
-                    &dataset,
-                    initial_points,
-                    resolved,
-                    0,
-                )
-                .await;
-            let candidate = match outcome {
-                Ok(path) => path,
-                Err(error)
-                    if explicit_numeric_divergence(&error)
-                        && recipe.fallback(AlgorithmFailure::InvalidWarmResult) =>
-                {
-                    previous_training_failure = Some(error);
-                    state.brush_training.resolved = None;
-                    save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
-                    self.events.stage(
-                        PipelineStage::TrainingSplats,
-                        0.,
-                        "当前方案未能完成，正在自动改用更耗时的方案。",
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    return Err(if let Some(previous) = previous_training_failure.take() {
-                        error.with_previous_attempt(previous)
-                    } else {
-                        error
-                    })
-                }
-            };
-            let validation = {
-                let _progress = ReshootProgress::new(
-                    &self.events,
-                    PipelineStage::TrainingSplats,
-                    &cancel,
-                    "正在校验并发布 final.ply",
-                    None,
-                );
-                validate_ply(&candidate, &cancel).await
-            };
-            match validation {
-                Ok(_) => {
-                    state.brush_complete = true;
-                    save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
-                    break candidate;
-                }
-                Err(error) => {
-                    if !matches!(error, SplatError::Io(_) | SplatError::Cancelled)
-                        && recipe.fallback(AlgorithmFailure::InvalidWarmResult)
-                    {
-                        state.brush_training.resolved = None;
-                        save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
-                        self.events.stage(
-                            PipelineStage::TrainingSplats,
-                            0.,
-                            "当前方案未能完成，正在自动改用更耗时的方案。",
-                        );
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        self.publish_reshoot_v2(
-            manager,
-            paths,
-            metadata,
-            &mut state,
-            &checkpoint,
-            &report,
-            &candidate,
-        )
-        .await
+        }
+        // The old algorithm owns source preparation and constrained SfM only.
+        // Every safely provable tail is executed by the normal work order.
+        if let Some(result) = self
+            .handoff_legacy_training(manager, paths, metadata, state, &model, acceleration)
+            .await?
+        {
+            return Ok(result);
+        }
+        Err(invalid(super::legacy_work_order::UNRESTORABLE_RECIPE))
     }
 
     async fn reshoot_matching(
@@ -2264,22 +2173,7 @@ impl PipelineRunner {
             .stage(PipelineStage::Exporting, 0., "正在校验并发布 final.ply");
         let ply = inspect_gaussian_ply(candidate)?;
         let final_ply = paths.project.join("final.ply");
-        atomic_replace_file(candidate, &final_ply).await?;
-        let completed_at = Utc::now();
-        let duration_ms = metadata.duration_ms.unwrap_or(0).saturating_add(
-            metadata
-                .started_at
-                .map(|t| (completed_at - t).num_milliseconds().max(0) as u64)
-                .unwrap_or(0),
-        );
-        if let Some(provenance) = metadata.reshoot.as_mut() {
-            provenance.registered_reshoot_count = checkpoint.registered_reshoot_count;
-            provenance.reshoot_frame_count = checkpoint.reshoot_frame_count;
-        }
-        metadata.status = ProjectStatus::Completed;
-        metadata.completed_at = Some(completed_at);
-        metadata.duration_ms = Some(duration_ms);
-        metadata.output = Some(ProjectOutput {
+        let output = ProjectOutput {
             final_ply: final_ply.clone(),
             file_size: ply.file_size,
             splat_count: ply.splat_count,
@@ -2287,12 +2181,10 @@ impl PipelineRunner {
             registered_images: report.registered_images,
             registered_ratio: report.registered_ratio,
             points_3d: report.points_3d,
-        });
-        state.stage = PipelineStage::Completed;
-        manager.write_state(&paths.state, state).await?;
-        manager.write_metadata(&paths.metadata, metadata).await?;
-        if let Some(output) = &metadata.output {
-            self.record_final_metrics(output);
+        };
+        if let Some(provenance) = metadata.reshoot.as_mut() {
+            provenance.registered_reshoot_count = checkpoint.registered_reshoot_count;
+            provenance.reshoot_frame_count = checkpoint.reshoot_frame_count;
         }
         let warning = (checkpoint.registered_reshoot_count as f64
             / (checkpoint.reshoot_frame_count.max(1) as f64)
@@ -2303,29 +2195,23 @@ impl PipelineRunner {
                 checkpoint.registered_reshoot_count, checkpoint.reshoot_frame_count
             )
         });
-        self.events.stage(
-            PipelineStage::Exporting,
-            1.,
-            format!("已发布 {} 个 Splat", ply.splat_count),
-        );
-        self.events
-            .stage(PipelineStage::Completed, 1., "高清补拍处理完成");
-        Ok(PipelineResult {
-            project_id: paths.id.to_string(),
-            project_path: paths.project.clone(),
-            final_ply,
-            file_size: ply.file_size,
-            splat_count: ply.splat_count,
-            input_images: report.input_images,
-            registered_images: report.registered_images,
-            registered_ratio: report.registered_ratio,
-            points_3d: report.points_3d,
-            duration_ms,
-            completed_at,
+        self.publish_work_order(
+            manager,
+            paths,
+            metadata,
+            state,
+            candidate,
+            output,
+            format!(
+                "reshoot-v2-training-{}",
+                checkpoint
+                    .recipe
+                    .as_ref()
+                    .map_or(0, |recipe| recipe.training_fallbacks)
+            ),
             warning,
-            logs_directory: paths.logs.clone(),
-            source_duration_seconds: None,
-        })
+        )
+        .await
     }
 }
 
@@ -2360,7 +2246,7 @@ pub(super) fn coordinates_match(base: &Path, updated: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn sync_refined_cameras(database: &Path, model: &Path) -> Result<()> {
+pub(super) fn sync_refined_cameras(database: &Path, model: &Path) -> Result<()> {
     let connection = rusqlite::Connection::open(database).map_err(|e| invalid(&e.to_string()))?;
     for camera in read_cameras(model)? {
         let params: Vec<_> = camera.params.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -2379,6 +2265,228 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn retained_v2_training_does_not_reopen_a_missing_original_project() {
+        let root = tempfile::tempdir().unwrap();
+        let (paths, authority) =
+            super::super::legacy_work_order::tests::retained_dataset(root.path());
+        let model = crate::reconstruction::direct_input::read_model(&authority).unwrap();
+        model.write(&paths.colmap.join("sparse/0")).unwrap();
+        for name in ["normal.png", "second.png"] {
+            std::fs::create_dir_all(&paths.frames).unwrap();
+            std::fs::copy(
+                paths.brush.join("dataset/images").join(name),
+                paths.frames.join(name),
+            )
+            .unwrap();
+        }
+        let missing = root.path().join("unregistered-original");
+        let mut metadata = ProjectMetadata {
+            quality: Quality::Fast,
+            reshoot: Some(ReshootProvenance {
+                source_project_id: uuid::Uuid::new_v4(),
+                source_project_path: missing.clone(),
+                source_final_ply: missing.join("final.ply"),
+                reshoot_source_path: root.path().join("input"),
+                camera_id: 7,
+                camera_model: "SIMPLE_RADIAL".into(),
+                width: 64,
+                height: 48,
+                has_alpha: false,
+                mask_count: 0,
+                source_image_count: 1,
+                reshoot_frame_count: 1,
+                registered_reshoot_count: 1,
+            }),
+            ..Default::default()
+        };
+        let mut state = PipelineStateFile::created(Quality::Fast);
+        state.brush_training.resolved = Some(crate::presets::resolve_brush_training_preset(
+            Quality::Fast,
+            false,
+            None,
+            64,
+            1,
+        ));
+        let plan = ReshootPlan::resolve(ModelCondition::Appearance, true, false);
+        state.reshoot = Some(ReshootState {
+            incremental_reconstruction_complete: true,
+            recipe: Some(ReshootRecipe {
+                version: RECIPE_VERSION,
+                normal_parameters_version: Some(1),
+                camera_assignment: None,
+                options: ReshootOptions {
+                    condition: ModelCondition::Appearance,
+                    camera_relation: None,
+                    allow_fallback: false,
+                    source_identity: "no-longer-needed".into(),
+                    input_identity: "input".into(),
+                    projection: VideoProjection::Perspective,
+                    image_matching_strategy: Default::default(),
+                },
+                initial: plan,
+                actual: plan,
+                batch_id: "saved".into(),
+                reconstruction_fallbacks: 0,
+                training_fallbacks: 0,
+                expanded_matching: true,
+                source_names: vec!["normal.png".into()],
+                new_names: vec!["second.png".into()],
+                warm_parameters: None,
+                init_sha256: None,
+                init_georeference: None,
+                stored_input_identity: None,
+                panorama_frames: vec![],
+            }),
+            ..Default::default()
+        });
+        let acceleration:crate::engines::ColmapAccelerationStatus=serde_json::from_value(serde_json::json!({
+            "backend":"cpu","detectionState":"unavailable","reasonCode":"noNvidiaGpu","reason":"fixture","device":null,
+            "requirements":{"minimumDriverVersion":"580.00","minimumComputeCapability":"7.5"}
+        })).unwrap();
+        let manager = ProjectManager::for_diagnostics(root.path().join("projects"));
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        );
+        let error = runner
+            .run_reshoot_v2(&manager, &paths, &mut metadata, state, &acceleration)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("INPUT_CHANGED"), "{error}");
+        assert!(
+            !error
+                .to_string()
+                .contains(super::super::legacy_work_order::UNRESTORABLE_RECIPE),
+            "{error}"
+        );
+        assert!(manager
+            .read_state(&paths.state)
+            .await
+            .unwrap()
+            .brush_training
+            .legacy_dataset_identity
+            .is_some());
+    }
+
+    #[test]
+    fn external_colmap_source_needs_no_state_and_uses_database_members_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, database) =
+            crate::reconstruction::direct_input::tests::legacy_shared_frames_fixture(root.path());
+        let model = crate::reconstruction::direct_input::read_model(&input.model).unwrap();
+        let camera = &model.cameras[0];
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute("ALTER TABLE cameras ADD COLUMN params BLOB", [])
+            .unwrap();
+        let params = camera
+            .params
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect::<Vec<_>>();
+        db.execute("UPDATE cameras SET params=?1", [params])
+            .unwrap();
+        drop(db);
+        image::RgbImage::new(64, 48)
+            .save(input.images.join("extra.png"))
+            .unwrap();
+        let metadata = ProjectMetadata {
+            imported: Some(crate::project::ImportedProjectProvenance {
+                source_model_path: root.path().join("external.ply"),
+                source_format: crate::project::ImportedGaussianFormat::Ply,
+                source_fingerprint: crate::project::ExternalFileFingerprint {
+                    sha256: "irrelevant-to-camera-eligibility".into(),
+                    file_size: 0,
+                    modified_ms: None,
+                },
+                canonical_model_path: None,
+                colmap: Some(crate::project::ImportedColmapProvenance {
+                    root_path: root.path().to_path_buf(),
+                    sparse_model_path: input.model.clone(),
+                    database_path: Some(database.clone()),
+                    images_path: Some(input.images.clone()),
+                    registered_images: 2,
+                    points_3d: 1,
+                    camera_count: 1,
+                    reshoot_eligible: true,
+                    reshoot_reason: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            root.path().join("project.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("external.ply"),
+            b"not read as an initialization",
+        )
+        .unwrap();
+        assert!(!root.path().join("state.json").exists());
+        let source = imported_source_assets(root.path().to_path_buf(), metadata.clone()).unwrap();
+        assert!(source.state.is_none());
+        assert_eq!(
+            source.names,
+            vec!["normal.png", "second.png", "unregistered.png"]
+        );
+        assert!(!source.names.contains(&"extra.png".to_string()));
+        assert!(source_identity(&source).is_ok());
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute("UPDATE images SET image_id=123 WHERE name='normal.png'", [])
+            .unwrap();
+        drop(db);
+        assert!(imported_source_assets(root.path().to_path_buf(), metadata).is_err());
+    }
+
+    #[test]
+    fn legacy_shared_frame_layout_is_part_of_the_source_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, database) =
+            crate::reconstruction::direct_input::tests::legacy_shared_frames_fixture(root.path());
+        std::fs::write(root.path().join("project.json"), b"legacy-project").unwrap();
+        std::fs::write(root.path().join("state.json"), b"legacy-state").unwrap();
+        std::fs::write(root.path().join("final.ply"), b"published").unwrap();
+        let metadata = ProjectMetadata::default();
+        let state = PipelineStateFile::created(Quality::Balanced);
+        let legacy_identity = crate::reconstruction::direct_input::validate_legacy_shared_frames(
+            &input.images,
+            &database,
+            &input.model,
+            3,
+        )
+        .unwrap()
+        .content_identity;
+        let make_source = |mode| SourceAssets {
+            root: root.path().to_path_buf(),
+            metadata: metadata.clone(),
+            state: Some(state.clone()),
+            names: crate::video::list_images(&input.images)
+                .unwrap()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
+            images: input.images.clone(),
+            colmap_images: input.images.clone(),
+            masks: root.path().join("masks"),
+            database: database.clone(),
+            model: input.model.clone(),
+            colmap_input_mode: mode,
+            legacy_content_identity: (mode == ReshootColmapInputMode::LegacySharedFrames)
+                .then_some(legacy_identity),
+        };
+        let current = source_identity(&make_source(ReshootColmapInputMode::CurrentV2)).unwrap();
+        let legacy =
+            source_identity(&make_source(ReshootColmapInputMode::LegacySharedFrames)).unwrap();
+        assert_ne!(current, legacy);
+        let mut changed_legacy = make_source(ReshootColmapInputMode::LegacySharedFrames);
+        let mut changed_identity = legacy_identity;
+        changed_identity[0] ^= 0xff;
+        changed_legacy.legacy_content_identity = Some(changed_identity);
+        assert_ne!(legacy, source_identity(&changed_legacy).unwrap());
+    }
+
+    #[tokio::test]
     #[ignore = "Requires the completed public GPS smoke project and native engines/GPU; repeated photographs test integration, not new detail"]
     async fn native_public_gps_reshoot() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -2390,12 +2498,19 @@ mod tests {
         let source = SourceAssets {
             root: original.clone(),
             metadata: source_metadata.clone(),
-            state: source_state,
+            state: Some(source_state),
+            names: crate::video::list_images(&original.join("work/frames"))
+                .unwrap()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
             images: original.join("work/frames"),
             colmap_images: original.join("work/colmap_frames"),
             masks: original.join("work/masks"),
             database: original.join("work/colmap/database.db"),
             model: original.join("work/colmap/gps-v1/model"),
+            colmap_input_mode: ReshootColmapInputMode::CurrentV2,
+            legacy_content_identity: None,
         };
         let before = source_identity(&source).unwrap();
         let protected = [
@@ -3024,12 +3139,19 @@ mod tests {
         let source = SourceAssets {
             root: original.clone(),
             metadata: source_metadata.clone(),
-            state: source_state,
+            state: Some(source_state),
+            names: crate::video::list_images(&original.join("work/frames"))
+                .unwrap()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
             images: original.join("work/frames"),
             colmap_images: original.join("work/colmap_frames"),
             masks: original.join("work/masks"),
             database: original.join("work/colmap/database.db"),
             model,
+            colmap_input_mode: ReshootColmapInputMode::CurrentV2,
+            legacy_content_identity: None,
         };
         let identity = source_identity(&source).unwrap();
         let test_root = repo.join(".cache/reshoot-v2-native");
