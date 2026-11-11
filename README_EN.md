@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
