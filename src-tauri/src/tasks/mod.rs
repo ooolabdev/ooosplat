@@ -781,9 +781,25 @@ impl TaskService {
         };
         let mut reconciled_publications = Vec::new();
         for task in registry.tasks.values_mut() {
-            if let Some(publication) = Self::reconcile_task_publication(task).await? {
-                reconciled_publications.push(publication);
-                continue;
+            match Self::reconcile_task_publication(task).await {
+                Ok(Some(publication)) => {
+                    reconciled_publications.push(publication);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // One project's unreadable or changed final.ply must not
+                    // make every other task unloadable. Report only this task.
+                    tracing::warn!(code=%error.code, task=%task.task_id, "Could not verify committed publication");
+                    if task.status == TaskStatus::Completed {
+                        task.status = TaskStatus::Interrupted;
+                        task.result = None;
+                        task.revision += 1;
+                        task.updated_at = Utc::now();
+                        task.error = Some(artifact_unavailable(task, None));
+                        continue;
+                    }
+                }
             }
             if task.status.active() {
                 task.status = TaskStatus::Interrupted;
@@ -2755,25 +2771,7 @@ impl TaskService {
                     task.result = None;
                     task.revision += 1;
                     task.updated_at = Utc::now();
-                    task.error = Some(TaskError {
-                        code: "ARTIFACT_UNAVAILABLE".into(),
-                        message: project.failure_message.clone().unwrap_or_else(|| {
-                            "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()
-                        }),
-                        failed_stage: None,
-                        engine: None,
-                        exit_code: None,
-                        classification: None,
-                        classification_is_heuristic: false,
-                        classification_version: None,
-                        termination: None,
-                        failure_id: None,
-                        log_sources: task
-                            .runs
-                            .last()
-                            .map(|run| run.logs.keys().cloned().collect())
-                            .unwrap_or_default(),
-                    });
+                    task.error = Some(artifact_unavailable(task, project.failure_message.clone()));
                     changes.push(task.clone());
                 }
             }
@@ -2821,6 +2819,27 @@ impl TaskService {
                 }
             }
         })
+    }
+}
+
+fn artifact_unavailable(task: &TaskRecord, message: Option<String>) -> TaskError {
+    TaskError {
+        code: "ARTIFACT_UNAVAILABLE".into(),
+        message: message
+            .unwrap_or_else(|| "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()),
+        failed_stage: None,
+        engine: None,
+        exit_code: None,
+        classification: None,
+        classification_is_heuristic: false,
+        classification_version: None,
+        termination: None,
+        failure_id: None,
+        log_sources: task
+            .runs
+            .last()
+            .map(|run| run.logs.keys().cloned().collect())
+            .unwrap_or_default(),
     }
 }
 
