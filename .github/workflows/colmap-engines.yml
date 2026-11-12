@@ -92,9 +92,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            ~/Library/Caches/Homebrew
             .cache/ccache
-          key: colmap-only-macos-15-arm64-${{ hashFiles('engines/colmap-build.json', 'engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/colmap-macos-common.sh') }}
+          key: colmap-only-macos-15-arm64-v2-${{ hashFiles('engines/colmap-build.json', 'engines/manifest.macos.json', 'scripts/setup-macos-build-deps.sh', 'scripts/colmap-macos-common.sh') }}
       - name: Install pinned macOS build prerequisites
         if: matrix.platform == 'macos'
         run: bash scripts/setup-macos-build-deps.sh

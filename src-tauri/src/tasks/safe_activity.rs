@@ -85,8 +85,9 @@ fn checked(
     faces: bool,
 ) -> Option<String> {
     let numbers = parse(message, parts)?;
-    for pair in numbers.chunks_exact(2) {
-        if pair[0].value > pair[1].value {
+    for index in (0..numbers.len()).step_by(2) {
+        let total = numbers.get(index + 1)?;
+        if numbers[index].value > total.value {
             return None;
         }
     }

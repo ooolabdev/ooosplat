@@ -59,10 +59,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            ~/Library/Caches/Homebrew
             .cache/ccache
             .cache/macos-engine-build/sources
-          key: macos-15-arm64-engines-${{ hashFiles('engines/manifest.macos.json', 'engines/colmap-runtime.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
+          key: macos-15-arm64-engines-v2-${{ hashFiles('engines/manifest.macos.json', 'engines/colmap-runtime.json', 'scripts/setup-macos-build-deps.sh', 'scripts/build-engines-macos.sh') }}
           save-always: true
 
       - name: Install engine build prerequisites

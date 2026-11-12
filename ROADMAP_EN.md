@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Current `main` version identifier: **0.7.1**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
+Current `main` version identifier: **0.8.0**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
 
 ## Product Principles
 
@@ -28,14 +28,21 @@ Current `main` version identifier: **0.7.1**. This page tracks source implementa
 | P0 | Generation quality optimization | Improve camera registration, geometric completeness, visual detail, and edge quality with measurable optimization strategies. | To be created |
 | P0 | Error guidance and fault validation | Extend native-fault and platform coverage beyond the implemented OOM, resource-limit, file-read, and crash classifications. Better classification does not fix the underlying hardware or engine fault. | To be created |
 | P0 | UI simplification | Reduce unnecessary information and interaction layers while unifying generation, history, preview, and editing workflows. | To be created |
+| P0 | Test framework design | Build a layered test framework for media preparation, SfM, training, continuation, reshoots, and publication transactions, with shared real-engine fixtures, fault injection, performance baselines, and cross-platform acceptance criteria. | To be created |
+| P0 | Brush crash point counts and depth output | Update Brush to report the last trustworthy Splat count on a crash or OOM and provide verifiable depth output. Point counts support accurate diagnostics and bounded retries; depth enables later geometry workflows. Requires Brush changes. | To be created |
 | P1 | Gaussian generation benchmark | Establish reproducible datasets, hardware profiles, quality metrics, and timing metrics to compare speed, resource use, and output quality across releases. | To be created |
 | P1 | Telemetry data collection and learning | Active-user, Pipeline performance, and Failure distribution metrics already exist. Improve data quality, long-term samples, dashboards, and release comparisons. | To be created |
 | P1 | Capture guidance improvements | Extend existing capture advice and image-order confirmation with examples of orbit paths, speed, overlap, and lighting. | To be created |
 | P1 | Panorama platform and large-scene acceptance | Check source diversity, long inputs, seams, directional coverage, and native-resolution training. Detailed now budgets 40× spherical sparse points without a fixed 10M cap; achieved counts, quality, and resource requirements still need measurement. | [Verification record](docs/PANORAMA_IMAGES_V1.md) |
 | P1 | Image GPS platform and dataset acceptance | Extend native validation beyond Windows x64 and add real panorama/reshoot GPS comparisons. Unverified paths do not enable georeferencing; survey-grade accuracy is not promised. | [Scope and validation](docs/IMAGE_GPS.md) |
 | P1 | Reshoot v2 cross-device and desktop acceptance | The native Ballintoy core flow passed. Real cross-device/lens inputs, repeated batches, and platform-specific desktop interactions still need acceptance; synthetic resizing does not substitute for captured data. | [PR #69](https://github.com/ooolabdev/ooosplat/pull/69) · [Validation notes](docs/RESHOOT_V2.md) |
-| P2 | AI masking and fine image matting Beta | Validate native person-exclusion and subject-Alpha inference, corrections, model distribution, and COLMAP/Brush semantics before enabling verified platforms. Not available on current main. | To be created |
-| P2 | Mesh export | Convert reconstruction results to common Mesh formats with documented texture, coordinate-system, and quality options. | To be created |
+| P1 | Import COLMAP and skip SfM | Import strictly validated cameras, images, and sparse models, then prepare Brush training data without rerunning feature extraction, matching, or Mapper. Keep sources read-only and define distortion, ERP, database, and reshoot compatibility boundaries. | To be created |
+| P1 | Resume training from its last position | Persist and restore Gaussian, optimizer, and schedule state so training resumes from the latest trustworthy position instead of restarting from initialization. Requires complete checkpoint support in Brush. | To be created |
+| P1 | One-click floater cleanup | Detect obvious spatial and visibility outliers through a previewable, undoable edit while protecting subject detail and validating cleanup thresholds. | To be created |
+| P2 | COLMAP AMD GPU acceleration | Research and validate a maintainable AMD GPU backend for feature extraction, matching, or BA. Preserve CPU fallback and do not present unverified compatibility layers as native support. | To be created |
+| P2 | Dark theme UI | Provide a consistent dark theme across task creation, details, preview editing, logs, and settings, including system-theme following, contrast, icons, and viewport readability. | To be created |
+| P2 | Automatic matting and refined masks Beta | Validate automatic subject-Alpha inference, person exclusion, manual correction, model distribution, and COLMAP/Brush semantics before enabling accepted platforms. Not available on current main. | To be created |
+| P3 | Depth-assisted Mesh generation (experimental) | Predict multi-view depth from Gaussian Splatting renders and fuse it into an experimental Mesh. Evaluate scale, occlusion, thin structures, textures, coordinates, and repeatability without presenting monocular predicted depth as measured ground truth. | To be created |
 | P3 | Panorama input expansion | Explore additional projections; dual-fisheye, stereo, VR180, cropped panoramas, and private originals remain unsupported. | To be created |
 
 ## Completed

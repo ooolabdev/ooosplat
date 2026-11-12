@@ -128,6 +128,14 @@ test("source and legacy engine builders are manual-only while application workfl
   }
 });
 
+test("macOS workflows never restore Homebrew's mutable backup directory", () => {
+  for (const workflowName of ["macos", "macos-engines", "colmap-engines"]) {
+    const workflow = read(`.github/workflows/${workflowName}.yml`);
+    assert.doesNotMatch(workflow, /Library\/Caches\/Homebrew/);
+    assert.match(workflow, /\.cache\/ccache/);
+  }
+});
+
 test("platform build scripts fail early and prepare macOS license destinations", () => {
   const windows = read(".github/workflows/windows.yml");
   assert.match(windows, /\$PSNativeCommandUseErrorActionPreference = \$true/);

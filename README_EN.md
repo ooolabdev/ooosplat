@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><img src="https://img.shields.io/badge/release-v0.7.1-blue?style=flat" alt="Release: v0.7.1"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><img src="https://img.shields.io/badge/release-v0.8.0-blue?style=flat" alt="Release: v0.8.0"></a>
   <a href="#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.7.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -23,9 +23,9 @@ OOOSplat is a local desktop application that turns ordinary or panorama videos a
 
 Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal generation and preview do not require a separate HTTP server.
 
-See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
+See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work. Current directions include Brush depth and crash diagnostics, imported COLMAP reconstruction without rerunning SfM, resumable training, floater cleanup, AMD acceleration, a dark theme, automatic matting, and experimental depth-assisted Mesh generation.
 
-> 0.7.1 updates generation defaults, automatic retries, and Detailed splat budgets, adds stepped frame sampling and movement-speed controls, and improves reshoots, image GPS assistance, exports, and error diagnostics.
+> 0.8.0 unifies multi-input, reshoot, and continuation workflows; improves generation logs, error diagnostics, and cross-platform builds; and refines panoramas, GPS, exports, and preview navigation.
 
 The features below describe the current `main` source tree. Source updates are not necessarily released features; consult each release's notes for installer contents.
 
@@ -69,7 +69,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 Each image set needs at least two images and one projection type. Ordinary sets may mix dimensions; ERP sets must remain same-sized and full monoscopic panoramas. A 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas and private originals are unsupported. Unconnected inputs are not forcibly merged. Panorama caches have no fixed 20 GiB cap; the 512 MiB per-image decode guard remains.
 
-New COLMAP file/folder imports are temporarily unavailable in the GUI, MCP, and CLI. The desktop app shows a dialog for unsupported inputs. Existing-task continuation, reshoots with previously verified COLMAP data, and normal reconstruction remain available.
+New COLMAP file/folder imports are temporarily unavailable in the GUI, MCP, and CLI. The desktop app shows a dialog for unsupported inputs. Existing-task continuation, reshoots with previously verified COLMAP data, and normal reconstruction remain available. Importing a validated COLMAP reconstruction and skipping SfM is tracked on the roadmap.
 
 Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated memory, but actual RAM, disk space, and format constraints still apply. Removing these gates does not guarantee large-model exports will succeed. See [export notes and verification](docs/model-export-verification.md).
 
@@ -148,10 +148,10 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
-After downloading the `OOOSplat-0.7.1-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
+After downloading the `OOOSplat-0.8.0-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
 
 ```bash
-sudo apt install ./OOOSplat-0.7.1-x64-linux.deb
+sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
 ```
 
 The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
@@ -160,7 +160,7 @@ The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned
 
 Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
 
-1. On Windows, run `OOOSplat-0.7.1-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.7.1-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.7.1-x64-linux.deb`.
+1. On Windows, run `OOOSplat-0.8.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.8.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.8.0-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Select a draft under “Task List → New Tasks,” or choose Add, then use Add files, Add folders, or drag and drop. Wait for each source's detection; choose ordinary or panorama processing inside that source if the type is uncertain.
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -259,7 +259,7 @@ What is sent:
 | Field | Description |
 | --- | --- |
 | Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
-| App version, OS, CPU architecture | For example `0.7.1` / `windows` / `x86_64` |
+| App version, OS, CPU architecture | For example `0.8.0` / `windows` / `x86_64` |
 | Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`, `planner_evaluation`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
 | Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
 | Stage and total durations | Milliseconds |
@@ -391,7 +391,7 @@ npm run package:windows
 The NSIS installer is written to:
 
 ```text
-dist-artifacts\OOOSplat-0.7.1-x64-windows.exe
+dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
 ```
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.

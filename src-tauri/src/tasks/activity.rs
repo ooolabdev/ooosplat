@@ -85,16 +85,7 @@ impl Journal {
             return;
         };
         bytes.push(b'\n');
-        if bytes.len() > MAX_LINE_BYTES
-            || self
-                .queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current
-                        .checked_add(bytes.len())
-                        .filter(|n| *n <= MAX_PENDING_BYTES)
-                })
-                .is_err()
-        {
+        if bytes.len() > MAX_LINE_BYTES || !self.reserve_pending_bytes(bytes.len()) {
             self.healthy.store(false, Ordering::Release);
             return;
         }
@@ -102,6 +93,27 @@ impl Journal {
         if self.sender.try_send(Message::Line(bytes)).is_err() {
             self.queued_bytes.fetch_sub(size, Ordering::AcqRel);
             self.healthy.store(false, Ordering::Release);
+        }
+    }
+
+    fn reserve_pending_bytes(&self, size: usize) -> bool {
+        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current
+                .checked_add(size)
+                .filter(|next| *next <= MAX_PENDING_BYTES)
+            else {
+                return false;
+            };
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
         }
     }
 
