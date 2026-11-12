@@ -6,6 +6,22 @@ import { LanguageProvider } from '../i18n';
 import { TaskProgress } from './TaskProgress';
 import type { RuntimeSnapshot } from '../types/pipeline';
 
+it.each([
+  ['zh-CN', 'running'], ['zh-CN', 'completed'], ['en', 'running'], ['en', 'completed'],
+])('omits the truncation notice for %s %s logs', async (locale, status) => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  localStorage.setItem('ooo-splat-language', locale);
+  const container = document.createElement('div'), root = createRoot(container);
+  try {
+    await act(async () => root.render(<LanguageProvider><TaskProgress progress={50} status={status}
+      stage="matching" logsTruncated logs={[{ key: 'entry-1', text: 'saved log entry', source: 'system' }]} /></LanguageProvider>));
+    expect(container.textContent).not.toContain('完整内容保存在项目日志中');
+    expect(container.textContent).not.toContain('Complete output is saved in the project logs.');
+    expect(container.querySelector('.live-process > .runtime-note')).toBeNull();
+    expect(container.querySelector('.live-log')?.textContent).toContain('saved log entry');
+  } finally { await act(async () => root.unmount()); localStorage.clear(); }
+});
+
 it('always displays a scoped monotonic percentage without remounting the monitor', async () => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   localStorage.setItem('ooo-splat-language', 'zh-CN');
@@ -46,5 +62,25 @@ it('retains fresh preparation-process resource monitoring without showing Brush 
     expect(container.querySelector('.runtime-resources')).not.toBeNull();
     expect(container.querySelector('.runtime-step-heading')).toBeNull();
     expect(container.querySelector('.training-remaining')).toBeNull();
+  } finally { await act(async () => root.unmount()); localStorage.clear(); }
+});
+
+it('marks ordinary Bridge Mapper percentages as estimates, but not its exact feature counts or unknown progress', async () => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  localStorage.setItem('ooo-splat-language', 'en');
+  const container = document.createElement('div'), root = createRoot(container);
+  const render = async (unit: string, stageProgress: number | null) => act(async () => root.render(<LanguageProvider>
+    <TaskProgress status="running" stage="validatingReconstruction" progress={50} stageProgress={stageProgress} progressUnit={unit} logs={[]} />
+  </LanguageProvider>));
+  try {
+    await render('registeredImages', 36);
+    const slot = () => container.querySelector('.stage-timeline li.active small');
+    expect(slot()?.textContent).toBe('36.0%');
+    expect(slot()?.getAttribute('aria-label')).toBe('Estimated 36.0%');
+    await render('images', 36);
+    expect(slot()?.getAttribute('aria-label')).toBeNull();
+    await render('registeredImages', null);
+    expect(slot()?.textContent).toBe('Processing');
+    expect(slot()?.getAttribute('aria-label')).toBeNull();
   } finally { await act(async () => root.unmount()); localStorage.clear(); }
 });

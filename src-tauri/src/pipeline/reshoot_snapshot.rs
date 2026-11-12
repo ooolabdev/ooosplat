@@ -174,6 +174,14 @@ impl ReshootSnapshotBuilder {
     }
 
     pub async fn build(self, cancel: &CancellationToken) -> Result<ReshootSnapshotV3> {
+        self.build_observed(cancel, None).await
+    }
+
+    pub(crate) async fn build_observed(
+        self,
+        cancel: &CancellationToken,
+        observer: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    ) -> Result<ReshootSnapshotV3> {
         let parent = self.ready_root.parent().ok_or_else(|| {
             SplatError::Process("Reshoot snapshot path has no parent directory".into())
         })?;
@@ -181,7 +189,7 @@ impl ReshootSnapshotBuilder {
         let staging = parent.join(format!(".reshoot-snapshot-{}.staging", Uuid::new_v4()));
         tokio::fs::create_dir(&staging).await?;
 
-        let result = self.build_in(&staging, cancel).await;
+        let result = self.build_in(&staging, cancel, observer).await;
         let manifest = match result {
             Ok(value) => value,
             Err(error) => {
@@ -214,6 +222,7 @@ impl ReshootSnapshotBuilder {
         &self,
         staging: &Path,
         cancel: &CancellationToken,
+        observer: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     ) -> Result<ReshootSnapshotV3> {
         let model = self.model.as_deref().ok_or_else(|| {
             SplatError::Process("Reshoot snapshot is missing a COLMAP model".into())
@@ -247,7 +256,7 @@ impl ReshootSnapshotBuilder {
         validate_inputs(&inputs)?;
 
         let mut assets = Vec::with_capacity(inputs.len());
-        for input in &inputs {
+        for (index, input) in inputs.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(SplatError::Cancelled);
             }
@@ -263,6 +272,9 @@ impl ReshootSnapshotBuilder {
                 sha256,
                 file_size,
             });
+            if let Some(observer) = observer {
+                observer(index as u64 + 1, inputs.len() as u64);
+            }
         }
         assets.sort_by(|a, b| {
             (a.role, a.relative_path.as_str()).cmp(&(b.role, b.relative_path.as_str()))
@@ -335,10 +347,43 @@ pub fn load_snapshot(root: &Path) -> Result<ReshootSnapshotV3> {
     Ok(manifest)
 }
 
+/// Authenticate only the small manifest against a previously saved identity.
+/// This is not asset validation: input preflight uses it to read frozen source
+/// policies without decoding or hashing every image in the source project.
+pub(crate) fn load_bound_snapshot_metadata(
+    root: &Path,
+    expected_identity: &str,
+) -> Result<ReshootSnapshotV3> {
+    let manifest = load_snapshot(root)?;
+    let actual = snapshot_content_identity(
+        &manifest.assets,
+        &manifest.cameras,
+        &manifest.registered_images,
+        manifest.source_ply.as_ref(),
+    )?;
+    if actual != manifest.content_identity || actual != expected_identity {
+        return Err(SplatError::Process(
+            "Reshoot snapshot content identity does not match its manifest".into(),
+        ));
+    }
+    Ok(manifest)
+}
+
 pub fn verify_snapshot(root: &Path) -> Result<ReshootSnapshotV3> {
+    verify_snapshot_observed(root, &CancellationToken::new(), None)
+}
+
+pub(crate) fn verify_snapshot_observed(
+    root: &Path,
+    cancel: &CancellationToken,
+    observer: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<ReshootSnapshotV3> {
     let manifest = load_snapshot(root)?;
     let mut assets = Vec::with_capacity(manifest.assets.len());
-    for expected in &manifest.assets {
+    for (index, expected) in manifest.assets.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
         let path = root.join(&expected.relative_path);
         let metadata = std::fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() || metadata.len() != expected.file_size {
@@ -346,13 +391,16 @@ pub fn verify_snapshot(root: &Path) -> Result<ReshootSnapshotV3> {
                 "Reshoot snapshot asset is missing or changed".into(),
             ));
         }
-        let actual = hash_file(&path)?;
+        let actual = crate::video::panorama::fingerprint_cancellable(&path, cancel)?;
         if actual != expected.sha256 {
             return Err(SplatError::Process(
                 "Reshoot snapshot asset content has changed".into(),
             ));
         }
         assets.push(expected.clone());
+        if let Some(observer) = observer {
+            observer(index as u64 + 1, manifest.assets.len() as u64);
+        }
     }
     let identity = snapshot_content_identity(
         &assets,
@@ -503,6 +551,7 @@ async fn copy_and_hash(
     Ok((format!("{:x}", hash.finalize()), file_size))
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
@@ -663,13 +712,17 @@ mod tests {
         write_ply(&source.join("final.ply"));
         let original = hash_file(&source.join("final.ply")).unwrap();
         let ready = temp.path().join("derived").join("snapshot");
+        let observed = std::sync::Mutex::new(Vec::new());
         let manifest = ReshootSnapshotBuilder::new(&ready)
             .source_project_id(Uuid::new_v4())
             .model(&model)
             .database(source.join("database.db"))
             .source_ply(source.join("final.ply"))
             .image(source.join("frame.jpg"), "frame.jpg")
-            .build(&CancellationToken::new())
+            .build_observed(
+                &CancellationToken::new(),
+                Some(&|current, total| observed.lock().unwrap().push((current, total))),
+            )
             .await
             .unwrap();
 
@@ -679,6 +732,19 @@ mod tests {
         assert_eq!(manifest.content_identity.len(), 64);
         assert!(manifest.coordinate_frame_id.starts_with("colmap-sha256:"));
         assert_eq!(hash_file(&source.join("final.ply")).unwrap(), original);
+        let counts = observed.lock().unwrap();
+        assert_eq!(counts.len(), manifest.assets.len());
+        assert_eq!(
+            counts.last(),
+            Some(&(manifest.assets.len() as u64, manifest.assets.len() as u64))
+        );
+        drop(counts);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            verify_snapshot_observed(&ready, &cancel, None),
+            Err(SplatError::Cancelled)
+        ));
         assert_eq!(verify_snapshot(&ready).unwrap(), manifest);
         assert!(std::fs::metadata(ready.join("training/init-source.ply"))
             .unwrap()

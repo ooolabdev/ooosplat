@@ -147,7 +147,8 @@ async fn preflight(tools: &McpTools, mut r: Request) -> Result<Preflight> {
     match &r.inputs {
         GenerationInputs::Materials { items } => {
             for item in items {
-                materials.push(inspect_material(&tools.engines, item, r.quality, policy).await?);
+                materials
+                    .push(inspect_new_material(&tools.engines, item, r.quality, policy).await?);
             }
         }
         GenerationInputs::Colmap { input } => {

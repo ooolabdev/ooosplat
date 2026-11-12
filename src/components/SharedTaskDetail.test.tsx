@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LanguageProvider } from '../i18n';
-import type { SharedTask } from '../types/tasks';
+import { mergeTask, type SharedTask } from '../types/tasks';
 import type { ProjectSummary, ReshootRecipeSummary } from '../types/pipeline';
 
 const mocks = vi.hoisted(() => ({ logs: vi.fn(), detail: vi.fn(), start: vi.fn(), cancel: vi.fn() }));
@@ -46,6 +46,115 @@ it('shows new retry consent without waiting for a project detail and marks only 
 });
 
 describe('restored shared task detail', () => {
+  it.each([
+    ['ordinary video', 'video', 'perspective', ['video-a'], [90]],
+    ['ERP video', 'video', 'equirectangular', ['erp-video'], [122]],
+    ['ERP photos', 'images', 'equirectangular', ['erp-images'], [40]],
+    ['multiple videos', 'video', 'perspective', ['video-a', 'video-b'], [30, 60]],
+    ['video and photos', 'images', 'perspective', ['video', 'images'], [30, 60]],
+    ['reshoot new sources', 'images', 'perspective', ['new-video', 'new-images'], [30, 60]],
+  ] as const)('shows global feature progress for %s without disguising group changes as retries', async (label, inputType, projection, sources, counts) => {
+    mocks.detail.mockResolvedValue({ project, inputType, videoProjection: projection, inputProjection: projection });
+    const total = counts.reduce((sum, value) => sum + value, 0);
+    let completed = 0, sequence = 0;
+    for (const [index, sourceId] of sources.entries()) {
+      const operation = { id: index + 1, attempt: 1, sourceId };
+      for (const count of [completed, completed + 1, completed + counts[index]]) {
+        const progress = { sequence: ++sequence, kind: count === completed ? 'stage' : 'progress', stage: 'extractingFeatures',
+          engine: 'colmap', operation, current: count, total, unit: 'images', message: 'actual engine step',
+        } as import('../types/pipeline').PipelineEvent;
+        await render(task({ project_id: project.id, task_kind: label === 'reshoot new sources' ? 'reshoot' : 'generation', input_type: inputType,
+          stage: 'extractingFeatures', operation, revision: sequence, sequence, current: count, total, unit: 'images',
+          recent_events: [progress], progress: count / total * 100,
+        }));
+        expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${count}/${total}）`);
+        expect(container.textContent).not.toContain('本阶段第');
+      }
+      completed += counts[index];
+    }
+    const operation = { id: sources.length + 1, attempt: 2, sourceId: sources.at(-1) };
+    await render(task({ project_id: project.id, input_type: inputType, stage: 'extractingFeatures', operation, current: completed - 1,
+      total, unit: 'images', recent_events: [], progress: null }));
+    expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${completed - 1}/${total}）`);
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+
+  it('restores authoritative global feature counters without borrowing a previous source or completed Bridge count', async () => {
+    const old = { sequence: 1, kind: 'progress', stage: 'extractingFeatures', current: 90, total: 90, unit: 'images',
+      operation: { id: 1, attempt: 1, sourceId: 'source-a' }, message: 'old completed feature step',
+    } as import('../types/pipeline').PipelineEvent;
+    await render(task({ stage: 'extractingFeatures', operation: { id: 2, attempt: 1, sourceId: 'source-b' },
+      current: 31, total: 90, unit: 'images', recent_events: [old] }));
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（31/90）');
+    await render(task({ stage: 'extractingFeatures', operation: { id: 3, attempt: 1, sourceId: 'source-b:bridge' },
+      current: 0, total: 18, unit: 'images', recent_events: [old] }));
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（0/18）');
+    expect(container.textContent).not.toContain('本阶段第');
+    await render(task({ stage: 'matching', operation: { id: 4, attempt: 2 }, current: null, total: null, recent_events: [] }));
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+    await render(task({ stage: 'trainingSplats', substage: 'training', operation: { id: 5, attempt: 2 }, current: 0, total: 12000, unit: 'iterations', recent_events: [] }));
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+
+  it('keeps same-operation feature snapshots stable and preserves reconstruction estimate semantics', async () => {
+    const known = task({ stage: 'extractingFeatures', operation: { id: 1, attempt: 1, sourceId: 'images' },
+      current: 18, total: 90, unit: 'images', progress: 20, estimated_progress: 25,
+    });
+    let tasks = mergeTask({}, known);
+    await render(tasks[known.task_id]);
+    tasks = mergeTask(tasks, { ...known, revision: 3, current: null, total: null, unit: null, progress: null });
+    await render(tasks[known.task_id]);
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+    const accepted = tasks;
+    tasks = mergeTask(tasks, { ...known, revision: 4, operation: { id: 1, attempt: 1, sourceId: 'wrong-reused-id' },
+      current: 0, progress: 0 });
+    expect(tasks).toBe(accepted);
+    await render(tasks[known.task_id]);
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+    tasks = mergeTask(tasks, { ...known, revision: 4, operation: { id: 2, attempt: 1, sourceId: 'video' } });
+    await render(tasks[known.task_id]);
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    await render(task({ stage: 'reconstructing', operation: { id: 3, attempt: 1 }, current: 100, total: 100,
+      unit: 'registeredImages', progress: 90, estimated_progress: 54 }));
+    const estimate = container.querySelector('.stage-timeline li.active small');
+    expect(estimate?.textContent).toBe('90.0%');
+    expect(estimate?.getAttribute('title')).toBe('估算 90.0%');
+    await render(task({ stage: 'reconstructing', operation: { id: 4, attempt: 2 }, current: 100, total: 100,
+      unit: 'registeredImages', progress: null, estimated_progress: 54 }));
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('处理中');
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+
+  it.each(['zh-CN', 'en'] as const)('keeps ordinary Mapper captions stable through real submodel reset patterns without hiding observed counts or estimates (%s)', async locale => {
+    localStorage.setItem('ooo-splat-language', locale);
+    const operation = { id: 8, attempt: 1, sourceId: 'ordinary-images' };
+    const events: import('../types/pipeline').PipelineEvent[] = [];
+    const observations = [[0, 0], [2, 2], [3, 3], [0, 3], [2, 3], [4, 4], [0, 4], [6, 6], [0, 6]];
+    for (const [index, [current, estimate]] of observations.entries()) {
+      events.push({ sequence: index + 1, kind: 'progress', stage: 'reconstructing', engine: 'colmap',
+        current, total: 90, unit: 'registeredImages', operation, stageProgress: estimate,
+        progress: 45 + estimate * .13, indeterminate: false,
+        message: current === 0 ? 'Registering initial image pair' : `已注册 ${current} 张图像`,
+      } as import('../types/pipeline').PipelineEvent);
+      await render(task({ stage: 'reconstructing', input_type: 'images', operation, current, total: 90,
+        unit: 'registeredImages', progress: estimate, estimated_progress: 45 + estimate * .13,
+        revision: index + 3, sequence: index + 1, recent_events: [...events] }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'en'
+        ? 'Rebuilding the captured scene. This step may take a while. Please wait.'
+        : '正在还原拍摄场景。此步骤可能耗时较长，请耐心等待');
+      expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe(`${estimate.toFixed(1)}%`);
+      expect(container.querySelector('.live-log')?.textContent).toContain('Registering initial image pair');
+      expect(events.at(-1)?.current).toBe(current);
+    }
+    await render(task({ stage: 'reconstructing', substage: 'panoramaReconstruction', current: 3, total: 90,
+      unit: 'registeredImages', progress: null, recent_events: [] }));
+    expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'en'
+      ? 'Current model: 3/90 original images registered. This step may take a while. Please wait.'
+      : '当前模型已注册 3/90 张原始画面。此步骤可能耗时较长，请耐心等待');
+  });
+
   it('allows a continuation without globally ready engines and closes the queue before starting', async () => {
     const before = vi.fn();
     await act(async () => root.render(<LanguageProvider><SharedTaskDetail task={task({ status: 'failed' })}
@@ -100,10 +209,12 @@ describe('restored shared task detail', () => {
         progress: 66, stageProgress: null, indeterminate: true },
     ] }));
     const lines = [...container.querySelectorAll('.live-log .log-line p')].map(line => line.textContent);
-    expect(lines).toEqual(locale === 'zh-CN' ? [rawFile, legacyStart, step, rawEvent] : [rawFile,
+    expect(lines).toEqual(locale === 'zh-CN' ? [legacyStart, step, rawEvent, rawFile] : [
       'Brush training started (using an available graphics backend) · 15000 iterations · max resolution 1920 · estimated about 100:05:09',
-      'Brush training · 1200/15000 steps', rawEvent,
+      'Brush training · 1200/15000 steps', rawEvent, rawFile,
     ]);
+    expect(container.querySelector('.legacy-source-log > summary')?.textContent).toBe('brush');
+    expect(container.querySelector('.legacy-source-log')?.hasAttribute('open')).toBe(false);
     expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'zh-CN'
       ? '正在生成高斯泼溅（1,200/15,000）。此步骤可能耗时较长，请耐心等待'
       : 'Generating Gaussian splats (1,200/15,000). This step may take a while. Please wait.');
@@ -367,7 +478,8 @@ describe('restored shared task detail', () => {
     expect(container.querySelector('.live-log')?.textContent).not.toContain('raw 0');
   });
 
-  it('keeps log rows stable during runtime-only updates and explains display truncation', async () => {
+  it('keeps log rows stable during runtime-only updates without a display-truncation notice', async () => {
+    mocks.logs.mockResolvedValue({ ...page(), activity_events: [], activity_journal_persisted: true });
     const events: import('../types/pipeline').PipelineEvent[] = [{ sequence: 1, timestamp: '2026-10-09T00:00:00Z',
       kind: 'log', level: 'info', stage: 'reconstructing', engine: 'colmap', progress: 50, stageProgress: null,
       indeterminate: true, message: 'registration detail', current: null, total: null, unit: null,
@@ -379,10 +491,42 @@ describe('restored shared task detail', () => {
         elapsed_ms: 60000 + index * 250, recent_events: events, dropped_event_count: 25 }));
       expect(format).not.toHaveBeenCalled();
       expect(container.querySelectorAll('.log-line')).toHaveLength(1);
-      expect(container.textContent).toContain('完整内容保存在项目日志中');
+      expect(container.textContent).not.toContain('完整内容保存在项目日志中');
       await render(task({ task_id: 'other-task', run_id: 'other-run' }));
       expect(container.textContent).not.toContain('完整内容保存在项目日志中');
     } finally { format.mockRestore(); }
+  });
+
+  it('does not claim complete disk history without a successful journal and scopes read failures to logs', async () => {
+    mocks.logs.mockRejectedValue(new Error('LOG_ACCESS_DENIED'));
+    await render(task({ dropped_event_count: 50, recent_events: [{ sequence: 1, kind: 'log', engine: 'system', message: 'useful line' } as import('../types/pipeline').PipelineEvent] }));
+    expect(container.querySelector('.live-log')?.textContent).toContain('useful line');
+    expect(container.textContent).toContain('日志暂时无法更新，正在重新读取');
+    expect(container.textContent).not.toContain('完整内容保存在项目日志中');
+    expect(container.querySelector('.inline-error')).toBeNull();
+    expect(container.querySelector('.current-message')?.textContent).not.toContain('LOG_ACCESS_DENIED');
+  });
+
+  it('shows completed legacy logs without treating an absent activity journal as a read failure', async () => {
+    mocks.logs.mockResolvedValue(page('saved legacy completion'));
+    await render(task({ status: 'completed', stage: 'completed', progress: 100, recent_events: [] }));
+    expect(container.querySelector('.legacy-source-log')?.textContent).toContain('saved legacy completion');
+    expect(container.querySelector('.live-process [role="status"]')).toBeNull();
+    expect(container.querySelector('.inline-error')).toBeNull();
+    // A real read error must remain visible even for a completed task.
+    mocks.logs.mockRejectedValueOnce(new Error('LOG_ACCESS_DENIED'));
+    await render(task({ task_id: 'other-completed', run_id: 'other-run', status: 'completed', stage: 'completed' }));
+    expect(container.querySelector('.live-process [role="status"]')).not.toBeNull();
+    expect(container.querySelector('.inline-error')).toBeNull();
+  });
+
+  it('keeps structured history when a task completes and does not duplicate engine text from the file page', async () => {
+    const event = { sequence: 3, taskId: 'agent-1', runId: 'run-1', timestamp: '2026-10-09T00:00:00Z', kind: 'log', engine: 'brush', message: 'repeated engine line' } as import('../types/pipeline').PipelineEvent;
+    mocks.logs.mockResolvedValue({ ...page('repeated engine line'), activity_events: [event], activity_journal_persisted: true });
+    await render(task({ recent_events: [event] }));
+    await render(task({ status: 'completed', stage: 'completed', recent_events: [] }));
+    expect([...container.querySelectorAll('.live-log .log-line p')].map(line => line.textContent)).toEqual(['repeated engine line']);
+    expect(container.querySelector('.legacy-source-log')).toBeNull();
   });
 
   it('ignores delayed log reads from another task/run after selection changes', async () => {

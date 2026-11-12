@@ -12,10 +12,12 @@ import { selectMaterialPaths,selectColmapDatabase,selectColmapFolder,classifyGen
 import { EngineStatusPopover } from '../components/EngineStatusPopover';
 import { isProgressEvent, stagePercent } from '../lib/progressState';
 import { TaskProgress } from "../components/TaskProgress";
+import { HistoricalTaskProgress } from '../components/HistoricalTaskProgress';
 import { taskIsActive } from "../types/tasks";
 import { SharedTaskDetail } from "../components/SharedTaskDetail";
 import { useSharedTasks } from "./useSharedTasks";
 import { useProgressMessage } from "./useProgressMessage";
+import { useTaskActivityLog } from './useTaskActivityLog';
 import { useGpsDetection } from './useGpsDetection';
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
@@ -415,6 +417,8 @@ export function App() {
     return [...store.events].reverse().find((event) => isProgressEvent(event) && !["failed", "cancelled"].includes(event.stage)) ?? null;
   }, [store.events, store.latestEvent]);
   const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime, progressEvent ?? undefined);
+  const liveActivity = useTaskActivityLog(selectedSharedTask ? null : store.liveTask?.task_id, store.liveTask?.run_id,
+    store.phase === 'running', store.events, locale);
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const queuedDrafts = useMemo(
     () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingEngines.length === 0),
@@ -2211,7 +2215,7 @@ export function App() {
   const historicalTaskProgress = selectedProject && projectDetail
     ? projectDetail.imported || projectDetail.stage == null || projectDetail.progress == null
       ? null
-      : <TaskProgress importedReconstruction={projectDetail.inputs?.importedReconstruction} progressKey={`project:${selectedProject.id}`} historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
+      : <HistoricalTaskProgress project={selectedProject} detail={projectDetail} />
     : null;
 
   const renderSharedNewRows = () => submittedNew.map(task => {
@@ -2369,7 +2373,7 @@ export function App() {
           </div> : detailErrorBanner}
         </section>}
 
-        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress importedReconstruction={store.liveTask?.imported_reconstruction||selectedDraft?.inputs?.mode==='colmap'||projectDetail?.inputs?.importedReconstruction} progressKey={store.liveTask ? `${store.liveTask.task_id}:${store.liveTask.run_id ?? 'pending'}` : progressEvent?.runId ? `${progressEvent.taskId}:${progressEvent.runId}` : `local:${runStartedAt.current}`} operationAttempt={progressEvent?.operation?.attempt} substage={progressEvent?.substage} status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.engine ?? "system", level: event.level, text: event.kind === "log" && event.engine !== "system" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
+        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress importedReconstruction={store.liveTask?.imported_reconstruction||selectedDraft?.inputs?.mode==='colmap'||projectDetail?.inputs?.importedReconstruction} progressKey={store.liveTask ? `${store.liveTask.task_id}:${store.liveTask.run_id ?? 'pending'}` : progressEvent?.runId ? `${progressEvent.taskId}:${progressEvent.runId}` : `local:${runStartedAt.current}`} operationAttempt={progressEvent?.operation?.attempt} substage={progressEvent?.substage} progressUnit={progressEvent?.unit} status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={liveActivity.logs} rawLogs={liveActivity.rawLogs} logsUnavailable={liveActivity.unavailable} logsTruncated={liveActivity.journalPersisted && liveActivity.truncated} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
 
 
       </section>

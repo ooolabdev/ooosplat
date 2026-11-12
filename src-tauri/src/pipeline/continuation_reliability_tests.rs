@@ -255,6 +255,9 @@ async fn prepared_transaction(fixture: &Fixture) -> PublicationTransaction {
 #[tokio::test]
 async fn legacy_candidate_continuation_does_not_count_two_days_of_stopped_time() {
     let mut fixture = fixture(false);
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events = captured.clone();
+    fixture.runner.events.emit = Arc::new(move |event| events.lock().unwrap().push(event));
     fixture.state.brush_complete = true;
     fixture.state.brush_training.legacy_dataset_identity =
         Some("saved-content-bound-dataset".into());
@@ -302,6 +305,18 @@ async fn legacy_candidate_continuation_does_not_count_two_days_of_stopped_time()
     assert_eq!(std::fs::read(&fixture.candidate).unwrap(), candidate);
     assert_eq!(std::fs::read(&result.final_ply).unwrap(), candidate);
     assert_no_engines(&fixture);
+    let events = captured.lock().unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.message.contains("即将启动训练")
+            || event.engine == Some(PipelineEngine::Brush)));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.message.starts_with("已发布 "))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -451,6 +466,7 @@ fn unified_groups(state: &mut PipelineStateFile) {
         inputs.sources.push(SourceCheckpoint {
             id: id.into(),
             identity: format!("saved-{id}"),
+            ordinary_image_preparation_version: None,
             camera_ids: vec![1],
             camera_assignment: None,
             projection: crate::video::panorama::VideoProjection::Perspective,

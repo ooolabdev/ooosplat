@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use image::{ColorType, DynamicImage, GrayImage, ImageReader, Luma};
+use image::{ColorType, DynamicImage, GenericImageView, GrayImage, ImageReader, Luma};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -233,6 +233,39 @@ pub fn prepare_scanned_image_sequence(
     observer: Option<ImagePreparationObserver>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PreparedImageSequence> {
+    prepare_scanned_image_sequence_with_preparation(
+        scan,
+        frames_dir,
+        colmap_frames_dir,
+        masks_dir,
+        naming,
+        observer,
+        cancellation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_scanned_image_sequence_with_preparation(
+    scan: ImageSequenceScan,
+    frames_dir: &Path,
+    colmap_frames_dir: &Path,
+    masks_dir: &Path,
+    naming: ImageSequenceNaming,
+    observer: Option<ImagePreparationObserver>,
+    cancellation: Option<&CancellationToken>,
+    ordinary_preparation: Option<u32>,
+) -> Result<PreparedImageSequence> {
+    let derived_sfm = match ordinary_preparation {
+        None => false,
+        Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION) => true,
+        Some(_) => {
+            return Err(SplatError::Process(
+                "Unsupported source image preparation policy".into(),
+            ))
+        }
+    };
+    let derivative_cancellation = cancellation.cloned().unwrap_or_default();
     let info = &scan.info;
     std::fs::create_dir_all(frames_dir)?;
     std::fs::create_dir_all(colmap_frames_dir)?;
@@ -258,7 +291,9 @@ pub fn prepare_scanned_image_sequence(
         ensure_not_cancelled(cancellation)?;
         let name = normalized_sequence_name(index, &image.path, prefix)?;
         link_or_copy(&image.path, &frames_dir.join(&name))?;
-        link_or_copy(&image.path, &colmap_frames_dir.join(&name))?;
+        if !derived_sfm || !image.has_alpha_channel {
+            link_or_copy(&image.path, &colmap_frames_dir.join(&name))?;
+        }
         names.push(name);
         reporter.report(ImagePreparationProgress {
             phase: ImagePreparationPhase::LinkingFrames,
@@ -278,7 +313,18 @@ pub fn prepare_scanned_image_sequence(
             ensure_not_cancelled(cancellation)?;
             let decoded = decode_image(&image.path)?;
             let transparent = has_native_transparency(&decoded);
-            write_alpha_mask(&decoded, &masks_dir.join(format!("{}.png", names[index])))?;
+            let mask = masks_dir.join(format!("{}.png", names[index]));
+            if derived_sfm {
+                write_ordinary_sfm_derivatives_from_source(
+                    Some(&image.path),
+                    &decoded,
+                    &colmap_frames_dir.join(&names[index]),
+                    &mask,
+                    &derivative_cancellation,
+                )?;
+            } else {
+                write_alpha_mask(&decoded, &mask)?;
+            }
             has_transparency |= transparent;
             completed += 1;
             reporter.report(ImagePreparationProgress {
@@ -313,7 +359,7 @@ pub fn prepare_scanned_image_sequence(
                     });
                 }
             }
-        } else {
+        } else if !derived_sfm {
             for (index, image) in scan.images.iter().enumerate() {
                 if image.has_alpha_channel {
                     ensure_not_cancelled(cancellation)?;
@@ -333,14 +379,15 @@ pub fn prepare_scanned_image_sequence(
         total: total_images,
         stage_progress: 0.95,
     });
-    let prepared = validate_named_sequence_with_cancellation(
+    let prepared = validate_image_sequence_with_preparation(
         frames_dir,
         colmap_frames_dir,
         masks_dir,
         info.image_count,
         has_transparency,
-        prefix,
+        naming,
         cancellation,
+        ordinary_preparation,
     )?;
     reporter.report(ImagePreparationProgress {
         phase: ImagePreparationPhase::Validating,
@@ -453,6 +500,88 @@ pub fn validate_prepared_image_names(
         has_alpha,
         None,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_image_sequence_with_preparation(
+    frames_dir: &Path,
+    colmap_frames_dir: &Path,
+    masks_dir: &Path,
+    expected_count: u64,
+    has_alpha: bool,
+    naming: ImageSequenceNaming,
+    cancellation: Option<&CancellationToken>,
+    ordinary_preparation: Option<u32>,
+) -> Result<PreparedImageSequence> {
+    let prefix = match naming {
+        ImageSequenceNaming::Primary => "frame_",
+        ImageSequenceNaming::Reshoot => "reshoot_",
+    };
+    if ordinary_preparation.is_none() {
+        return validate_named_sequence_with_cancellation(
+            frames_dir,
+            colmap_frames_dir,
+            masks_dir,
+            expected_count,
+            has_alpha,
+            prefix,
+            cancellation,
+        );
+    }
+    if ordinary_preparation != Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION) {
+        return Err(SplatError::Process(
+            "Unsupported source image preparation policy".into(),
+        ));
+    }
+    let named_images = |directory: &Path| -> Result<Vec<PathBuf>> {
+        Ok(list_images(directory)?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect())
+    };
+    let frames = named_images(frames_dir)?;
+    let colmap_frames = named_images(colmap_frames_dir)?;
+    if expected_count == 0
+        || frames.len() as u64 != expected_count
+        || colmap_frames.len() != frames.len()
+    {
+        return Err(SplatError::Process(
+            "Prepared image set does not match the saved image names".into(),
+        ));
+    }
+    let cancel = cancellation.cloned().unwrap_or_default();
+    let mut mask_count = 0;
+    for (frame, colmap_frame) in frames.iter().zip(&colmap_frames) {
+        ensure_not_cancelled(Some(&cancel))?;
+        if frame.file_name() != colmap_frame.file_name()
+            || std::fs::metadata(frame)?.len() == 0
+            || std::fs::metadata(colmap_frame)?.len() == 0
+        {
+            return Err(SplatError::Process(
+                "Prepared image set does not match the saved image names".into(),
+            ));
+        }
+        let name = frame
+            .file_name()
+            .ok_or_else(|| SplatError::InvalidPath(frame.clone()))?;
+        let mask = masks_dir.join(format!("{}.png", name.to_string_lossy()));
+        validate_ordinary_sfm_derivatives(frame, colmap_frame, &mask, &cancel)?;
+        match std::fs::metadata(&mask) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => mask_count += 1,
+            Ok(_) => return Err(SplatError::InvalidPath(mask)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !has_alpha => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(PreparedImageSequence {
+        image_count: frames.len() as u64,
+        mask_count,
+        has_alpha,
+    })
 }
 
 fn validate_named_sequence_with_cancellation(
@@ -648,6 +777,189 @@ pub(crate) fn has_native_transparency(image: &DynamicImage) -> bool {
     }
 }
 
+/// Separate SfM pixels from training pixels. This reproduces the original
+/// ordinary-photo recipe without applying Alpha twice to Brush's RGBA input.
+pub(crate) fn write_ordinary_sfm_derivatives(
+    decoded: &DynamicImage,
+    colmap_frame: &Path,
+    mask: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    write_ordinary_sfm_derivatives_with_metadata(decoded, colmap_frame, mask, cancel, None)
+}
+
+/// Retain camera metadata only when this PNG still uses the original pixel
+/// coordinates. Training frames and Alpha are unchanged and remain separate.
+pub(crate) fn write_ordinary_sfm_derivatives_from_source(
+    source: Option<&Path>,
+    decoded: &DynamicImage,
+    colmap_frame: &Path,
+    mask: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let metadata = source
+        .map(|source| {
+            super::png_camera_metadata::PngCameraMetadata::read(
+                source,
+                decoded.dimensions(),
+                cancel,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if metadata.is_none() {
+        return write_ordinary_sfm_derivatives(decoded, colmap_frame, mask, cancel);
+    }
+    write_ordinary_sfm_derivatives_with_metadata(decoded, colmap_frame, mask, cancel, metadata)
+}
+
+fn write_ordinary_sfm_derivatives_with_metadata(
+    decoded: &DynamicImage,
+    colmap_frame: &Path,
+    mask: &Path,
+    cancel: &CancellationToken,
+    metadata: Option<super::png_camera_metadata::PngCameraMetadata>,
+) -> Result<()> {
+    let (rgb, alpha) = ordinary_sfm_pixels(decoded, cancel)?;
+    for destination in [colmap_frame, mask] {
+        // A previous target can be a hard link to immutable source pixels.
+        // Always unlink the destination before encoding derived bytes.
+        match std::fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    ensure_not_cancelled(Some(cancel))?;
+    if let Some(metadata) = metadata {
+        metadata.encode(&rgb, colmap_frame, cancel)?;
+    } else {
+        rgb.save(colmap_frame).map_err(derivative_image_error)?;
+    }
+    ensure_not_cancelled(Some(cancel))?;
+    save_mask(&alpha, mask)?;
+    ensure_not_cancelled(Some(cancel))
+}
+
+fn derivative_image_error(error: image::ImageError) -> SplatError {
+    match error {
+        image::ImageError::IoError(error) => SplatError::Io(error),
+        error => SplatError::Process(error.to_string()),
+    }
+}
+
+fn ordinary_sfm_pixels(
+    image: &DynamicImage,
+    cancel: &CancellationToken,
+) -> Result<(DynamicImage, GrayImage)> {
+    let rgb = match image {
+        DynamicImage::ImageLumaA16(_) | DynamicImage::ImageRgba16(_) => {
+            let rgba = image.to_rgba16();
+            let mut rgb =
+                image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(rgba.width(), rgba.height());
+            for (y, row) in rgba.rows().enumerate() {
+                ensure_not_cancelled(Some(cancel))?;
+                for (x, pixel) in row.enumerate() {
+                    let alpha = u64::from(pixel[3]);
+                    rgb.put_pixel(
+                        x as u32,
+                        y as u32,
+                        image::Rgb([
+                            ((u64::from(pixel[0]) * alpha + 32_767) / 65_535) as u16,
+                            ((u64::from(pixel[1]) * alpha + 32_767) / 65_535) as u16,
+                            ((u64::from(pixel[2]) * alpha + 32_767) / 65_535) as u16,
+                        ]),
+                    );
+                }
+            }
+            DynamicImage::ImageRgb16(rgb)
+        }
+        _ => {
+            let rgba = image.to_rgba8();
+            let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+            for (y, row) in rgba.rows().enumerate() {
+                ensure_not_cancelled(Some(cancel))?;
+                for (x, pixel) in row.enumerate() {
+                    let alpha = u32::from(pixel[3]);
+                    rgb.put_pixel(
+                        x as u32,
+                        y as u32,
+                        image::Rgb([
+                            ((u32::from(pixel[0]) * alpha + 127) / 255) as u8,
+                            ((u32::from(pixel[1]) * alpha + 127) / 255) as u8,
+                            ((u32::from(pixel[2]) * alpha + 127) / 255) as u8,
+                        ]),
+                    );
+                }
+            }
+            DynamicImage::ImageRgb8(rgb)
+        }
+    };
+    ensure_not_cancelled(Some(cancel))?;
+    let rgba = image.to_rgba8();
+    let alpha = GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        Luma([rgba.get_pixel(x, y)[3]])
+    });
+    Ok((rgb, alpha))
+}
+
+/// Deep validation of a versioned ordinary-photo derivative. Legacy binary
+/// masks and videos retain their existing validator, never this soft rule.
+pub(crate) fn validate_ordinary_sfm_derivatives(
+    frame: &Path,
+    colmap_frame: &Path,
+    mask: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    ensure_not_cancelled(Some(cancel))?;
+    let header = super::image_projection::inspect(frame)?;
+    if !header.alpha {
+        validate_colmap_frame_copy(frame, colmap_frame)?;
+        return match std::fs::metadata(mask) {
+            Ok(_) => {
+                validate_binary_mask(mask, read_image_header(frame)?.0)?;
+                let alpha = ImageReader::open(mask)?
+                    .decode()
+                    .map_err(derivative_image_error)?
+                    .into_luma8();
+                if alpha.pixels().any(|pixel| pixel[0] != 255) {
+                    return Err(SplatError::Process(format!(
+                        "COLMAP 图片内容与原始准备帧不一致：{}",
+                        mask.display()
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    let decode = |path: &Path| -> Result<DynamicImage> {
+        let mut reader = ImageReader::open(path)?.with_guessed_format()?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(super::panorama::MAX_DECODE_BYTES);
+        reader.limits(limits);
+        reader.decode().map_err(derivative_image_error)
+    };
+    let decoded = decode(frame)?;
+    let (expected_rgb, expected_alpha) = ordinary_sfm_pixels(&decoded, cancel)?;
+    let rgb = decode(colmap_frame)?;
+    let alpha = decode(mask)?;
+    if rgb.color() != expected_rgb.color()
+        || rgb.dimensions() != expected_rgb.dimensions()
+        || rgb.into_bytes() != expected_rgb.into_bytes()
+        || alpha.color() != ColorType::L8
+        || alpha.dimensions() != expected_alpha.dimensions()
+        || alpha.into_luma8() != expected_alpha
+    {
+        return Err(SplatError::Process(format!(
+            "COLMAP 图片内容与原始准备帧不一致：{}",
+            colmap_frame.display()
+        )));
+    }
+    ensure_not_cancelled(Some(cancel))
+}
+
 pub(crate) fn validate_colmap_frame_copy(frame: &Path, colmap_frame: &Path) -> Result<()> {
     if read_image_header(frame)?.0 != read_image_header(colmap_frame)?.0 {
         return Err(SplatError::Process(format!(
@@ -838,6 +1150,128 @@ pub(crate) fn natural_cmp(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_sfm_recipe_preserves_training_rgba_and_soft_alpha_at_both_bit_depths() {
+        for depth in [8, 16] {
+            let root = tempfile::tempdir().unwrap();
+            let frame = root.path().join("frame.png");
+            let rgb = root.path().join("sfm.png");
+            let mask = root.path().join("mask.png");
+            let image = if depth == 16 {
+                let alpha = [0, 1, 16_384, 32_767, 32_768, 65_534, 65_535];
+                DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(7, 2, |x, _| {
+                    image::Rgba([60_001, 32_769, 101, alpha[x as usize]])
+                }))
+            } else {
+                let alpha = [0, 1, 64, 127, 128, 254, 255];
+                DynamicImage::ImageRgba8(image::RgbaImage::from_fn(7, 2, |x, _| {
+                    image::Rgba([201, 129, 17, alpha[x as usize]])
+                }))
+            };
+            image.save(&frame).unwrap();
+            let original = std::fs::read(&frame).unwrap();
+            std::fs::hard_link(&frame, &rgb).unwrap();
+            let cancel = CancellationToken::new();
+            write_ordinary_sfm_derivatives(&image, &rgb, &mask, &cancel).unwrap();
+            assert_eq!(std::fs::read(&frame).unwrap(), original);
+            validate_ordinary_sfm_derivatives(&frame, &rgb, &mask, &cancel).unwrap();
+            assert_eq!(
+                ImageReader::open(&rgb).unwrap().decode().unwrap().color(),
+                if depth == 16 {
+                    ColorType::Rgb16
+                } else {
+                    ColorType::Rgb8
+                }
+            );
+            let alpha = image::open(&mask).unwrap().into_luma8();
+            assert_eq!(alpha.get_pixel(3, 0)[0], 127);
+            assert!(validate_binary_mask(&mask, (7, 2)).is_err());
+            if depth == 16 {
+                let pixels = image::open(&rgb).unwrap().into_rgb16();
+                assert_eq!(
+                    pixels.get_pixel(4, 0)[0],
+                    ((60_001_u64 * 32_768 + 32_767) / 65_535) as u16
+                );
+                assert_eq!(pixels.get_pixel(6, 0)[0], 60_001);
+            } else {
+                let pixels = image::open(&rgb).unwrap().into_rgb8();
+                assert_eq!(
+                    pixels.get_pixel(4, 0)[0],
+                    ((201_u32 * 128 + 127) / 255) as u8
+                );
+                assert_eq!(pixels.get_pixel(6, 0)[0], 201);
+            }
+            let mut broken = alpha;
+            broken.put_pixel(3, 0, Luma([255]));
+            broken.save(&mask).unwrap();
+            assert!(validate_ordinary_sfm_derivatives(&frame, &rgb, &mask, &cancel).is_err());
+            assert_eq!(std::fs::read(&frame).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn cancelled_ordinary_sfm_preparation_does_not_overwrite_linked_originals() {
+        let root = tempfile::tempdir().unwrap();
+        let frame = root.path().join("frame.png");
+        let rgb = root.path().join("sfm.png");
+        let mask = root.path().join("mask.png");
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([201, 32, 10, 1]),
+        ));
+        image.save(&frame).unwrap();
+        std::fs::hard_link(&frame, &rgb).unwrap();
+        let before = std::fs::read(&frame).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            write_ordinary_sfm_derivatives(&image, &rgb, &mask, &token),
+            Err(SplatError::Cancelled)
+        ));
+        assert_eq!(std::fs::read(&frame).unwrap(), before);
+        assert_eq!(std::fs::read(&rgb).unwrap(), before);
+        assert!(!mask.exists());
+    }
+
+    #[test]
+    #[ignore = "requires explicit source/reference folders; reads two real photos and writes only its temporary derivatives"]
+    fn real_ordinary_sfm_derivatives_match_historical_success_pixels() {
+        let source = PathBuf::from(
+            std::env::var_os("OOOSPLAT_ORDINARY_SFM_COMPARE_SOURCE").expect("source folder"),
+        );
+        let reference = PathBuf::from(
+            std::env::var_os("OOOSPLAT_ORDINARY_SFM_COMPARE_REFERENCE").expect("reference project"),
+        );
+        let files = list_images(&source).unwrap();
+        let historical = list_images(&reference.join("work/colmap_frames")).unwrap();
+        assert_eq!(files.len(), historical.len());
+        for index in [0, files.len() - 1] {
+            let root = tempfile::tempdir().unwrap();
+            let image = image::open(&files[index]).unwrap();
+            let original = std::fs::read(&files[index]).unwrap();
+            let rgb = root.path().join("sfm.png");
+            let mask = root.path().join("mask.png");
+            let cancel = CancellationToken::new();
+            write_ordinary_sfm_derivatives(&image, &rgb, &mask, &cancel).unwrap();
+            let output = image::open(&rgb).unwrap();
+            let expected = image::open(&historical[index]).unwrap();
+            assert_eq!(output.color(), expected.color());
+            assert_eq!(output.dimensions(), expected.dimensions());
+            assert_eq!(output.into_bytes(), expected.into_bytes());
+            let historical_mask = reference.join("work/masks").join(format!(
+                "{}.png",
+                historical[index].file_name().unwrap().to_string_lossy()
+            ));
+            assert_eq!(
+                image::open(&mask).unwrap().into_luma8(),
+                image::open(&historical_mask).unwrap().into_luma8()
+            );
+            assert_eq!(std::fs::read(&files[index]).unwrap(), original);
+            eprintln!("ordinary SfM real source/reference pixels match at index={index}");
+        }
+    }
     use image::{ColorType, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
 
     fn write_rgba(path: &Path, alpha: u8) {
@@ -1051,6 +1485,151 @@ mod tests {
         assert!(!prepared.has_alpha);
         assert_eq!(prepared.mask_count, 0);
         assert!(frames.path().join("frame_000002.png").is_file());
+    }
+
+    #[test]
+    fn versioned_sequence_preparation_preserves_source_and_writes_soft_derivatives() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        for name in ["1.png", "2.png"] {
+            RgbaImage::from_pixel(2, 1, Rgba([200, 100, 50, 127]))
+                .save(source.path().join(name))
+                .unwrap();
+        }
+        let original = std::fs::read(source.path().join("1.png")).unwrap();
+        // A stale linked SfM file must be unlinked before derivative encoding.
+        std::fs::hard_link(
+            source.path().join("1.png"),
+            colmap_frames.path().join("frame_000001.png"),
+        )
+        .unwrap();
+        let policy = Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION);
+        let prepared = prepare_scanned_image_sequence_with_preparation(
+            scan_image_sequence(source.path(), None).unwrap(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            ImageSequenceNaming::Primary,
+            None,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(prepared.image_count, 2);
+        assert_eq!(prepared.mask_count, 2);
+        assert!(prepared.has_alpha);
+        assert_eq!(
+            std::fs::read(source.path().join("1.png")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(frames.path().join("frame_000001.png")).unwrap(),
+            original
+        );
+        let rgb = image::open(colmap_frames.path().join("frame_000001.png")).unwrap();
+        assert_eq!(rgb.color(), ColorType::Rgb8);
+        assert_eq!(rgb.to_rgb8().get_pixel(0, 0).0, [100, 50, 25]);
+        let mask = masks.path().join("frame_000001.png.png");
+        assert_eq!(
+            image::open(&mask).unwrap().to_luma8().get_pixel(0, 0)[0],
+            127
+        );
+        assert!(validate_prepared_image_sequence(
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            2,
+            true,
+        )
+        .is_err());
+        GrayImage::from_pixel(2, 1, Luma([128])).save(mask).unwrap();
+        assert!(validate_image_sequence_with_preparation(
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            2,
+            true,
+            ImageSequenceNaming::Primary,
+            None,
+            policy,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn versioned_opaque_alpha_keeps_mask_without_enabling_transparency() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        for name in ["1.png", "2.png"] {
+            write_rgba(&source.path().join(name), 255);
+        }
+        let policy = Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION);
+        let prepared = prepare_scanned_image_sequence_with_preparation(
+            scan_image_sequence(source.path(), None).unwrap(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            ImageSequenceNaming::Reshoot,
+            None,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert!(!prepared.has_alpha);
+        assert_eq!(prepared.mask_count, 2);
+        assert_eq!(
+            validate_image_sequence_with_preparation(
+                frames.path(),
+                colmap_frames.path(),
+                masks.path(),
+                2,
+                false,
+                ImageSequenceNaming::Reshoot,
+                None,
+                policy,
+            )
+            .unwrap(),
+            prepared
+        );
+    }
+
+    #[test]
+    fn versioned_sequence_without_policy_retains_legacy_rgba_and_binary_masks() {
+        let source = tempfile::tempdir().unwrap();
+        let frames = tempfile::tempdir().unwrap();
+        let colmap_frames = tempfile::tempdir().unwrap();
+        let masks = tempfile::tempdir().unwrap();
+        for name in ["1.png", "2.png"] {
+            write_rgba(&source.path().join(name), 127);
+        }
+        let original = std::fs::read(source.path().join("1.png")).unwrap();
+        let prepared = prepare_scanned_image_sequence_with_preparation(
+            scan_image_sequence(source.path(), None).unwrap(),
+            frames.path(),
+            colmap_frames.path(),
+            masks.path(),
+            ImageSequenceNaming::Primary,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(prepared.has_alpha);
+        assert_eq!(
+            std::fs::read(colmap_frames.path().join("frame_000001.png")).unwrap(),
+            original
+        );
+        assert_eq!(
+            image::open(masks.path().join("frame_000001.png.png"))
+                .unwrap()
+                .to_luma8()
+                .get_pixel(0, 0)[0],
+            0
+        );
     }
 
     #[test]

@@ -462,6 +462,14 @@ impl From<&FramePlan> for FrameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineStateFile {
+    /// Frozen SfM image derivation. Missing means historical prepared pixels
+    /// and masks must retain their original interpretation on continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_image_preparation_version: Option<u32>,
+    /// Frozen camera initialization policy. Historical checkpoints keep their
+    /// original per-photo grouping when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_grouping_policy_version: Option<u32>,
     /// Missing on historical tasks; never expand their BA scope on continue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ba_policy_version: Option<u32>,
@@ -581,6 +589,8 @@ impl PipelineStateFile {
     pub fn created_for(preset: Quality, input_type: ProjectInputType) -> Self {
         Self {
             validated_output: None,
+            ordinary_image_preparation_version: None,
+            camera_grouping_policy_version: None,
             ba_policy_version: None,
             artifact_manifests: Default::default(),
             inputs: None,
@@ -617,6 +627,34 @@ impl PipelineStateFile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_preparation_is_optional_and_round_trips_without_reinterpreting_old_state() {
+        let mut state = super::PipelineStateFile::created(crate::presets::Quality::Fast);
+        let legacy = serde_json::to_value(&state).unwrap();
+        assert!(legacy.get("ordinaryImagePreparationVersion").is_none());
+        let restored: super::PipelineStateFile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.ordinary_image_preparation_version, None);
+        state.ordinary_image_preparation_version =
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION);
+        let restored: super::PipelineStateFile =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.ordinary_image_preparation_version, Some(1));
+    }
+
+    #[test]
+    fn camera_grouping_policy_is_optional_and_round_trips_without_a_schema_migration() {
+        let mut state = super::PipelineStateFile::created(crate::presets::Quality::Balanced);
+        let legacy = serde_json::to_value(&state).unwrap();
+        assert!(legacy.get("cameraGroupingPolicyVersion").is_none());
+        let restored: super::PipelineStateFile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.camera_grouping_policy_version, None);
+        state.camera_grouping_policy_version =
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
+        let restored: super::PipelineStateFile =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.camera_grouping_policy_version, Some(1));
+    }
+
     #[test]
     fn missing_ba_scope_remains_legacy_without_a_schema_migration() {
         let state = super::PipelineStateFile::created(crate::presets::Quality::Balanced);

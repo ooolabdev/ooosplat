@@ -242,6 +242,9 @@ export interface AppRuntimeStatus {
 
 export interface ProjectTaskLogLine { source: string; message: string; }
 export interface ProjectTaskDetail {
+  activityEvents?: PipelineEvent[] | null;
+  activityJournalPersisted?: boolean;
+  logsUnavailable?: boolean;
   inputs?:import('./inputs').SavedInputs|null;
   generationPolicy?: GenerationPolicy | null;
   automaticallyRetried?: boolean;

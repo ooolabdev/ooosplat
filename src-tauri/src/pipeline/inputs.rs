@@ -20,11 +20,21 @@ use std::{
 
 pub const DUPLICATE: &str = "素材存在重复输入，请移除重复项。";
 pub const INVALID_COLMAP: &str = "COLMAP 数据不完整或与图片不匹配，无法直接训练。";
+/// New sources share intrinsics within a same-sized image set. Missing on old
+/// work orders: their saved per-image camera grouping remains authoritative.
+pub const CAMERA_GROUPING_POLICY_VERSION: u32 = 1;
+/// Ordinary photo SfM derivatives use precision-preserving premultiplied RGB
+/// and the original soft Alpha mask. Training pixels remain unchanged.
+pub const ORDINARY_IMAGE_PREPARATION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputCheckpoint {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_grouping_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_image_preparation_version: Option<u32>,
     pub request: GenerationInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_plan: Option<super::execution_plan::ExecutionPlan>,
@@ -80,6 +90,8 @@ impl InputCheckpoint {
     pub fn new(request: GenerationInputs) -> Self {
         Self {
             version: 1,
+            camera_grouping_policy_version: None,
+            ordinary_image_preparation_version: None,
             request,
             execution_plan: None,
             sources: vec![],
@@ -281,6 +293,10 @@ pub fn source_adoption_warning(checkpoint: &InputCheckpoint) -> Option<String> {
 pub struct SourceCheckpoint {
     pub id: String,
     pub identity: String,
+    /// Frozen preparation semantics for this source, not the newest task's
+    /// default. Historical source snapshots retain their original policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_image_preparation_version: Option<u32>,
     #[serde(default)]
     pub camera_ids: Vec<u32>,
     #[serde(default)]
@@ -406,6 +422,24 @@ pub async fn validate(
     quality: Quality,
     policy: GenerationPolicy,
 ) -> Result<()> {
+    validate_for_camera_policy(
+        engines,
+        inputs,
+        quality,
+        policy,
+        Some(CAMERA_GROUPING_POLICY_VERSION),
+    )
+    .await
+}
+
+pub async fn validate_for_camera_policy(
+    engines: &EnginePaths,
+    inputs: &GenerationInputs,
+    quality: Quality,
+    policy: GenerationPolicy,
+    camera_policy: Option<u32>,
+) -> Result<()> {
+    validate_camera_policy_version(camera_policy)?;
     if policy.frame_sampling_ratio.is_some()
         && !matches!(inputs,GenerationInputs::Materials{items} if items.len()==1&&matches!(items[0].source,InputSource::Video{..}))
     {
@@ -424,6 +458,7 @@ pub async fn validate(
                 ));
             }
             let a = inspect_material(engines, item, quality, policy).await?;
+            validate_camera_grouping_analysis(item, &a, camera_policy)?;
             projection(item, &a)?;
             if let Some(images) = a.image_sequence {
                 if (images.image_count < 30 && !item.confirmed_small_images)
@@ -746,6 +781,91 @@ pub async fn inspect_material(
     Ok(value)
 }
 
+/// New-input admission only. Existing work orders may still contain the
+/// earlier independent-camera image sets, including mixed pixel dimensions.
+pub async fn inspect_new_material(
+    engines: &EnginePaths,
+    item: &MaterialInput,
+    quality: Quality,
+    policy: GenerationPolicy,
+) -> Result<MaterialAnalysis> {
+    let analysis = inspect_material(engines, item, quality, policy).await?;
+    validate_camera_grouping_analysis(item, &analysis, Some(CAMERA_GROUPING_POLICY_VERSION))?;
+    Ok(analysis)
+}
+
+pub fn validate_camera_grouping_analysis(
+    item: &MaterialInput,
+    analysis: &MaterialAnalysis,
+    camera_policy: Option<u32>,
+) -> Result<()> {
+    validate_camera_policy_version(camera_policy)?;
+    if camera_policy != Some(CAMERA_GROUPING_POLICY_VERSION)
+        || analysis.image_sequence.is_none()
+        || analysis.dimensions.len() <= 1
+    {
+        return Ok(());
+    }
+    // The cached bounded-header analysis already found a mismatch. Only this
+    // rejected path rereads enough headers to use the existing precise error
+    // (file and actual/expected dimensions), not a new generic UI message.
+    let files = item.source.members()?;
+    let first = files
+        .first()
+        .ok_or_else(|| SplatError::Process("INPUT_CHANGED".into()))?;
+    let expected = crate::video::image_projection::inspect(first)?;
+    for file in files.iter().skip(1) {
+        let image = crate::video::image_projection::inspect(file)?;
+        if (image.width, image.height) != (expected.width, expected.height) {
+            return Err(SplatError::InvalidVideo(format!(
+                "图片序列分辨率不一致：{} 为 {}×{}，预期 {}×{}",
+                file.display(),
+                image.width,
+                image.height,
+                expected.width,
+                expected.height,
+            )));
+        }
+    }
+    Err(SplatError::Process("INPUT_CHANGED".into()))
+}
+
+/// Final creation guard for transports that did not perform GUI/MCP
+/// inspection. Image analysis is cached; videos never launch FFprobe here.
+pub async fn validate_camera_grouping_inputs(
+    inputs: &GenerationInputs,
+    quality: Quality,
+    policy: GenerationPolicy,
+    camera_policy: Option<u32>,
+) -> Result<()> {
+    validate_camera_policy_version(camera_policy)?;
+    if camera_policy != Some(CAMERA_GROUPING_POLICY_VERSION) {
+        return Ok(());
+    }
+    if let GenerationInputs::Materials { items } = inputs {
+        let engines = crate::pipeline::runner::default_engine_paths(None);
+        for item in items {
+            if matches!(&item.source, InputSource::Video { .. }) {
+                continue;
+            }
+            let analysis = inspect_material(&engines, item, quality, policy).await?;
+            validate_camera_grouping_analysis(item, &analysis, camera_policy)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_camera_policy_version(version: Option<u32>) -> Result<()> {
+    if let Some(version) = version {
+        if version != CAMERA_GROUPING_POLICY_VERSION {
+            return Err(SplatError::Process(format!(
+                "Unsupported camera grouping policy version: {version}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn projection(item: &MaterialInput, analysis: &MaterialAnalysis) -> Result<VideoProjection> {
     use VideoProjection::*;
     let d = &analysis.projection_detection;
@@ -939,7 +1059,7 @@ mod tests {
         assert_eq!(range.maximum.retention_ratio, 1.);
     }
     #[tokio::test]
-    async fn shared_image_preflight_accepts_mixed_sizes_and_replans_without_reading_headers() {
+    async fn legacy_image_preflight_accepts_mixed_sizes_and_replans_without_reading_headers() {
         let root = tempfile::tempdir().unwrap();
         images(root.path(), 3);
         image::RgbImage::new(48, 64)
@@ -971,6 +1091,107 @@ mod tests {
             crate::video::image_projection::header_reads_for_test(root.path()),
             reads
         );
+    }
+    #[tokio::test]
+    async fn new_image_admission_rejects_mixed_dimensions_but_saved_legacy_policy_remains_valid() {
+        let root = tempfile::tempdir().unwrap();
+        images(root.path(), 3);
+        image::RgbImage::new(48, 64)
+            .save(root.path().join("image1.png"))
+            .unwrap();
+        let engines =
+            crate::pipeline::runner::default_engine_paths(Some(root.path().join("missing")));
+        let mut input = item(root.path());
+        input.confirmed_small_images = true;
+        let error =
+            inspect_new_material(&engines, &input, Quality::Fast, GenerationPolicy::default())
+                .await
+                .err()
+                .expect("mixed image dimensions must be rejected")
+                .to_string();
+        assert!(error.contains("图片序列分辨率不一致"), "{error}");
+        assert!(error.contains("image1.png") && error.contains("48×64") && error.contains("32×24"));
+        let request = GenerationInputs::Materials { items: vec![input] };
+        assert!(validate(
+            &engines,
+            &request,
+            Quality::High,
+            GenerationPolicy::default()
+        )
+        .await
+        .is_err());
+        validate_for_camera_policy(
+            &engines,
+            &request,
+            Quality::High,
+            GenerationPolicy::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn separate_same_sized_sources_may_have_different_dimensions_without_extra_header_scans()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        images(&first, 2);
+        images(&second, 2);
+        for index in 0..2 {
+            image::RgbImage::new(64, 48)
+                .save(second.join(format!("image{index}.png")))
+                .unwrap();
+        }
+        let engines =
+            crate::pipeline::runner::default_engine_paths(Some(root.path().join("missing")));
+        let mut one = item(&first);
+        one.confirmed_small_images = true;
+        let mut two = item(&second);
+        two.id = "second".into();
+        two.confirmed_small_images = true;
+        for input in [&one, &two] {
+            inspect_new_material(&engines, input, Quality::Fast, GenerationPolicy::default())
+                .await
+                .unwrap();
+        }
+        let reads = [first.as_path(), second.as_path()]
+            .map(crate::video::image_projection::header_reads_for_test);
+        let request = GenerationInputs::Materials {
+            items: vec![one, two],
+        };
+        validate(
+            &engines,
+            &request,
+            Quality::High,
+            GenerationPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            [first.as_path(), second.as_path()]
+                .map(crate::video::image_projection::header_reads_for_test),
+            reads
+        );
+    }
+    #[test]
+    fn absent_camera_policy_keeps_legacy_checkpoint_identity_and_unknown_versions_are_rejected() {
+        let mut checkpoint = InputCheckpoint::new(GenerationInputs::Materials { items: vec![] });
+        let old = serde_json::to_value(&checkpoint).unwrap();
+        assert!(old.get("cameraGroupingPolicyVersion").is_none());
+        assert_eq!(
+            serde_json::from_value::<InputCheckpoint>(old)
+                .unwrap()
+                .camera_grouping_policy_version,
+            None
+        );
+        checkpoint.camera_grouping_policy_version = Some(CAMERA_GROUPING_POLICY_VERSION);
+        let new = serde_json::to_value(&checkpoint).unwrap();
+        assert_eq!(
+            new["cameraGroupingPolicyVersion"],
+            CAMERA_GROUPING_POLICY_VERSION
+        );
+        assert!(validate_camera_policy_version(Some(2)).is_err());
     }
     #[test]
     fn image_members_are_natural_sorted_identity_bound_and_overlap_checked() {

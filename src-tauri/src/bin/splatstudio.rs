@@ -269,7 +269,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     if video_projection != ooo_splat::video::panorama::VideoProjection::Auto {
                         item.projection = video_projection;
                     }
-                    let a = inspect_material(&engines, item, quality, policy).await?;
+                    let a = inspect_new_material(&engines, item, quality, policy).await?;
                     item.identity = Some(a.identity.clone());
                     if !a.projection_detection.requires_choice
                         && item.projection == ooo_splat::video::panorama::VideoProjection::Auto
@@ -429,6 +429,81 @@ fn ensure_engine(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod input_admission_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "Requires the original 90-photo Fast validation project, pinned native engines and GPU; continues only its isolated task"]
+    async fn real_original_ordinary_alpha_fast_validation_continue() {
+        let root = PathBuf::from(
+            std::env::var_os("OOOSPLAT_ORDINARY_FAST_VALIDATION_ROOT")
+                .expect("OOOSPLAT_ORDINARY_FAST_VALIDATION_ROOT is required"),
+        );
+        let expected_base = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("experiments"),
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        assert!(root.starts_with(&expected_base));
+        assert_eq!(root.file_name().unwrap(), "projects");
+        assert!(root
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ordinary-alpha-fast-full-"));
+        let registry = root.join(".cli-task-records");
+        let _owner = ooo_splat::tasks::cli_guard::claim(&registry).unwrap();
+        let service = ooo_splat::tasks::TaskService::at(registry)
+            .with_run_lock(ooo_splat::tasks::TaskService::desktop_execution_lock().unwrap());
+        let tasks = service.all().await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "The real-input fixture must contain exactly one isolated task"
+        );
+        let saved = &tasks[0];
+        let id = saved.task_id;
+        assert_eq!(saved.quality, Quality::Fast);
+        assert!(saved.project_id.is_some());
+        assert_eq!(saved.ordinary_image_preparation_version, Some(1));
+        let engines = default_engine_paths(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/engines"),
+        ));
+        let receipt = service
+            .continue_identified(id, saved.run_id.unwrap(), engines, None)
+            .await
+            .unwrap();
+        let mut sequence = 0;
+        loop {
+            let task = service.get(id).await.unwrap();
+            assert_eq!(task.run_id, receipt.run_id);
+            for event in task
+                .recent_events
+                .iter()
+                .filter(|event| event.sequence > sequence)
+            {
+                eprintln!(
+                    "{:>6.2}% {:?}: {}",
+                    event.progress, event.stage, event.message
+                );
+            }
+            sequence = task.sequence;
+            if !task.status.active() && service.execution_settled(task.run_id) {
+                assert_eq!(
+                    task.status,
+                    ooo_splat::tasks::TaskStatus::Completed,
+                    "{:?}",
+                    task.error
+                );
+                println!("{}", serde_json::to_string_pretty(&task.result).unwrap());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
 
     #[tokio::test]
     async fn new_colmap_flags_and_manifest_are_rejected_before_engine_or_task_work() {

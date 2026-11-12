@@ -97,6 +97,55 @@ describe('shared task synchronization', () => {
     expect(latest.tasks['task-1'].status).toBe('interrupted');
   });
 
+  it('merges snapshot and notification history behind the live watermark without reverting terminal state', async () => {
+    mocks.get.mockResolvedValue([{ ...task(20), sequence: 20, recent_events: [event(20)] }]);
+    await act(async () => root.render(<Harness />));
+    await act(async () => handler({ task: { ...task(21, 'completed'), sequence: 21, recent_events: [event(18)] }, events: [event(21)], dropped_event_count: 0 }));
+    mocks.get.mockResolvedValue([{ ...task(19), sequence: 19, recent_events: [event(17), event(19)] }]);
+    await act(async () => latest.refreshTasks());
+    expect(latest.tasks['task-1'].status).toBe('completed');
+    expect(latest.tasks['task-1'].recent_events.map(value => value.sequence)).toEqual([17, 18, 19, 20, 21]);
+    expect(useAppStore.getState().phase).toBe('completed');
+    expect(useAppStore.getState().events.map(value => value.sequence)).toEqual([17, 18, 19, 20, 21]);
+    expect(useAppStore.getState().lastEventSequence).toBe(21);
+  });
+
+  it('restores global feature counts and does not let a late group or prior run reset the current source', async () => {
+    const feature = (sequence: number, current: number, operationId: number, sourceId: string, kind: PipelineEvent['kind'] = 'progress'): PipelineEvent => ({
+      ...event(sequence), kind, stage: 'extractingFeatures', unit: 'images', current, total: 90,
+      operation: { id: operationId, attempt: 1, sourceId },
+    });
+    const snapshot = { ...task(10), sequence: 100, stage: 'extractingFeatures', current: 44, total: 90,
+      unit: 'images', operation: { id: 44, attempt: 1, sourceId: 'images' },
+    } as SharedTask;
+    mocks.get.mockResolvedValue([snapshot]);
+    await act(async () => root.render(<Harness />));
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: 44, total: 90, operation: { id: 44, attempt: 1 } });
+    const running = { ...snapshot, revision: 11, sequence: 102, current: 45,
+      operation: { id: 45, attempt: 1, sourceId: 'images' },
+    };
+    await act(async () => handler({ task: running, events: [feature(101, 44, 45, 'images', 'stage'), feature(102, 45, 45, 'images')], dropped_event_count: 0 }));
+    mocks.get.mockResolvedValue([{ ...snapshot, revision: 9, sequence: 90, current: 1,
+      operation: { id: 1, attempt: 1, sourceId: 'old-video' }, recent_events: [feature(90, 1, 1, 'old-video')],
+    }]);
+    await act(async () => latest.refreshTasks());
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: 45, total: 90, operation: { id: 45, sourceId: 'images' } });
+    expect(useAppStore.getState().lastEventSequence).toBe(102);
+    expect(useAppStore.getState().events.map(value => value.sequence)).toEqual([90, 101, 102]);
+    const nextSource = { ...running, revision: 12, sequence: 103, operation: { id: 46, attempt: 1, sourceId: 'video-b' } };
+    await act(async () => handler({ task: nextSource, events: [feature(103, 45, 46, 'video-b', 'stage')], dropped_event_count: 0 }));
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: 45, total: 90, operation: { id: 46, attempt: 1, sourceId: 'video-b' } });
+
+    const continued = { ...task(20, 'running', 'run-2'), sequence: 1, stage: 'extractingFeatures',
+      current: 0, total: 18, unit: 'images', operation: { id: 1, attempt: 1, sourceId: 'video-b:bridge' },
+    } as SharedTask;
+    await act(async () => handler({ task: continued, events: [{ ...feature(1, 0, 1, 'video-b:bridge', 'stage'), runId: 'run-2', total: 18 }], dropped_event_count: 0 }));
+    await act(async () => handler({ task: { ...running, revision: 11 }, events: [feature(104, 90, 47, 'old-video')], dropped_event_count: 0 }));
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: 0, total: 18, operation: { id: 1, attempt: 1 } });
+    expect(useAppStore.getState().liveTask?.run_id).toBe('run-2');
+    expect(useAppStore.getState().events.map(value => value.sequence)).toEqual([1]);
+  });
+
   it('reconciles an existing live run to a terminal snapshot after remounting the page', async () => {
     useAppStore.setState({ phase: 'running', liveTask: { task_id: 'task-1', run_id: 'run-1', status: 'running',
       elapsed_ms: 10_000, updated_at: '2026-10-09T00:00:00Z' } });

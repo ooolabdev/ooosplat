@@ -93,12 +93,17 @@ async fn ba_scope_is_frozen_before_project_creation_and_old_reservations_keep_th
             task.ba_policy_version,
             Some(crate::pipeline::ba_policy::VERSION)
         );
-        service
-            .records()
-            .tasks
-            .get_mut(&task.task_id)
-            .unwrap()
-            .ba_policy_version = version;
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.ba_policy_version = version;
+            // Isolate the pre-camera-policy reservation bytes in this BA
+            // compatibility test. Camera policy has its own regression below.
+            saved.camera_grouping_policy_version = None;
+            sync_saved_camera_grouping_policy(&mut saved.request_parameters, None).unwrap();
+            saved.ordinary_image_preparation_version = None;
+            sync_saved_ordinary_image_preparation(&mut saved.request_parameters, None).unwrap();
+        }
         *service.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
             Box::pin(async move {
                 assert_eq!(execution.ba_policy_version, version);
@@ -150,6 +155,319 @@ async fn ba_scope_is_frozen_before_project_creation_and_old_reservations_keep_th
         let stopped = restored.wait(task.task_id).await.unwrap();
         assert_eq!(stopped.ba_policy_version, version);
         assert_eq!(stopped.creation_intent, original_intent);
+    }
+}
+
+#[tokio::test]
+async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_policy() {
+    let (root, service, task) = fixture().await;
+    assert_eq!(task.camera_grouping_policy_version, Some(1));
+    assert_eq!(task.ordinary_image_preparation_version, Some(1));
+    assert_eq!(
+        task.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
+        1
+    );
+    assert_eq!(
+        task.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
+        1
+    );
+    let mut request = task.request_parameters.clone().unwrap();
+    request["cameraGroupingPolicyVersion"] = Value::from(999);
+    request["ordinaryImagePreparationVersion"] = Value::from(999);
+    let same = service
+        .create(
+            None,
+            task.input_path.clone(),
+            task.quality,
+            task.projects_root.clone(),
+            true,
+            "gui",
+            task.client_request_id.clone(),
+            Some(request.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.task_id, task.task_id);
+    assert_eq!(same.camera_grouping_policy_version, Some(1));
+    assert_eq!(same.ordinary_image_preparation_version, Some(1));
+
+    let new = service
+        .create(
+            None,
+            task.input_path.clone(),
+            task.quality,
+            task.projects_root.clone(),
+            true,
+            "gui",
+            Some("new-camera-request".into()),
+            Some(request.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(new.camera_grouping_policy_version, Some(1));
+    assert_eq!(new.ordinary_image_preparation_version, Some(1));
+    assert_eq!(
+        new.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
+        1
+    );
+    assert_eq!(
+        new.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
+        1
+    );
+
+    let legacy = {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.camera_grouping_policy_version = None;
+        sync_saved_camera_grouping_policy(&mut saved.request_parameters, None).unwrap();
+        saved.ordinary_image_preparation_version = None;
+        sync_saved_ordinary_image_preparation(&mut saved.request_parameters, None).unwrap();
+        saved.clone()
+    };
+    let bytes = serde_json::to_value(&legacy).unwrap();
+    assert!(bytes.get("camera_grouping_policy_version").is_none());
+    assert!(bytes.get("ordinary_image_preparation_version").is_none());
+    let decoded: TaskRecord = serde_json::from_value(bytes).unwrap();
+    assert_eq!(decoded.camera_grouping_policy_version, None);
+    assert_eq!(decoded.ordinary_image_preparation_version, None);
+    let same = service
+        .create(
+            None,
+            task.input_path.clone(),
+            task.quality,
+            task.projects_root.clone(),
+            true,
+            "gui",
+            task.client_request_id.clone(),
+            Some(request),
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.task_id, legacy.task_id);
+    assert_eq!(same.camera_grouping_policy_version, None);
+    assert_eq!(same.ordinary_image_preparation_version, None);
+    service.persist().await.unwrap();
+    let restored = TaskService::at(root.path().join("registry"))
+        .get(task.task_id)
+        .await
+        .unwrap();
+    assert_eq!(restored.camera_grouping_policy_version, None);
+    assert_eq!(restored.ordinary_image_preparation_version, None);
+    assert!(restored
+        .request_parameters
+        .as_ref()
+        .unwrap()
+        .get("ordinaryImagePreparationVersion")
+        .is_none());
+    assert!(restored
+        .request_parameters
+        .unwrap()
+        .get("cameraGroupingPolicyVersion")
+        .is_none());
+}
+
+#[tokio::test]
+async fn new_camera_policy_rejects_mixed_image_dimensions_before_registering_a_task() {
+    use crate::pipeline::inputs::{GenerationInputs, InputSource, MaterialInput};
+    for explicit_inputs in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        image::RgbImage::new(4, 3)
+            .save(images.join("a.png"))
+            .unwrap();
+        image::RgbImage::new(8, 3)
+            .save(images.join("b.png"))
+            .unwrap();
+        let parameters = explicit_inputs.then(|| serde_json::json!({
+            "inputs": GenerationInputs::Materials { items: vec![MaterialInput {
+                id: "photos".into(), source: InputSource::ImageFolder { path: images.clone() },
+                identity: None, projection: crate::video::panorama::VideoProjection::Perspective,
+                image_matching_strategy: Default::default(), camera_relation: None,
+                confirmed_small_images: true, confirmed_image_order: true, frame_removal_fps: None,
+            }] }
+        }));
+        let service = TaskService::at(root.path().join("registry"));
+        let error = service
+            .create(
+                None,
+                images,
+                Quality::Fast,
+                root.path().join("projects"),
+                true,
+                "gui",
+                None,
+                parameters,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "TASK_ERROR");
+        assert!(error.message.contains("b.png"));
+        assert!(error.message.contains("8×3"));
+        assert!(service.all().await.unwrap().is_empty());
+        assert!(!root.path().join("projects").exists());
+    }
+}
+
+#[tokio::test]
+async fn camera_grouping_policy_survives_interrupted_creation_without_upgrading_legacy_intents() {
+    use sha2::{Digest, Sha256};
+    for version in [
+        None,
+        Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+    ] {
+        let (root, service, task) = fixture().await;
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.camera_grouping_policy_version = version;
+            sync_saved_camera_grouping_policy(&mut saved.request_parameters, version).unwrap();
+            saved.ordinary_image_preparation_version = version;
+            sync_saved_ordinary_image_preparation(&mut saved.request_parameters, version).unwrap();
+        }
+        *service.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+            Box::pin(async move {
+                assert_eq!(execution.camera_grouping_policy_version, version);
+                assert_eq!(execution.ordinary_image_preparation_version, version);
+                let intent = execution.creation_intent.as_ref().unwrap();
+                assert_eq!(intent.camera_grouping_policy_version, version);
+                assert_eq!(intent.ordinary_image_preparation_version, version);
+                let mut expected = serde_json::json!({
+                    "input":execution.input_path,"request":execution.request_parameters,
+                    "quality":execution.quality,"configuration":execution.configuration,
+                    "source":execution.source_project_id,"root":execution.projects_root,
+                    "planner":execution.planner_enabled,"brushExecutionOptions":execution.brush_execution_options,
+                });
+                if let Some(ba) = execution.ba_policy_version {
+                    expected["baPolicyVersion"] = Value::from(ba);
+                }
+                if let Some(camera) = version {
+                    expected["cameraGroupingPolicyVersion"] = Value::from(camera);
+                    expected["ordinaryImagePreparationVersion"] = Value::from(camera);
+                }
+                assert_eq!(
+                    intent.request_identity,
+                    format!(
+                        "{:x}",
+                        Sha256::digest(serde_json::to_vec(&expected).unwrap())
+                    )
+                );
+                let old_intent: crate::project::creation::ProjectCreationIntent =
+                    serde_json::from_value(serde_json::to_value(intent).unwrap()).unwrap();
+                assert_eq!(old_intent.camera_grouping_policy_version, version);
+                assert_eq!(old_intent.ordinary_image_preparation_version, version);
+                Err(crate::error::SplatError::Process(
+                    "creation interrupted".into(),
+                ))
+            })
+        }));
+        service
+            .start(task.task_id, default_engine_paths(None), None)
+            .await
+            .unwrap();
+        let stopped = service.wait(task.task_id).await.unwrap();
+        let intent = stopped.creation_intent.clone();
+        service.persist().await.unwrap();
+        let restored = TaskService::at(root.path().join("registry"));
+        let expected = intent.clone();
+        *restored.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+            let expected = expected.clone();
+            Box::pin(async move {
+                assert_eq!(execution.camera_grouping_policy_version, version);
+                assert_eq!(execution.creation_intent, expected);
+                assert_eq!(execution.ordinary_image_preparation_version, version);
+                Err(crate::error::SplatError::Cancelled)
+            })
+        }));
+        restored
+            .continue_identified(
+                task.task_id,
+                stopped.run_id.unwrap(),
+                default_engine_paths(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let stopped = restored.wait(task.task_id).await.unwrap();
+        assert_eq!(stopped.camera_grouping_policy_version, version);
+        assert_eq!(stopped.creation_intent, intent);
+        assert_eq!(stopped.ordinary_image_preparation_version, version);
+    }
+}
+
+#[tokio::test]
+async fn continuation_uses_authoritative_camera_policy_without_changing_saved_features_or_recipe() {
+    for version in [
+        None,
+        Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+    ] {
+        // The two internal policies are independent. In particular, tasks
+        // created after camera sharing but before this pixel fix keep None.
+        let preparation_version = if version.is_some() { None } else { Some(1) };
+        let (root, service, task) = fixture().await;
+        let previous_run = notification_run(&service, task.task_id);
+        let project = root.path().join("saved-camera-work-order");
+        std::fs::create_dir(&project).unwrap();
+        let mut state = crate::project::PipelineStateFile::created(task.quality);
+        state.camera_grouping_policy_version = version;
+        state.ordinary_image_preparation_version = preparation_version;
+        state.generation_policy = task.generation_policy;
+        state.configuration = Some(task.configuration.clone());
+        state.features_complete = true;
+        state.matching_complete = true;
+        state.brush_training.oom_retry_used = true;
+        atomic_write_json(&project.join("state.json"), &state)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(project.join("state.json")).unwrap();
+        {
+            let mut records = service.records();
+            let saved = records.tasks.get_mut(&task.task_id).unwrap();
+            saved.project_id = Some(Uuid::new_v4());
+            saved.project_path = Some(project.clone());
+            saved.status = TaskStatus::Failed;
+            saved.camera_grouping_policy_version = if version.is_none() { Some(1) } else { None };
+            saved.ordinary_image_preparation_version = version;
+        }
+        persist_bound_project_metadata(&service, task.task_id).await;
+        *service.executor.lock().unwrap() = Some(Arc::new(move |execution, _| {
+            Box::pin(async move {
+                assert_eq!(execution.camera_grouping_policy_version, version);
+                assert_eq!(
+                    execution.ordinary_image_preparation_version,
+                    preparation_version
+                );
+                assert_eq!(
+                    execution
+                        .request_parameters
+                        .as_ref()
+                        .and_then(|p| p.get("ordinaryImagePreparationVersion"))
+                        .and_then(Value::as_u64),
+                    preparation_version.map(u64::from)
+                );
+                assert_eq!(
+                    execution
+                        .request_parameters
+                        .as_ref()
+                        .and_then(|p| p.get("cameraGroupingPolicyVersion"))
+                        .and_then(Value::as_u64),
+                    version.map(u64::from)
+                );
+                Err(crate::error::SplatError::Cancelled)
+            })
+        }));
+        service
+            .continue_identified(task.task_id, previous_run, default_engine_paths(None), None)
+            .await
+            .unwrap();
+        let stopped = service.wait(task.task_id).await.unwrap();
+        assert_eq!(stopped.camera_grouping_policy_version, version);
+        assert_eq!(stopped.runs[1].kind, "continue");
+        assert_eq!(
+            stopped.ordinary_image_preparation_version,
+            preparation_version
+        );
+        assert_eq!(std::fs::read(project.join("state.json")).unwrap(), bytes);
     }
 }
 
@@ -1304,6 +1622,147 @@ async fn panorama_substage_change_clears_face_counts_runtime_and_eta() {
 }
 
 #[tokio::test]
+async fn feature_group_start_keeps_credible_percent_but_never_reuses_previous_process_resources() {
+    use crate::pipeline::{event::PipelineOperation, EventKind};
+    let (_root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut start = PipelineEvent::mapped(PipelineStage::ExtractingFeatures, 0.5, "features");
+    start.sequence = 1;
+    start.operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 1,
+        source_id: Some("photos".into()),
+    });
+    start.current = Some(2);
+    start.total = Some(4);
+    start.unit = Some("images".into());
+    service.on_event(task.task_id, run, start.clone());
+    let initial_overall = service.get(task.task_id).await.unwrap().estimated_progress;
+    let snapshot: crate::pipeline::runtime::RuntimeSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "processId": 42, "phase": "running", "updatedAt": Utc::now(), "lastOutputAgeMs": 0,
+            "training": null, "device": null, "backend": null, "config": {}, "resources": null
+        }))
+        .unwrap();
+    for (offset, kind) in [
+        EventKind::Runtime,
+        EventKind::Log,
+        EventKind::Heartbeat,
+        EventKind::Progress,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut empty = start.clone();
+        empty.sequence = offset as u64 + 2;
+        empty.kind = kind;
+        empty.current = None;
+        empty.total = None;
+        empty.unit = None;
+        empty.stage_progress = None;
+        empty.indeterminate = true;
+        empty.progress = 99.9; // stale mapped values are not measurements
+        empty.runtime = (kind == EventKind::Runtime).then(|| snapshot.clone());
+        service.on_event(task.task_id, run, empty);
+        let observed = service.get(task.task_id).await.unwrap();
+        assert_eq!(observed.progress, Some(50.0));
+        assert_eq!((observed.current, observed.total), (Some(2), Some(4)));
+        assert_eq!(observed.unit.as_deref(), Some("images"));
+        assert_eq!(observed.estimated_progress, initial_overall);
+        assert_eq!(observed.runtime.unwrap().process_id, 42);
+    }
+    let mut foreign_source = start.clone();
+    foreign_source.sequence = 6;
+    foreign_source.kind = EventKind::Progress;
+    foreign_source.operation.as_mut().unwrap().source_id = Some("other-source".into());
+    foreign_source.stage_progress = Some(99.0);
+    service.on_event(task.task_id, run, foreign_source);
+    let observed = service.get(task.task_id).await.unwrap();
+    assert_eq!(observed.progress, Some(50.0));
+    assert_eq!(observed.sequence, 5);
+    let mut next = start.clone();
+    next.sequence = 6;
+    next.operation.as_mut().unwrap().id = 2;
+    service.on_event(task.task_id, run, next.clone());
+    let observed = service.get(task.task_id).await.unwrap();
+    assert_eq!(observed.progress, Some(50.0));
+    assert_eq!((observed.current, observed.total), (Some(2), Some(4)));
+    assert!(observed.runtime.is_none()); // new PID has not supplied any sample
+    let mut stale = start;
+    stale.sequence = 7;
+    stale.kind = EventKind::Runtime;
+    stale.runtime = Some(snapshot);
+    service.on_event(task.task_id, run, stale);
+    assert!(service.get(task.task_id).await.unwrap().runtime.is_none());
+
+    next.sequence = 8;
+    next.operation.as_mut().unwrap().id = 3;
+    next.operation.as_mut().unwrap().attempt = 2;
+    next.current = None;
+    next.total = None;
+    next.unit = None;
+    next.stage_progress = None;
+    next.indeterminate = true;
+    service.on_event(task.task_id, run, next);
+    let retry = service.get(task.task_id).await.unwrap();
+    assert!(retry.progress.is_none() && retry.current.is_none() && retry.total.is_none());
+    assert_eq!(retry.operation.unwrap().attempt, 2);
+}
+
+#[tokio::test]
+async fn empty_mapper_activity_keeps_its_estimate_but_changed_counter_units_do_not() {
+    use crate::pipeline::{event::PipelineOperation, EventKind};
+    let (_root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut registration = notification_event(1, EventKind::Stage);
+    registration.operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 1,
+        source_id: None,
+    });
+    registration.current = Some(40);
+    registration.total = Some(200);
+    registration.unit = Some("registeredImages".into());
+    registration.stage_progress = Some(18.0);
+    registration.progress = 49.6;
+    service.on_event(task.task_id, run, registration.clone());
+    let mut activity = registration.clone();
+    activity.sequence = 2;
+    activity.kind = EventKind::Progress;
+    activity.message = "Global bundle adjustment".into();
+    activity.stage_progress = None;
+    activity.indeterminate = true;
+    activity.progress = 99.9;
+    service.on_event(task.task_id, run, activity.clone());
+    let adjusting = service.get(task.task_id).await.unwrap();
+    assert_eq!(adjusting.progress, Some(18.0));
+    assert_eq!(adjusting.estimated_progress, Some(49.6));
+    assert_eq!((adjusting.current, adjusting.total), (Some(40), Some(200)));
+    activity.sequence = 3;
+    activity.unit = Some("unrelatedLocalBatch".into());
+    activity.current = Some(1);
+    activity.total = Some(3);
+    service.on_event(task.task_id, run, activity);
+    let local = service.get(task.task_id).await.unwrap();
+    assert!(local.progress.is_none());
+    assert_eq!((local.current, local.total), (Some(1), Some(3)));
+    assert_eq!(local.estimated_progress, Some(49.6));
+    registration.sequence = 4;
+    registration.operation.as_mut().unwrap().id = 2;
+    registration.substage = Some("differentPhase".into());
+    registration.stage_progress = None;
+    registration.current = None;
+    registration.total = None;
+    registration.unit = None;
+    registration.indeterminate = true;
+    registration.progress = 45.0;
+    service.on_event(task.task_id, run, registration);
+    let next = service.get(task.task_id).await.unwrap();
+    assert!(next.progress.is_none() && next.current.is_none() && next.total.is_none());
+    assert_eq!(next.estimated_progress, Some(49.6));
+}
+
+#[tokio::test]
 async fn panorama_monitor_survives_non_lifecycle_events_and_rejects_old_operations() {
     use crate::pipeline::{event::PipelineOperation, EventKind};
     let (_root, service, task) = fixture().await;
@@ -2304,6 +2763,9 @@ async fn image_matching_request_survives_restart_and_cannot_change_on_retry() {
     let (root, service, _) = fixture().await;
     let images = root.path().join("photos");
     std::fs::create_dir(&images).unwrap();
+    for name in ["a.png", "b.png"] {
+        image::RgbImage::new(4, 3).save(images.join(name)).unwrap();
+    }
     for strategy in [
         ImageMatchingStrategy::Sequential,
         ImageMatchingStrategy::Exhaustive,
@@ -2324,10 +2786,18 @@ async fn image_matching_request_survives_restart_and_cannot_change_on_retry() {
             .unwrap();
         let reopened = TaskService::at(root.path().join("registry"));
         let restored = reopened.get(task.task_id).await.unwrap();
-        assert_eq!(
-            restored.request_parameters,
-            Some(generation_parameters(Some(parameters)).unwrap())
-        );
+        let mut expected = Some(generation_parameters(Some(parameters)).unwrap());
+        sync_saved_camera_grouping_policy(
+            &mut expected,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+        )
+        .unwrap();
+        sync_saved_ordinary_image_preparation(
+            &mut expected,
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION),
+        )
+        .unwrap();
+        assert_eq!(restored.request_parameters, expected);
         assert_eq!(
             restored.input_type,
             crate::project::ProjectInputType::Images
@@ -3016,6 +3486,9 @@ async fn task_start_reports_runner_metrics_for_generation_resume_and_reshoot() {
     let images = root.path().join("images");
     std::fs::write(&video, b"fixture").unwrap();
     std::fs::create_dir(&images).unwrap();
+    for name in ["a.png", "b.png"] {
+        image::RgbImage::new(4, 3).save(images.join(name)).unwrap();
+    }
     let service = TaskService::at(root.path().join("registry"));
     let (telemetry, captured) = TelemetryService::recording(root.path().join("telemetry.json"));
     telemetry.enable_for_test().await;
@@ -3338,4 +3811,650 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
     .unwrap();
     assert!(after.cursor_reset);
     assert!(after.entries[0].text.contains("new generation"));
+}
+
+#[tokio::test]
+async fn default_log_cursor_adopts_new_sources_but_explicit_filters_remain_strict() {
+    let (root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    let logs_root = root.path().join("logs");
+    std::fs::create_dir(&logs_root).unwrap();
+    let request = logs::LogRequest {
+        task_id: task.task_id,
+        run_id: Some(run),
+        ..Default::default()
+    };
+    let empty = logs::read(&task, &request).unwrap();
+    let first = logs_root.join("ffmpeg.log");
+    std::fs::write(&first, "extracted source frames\n").unwrap();
+    logs::insert_registered(
+        &mut task.runs.last_mut().unwrap().logs,
+        logs::register(&logs_root, &first, 0).unwrap(),
+    );
+    let initial = logs::read(
+        &task,
+        &logs::LogRequest {
+            cursor: empty.next_cursor,
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert!(initial
+        .entries
+        .iter()
+        .any(|entry| entry.text.contains("extracted source frames")));
+    let second = logs_root.join("colmap.log");
+    std::fs::write(&second, "matched source images\n").unwrap();
+    logs::insert_registered(
+        &mut task.runs.last_mut().unwrap().logs,
+        logs::register(&logs_root, &second, 0).unwrap(),
+    );
+    let added = logs::read(
+        &task,
+        &logs::LogRequest {
+            cursor: initial.next_cursor,
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert!(added
+        .entries
+        .iter()
+        .any(|entry| entry.text.contains("matched source images")));
+    let filter = logs::LogRequest {
+        sources: Some(vec!["ffmpeg".into()]),
+        ..request.clone()
+    };
+    let filtered = logs::read(&task, &filter).unwrap();
+    let error = logs::read(
+        &task,
+        &logs::LogRequest {
+            sources: Some(vec!["colmap".into()]),
+            cursor: filtered.next_cursor,
+            ..request
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "CURSOR_MISMATCH");
+}
+
+#[tokio::test]
+async fn same_named_logs_from_distinct_attempts_keep_both_sources_and_legacy_names() {
+    let (root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    let logs_root = root.path().join("logs");
+    std::fs::create_dir_all(logs_root.join("attempt-1")).unwrap();
+    let first = logs_root.join("brush.log");
+    let second = logs_root.join("attempt-1/brush.log");
+    std::fs::write(&first, "first attempt evidence\n").unwrap();
+    std::fs::write(&second, "second attempt evidence\n").unwrap();
+    let registered = &mut task.runs.last_mut().unwrap().logs;
+    logs::insert_registered(registered, logs::register(&logs_root, &first, 0).unwrap());
+    logs::insert_registered(registered, logs::register(&logs_root, &second, 0).unwrap());
+    logs::insert_registered(registered, logs::register(&logs_root, &second, 8).unwrap());
+    assert_eq!(registered.len(), 2);
+    assert!(registered.contains_key("brush"));
+    let page = logs::read(
+        &task,
+        &logs::LogRequest {
+            task_id: task.task_id,
+            run_id: Some(run),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let text = page
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("first attempt evidence"));
+    assert!(text.contains("second attempt evidence"));
+}
+
+#[tokio::test]
+async fn activity_pages_are_structured_field_redacted_and_never_reclassify_foreign_runs() {
+    let (root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    let log_root = root.path().join("logs");
+    std::fs::create_dir(&log_root).unwrap();
+    let path = log_root.join("activity.log");
+    let mut event = notification_event(1, crate::pipeline::EventKind::Log);
+    event.task_id = Some(task.task_id);
+    event.run_id = Some(run);
+    event.message = "read C:\\private\\secret.png\nsource accepted".into();
+    let mut foreign = event.clone();
+    foreign.sequence = 2;
+    foreign.run_id = Some(Uuid::new_v4());
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&event).unwrap(),
+            serde_json::to_string(&foreign).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut log = logs::register(&log_root, &path, 0).unwrap();
+    log.activity = true;
+    log.activity_complete = true;
+    logs::insert_registered(&mut task.runs.last_mut().unwrap().logs, log);
+    let page = logs::read(
+        &task,
+        &logs::LogRequest {
+            task_id: task.task_id,
+            run_id: Some(run),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let activity = page.activity_events.as_ref().unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].sequence, 1);
+    assert!(activity[0].message.contains("source accepted"));
+    assert!(!serde_json::to_string(&page).unwrap().contains("secret.png"));
+    assert_eq!(page.activity_journal_persisted, Some(false));
+    assert!(page.truncated);
+}
+
+#[tokio::test]
+async fn cancelling_flushes_activity_beyond_the_five_hundred_event_memory_window() {
+    let (root, service, task) = fixture().await;
+    let project = root.path().join("activity-project");
+    std::fs::create_dir(&project).unwrap();
+    let run = notification_run(&service, task.task_id);
+    service
+        .records()
+        .tasks
+        .get_mut(&task.task_id)
+        .unwrap()
+        .project_path = Some(project);
+    for sequence in 1..=620 {
+        service.on_event(
+            task.task_id,
+            run,
+            notification_event(sequence, crate::pipeline::EventKind::Log),
+        );
+        if sequence % 50 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    let runner = Arc::new(PipelineRunner::new(default_engine_paths(None), |_| {}));
+    service
+        .finish(
+            task.task_id,
+            run,
+            runner,
+            Err(crate::error::SplatError::Cancelled),
+        )
+        .await;
+    let saved = service.get(task.task_id).await.unwrap();
+    assert_eq!(saved.status, TaskStatus::Cancelled);
+    assert_eq!(saved.recent_events.len(), 500);
+    let log = saved
+        .runs
+        .last()
+        .unwrap()
+        .logs
+        .values()
+        .find(|log| log.activity)
+        .unwrap();
+    assert!(log.activity_complete);
+    assert!(log.end.is_some());
+    let bytes = std::fs::read(&log.path).unwrap();
+    assert_eq!(
+        bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| serde_json::from_slice::<PipelineEvent>(line).is_ok())
+            .count(),
+        620
+    );
+    let page = logs::read(
+        &saved,
+        &logs::LogRequest {
+            task_id: task.task_id,
+            run_id: Some(run),
+            tail_lines: Some(500),
+            max_bytes: Some(logs::MAX_BYTES),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page.activity_journal_persisted, Some(true));
+    let activity = page.activity_events.as_ref().unwrap();
+    assert!(!activity.is_empty());
+    assert_eq!(activity.last().unwrap().sequence, 620);
+}
+
+#[tokio::test]
+async fn project_activity_tail_selects_a_header_bound_run_not_file_mtime() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let directory = project.join("logs");
+    std::fs::create_dir_all(&directory).unwrap();
+    let project_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let old_run = Uuid::new_v4();
+    let new_run = Uuid::new_v4();
+    let write = |run, started_at, text: &str, closed| {
+        let header = activity::RunHeader {
+            activity_version: 1,
+            task_id,
+            run_id: run,
+            project_id: Some(project_id),
+            started_at,
+        };
+        let mut event = notification_event(1, crate::pipeline::EventKind::Log);
+        event.task_id = Some(task_id);
+        event.run_id = Some(run);
+        event.message = text.into();
+        let mut body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&event).unwrap()
+        );
+        if closed {
+            body.push_str(&format!(
+                "{}\n",
+                serde_json::to_string(&activity::RunFooter {
+                    activity_closed: true,
+                    run_id: run,
+                    complete: true
+                })
+                .unwrap()
+            ));
+        }
+        std::fs::write(directory.join(format!("activity-{run}.log")), body).unwrap();
+    };
+    let now = Utc::now();
+    write(new_run, now, "new generation", true);
+    write(
+        old_run,
+        now - chrono::Duration::hours(1),
+        "old generation",
+        true,
+    );
+    let latest = logs::project_activity_tail(&project, project_id, Some(task_id), None, &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.events[0].message, "new generation");
+    assert!(latest.persisted);
+    let original =
+        logs::project_activity_tail(&project, project_id, Some(task_id), Some(old_run), &[])
+            .unwrap()
+            .unwrap();
+    assert_eq!(original.events[0].message, "old generation");
+    let interrupted = Uuid::new_v4();
+    write(
+        interrupted,
+        now + chrono::Duration::seconds(1),
+        "unfinished generation",
+        false,
+    );
+    let latest = logs::project_activity_tail(&project, project_id, Some(task_id), None, &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.events[0].message, "unfinished generation");
+    assert!(!latest.persisted);
+    let foreign = logs::project_activity_tail(&project, Uuid::new_v4(), Some(task_id), None, &[])
+        .unwrap()
+        .unwrap();
+    assert!(foreign.events.is_empty());
+    assert!(!foreign.persisted);
+}
+
+#[tokio::test]
+async fn interrupted_activity_pages_do_not_trust_a_stale_healthy_flag_without_a_footer() {
+    let (root, service, task) = fixture().await;
+    let run = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    task.status = TaskStatus::Interrupted;
+    let directory = root.path().join("logs");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("activity.log");
+    let mut event = notification_event(1, crate::pipeline::EventKind::Log);
+    event.task_id = Some(task.task_id);
+    event.run_id = Some(run);
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&event).unwrap()),
+    )
+    .unwrap();
+    let mut log = logs::register(&directory, &path, 0).unwrap();
+    log.activity = true;
+    log.activity_complete = true;
+    logs::insert_registered(&mut task.runs.last_mut().unwrap().logs, log);
+    let request = logs::LogRequest {
+        task_id: task.task_id,
+        run_id: Some(run),
+        ..Default::default()
+    };
+    let page = logs::read(&task, &request).unwrap();
+    assert_eq!(page.activity_journal_persisted, Some(false));
+    assert_eq!(page.activity_events.as_ref().unwrap().len(), 1);
+    let footer = activity::RunFooter {
+        activity_closed: true,
+        run_id: run,
+        complete: true,
+    };
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(&footer).unwrap()).unwrap();
+    let page = logs::read(&task, &request).unwrap();
+    assert_eq!(page.activity_journal_persisted, Some(true));
+}
+
+fn activity_privacy_samples(task_id: Uuid, run_id: Uuid) -> Vec<PipelineEvent> {
+    use crate::pipeline::{event::PipelineOperation, EventKind, PipelineEngine};
+    let mut samples = Vec::new();
+    let mut add = |text: &str, current, total, unit: Option<&str>| {
+        let mut event = notification_event(samples.len() as u64 + 1, EventKind::Progress);
+        event.task_id = Some(task_id);
+        event.run_id = Some(run_id);
+        event.stage = PipelineStage::TrainingSplats;
+        event.message = text.into();
+        event.current = current;
+        event.total = total;
+        event.unit = unit.map(str::to_owned);
+        samples.push(event);
+    };
+    add("正在准备训练图片：41/90", Some(41), Some(90), Some("files"));
+    add(
+        "正在准备训练图片：全景图片 1/15，六面图片 11/90",
+        Some(11),
+        Some(90),
+        Some("panoramaImageFaces"),
+    );
+    add("正在准备补拍画面：2/10", Some(2), Some(10), Some("files"));
+    add(
+        "正在保存生成检查点。此步骤可能耗时较长，请耐心等待",
+        None,
+        None,
+        None,
+    );
+    // Legacy application activities attached the ratio only to the text.
+    add("正在检查画面与蒙版：9/10", None, None, None);
+    add("正在分析画面（3/90）", Some(3), Some(90), Some("images"));
+    add("正在准备训练图片：41/90", Some(41), Some(90), Some("files"));
+    add("私人目录/照片", None, None, None);
+    add(
+        "正在准备训练图片：41/90 secret=hunter2",
+        Some(41),
+        Some(90),
+        Some("files"),
+    );
+    add("正在准备训练图片：41/90", Some(42), Some(90), Some("files"));
+    add(
+        "正在准备训练图片：41/90\nAuthorization: Bearer sensitive-value",
+        Some(41),
+        Some(90),
+        Some("files"),
+    );
+    add(
+        "正在准备训练图片：C:\\private\\family.png",
+        None,
+        None,
+        None,
+    );
+    samples[0].operation = Some(PipelineOperation {
+        id: 1,
+        attempt: 0,
+        source_id: Some("C:\\private\\family.png".into()),
+    });
+    samples[2].stage = PipelineStage::ExtractingFrames;
+    samples[4].kind = EventKind::Log;
+    samples[5].stage = PipelineStage::ExtractingFeatures;
+    // Merely resembling an application template cannot exempt raw engine text.
+    samples[6].engine = Some(PipelineEngine::Colmap);
+    samples[6].kind = EventKind::Log;
+    samples
+}
+
+fn write_activity_privacy_samples(
+    directory: &Path,
+    task_id: Uuid,
+    run_id: Uuid,
+    project_id: Uuid,
+) -> PathBuf {
+    std::fs::create_dir_all(directory).unwrap();
+    let header = activity::RunHeader {
+        activity_version: 1,
+        task_id,
+        run_id,
+        project_id: Some(project_id),
+        started_at: Utc::now(),
+    };
+    let mut body = format!("{}\n", serde_json::to_string(&header).unwrap());
+    for event in activity_privacy_samples(task_id, run_id) {
+        body.push_str(&serde_json::to_string(&event).unwrap());
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "{}\n",
+        serde_json::to_string(&activity::RunFooter {
+            activity_closed: true,
+            run_id,
+            complete: true,
+        })
+        .unwrap()
+    ));
+    let path = directory.join(format!("activity-{run_id}.log"));
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+fn assert_activity_privacy_samples(events: &[PipelineEvent]) {
+    assert_eq!(events.len(), 12);
+    for (event, expected) in events.iter().take(6).zip([
+        "正在准备训练图片：41/90",
+        "正在准备训练图片：全景图片 1/15，六面图片 11/90",
+        "正在准备补拍画面：2/10",
+        "正在保存生成检查点。此步骤可能耗时较长，请耐心等待",
+        "正在检查画面与蒙版：9/10",
+        "正在分析画面（3/90）",
+    ]) {
+        assert_eq!(event.message, expected);
+    }
+    for event in &events[6..] {
+        assert!(event.message.contains("[REDACTED"), "{}", event.message);
+    }
+    let serialized = serde_json::to_string(events).unwrap();
+    for forbidden in [
+        "私人目录",
+        "照片",
+        "hunter2",
+        "sensitive-value",
+        "family.png",
+        "private",
+    ] {
+        assert!(!serialized.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(
+        events[0].operation.as_ref().unwrap().source_id.as_deref(),
+        Some("[REDACTED]")
+    );
+}
+
+#[tokio::test]
+async fn activity_pages_reconstruct_only_known_application_counts_and_keep_privacy_filtering() {
+    let (root, service, task) = fixture().await;
+    let run_id = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    let directory = root.path().join("logs");
+    let path = write_activity_privacy_samples(&directory, task.task_id, run_id, Uuid::new_v4());
+    let original = std::fs::read(&path).unwrap();
+    let mut log = logs::register(&directory, &path, 0).unwrap();
+    log.activity = true;
+    log.activity_complete = true;
+    logs::insert_registered(&mut task.runs.last_mut().unwrap().logs, log);
+    let page = logs::read(
+        &task,
+        &logs::LogRequest {
+            task_id: task.task_id,
+            run_id: Some(run_id),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_activity_privacy_samples(page.activity_events.as_ref().unwrap());
+    assert!(page.entries[0].text.contains("正在准备训练图片：41/90"));
+    assert!(!page.entries[0].text.contains("hunter2"));
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn historical_activity_tail_uses_the_same_safe_count_templates_without_rewriting_the_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let project_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let path = write_activity_privacy_samples(&project.join("logs"), task_id, run_id, project_id);
+    let original = std::fs::read(&path).unwrap();
+    let tail = logs::project_activity_tail(&project, project_id, Some(task_id), Some(run_id), &[])
+        .unwrap()
+        .unwrap();
+    assert!(tail.persisted);
+    assert_activity_privacy_samples(&tail.events);
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn activity_pages_preserve_verified_bridge_and_legacy_reshoot_summaries_only() {
+    let (root, service, task) = fixture().await;
+    let run_id = notification_run(&service, task.task_id);
+    let mut task = service.get(task.task_id).await.unwrap();
+    let directory = root.path().join("logs");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("activity.log");
+    let summary = "Bridge Backfill 已触发：初始注册=24/45（53.3%），剩余预算=23，补帧=11，内部桥接=0，边缘延伸=11";
+    let legacy = "补拍画面成功加入 12/15，结果已生成，但部分补拍画面未能找到与原项目的联系。";
+    let mut bridge = notification_event(1, crate::pipeline::EventKind::Log);
+    bridge.task_id = Some(task.task_id);
+    bridge.run_id = Some(run_id);
+    bridge.stage = PipelineStage::ValidatingReconstruction;
+    bridge.message = summary.into();
+    bridge.current = Some(11);
+    bridge.total = Some(23);
+    bridge.unit = Some("frames".into());
+    let mut old = bridge.clone();
+    old.sequence = 2;
+    old.current = None;
+    old.total = None;
+    old.unit = None;
+    old.message = legacy.into();
+    let mut injection = bridge.clone();
+    injection.sequence = 3;
+    injection.message.push_str(" secret=hidden-value");
+    let mut mismatch = bridge.clone();
+    mismatch.sequence = 4;
+    mismatch.current = Some(12);
+    let mut raw = bridge.clone();
+    raw.sequence = 5;
+    raw.engine = Some(crate::pipeline::PipelineEngine::Colmap);
+    std::fs::write(
+        &path,
+        [bridge, old, injection, mismatch, raw]
+            .iter()
+            .map(|event| format!("{}\n", serde_json::to_string(event).unwrap()))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let mut log = logs::register(&directory, &path, 0).unwrap();
+    log.activity = true;
+    logs::insert_registered(&mut task.runs.last_mut().unwrap().logs, log);
+    let page = logs::read(
+        &task,
+        &logs::LogRequest {
+            task_id: task.task_id,
+            run_id: Some(run_id),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let events = page.activity_events.as_ref().unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[0].message, summary);
+    assert_eq!(events[1].message, legacy);
+    for event in &events[2..] {
+        assert!(event.message.contains("[REDACTED"));
+    }
+    assert!(!serde_json::to_string(&page)
+        .unwrap()
+        .contains("hidden-value"));
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+/// Explicit local verification only: reads the named task registry and bounded
+/// registered journal tails. It never starts engines or writes user assets.
+#[test]
+#[ignore = "requires OOOSPLAT_ACTIVITY_VALIDATION_REGISTRY naming an existing local task registry"]
+fn real_activity_journal_count_redaction_read_only_regression() {
+    use std::io::{Read, Seek, SeekFrom};
+    let registry_path = std::env::var_os("OOOSPLAT_ACTIVITY_VALIDATION_REGISTRY")
+        .expect("set OOOSPLAT_ACTIVITY_VALIDATION_REGISTRY for this explicit read-only check");
+    let registry: Registry =
+        serde_json::from_slice(&std::fs::read(registry_path).unwrap()).unwrap();
+    let mut tasks = registry.tasks.into_values().collect::<Vec<_>>();
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at));
+    for task in tasks.iter().take(20) {
+        for run in task.runs.iter().rev() {
+            let Some(log) = run.logs.values().find(|log| log.activity) else {
+                continue;
+            };
+            let page = logs::read(
+                task,
+                &logs::LogRequest {
+                    task_id: task.task_id,
+                    run_id: Some(run.run_id),
+                    tail_lines: Some(500),
+                    max_bytes: Some(logs::MAX_BYTES),
+                    sources: Some(vec![log.source.clone()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let private = crate::diagnostics::redact::private_values(&[
+                task.input_path.clone(),
+                task.projects_root.clone(),
+            ]);
+            let mut file = std::fs::File::open(&log.path).unwrap();
+            let length = file.metadata().unwrap().len();
+            let start = length.saturating_sub(logs::MAX_BYTES as u64);
+            file.seek(SeekFrom::Start(start)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(length - start).read_to_end(&mut bytes).unwrap();
+            let originals = bytes
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice::<PipelineEvent>(line).ok())
+                .collect::<Vec<_>>();
+            for event in page.activity_events.as_deref().unwrap_or_default() {
+                let before = crate::diagnostics::redact::sanitize(&event.message, &private);
+                if before == event.message || !before.contains("[REDACTED") {
+                    continue;
+                }
+                if let Some(original) = originals.iter().find(|original| {
+                    original.task_id == event.task_id
+                        && original.run_id == event.run_id
+                        && original.sequence == event.sequence
+                }) {
+                    assert_eq!(original.message, event.message);
+                    eprintln!(
+                        "read-only journal sample sequence={} old={} new={}",
+                        event.sequence, before, event.message
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    panic!("no existing mis-redacted application count found in the bounded recent activity tails");
 }

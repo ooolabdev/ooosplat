@@ -252,6 +252,12 @@ pub struct ProjectTaskDetail {
     image_sequence: Option<ImageSequenceInfo>,
     source_project_id: Option<String>,
     logs: Vec<ProjectTaskLogLine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_events: Option<Vec<crate::pipeline::PipelineEvent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_journal_persisted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logs_unavailable: Option<bool>,
     imported: Option<ImportedProjectDetail>,
 }
 
@@ -463,8 +469,10 @@ pub async fn inspect_material_inputs(
     match inputs {
         crate::pipeline::inputs::GenerationInputs::Materials { items } => {
             for item in items {
-                match crate::pipeline::inputs::inspect_material(&engines, &item, quality, policy)
-                    .await
+                match crate::pipeline::inputs::inspect_new_material(
+                    &engines, &item, quality, policy,
+                )
+                .await
                 {
                     Ok(a) => materials.push(a),
                     Err(e) => {
@@ -538,7 +546,7 @@ pub async fn estimate_material_inputs(
     let mut analyses = vec![];
     for item in items {
         analyses.push(
-            crate::pipeline::inputs::inspect_material(&engines, item, quality, policy).await?,
+            crate::pipeline::inputs::inspect_new_material(&engines, item, quality, policy).await?,
         );
     }
     Ok(crate::pipeline::inputs::estimate(
@@ -1272,20 +1280,55 @@ async fn read_project_log_tail(logs_directory: &Path) -> Result<Vec<ProjectTaskL
     const MAX_TOTAL_BYTES: usize = 256 * 1024;
     const MAX_LINES: usize = 500;
     let mut files = Vec::new();
-    if !logs_directory.is_dir() {
-        return Ok(Vec::new());
+    let metadata = match tokio::fs::symlink_metadata(logs_directory).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let denied = || SplatError::Io(std::io::ErrorKind::PermissionDenied.into());
+    if metadata.file_type().is_symlink() {
+        return Err(denied());
     }
-    let mut entries = tokio::fs::read_dir(logs_directory).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !entry.file_type().await?.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("log")
-        {
-            continue;
+    let root = tokio::fs::canonicalize(logs_directory).await?;
+    let project = tokio::fs::canonicalize(logs_directory.parent().ok_or_else(denied)?).await?;
+    if root.parent() != Some(project.as_path()) {
+        return Err(denied());
+    }
+    let mut directories = vec![(root.clone(), 0_usize)];
+    let mut scanned = 0;
+    while let Some((directory, depth)) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            scanned += 1;
+            if scanned > 4096 {
+                return Err(SplatError::Io(std::io::ErrorKind::InvalidData.into()));
+            }
+            let path = entry.path();
+            let kind = entry.file_type().await?;
+            if kind.is_symlink() {
+                return Err(denied());
+            }
+            if kind.is_dir() {
+                if depth < 8 {
+                    directories.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !kind.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("log")
+                || path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("activity-"))
+            {
+                continue;
+            }
+            let resolved = tokio::fs::canonicalize(&path).await?;
+            if !resolved.starts_with(&root) {
+                return Err(denied());
+            }
+            let metadata = entry.metadata().await?;
+            files.push((metadata.modified().ok(), resolved, metadata.len()));
         }
-        let metadata = entry.metadata().await?;
-        let modified = metadata.modified().ok();
-        files.push((modified, path, metadata.len()));
     }
     files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let mut lines = Vec::new();
@@ -1298,10 +1341,11 @@ async fn read_project_log_tail(logs_directory: &Path) -> Result<Vec<ProjectTaskL
         file.read_to_end(&mut bytes).await?;
         let text = String::from_utf8_lossy(&bytes);
         let source = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("system")
-            .to_string();
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
         let mut file_lines = text.lines();
         if start > 0 {
             let _ = file_lines.next();
@@ -1326,6 +1370,39 @@ async fn read_project_log_tail(logs_directory: &Path) -> Result<Vec<ProjectTaskL
     Ok(lines)
 }
 
+#[cfg(test)]
+pub(crate) async fn probe_historical_log_read_for_test(
+    task: &crate::tasks::TaskRecord,
+) -> std::result::Result<(usize, Option<bool>), String> {
+    let root = task.project_path.as_deref().ok_or("MISSING_PROJECT")?;
+    let id = task.project_id.ok_or("MISSING_PROJECT_ID")?;
+    let run_id = task
+        .runs
+        .iter()
+        .find(|run| Some(run.run_id) == task.run_id && run.kind != "legacy")
+        .map(|run| run.run_id);
+    let activity = crate::tasks::logs::project_activity_tail(
+        root,
+        id,
+        Some(task.task_id),
+        run_id,
+        &[task.input_path.clone(), root.to_path_buf()],
+    )
+    .map_err(|error| format!("ACTIVITY:{}", error.code))?;
+    if let Some(activity) = activity {
+        return Ok((activity.events.len(), Some(activity.persisted)));
+    }
+    read_project_log_tail(&root.join("logs"))
+        .await
+        .map(|logs| (logs.len(), None))
+        .map_err(|error| match error {
+            SplatError::Io(error) => {
+                format!("RAW_IO:{:?}:{:?}", error.kind(), error.raw_os_error())
+            }
+            _ => "RAW_LOG_READ_FAILED".to_owned(),
+        })
+}
+
 #[tauri::command]
 pub async fn get_project_task_detail(
     controller: State<'_, PipelineController>,
@@ -1334,13 +1411,13 @@ pub async fn get_project_task_detail(
     let id = parse_project_id(&project_id)?;
     let (project_root, metadata, mut project) =
         catalog::load_registered_project_summary(id).await?;
-    if let Some(task) = controller
+    let linked_task = controller
         .all()
         .await
         .map_err(|e| SplatError::Process(e.to_string()))?
         .into_iter()
-        .find(|t| t.project_id == Some(id))
-    {
+        .find(|t| t.project_id == Some(id));
+    if let Some(task) = &linked_task {
         project.status = task.status.project_status();
     }
     let imported_detail = metadata
@@ -1394,10 +1471,44 @@ pub async fn get_project_task_detail(
     let stage = state
         .as_ref()
         .map(|state| persisted_task_stage(state, project.status));
-    let logs = if is_imported {
+    let mut logs_unavailable = false;
+    let activity = if is_imported {
+        None
+    } else {
+        let root = project_root.clone();
+        let task_id = linked_task
+            .as_ref()
+            .map(|task| task.task_id)
+            .or(metadata.workspace_task_id);
+        let run_id = linked_task.as_ref().and_then(|task| {
+            task.runs
+                .iter()
+                .find(|run| Some(run.run_id) == task.run_id && run.kind != "legacy")
+                .map(|run| run.run_id)
+        });
+        let private = vec![metadata.source_path.clone(), root.clone()];
+        match tokio::task::spawn_blocking(move || {
+            crate::tasks::logs::project_activity_tail(&root, id, task_id, run_id, &private)
+        })
+        .await
+        {
+            Ok(Ok(activity)) => activity,
+            _ => {
+                logs_unavailable = true;
+                None
+            }
+        }
+    };
+    let logs = if is_imported || activity.is_some() || logs_unavailable {
         Vec::new()
     } else {
-        read_project_log_tail(&project_root.join("logs")).await?
+        match read_project_log_tail(&project_root.join("logs")).await {
+            Ok(logs) => logs,
+            Err(_) => {
+                logs_unavailable = true;
+                Vec::new()
+            }
+        }
     };
     let input_images = metadata.output.as_ref().map(|output| output.input_images);
     let registered_images = metadata
@@ -1451,6 +1562,9 @@ pub async fn get_project_task_detail(
             .as_ref()
             .map(|reshoot| reshoot.source_project_id.to_string()),
         logs,
+        activity_events: activity.as_ref().map(|tail| tail.events.clone()),
+        activity_journal_persisted: activity.map(|tail| tail.persisted),
+        logs_unavailable: logs_unavailable.then_some(true),
         imported: imported_detail,
     })
 }
@@ -3213,6 +3327,24 @@ mod tests {
         assert_eq!(lines.first().unwrap().message, "line-0120");
         assert_eq!(lines.last().unwrap().message, "line-0619");
         assert!(lines.iter().all(|line| line.source == "brush"));
+    }
+
+    #[tokio::test]
+    async fn historical_raw_logs_include_nested_attempts_without_merging_source_names() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        fs::create_dir_all(logs.join("attempt-1")).unwrap();
+        fs::write(logs.join("brush.log"), "root attempt\n").unwrap();
+        fs::write(logs.join("attempt-1/brush.log"), "nested attempt\n").unwrap();
+        fs::write(logs.join("activity-invalid.log"), "not raw engine output\n").unwrap();
+        let lines = read_project_log_tail(&logs).await.unwrap();
+        assert!(lines
+            .iter()
+            .any(|line| line.source == "brush" && line.message == "root attempt"));
+        assert!(lines
+            .iter()
+            .any(|line| line.source == "attempt-1/brush" && line.message == "nested attempt"));
+        assert!(!lines.iter().any(|line| line.message.contains("not raw")));
     }
 
     #[tokio::test]

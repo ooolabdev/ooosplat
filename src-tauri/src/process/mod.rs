@@ -552,9 +552,16 @@ impl ProcessManager {
                 stderr_task.abort();
                 if let Some(task) = heartbeat_task { task.abort(); }
                 if let Some(log_path) = &spec.log_path {
-                    if let Some(parent) = log_path.parent() { fs::create_dir_all(parent).await?; }
-                    let mut file = OpenOptions::new().create(true).append(true).open(log_path).await?;
-                    file.write_all(format!("cancelled after {} ms\n\n", started.elapsed().as_millis()).as_bytes()).await?;
+                    let note = async {
+                        if let Some(parent) = log_path.parent() { fs::create_dir_all(parent).await?; }
+                        let mut file = OpenOptions::new().create(true).append(true).open(log_path).await?;
+                        file.write_all(format!("cancelled after {} ms\n\n", started.elapsed().as_millis()).as_bytes()).await
+                    }.await;
+                    if let Err(error) = note {
+                        // This is an explanatory note after our own process
+                        // termination, not a new generation failure.
+                        tracing::warn!(%error, "Could not append the cancellation note");
+                    }
                 }
                 return Err(SplatError::Cancelled);
             }
@@ -798,6 +805,54 @@ mod tests {
                 .await,
             Err(SplatError::Cancelled)
         ));
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn cancellation_note_failure_cannot_replace_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("engine.log");
+        let moved_log = directory.path().join("opened-engine.log");
+        let manager = ProcessManager::new();
+        let cancel = manager.clone();
+        let redirected = log.clone();
+        let manager = manager.with_lifecycle(Arc::new(move |event| {
+            if matches!(event, ProcessUpdate::LogOpened { .. }) {
+                // Only this test's log is redirected. The already open raw
+                // writer stays valid, but the later explanation cannot open it.
+                std::fs::rename(&redirected, &moved_log).unwrap();
+                std::fs::create_dir(&redirected).unwrap();
+                cancel.cancel();
+            }
+        }));
+        #[cfg(windows)]
+        let (executable, args) = (
+            system_executable("WindowsPowerShell/v1.0/powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 30".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (executable, args) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), "sleep 30".into()],
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.run(ProcessSpec {
+                executable,
+                args,
+                working_directory: Some(directory.path().to_owned()),
+                log_path: Some(log),
+                observer: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(SplatError::Cancelled)));
     }
 
     #[tokio::test]

@@ -2,9 +2,29 @@
 
 开发与验收记录，2026-10-26。对应 [PR #69](https://github.com/ooolabdev/ooosplat/pull/69)，不代表所有平台已完成发布验收。
 
+## 当前执行与恢复架构（2026-11-09）
+
+新建补拍不再拥有独立的素材准备、训练、发布和恢复实现。任务先把源项目冻结为项目内的只读 `ReshootSnapshotV3`，再把用户答案转换为 `ExecutionPlan`，由普通多素材生成执行器处理准备、匹配、Bridge、训练数据、Brush 和结果发布。源项目在快照完成后不再参与继续生成或失败重试。
+
+首次生成、补拍、COLMAP直接训练及停止后的继续生成使用同一条成果驱动流水线，工作单保存在现有 `state.json`，不新增 Ticket 文件。统一 Artifact Manifest 校验准备图片、特征数据库、匹配、稀疏模型、训练数据和 Brush candidate；有效成果复用，只执行新增、未完成或失效部分。源快照、增量约束、新旧来源匹配和新增素材成功条件仍属于补拍规则。
+
+失败、取消和中断均通过“继续生成”处理，新增 `continue` 运行记录以隔离日志和迟到事件，但不恢复初始方案、不升级原策略，也不重置已消耗额度。实际执行路线、训练配方、OOM降低后的上限、Bridge结果及补拍回退次数均保留；旧 `resume`／`retry` 运行历史不改写。次数耗尽仍允许主动执行未完成步骤，只是不再自动降点或换方案。未完成训练从该次初始化重新启动，不恢复优化器；已有有效候选只恢复发布。旧任务通过兼容适配保留保存配方，不能安全解释时停止，不能静默改用新默认值。
+
+发布使用项目内耐久事务：候选校验、安装 `final.ply`、Commit、项目视图对齐和任务视图对齐分阶段保存。启动及继续生成都会先恢复该事务；已有 Commit 时不会再次启动 Brush。部分新增来源成功可完成并保存逐来源警告，全部新增来源零注册则失败。软件重启不会自动继续生成；需要用户或已授权Agent明确请求。
+
+本轮收口：外部Gaussian来源按已登记的COLMAP资产校验，不要求伪造内部`state.json`；没有可信坐标证据时不用于旧PLY初始化。缺策略字段的旧任务按实际保存参数判断，不一概拒绝，也不猜测缺失配方。继续关闭自动队列；新增画面的总体／逐来源低注册率单独提示，不被旧画面覆盖。补拍素材框提前拒绝COLMAP直接训练输入。上述路径的自动测试、真实引擎及桌面验收分别记录，不因已修改代码就宣称跨设备画质已通过。
+
+Generation, reshoots, direct COLMAP training and continuation share one artifact-driven processing flow backed by the existing `state.json`, not a new Ticket file. Failed, cancelled and interrupted tasks all use Continue generation. Each explicit continuation creates a `continue` run record but preserves the saved policy, actual route/recipe, OOM-lowered cap, Bridge results and consumed fallback allowances. Historical `resume`/`retry` records are unchanged. Consumed allowances do not renew, and app restart does not start work automatically. Incomplete Brush training restarts from its recorded initialization, not optimizer state; validated candidates/committed outputs recover publication without training again.
+
+本轮自动化与尚未完成的原生验收见[统一继续验证记录](UNIFIED_CONTINUATION_VALIDATION.md)。以下2026-10-30及更早章节保留当时的接口、配方和实测上下文；当前默认参数及授权以[生成策略说明](GENERATION_POLICY.md)为准，不能将历史“自动优化”、1000万上限或微调倍率解释为新任务行为。
+
+2026-10-30 更新：新建补拍可使用有序多素材列表，混合普通／完整ERP视频、图片文件夹和散图集；每个普通来源分别确认拍摄设置，每个超过100张的图片集分别确认顺序。版本4视频共用目标FPS，训练使用正常完整配方，含ERP训练面时使用全景配方。旧任务续跑不改写快照。下方原始单素材、旧配方与原生测试记录保留为历史；当前边界及未完成验收见[统一输入说明](MULTI_INPUTS.md)。
+
+New reshoots accept ordered mixed sources, with camera-relation and image-order answers bound to each applicable source. Policy v4 uses shared FPS and normal full training recipes, preserving saved older resumes. Historical notes below are not acceptance evidence for mixed-device/project end-to-end runs.
+
 ## 使用方式
 
-从已完成项目创建补拍草稿。默认继承质量与自动优化，启动前可调整。视频沿用正常生成的抽帧；超过100张补拍图片需回答顺序问题。依次询问原模型情况、普通素材的拍摄设置、必要的图片顺序，不增加方案确认页；全部必要问题回答后才创建任务。全景跳过拍摄设置问题。GUI自动回退随自动优化开关保存；已创建任务沿用原快照，不追溯改写。
+从已完成项目创建补拍草稿。继承质量，自动重试默认开启，启动前可调整。视频沿用正常抽帧；超过100张的图片集在素材框内回答顺序问题。启动前依次询问原模型情况及普通素材拍摄设置，不增加方案确认页；全部必要答案完整后才创建任务。全景跳过拍摄设置问题。改变方案的回退受自动重试授权控制；已创建任务沿用原快照，不追溯改写。
 
 | 原模型情况 | 初始方案 |
 | --- | --- |
@@ -18,18 +38,18 @@
 ## 重建和缓存
 
 - 普通补拍允许跨分辨率、宽高比、设备和镜头。选择拍摄设置“相同”、源模型只有一组普通相机且全部实际工作图片尺寸/方向兼容时，用`existing_camera_id`复用原内参；其他情况普通照片逐张独立、视频批内共享。不凭同设备名或同尺寸自动合并。答案与实际相机分组保存到检查点，旧任务不追溯改变。
-- 原相机 ID 和已注册图片引用保留，最终稀疏模型的优化后内参仅同步到派生数据库。增量固定旧位姿和内参；全量不加载旧模型。局部/全局 BA 显式 Ceres。
+- 原相机 ID 和已注册图片引用保留，最终稀疏模型的优化后内参仅同步到派生数据库。增量固定旧位姿和内参；全量不加载旧模型。新任务的普通补拍在相机／约束兼容、数据量达标且实际 GPU 探测通过时采用局部 Ceres／全局 Caspar，含ERP或位置先验仍全 Ceres；旧任务不扩大保存的 BA 范围。
 - 小规模枚举新旧图片对；大规模用捆绑 COLMAP 的词袋检索，仅索引已注册旧图，每张新图取30个候选，零新增注册时扩大至60并重试增量一次。新增视频/已排序图片使用窗口10；其他图片穷举；闭环继承档位与自动优化规则。
-- ERP 补拍保留原始球面 SfM；各批可有不同尺寸。仅注册成功的画面生成92°六面，面上限512/768/1024且不放大。RGB和Alpha同投影；点云保留3D初始化点，移除失效ERP观测与轨迹。
+- ERP 补拍保留原始球面 SfM；各批可有不同尺寸。仅注册成功的画面生成92°六面，当前快速／均衡面上限512／768，精细面边长为ERP宽度的四分之一且不放大；旧任务采用保存尺寸。RGB和Alpha同投影；点云保留3D初始化点，移除失效ERP观测与轨迹。
 - 六面映射记录批次、原文件名、身份/方向、时间或自然顺序、ERP和派生相机；图片不伪造PTS。自动定位取最早有效来源的front面。
 - 来源身份、问题答案、初始/实际方案、回退次数、实际训练参数和初始化哈希保存到可选检查点，不升级项目schema。旧任务缺少recipe时继续旧路径。恢复未完成训练是重新从该次初始化开始，不恢复优化器。
 - 大型处理在阻塞工作线程执行；逐图/逐面转换和完整PLY校验支持取消，不并行驻留所有源图。
 
 ## 训练参数
 
-新建任务保存`normalParametersVersion: 1`，直接使用对应普通/全景正常生成的参数解析器和任务配置快照。质量档位、自动优化、显存及实际尺寸决定完整步数、分辨率、Refine、增密、学习率和Splat预算；不再使用补拍倍率。视频调用原有`prepare_frames()`，自动优化开启时也使用正常工作分辨率规划。
+新建任务使用普通／全景正常生成的参数解析器和任务配置快照，不再使用补拍倍率。质量档位、策略、硬件及实际训练数据决定完整配方；自动重试只控制有损降点或换方案授权，不切换基础优化策略。视频使用公共画面准备和逐素材计划。旧任务按其保存的策略及实际参数执行。
 
-第一选项仍可从可信的未编辑PLY初始化，并新建优化器；正常预算解析使用实际旧PLY点数，不再用稀疏点数代替。普通配方未指定上限时不另加上限，全景仍受1000万硬上限保护。旧图与新图共同训练，不冻结旧Gaussian，不保证仅改变新增区域。完整配方可能比历史微调耗时更长。
+第一选项仍可从可信的未编辑PLY初始化，并新建优化器；正常预算解析使用实际旧PLY点数，不再用稀疏点数代替。当前精细普通预算使用有效像素公式，含ERP训练面使用权威重建稀疏点数×40，不乘六；初始化点数保护及数值范围校验保持不变，不再描述为统一1000万硬上限。旧图与新图共同训练，不冻结旧Gaussian，不保证仅改变新增区域。完整配方可能比历史微调耗时更长。
 
 以下为**历史配方**，只供已有任务恢复和旧实测记录解读；缺少新策略字段的任务保留它，新任务不再采用：
 
@@ -43,7 +63,7 @@
 
 位置学习率初始/最终为Brush默认值×0.25；颜色、透明度、尺寸、旋转×0.5；位置噪声×0.1。保持原SH阶数和初始化点数，预算不得低于初始化点数；全景硬上限仍为1000万。完整重训不使用微调倍率。不冻结旧Gaussian，也不保证只改变补拍区域。
 
-新建GUI补拍只有开启自动优化才自动允许零新增注册/旧坐标不兼容时全量重建一次，或明确数值发散/正常结束输出非法时冷启动一次；MCP仍使用显式`allowFallback`参数，旧任务保留已保存授权。OOM、资源限制、进程崩溃、磁盘/文件错误、素材变化和取消不触发算法回退。低但非零注册只警告。原有有界OOM保护独立保留；不丢弃初始化点避开显存错误。各次训练保留独立尝试目录，恢复不重置回退次数。
+当前补拍只有取得自动重试授权，才允许零新增注册／旧坐标不兼容时全量重建一次，或明确数值发散／正常结束输出非法时重新训练一次；旧任务保留原授权。OOM、资源限制、进程崩溃、磁盘／文件错误、素材变化和取消不触发算法回退。低但非零注册只警告。OOM独立按保存的有界规则处理，不丢弃初始化点避开显存错误。各次训练保留独立尝试目录，继续不重置次数。
 
 ## MCP
 
@@ -84,8 +104,8 @@ Windows x64，本机RTX 3060 Ti 8GB，捆绑COLMAP 4.2.1和现有OOOBrush；使�
 
 New reshoots use the normal full ordinary/panorama training recipe, including when initialized from the unedited old PLY. There are no shortened warm-start steps or reduced learning/densification multipliers. Existing tasks keep their saved recipe. Ordinary inputs additionally ask whether capture settings match; original intrinsics are reused only after explicit confirmation and compatible single-camera pixel checks. Otherwise the current independent-camera strategy remains. ERP batches stay independent. Reshoot-only preparation/cache logs are throttled and cancellable; successful publishing logs the verified PLY count, and completed tasks no longer show a stale training monitor.
 
-Reshoot v2 preserves the source project and writes a derived project. Ordinary inputs may differ in size/aspect/device/lens; full monoscopic ERP inputs may differ across batches. Ordinary and ERP projections cannot be mixed. Conservative independent photo cameras avoid falsely sharing intrinsics. Incremental reconstruction fixes old poses/intrinsics; full reconstruction does not load the old sparse model. Both use explicit Ceres BA.
+Reshoots preserve the source project and write a derived project. Ordinary inputs may differ in size/aspect/device/lens; full monoscopic ERP inputs may differ across batches. The unified pipeline supports ordinary/ERP source combinations, while each image set has one projection. Conservative independent photo cameras avoid falsely sharing intrinsics. Incremental reconstruction fixes old poses/intrinsics; full reconstruction does not load the old sparse model. Both use explicit Ceres BA.
 
-The four model-condition answers choose incremental+warm, incremental+cold, full+cold, and incremental+cold respectively, with plain-language explanations in the choices and no separate plan-confirmation page. For new GUI reshoots, Auto Optimize also enables slower algorithm fallback; switching it off disables that fallback. MCP retains its explicit `allowFallback` parameter, and existing tasks keep saved decisions. Fallbacks remain bounded across resumes; resource/process/storage failures never trigger algorithm fallback. Warm-start uses the unedited generated PLY and a new optimizer, not optimizer-state continuation. Old and new views both train.
+The four model-condition answers choose incremental+warm, incremental+cold, full+cold, and incremental+cold respectively, with plain-language explanations and no separate plan-confirmation page. Image order is answered inline; ordinary inputs also ask about camera settings. Automatic retry authorizes bounded quality/route-changing fallbacks; existing tasks retain saved decisions and consumed allowances. Resource/process/storage failures never trigger algorithm fallback. Warm initialization uses a trusted unedited PLY and a new optimizer, not optimizer-state continuation. External Gaussian/COLMAP associations do not prove compatible Gaussian coordinates. Old and new views both train. Explicit continuation disables the automatic queue and runs only that task.
 
 Earlier Ballintoy tests used the historical 3000-step warm recipe. The current normal-recipe test registered all eight new ERP images (64 total), initialized from 209,467 splats, and published 578,827 splats after 12,000 steps in 358,226 ms. The source PLY hash was unchanged. A separate real COLMAP extraction test verified shared versus independent camera IDs and unchanged source PNG bytes. These are Windows core tests, not desktop or cross-device acceptance. Desktop interaction, ordinary-video reshoot end-to-end, macOS/Linux, visual quality comparisons, and peak resource measurements remain unverified. See the Chinese sections above for evidence paths and automatic-test results.

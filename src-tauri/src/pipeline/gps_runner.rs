@@ -126,6 +126,14 @@ struct GpsMapperOptions<'a> {
     allow_two_view_tracks: bool,
 }
 
+fn gps_command_observer(args: &[OsString]) -> ObserverMode {
+    match args.first().and_then(|value| value.to_str()) {
+        Some("spatial_matcher") => ObserverMode::Matching,
+        Some("mapper" | "pose_prior_mapper") => ObserverMode::Mapper,
+        _ => ObserverMode::Generic,
+    }
+}
+
 /// Keep the GPS reconstruction request independent of BA backend selection.
 /// Both initial execution and a Ceres compatibility retry use this same list.
 fn gps_mapper_args(options: GpsMapperOptions<'_>) -> Vec<OsString> {
@@ -371,6 +379,7 @@ impl PipelineRunner {
     }
     #[allow(clippy::too_many_arguments)]
     async fn gps_command(&self, paths: &ProjectPaths, args: Vec<OsString>) -> Result<()> {
+        let mode = gps_command_observer(&args);
         colmap::run_colmap(
             &self.engines.colmap,
             args,
@@ -381,7 +390,7 @@ impl PipelineRunner {
                 PipelineStage::Reconstructing,
                 PipelineEngine::Colmap,
                 None,
-                ObserverMode::Mapper,
+                mode,
             )),
         )
         .await
@@ -730,6 +739,54 @@ impl PipelineRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gps_matcher_uses_matching_counts_without_switching_the_reconstruction_stage() {
+        assert_eq!(
+            gps_command_observer(&["spatial_matcher".into()]),
+            ObserverMode::Matching
+        );
+        assert_eq!(
+            gps_command_observer(&["pose_prior_mapper".into()]),
+            ObserverMode::Mapper
+        );
+        assert_eq!(
+            gps_command_observer(&["model_aligner".into()]),
+            ObserverMode::Generic
+        );
+        assert_eq!(
+            gps_command_observer(&["model_transformer".into()]),
+            ObserverMode::Generic
+        );
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(PathBuf::from("missing-engines")),
+            move |event| output.lock().unwrap().push(event),
+        );
+        let observer = runner.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            None,
+            gps_command_observer(&["spatial_matcher".into()]),
+        );
+        observer(crate::process::ProcessUpdate::Started { process_id: 42 });
+        observer(crate::process::ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stderr,
+            line: "Indexing image [1/5]".into(),
+        });
+        let events = captured.lock().unwrap();
+        let progress = events
+            .iter()
+            .find(|event| event.current == Some(1))
+            .unwrap();
+        assert_eq!(progress.unit.as_deref(), Some("matchingIndexImages"));
+        assert_eq!(progress.total, Some(5));
+        assert!(progress.indeterminate && progress.stage_progress.is_none());
+        assert!(events
+            .iter()
+            .all(|event| event.stage == PipelineStage::Reconstructing));
+    }
 
     #[tokio::test]
     async fn gps_training_continuation_reuses_cache_after_json_reload_without_engines() {

@@ -24,7 +24,7 @@ it('keeps face counts separate from Brush iterations and hides preparation ETA',
 });
 
 it.each([
-  ['reconstructing', null, 40, 173, 'registeredImages', '正在还原拍摄场景（40/173）。此步骤可能耗时较长，请耐心等待'],
+  ['reconstructing', null, 40, 173, 'registeredImages', '正在还原拍摄场景。此步骤可能耗时较长，请耐心等待'],
   ['reconstructing', 'panoramaReconstruction', 40, 173, 'registeredImages', '当前模型已注册 40/173 张原始画面。此步骤可能耗时较长，请耐心等待'],
   ['reconstructing', 'panoramaImagesReconstruction', 40, 94, 'registeredImages', '当前模型已注册 40/94 张原始图片。此步骤可能耗时较长，请耐心等待'],
   ['extractingFrames', 'panoramaImagesPreparation', 12, 94, 'images', '正在准备全景图片 12/94'],
@@ -46,6 +46,61 @@ it.each([
     await act(async () => root.render(<LanguageProvider><Caption /></LanguageProvider>));
     expect(container.textContent).toBe(expected);
     expect(container.textContent).not.toContain('非完成进度');
+  } finally { await act(async () => root.unmount()); localStorage.clear(); }
+});
+
+it.each(['zh-CN', 'en'] as const)('does not present repeated Mapper submodel initializations as whole-stage image progress (%s)', async locale => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  localStorage.setItem('ooo-splat-language', locale);
+  const container = document.createElement('div'), root = createRoot(container);
+  // Sanitized replay from a real 90-photo Mapper process: every new initial
+  // pair resets its local registration count, not the stage's observed estimate.
+  const observations = [[0, 0], [2, 2], [3, 3], [0, 3], [2, 3], [4, 4], [0, 4], [6, 6], [0, 6]];
+  const events: PipelineEvent[] = [];
+  function View({ event }: { event: PipelineEvent }) {
+    const message = useProgressMessage('running', 'reconstructing', events, null, event);
+    return <TaskProgress status="running" stage="reconstructing" progress={event.progress} stageProgress={event.stageProgress}
+      progressUnit={event.unit} message={message} showRuntimePanel={false} logs={[]} />;
+  }
+  try {
+    for (const [index, [current, stageProgress]] of observations.entries()) {
+      const event = { sequence: index + 1, kind: 'progress', stage: 'reconstructing', engine: 'colmap',
+        operation: { id: 8, attempt: 1 }, current, total: 90, unit: 'registeredImages', stageProgress,
+        progress: 45 + stageProgress * .13, indeterminate: false,
+        message: current === 0 ? 'Registering initial image pair' : `已注册 ${current} 张图像`,
+      } as PipelineEvent;
+      events.push(event);
+      const saved = structuredClone(event);
+      await act(async () => root.render(<LanguageProvider><View event={event} /></LanguageProvider>));
+      expect(container.querySelector('.current-message')?.textContent).toBe(locale === 'en'
+        ? 'Rebuilding the captured scene. This step may take a while. Please wait.'
+        : '正在还原拍摄场景。此步骤可能耗时较长，请耐心等待');
+      expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe(`${stageProgress.toFixed(1)}%`);
+      expect(event).toEqual(saved);
+      expect(events.at(-1)?.current).toBe(current);
+    }
+  } finally { await act(async () => root.unmount()); localStorage.clear(); }
+});
+
+it.each(['zh-CN', 'en'] as const)('suppresses only ordinary Bridge Mapper counters under validation, preserving real validation and panorama counters (%s)', async locale => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  localStorage.setItem('ooo-splat-language', locale);
+  const container = document.createElement('div'), root = createRoot(container);
+  function Caption({ current, unit, substage }: { current: number; unit: string; substage?: string }) {
+    const event = { kind: 'progress', stage: 'validatingReconstruction', current, total: 90, unit, substage } as PipelineEvent;
+    return <p>{useProgressMessage('running', 'validatingReconstruction', [event], null, event)}</p>;
+  }
+  try {
+    for (const current of [0, 2, 6, 0, 2, 3, 0]) {
+      await act(async () => root.render(<LanguageProvider><Caption current={current} unit="registeredImages" /></LanguageProvider>));
+      expect(container.textContent).toBe(locale === 'en'
+        ? 'Checking the reconstruction. This step may take a while. Please wait.'
+        : '正在检查重建结果。此步骤可能耗时较长，请耐心等待');
+    }
+    await act(async () => root.render(<LanguageProvider><Caption current={8} unit="images" /></LanguageProvider>));
+    expect(container.textContent).toBe(locale === 'en' ? 'Checking the reconstruction (8/90)' : '正在检查重建结果（8/90）');
+    await act(async () => root.render(<LanguageProvider><Caption current={3} unit="registeredImages" substage="panoramaReconstruction" /></LanguageProvider>));
+    expect(container.textContent).toBe(locale === 'en' ? 'Checking the reconstruction (3/90)' : '正在检查重建结果（3/90）');
   } finally { await act(async () => root.unmount()); localStorage.clear(); }
 });
 

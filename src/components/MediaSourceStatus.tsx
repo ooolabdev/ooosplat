@@ -1,6 +1,6 @@
 import { useId } from 'react';
 import { CircleAlert, Globe, Images, LoaderCircle, MapPin, RotateCcw, TvMinimalPlay } from 'lucide-react';
-import { useI18n } from '../i18n';
+import { localizePipelineMessage, useI18n } from '../i18n';
 import type { InputType, ProjectionDetection, VideoProjection } from '../types/pipeline';
 import { AlphaSourceStatus } from './AlphaSourceStatus';
 import { CompactError } from './CompactError';
@@ -25,10 +25,12 @@ interface Props {
 
 /** The connected lower half of the media picker; no independent card or preview. */
 export function MediaSourceStatus({ inputType, checking, error, detection, projection, historical, gpsDetected, gpsFallback, alphaDetected, metadataSummary, disabled, onProjectionChange, onRetry, showTypeIcon = true }: Props) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const id = useId();
+  const dimensionError = error?.includes('图片序列分辨率不一致：')
+    ? error.slice(error.indexOf('图片序列分辨率不一致：')) : null;
   if (checking) return <div className="media-source-status checking" role="status" aria-live="polite"><LoaderCircle size={17} className="spin" /><span>{t(inputType === 'video' ? 'source.detectingVideo' : 'source.detectingImages')}</span></div>;
-  if (error) return <div className="media-source-status source-analysis-error" role="alert"><CircleAlert size={17} /><div><strong>{t('source.analysisFailed')}</strong><CompactError message={error} /></div>{onRetry && <button className="media-retry" type="button" disabled={disabled} onClick={onRetry}><RotateCcw size={13} />{t('source.retry')}</button>}</div>;
+  if (error) return <div className="media-source-status source-analysis-error" role="alert"><CircleAlert size={17} /><div><strong>{t('source.analysisFailed')}</strong>{dimensionError ? <span className="source-dimension-error">{localizePipelineMessage(locale, dimensionError)}</span> : <CompactError message={error} />}</div>{onRetry && <button className="media-retry" type="button" disabled={disabled} onClick={onRetry}><RotateCcw size={13} />{t('source.retry')}</button>}</div>;
   const images = inputType === 'images';
   const panorama = projection === 'equirectangular';
   const choice = !historical && detection?.requiresChoice;

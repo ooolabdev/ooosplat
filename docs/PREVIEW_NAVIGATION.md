@@ -4,7 +4,9 @@
 
 ## 使用方式
 
-- 点击预览画布或“自动定位视角”后即可使用 W/S 沿水平面前后移动、A/D 沿水平面左右移动。方向随相机水平朝向变化，不受俯仰或侧倾影响，相机与观察中心高度保持不变；垂直朝上／朝下时继续使用当前水平朝向。基础速度为每秒当前可见画面高度的15%（原倍率的15%），随滚轮放大减速、缩小加速，Shift 三倍加速；相同距离和 FOV 下倍率一致。只在“调整”模式的透视视图中生效；正交视图不响应、不自动转为透视。
+- 按住任一 WASD 时申请锁定并隐藏鼠标，无需按住鼠标键即可原地转向；W/S 的行进方向随视线转向，包含俯仰变化，A/D 始终水平侧移。最后一个 WASD 松开或按 Esc 后恢复光标；Esc 不清空框选，需重新按下漫游键才可再次进入。锁定期间不响应编辑、框选、操作轴和滚轮；不支持或拒绝锁定时保留原有 WASD＋拖动操作，不弹窗或循环申请。鼠标转向保留侧倾、FOV、距离及画面偏移，不触发绕模型旋转的调平。
+
+- 点击预览画布或“自动定位视角”后即可使用 W/S 沿当前视线前后移动：抬头按 W 上升，低头按 W 下降，S 沿相反方向移动。A/D 按相机水平朝向左右侧移，不受俯仰或侧倾影响；垂直朝上／朝下时仍保留当前水平朝向。相机与观察中心同步平移，不重新朝向模型。基础速度为每秒当前可见画面高度的15%（原倍率的15%），随滚轮放大减速、缩小加速，Shift 三倍加速；相同距离和 FOV 下倍率一致。只在“调整”模式的透视视图中生效；正交视图不响应、不自动转为透视。
 - 输入框、弹窗、导出、选择手势和操作轴拖动不会触发漫游；释放按键、失焦、切换工具或离开页面时停止。一次连续漫游结束后保存视角，不逐帧写本地存储。
 - 底部黑色状态栏右侧的“漫游速度”支持0.1×–5.0×、每级0.1×，默认1.0×保持上述15%基础速度，Shift在此基础上继续三倍。偏好按本机保存，不进入项目或撤销记录；正交／三视图下灰显。滑轨为2px，保留18px操作高度。
 - 画布编辑、编辑按钮、撤销／重做、保存结束后安全归还画布焦点；数值输入通过Enter主动确认、鼠标调速结束时也可直接继续WASD。Tab切换输入框、弹窗及正在执行的编辑／导出不被抢焦点；键盘调速时方向键仍操作滑轨，Enter再回到画布。迟到的异步操作、旧项目或旧预览实例不能恢复焦点。
@@ -13,7 +15,26 @@
 - 相机侧倾导致网格看起来歪斜时，主动旋转拖动超过阈值后会用约 180 毫秒平滑调平。自动定位和视角恢复仍保留原始完整朝向；单击、右键平移、滚轮和 WASD 不触发调平。矩形选择工具沿用中键旋转手势，不抢占左键选择。网格、模型和缩放均不因此调整。
 - 右上角统一为“图标 + 按键 + 功能”，如“左键 旋转”“右键 平移”“滚轮 缩放”“WASD 漫游”；不再展开 Shift 加速或透视限制说明，正交模式下漫游仍灰显且不生效。定位同步将焦点交还画布，动画结束不会抢走后来打开的输入框或弹窗焦点。
 
-2026-10-27 漫游速度滑轨、编辑后焦点恢复及抽帧控件的本轮验证见[验证记录](PREVIEW_CONTROLS_VALIDATION.md)：632项前端与7项诊断测试、构建、中英文三种缩放布局及真实全景模型WebGL2/WebGPU预览均通过；原生桌面人工验收仍待完成。
+2026-10-27 漫游速度滑轨、编辑后焦点恢复及抽帧控件的历史验证见[验证记录](PREVIEW_CONTROLS_VALIDATION.md)：632项前端与7项诊断测试、构建、中英文三种缩放布局及真实全景模型WebGL2/WebGPU预览均通过；这些记录不代表本次 W/S 视线移动已完成实际渲染验收，原生桌面人工验收仍待完成。
+
+### 2026-11-10：W/S 沿视线移动
+
+- W/S 使用包含俯仰的当前视线方向，A/D 继续按水平朝向侧移；合并方向后归一化，不改变15%基础速度、调速倍率、Shift加速和Pointer Lock生命周期。
+- 前端完整844项、诊断协议7项、生产构建和差异检查通过。113项相机／鼠标转向定向测试覆盖抬头、低头、W/S反向、正负90°极点、侧倾下水平侧移、组合键、帧率与速度、锁定及退出。相机矩阵采用Float32，精确速度通过观察中心验证，并独立检查眼点同步平移误差不超过1e-6。
+- 真实Edge浏览器15组交互通过，证据：`.cache/viewer-mouse-look/1794321811896/`。包括W/S升降与反向、带侧倾的A/D水平移动，以及既有锁定、组合键、鼠标转向、Esc、焦点隔离、拒绝降级和销毁；运行时异常为空。使用实际控制器和浏览器API的示意2D画布，原生Tauri／WebView2及真实Gaussian GPU渲染未在本轮验收。
+
+W/S now follows the full viewing direction, including pitch; A/D remains world-horizontal and roll-independent. Speed, Shift, normalization and pointer-lock ownership are unchanged. All 844 frontend tests, 7 diagnostic tests, the production build and 15 real Edge controller/input cases passed. Native Tauri/WebView2 and Gaussian GPU rendering remain unverified for this change.
+
+### 历史验证记录：2026-11-10 按住 WASD 鼠标转向
+
+以下为 W/S 仍沿水平面移动时的验证记录；当前 W/S 已改为沿视线移动，测试数量及浏览器证据不追溯改写，也不作为该方向调整的新验收结论。
+
+- 前端完整测试833项、诊断协议测试7项及生产构建通过；新增29项控制器测试、5项编辑事件边界测试和1项中英文提示测试。覆盖组合键、Esc、最后增量保存、固定眼位、侧倾／投影偏移、void／Promise接口、拒绝降级、销毁和迟到授权隔离。
+- `node scripts/verify-viewer-mouse-look.mjs` 的7组真实Edge浏览器交互通过，证据位于 `.cache/viewer-mouse-look/1794319848370/`。实际使用浏览器Pointer Lock、可信键鼠事件和生产ViewerControls，校验无按钮转向、最后松键、Esc、反向按键固定眼位、投影参数、输入焦点／正交隔离、sandbox拒绝降级及销毁释放；运行时异常为空。
+- 浏览器测试仅使用示意2D画布和相机节点，不等同于Gaussian、WebGPU／WebGL2渲染、原生Tauri／WebView2或OS光标外观验收；这些仍未验证。Esc后的浏览器原生短暂锁定冷却仅在测试中等待，产品代码不自动循环申请。
+- 新增锁定状态不持久化，不改变漫游速度、调速偏好、相机记录、训练或模型。React事件边界已复核：锁定期间在捕获阶段拦截鼠标编辑，Esc先结束导航而不清空框选；无新增逐帧React状态更新或持续重绘。
+
+The mouse-look implementation verified in this historical run enabled first-person mouse look only while WASD was held in a focused, interactive perspective canvas. Mouse look preserved the eye, roll and projection; movement was horizontal at the existing speed. Last-key release or Escape restored the cursor, and unavailable/denied Pointer Lock fell back to keyboard/drag controls. All 833 frontend tests, 7 diagnostic tests, the production build and 7 real Edge controller/input cases passed. These results predate the current W/S view-direction movement; native Tauri/WebView2 and Gaussian GPU rendering remained unverified.
 
 ## 参考相机来源
 
@@ -134,10 +155,10 @@ node scripts/verify-preview-navigation.mjs '<已完成项目目录>' '.cache/pan
 
 ## English summary
 
-Perspective-only WASD navigation stays on the world-horizontal XZ plane, following camera yaw independently of pitch/roll (including vertical views), and preserves camera/target height. Speed is 15% of one visible height per second, zoom-relative, with Shift ×3. Clicking the canvas or the text-only “Auto locate view” button enables it directly in Adjust; locating returns focus synchronously, never at animation completion. Upper-right hints remain visible but disabled in orthographic views. Queued timestamps cannot move the flight clock backwards or double-count movement. Ordinary projects use their actual first valid Brush dataset image; panorama projects use the earliest registered ERP frame's front training face. Locate always restores that perspective camera, leaving any fixed/free orthographic view and clearing fixed-view selection. The cached robust depth (or bounds fallback) sets only the orbit target/distance, not a substitute orthographic zoom or camera pose. Imported/missing/unverified cameras disable locating. Right-button pan is unchanged. Roll, FOV and projection state remain compatible with saved views, video capture and offline HTML. Earlier speed and orthographic-scale verification records above describe superseded behavior.
+Perspective-only navigation moves W/S along the current view direction, including pitch: W ascends when looking up and descends when looking down, while S reverses that direction. A/D strafe on the world-horizontal XZ plane, following camera yaw independently of pitch/roll, including vertical views. Movement translates the camera and target together without changing orientation. Speed is 15% of one visible height per second, zoom-relative, with Shift ×3. Clicking the canvas or the text-only “Auto locate view” button enables it directly in Adjust; locating returns focus synchronously, never at animation completion. Upper-right hints remain visible but disabled in orthographic views. Queued timestamps cannot move the flight clock backwards or double-count movement. Ordinary projects use their actual first valid Brush dataset image; panorama projects use the earliest registered ERP frame's front training face. Locate always restores that perspective camera, leaving any fixed/free orthographic view and clearing fixed-view selection. The cached robust depth (or bounds fallback) sets only the orbit target/distance, not a substitute orthographic zoom or camera pose. Imported/missing/unverified cameras disable locating. Right-button pan is unchanged. Roll, FOV and projection state remain compatible with saved views, video capture and offline HTML. Earlier horizontal-navigation, speed and orthographic-scale verification records describe superseded behavior, not new validation of this W/S change.
 
 Earlier reference-view verification (before the horizontal-movement change) passed 427 frontend tests, 6 diagnostic tests, build, 11 Rust HTML-export tests, a separate real-project reference-camera test, formatting and Clippy. One optional HTML browser-fixture test remained ignored. A test run concurrent with software-rendered browser checks timed out and cascaded; the full isolated rerun passed without increasing timeouts. Real ordinary/panorama PLYs passed production Edge WebGL2/WebGPU checks for direct post-locate flight and orthographic pixel scale; the panorama sample exercised the invalid-depth fallback. The English narrow-layout check used an exact 1100px CSS viewport. Tauri IPC was mocked; native WebView2 manual and non-Windows platform checks remain outstanding. No generation/training was rerun.
 
 The bottom-right Movement speed slider applies a 0.1×–5.0× multiplier in 0.1× steps, defaulting to 1.0× (the existing 15%-visible-height base speed). Its 2px track retains an 18px interaction height. It stores a device-local preference and is disabled in orthographic views. Completed edits, history actions, saves, explicit numeric Enter and pointer speed adjustment return canvas focus safely. Keyboard range adjustment retains focus until Enter. Pending editing/selection, inputs, dialogs, export, stale operations and old preview instances cannot trigger unwanted navigation or steal focus. See the [control validation record](PREVIEW_CONTROLS_VALIDATION.md).
 
-Horizontal-navigation update (2026-10-19): 475 frontend tests (including 58 camera-control tests), 6 diagnostic tests and the production build passed. Coverage includes four ground-plane directions, pitch/roll and exact vertical views, unchanged camera height/orientation, 15% speed, zoom/FOV scaling, 30/60/144 FPS, normalized diagonals, opposing keys, Shift, focus isolation and immediate post-locate navigation. Movement translates the camera/target without recomputing lookAt, avoiding roll jitter at vertical views. This update did not rerun real-model browser/native rendering or generation/training; prior rendering results are not new validation of horizontal movement. Existing browser externalization/WASM URL/chunk-size build warnings remain.
+Historical horizontal-navigation update (2026-10-19): 475 frontend tests (including 58 camera-control tests), 6 diagnostic tests and the production build passed. Coverage includes four ground-plane directions, pitch/roll and exact vertical views, unchanged camera height/orientation, 15% speed, zoom/FOV scaling, 30/60/144 FPS, normalized diagonals, opposing keys, Shift, focus isolation and immediate post-locate navigation. Movement translates the camera/target without recomputing lookAt, avoiding roll jitter at vertical views. This update did not rerun real-model browser/native rendering or generation/training; prior rendering results are not new validation of horizontal movement. Existing browser externalization/WASM URL/chunk-size build warnings remain.

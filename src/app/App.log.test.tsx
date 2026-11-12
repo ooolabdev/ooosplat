@@ -169,6 +169,7 @@ describe("App live log", () => {
   it("does not substitute overall progress when the current stage percentage is unavailable", async () => {
     await act(async () => useAppStore.getState().receiveEvent({
       ...event(1),
+      kind: 'stage',
       stage: "reconstructing",
       progress: 47.3,
       stageProgress: null,
@@ -261,11 +262,11 @@ describe("App live log", () => {
     expect(viewport.getScrollTop()).toBe(1_500);
   });
 
-  it("shows plain-language progress with counts for the four processing stages", async () => {
+  it("shows plain-language processing captions without calling Mapper submodel counts completed work", async () => {
     const cases = [
       ["extractingFeatures", "正在分析画面（8/20）"],
       ["matching", "正在匹配图像：当前批次 9/20（非阶段完成进度）"],
-      ["reconstructing", "正在还原拍摄场景（10/20）。此步骤可能耗时较长，请耐心等待"],
+      ["reconstructing", "正在还原拍摄场景。此步骤可能耗时较长，请耐心等待"],
       ["trainingSplats", "正在生成高斯泼溅（11/20）。此步骤可能耗时较长，请耐心等待"],
     ] as const;
 
@@ -283,6 +284,132 @@ describe("App live log", () => {
       await flush();
       expect(container.querySelector(".current-message")?.textContent).toBe(expected);
     }
+  });
+
+  it('keeps all 90 ordinary photo groups on one global image count without labelling each group as a retry', async () => {
+    let sequence = 0;
+    for (let current = 0; current < 90; current++) {
+      const operation = { id: current + 1, attempt: 1, sourceId: 'ordinary-images' };
+      await act(async () => useAppStore.getState().receiveEvent({
+        ...event(++sequence), kind: 'stage', stage: 'extractingFeatures', engine: 'colmap', operation,
+        current, total: 90, unit: 'images', stageProgress: current / 90 * 100,
+      }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${current}/90）`);
+      await act(async () => useAppStore.getState().receiveEvent({
+        ...event(++sequence), stage: 'extractingFeatures', engine: 'colmap', operation,
+        current: current + 1, total: 90, unit: 'images', stageProgress: (current + 1) / 90 * 100,
+      }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${current + 1}/90）`);
+      expect(container.textContent).not.toContain('本阶段第');
+    }
+  });
+
+  it.each([
+    ['ordinary video', ['video'], [90]],
+    ['ERP video', ['erp-video'], [122]],
+    ['ERP image set', ['erp-images'], [40]],
+    ['multiple videos', ['video-a', 'video-b'], [30, 60]],
+    ['video and photos', ['video', 'images'], [30, 60]],
+    ['reshoot new sources', ['new-video', 'new-images'], [30, 60]],
+  ] as const)('accepts source-scoped global feature counters for %s', async (_label, sources, counts) => {
+    const total = counts.reduce((sum, value) => sum + value, 0);
+    let completed = 0, sequence = 0;
+    for (const [index, sourceId] of sources.entries()) {
+      const operation = { id: index + 1, attempt: 1, sourceId };
+      await act(async () => useAppStore.getState().receiveEvent({
+        ...event(++sequence), kind: 'stage', stage: 'extractingFeatures', engine: 'colmap', operation,
+        current: completed, total, unit: 'images', stageProgress: completed / total * 100,
+      }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${completed}/${total}）`);
+      completed += counts[index];
+      await act(async () => useAppStore.getState().receiveEvent({
+        ...event(++sequence), stage: 'extractingFeatures', engine: 'colmap', operation,
+        current: completed, total, unit: 'images', stageProgress: completed / total * 100,
+      }));
+      expect(container.querySelector('.current-message')?.textContent).toBe(`正在分析画面（${completed}/${total}）`);
+      expect(container.textContent).not.toContain('本阶段第');
+    }
+  });
+
+  it('ignores late counters from a previous feature source and starts Bridge with an independent total', async () => {
+    const first = { id: 1, attempt: 1, sourceId: 'video-a' };
+    const second = { id: 2, attempt: 1, sourceId: 'video-b' };
+    const send = async (sequence: number, operation: typeof first, current: number, total: number, kind: PipelineEvent['kind'] = 'progress') => act(async () => useAppStore.getState().receiveEvent({
+      ...event(sequence), kind, stage: 'extractingFeatures', engine: 'colmap', operation,
+      current, total, unit: 'images', stageProgress: current / total * 100,
+    }));
+    await send(1, first, 0, 90, 'stage');
+    await send(2, first, 30, 90);
+    await send(3, second, 30, 90, 'stage');
+    await send(4, second, 31, 90);
+    await send(5, first, 1, 90);
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（31/90）');
+    await send(6, second, 90, 90);
+    await act(async () => useAppStore.getState().receiveEvent({ ...event(7), kind: 'stage', stage: 'reconstructing', operation: { id: 3, attempt: 1 }, current: null, total: null }));
+    const bridge = { id: 4, attempt: 1, sourceId: 'video-b:bridge' };
+    await send(8, bridge, 0, 18, 'stage');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（0/18）');
+    await send(9, bridge, 1, 18);
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（1/18）');
+    expect(container.textContent).not.toContain('本阶段第');
+    await send(10, { ...bridge, id: 5, attempt: 2 }, 0, 18, 'stage');
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+
+  it('keeps a measured feature percentage through empty updates and non-progress logs without borrowing a prior PID', async () => {
+    const operation = { id: 1, attempt: 1, sourceId: 'photos' };
+    const known = { ...event(1), kind: 'stage' as const, stage: 'extractingFeatures', engine: 'colmap' as const,
+      operation, current: 18, total: 90, unit: 'images', stageProgress: 20, progress: 25,
+    };
+    await act(async () => useAppStore.getState().receiveEvent(known));
+    await act(async () => useAppStore.getState().receiveEvent({ ...known, sequence: 2, kind: 'progress',
+      progress: 99, stageProgress: null, indeterminate: true, current: null, total: null, unit: null }));
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('25.0%');
+    for (const [index, kind] of (['log', 'heartbeat'] as const).entries()) {
+      await act(async () => useAppStore.getState().receiveEvent({ ...known, sequence: index + 3, kind,
+        stage: 'completed', progress: 100, current: null, total: null, stageProgress: null }));
+      expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+      expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+      expect(container.querySelector('.live-heading .mono')?.textContent).toBe('25.0%');
+    }
+    await act(async () => useAppStore.getState().receiveEvent({ ...known, sequence: 5,
+      operation: { id: 1, attempt: 1, sourceId: 'wrong-reused-id' }, current: 0, stageProgress: 0 }));
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+    await act(async () => useAppStore.getState().receiveEvent({ ...known, sequence: 6,
+      operation: { id: 2, attempt: 1, sourceId: 'next-video' } }));
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('20.0%');
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在分析画面（18/90）');
+  });
+
+  it('displays observed reconstruction estimates without treating image counts as a completion fraction', async () => {
+    const operation = { id: 1, attempt: 1, sourceId: 'ordinary-video' };
+    await act(async () => useAppStore.getState().receiveEvent({ ...event(1), kind: 'stage', stage: 'reconstructing',
+      engine: 'colmap', operation, current: null, total: null, unit: null, stageProgress: null, indeterminate: true, progress: 45 }));
+    const update = async (sequence: number, current: number, stageProgress: number | null, progress: number) => act(async () =>
+      useAppStore.getState().receiveEvent({ ...event(sequence), stage: 'reconstructing', engine: 'colmap', operation,
+        current, total: 100, unit: 'registeredImages', stageProgress, indeterminate: stageProgress == null, progress }));
+    await update(2, 40, 36, 48.6);
+    const slot = () => container.querySelector('.stage-timeline li.active small');
+    expect(slot()?.textContent).toBe('36.0%');
+    expect(slot()?.getAttribute('aria-label')).toBe('估算 36.0%');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('48.6%');
+    // Another visual submodel's current count can be smaller. Keep the actual
+    // count in events, not a whole-stage caption, and trust only its estimate.
+    await update(3, 10, 36, 48.6);
+    expect(container.querySelector('.current-message')?.textContent).toBe('正在还原拍摄场景。此步骤可能耗时较长，请耐心等待');
+    expect(useAppStore.getState().events.at(-1)?.current).toBe(10);
+    expect(slot()?.textContent).toBe('36.0%');
+    await update(4, 100, 90, 54);
+    expect(slot()?.textContent).toBe('90.0%');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('54.0%');
+    await act(async () => useAppStore.getState().receiveEvent({ ...event(5), kind: 'stage', stage: 'reconstructing',
+      operation: { id: 2, attempt: 2 }, current: 100, total: 100, unit: 'registeredImages', stageProgress: null,
+      indeterminate: true, progress: 54 }));
+    expect(slot()?.textContent).toBe('处理中');
+    expect(slot()?.getAttribute('aria-label')).toBeNull();
   });
 
   it.each(['zh-CN', 'en'] as const)('localizes Brush progress and legacy stage events without changing raw logs or the current caption (%s)', async locale => {

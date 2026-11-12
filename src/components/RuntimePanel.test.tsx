@@ -34,7 +34,7 @@ function SwitchLanguage() {
   return <button onClick={toggleLocale}>switch</button>;
 }
 
-async function render(value: RuntimeSnapshot, running = true) {
+async function render(value: RuntimeSnapshot | null, running = true) {
   await act(async () => root.render(<LanguageProvider><SwitchLanguage /><RuntimePanel snapshot={value} running={running} /></LanguageProvider>));
 }
 
@@ -105,6 +105,43 @@ describe("runtime panel", () => {
     expect(container.textContent).toContain("数据已过期");
     expect(container.textContent).toContain("暂不支持");
     expect(container.textContent).not.toContain("10 步/秒");
+  });
+
+  it('keeps the resource and GPU containers while a real process switches without borrowing its old samples', async () => {
+    const first = { ...snapshot(), phase: 'running', training: null, config: {}, device: null, backend: null };
+    await render(first);
+    const panel = container.querySelector('.runtime-panel');
+    const resources = container.querySelector('.runtime-resources');
+    const gpu = container.querySelector('.runtime-gpus');
+    expect(resources?.textContent).toContain('100 MiB');
+    await render(null);
+    expect(container.querySelector('.runtime-panel')).toBe(panel);
+    expect(container.querySelector('.runtime-resources')).toBe(resources);
+    expect(container.querySelector('.runtime-gpus')).toBe(gpu);
+    expect(container.querySelector('.runtime-heading')?.textContent).not.toContain('42');
+    expect(resources?.textContent).toContain('采样中');
+    expect(gpu?.textContent).not.toContain('RTX');
+    await render({ ...first, processId: 43 }); // stale sample is still owned by PID 42
+    expect(resources?.textContent).not.toContain('100 MiB');
+    expect(gpu?.textContent).not.toContain('80%');
+    const second = { ...first, processId: 43, resources: { ...first.resources!, processId: 43, memoryBytes: 50 * 1024 * 1024 } };
+    await render(second);
+    expect(container.querySelector('.runtime-resources')).toBe(resources);
+    expect(resources?.textContent).toContain('50 MiB');
+  });
+
+  it('does not show an exited process as active while the task is still saving or validating', async () => {
+    const stopped = { ...snapshot(), phase: 'stopped' };
+    await render(stopped, true);
+    const before = container.querySelector('.runtime-output')?.textContent;
+    expect(container.querySelector('.runtime-heading')?.textContent).toContain('已停止更新');
+    expect(container.querySelector('.runtime-heading')?.textContent).not.toContain('PID');
+    expect(container.querySelector('.runtime-panel')?.getAttribute('aria-busy')).toBe('false');
+    expect(container.querySelector('.runtime-resources')?.textContent).not.toContain('100 MiB');
+    expect(container.querySelector('.runtime-gpus')?.textContent).not.toContain('80%');
+    expect(container.textContent).toContain('50 / 100');
+    expect(container.textContent).not.toContain('10 步/秒');
+    expect(container.querySelector('.runtime-output')?.textContent).toBe(before);
   });
 
   it("freezes the output timer and rate when a task stops", async () => {

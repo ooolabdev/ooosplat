@@ -18,17 +18,28 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
+#[path = "application_activity.rs"]
+mod application_activity;
 #[cfg(test)]
 #[path = "continuation_reliability_tests.rs"]
 mod continuation_reliability_tests;
+#[path = "feature_progress.rs"]
+mod feature_progress;
 #[path = "gps_runner.rs"]
 mod gps_runner;
+use feature_progress::{FeatureGroupProgress, FeatureProgressScope};
+#[cfg(test)]
+#[path = "feature_progress_tests.rs"]
+mod feature_progress_tests;
 #[path = "input_dataset.rs"]
 mod input_dataset;
 #[path = "inputs_runner.rs"]
 mod inputs_runner;
 #[path = "legacy_work_order.rs"]
 mod legacy_work_order;
+#[cfg(test)]
+#[path = "mapper_progress_tests.rs"]
+mod mapper_progress_tests;
 #[path = "prepared_recovery.rs"]
 mod prepared_recovery;
 #[cfg(test)]
@@ -86,12 +97,15 @@ use crate::{
         validator::{ReconstructionQuality, ReconstructionReport, ReconstructionValidator},
     },
     video::{
-        prepare_scanned_image_sequence, scaled_video_dimensions, scan_image_sequence,
-        validate_prepared_image_names, validate_prepared_image_sequence,
-        validate_reshoot_image_sequence, video_can_scale_to, FramePlan, FrameSelectionStrategy,
-        ImagePreparationObserver, ImagePreparationPhase, ImageSequenceInfo, ImageSequenceNaming,
-        PlannedFrame, PreparedImageSequence, QualityV2FrameSelection, UniformRatioFrameSelection,
-        VideoInfo,
+        image_sequence::{
+            prepare_scanned_image_sequence_with_preparation,
+            validate_image_sequence_with_preparation,
+        },
+        scaled_video_dimensions, scan_image_sequence, validate_prepared_image_names,
+        validate_prepared_image_sequence, validate_reshoot_image_sequence, video_can_scale_to,
+        FramePlan, FrameSelectionStrategy, ImagePreparationObserver, ImagePreparationPhase,
+        ImageSequenceInfo, ImageSequenceNaming, PlannedFrame, PreparedImageSequence,
+        QualityV2FrameSelection, UniformRatioFrameSelection, VideoInfo,
     },
 };
 
@@ -237,10 +251,27 @@ struct OperationContext {
     stage: Option<PipelineStage>,
     substage: Option<String>,
     current: Option<super::event::PipelineOperation>,
-    attempts: Vec<(PipelineStage, Option<String>, u32)>,
+    attempts: Vec<(PipelineStage, Option<String>, Option<String>, u32)>,
 }
 
 impl EventSink {
+    fn begin_application(&self, stage: PipelineStage) -> Self {
+        let _dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut context = self.context.lock().unwrap_or_else(|p| p.into_inner());
+        context.serial += 1;
+        let operation = super::event::PipelineOperation {
+            source_id: context.source_id.clone(),
+            id: context.serial,
+            attempt: 0,
+        };
+        context.stage = Some(stage);
+        context.substage = self.substage(stage);
+        context.current = Some(operation.clone());
+        let mut scoped = self.clone();
+        scoped.bound_operation = Some(operation);
+        scoped
+    }
+
     fn training_substage(&self, substage: &str) {
         let phase = match substage {
             "panoramaTrainingPreparation" => 2,
@@ -290,18 +321,23 @@ impl EventSink {
     }
 
     fn begin_process(&self, stage: PipelineStage) -> Self {
+        self.begin_process_with_key(stage, None)
+    }
+
+    fn begin_process_with_key(&self, stage: PipelineStage, logical_group: Option<&str>) -> Self {
         let _dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner());
         let mut context = self.context.lock().unwrap_or_else(|p| p.into_inner());
         let substage = self.substage(stage);
-        let attempt = if let Some((_, _, count)) = context
-            .attempts
-            .iter_mut()
-            .find(|(key, sub, _)| *key == stage && *sub == substage)
-        {
+        let attempt = if let Some((_, _, _, count)) =
+            context.attempts.iter_mut().find(|(key, sub, group, _)| {
+                *key == stage && *sub == substage && group.as_deref() == logical_group
+            }) {
             *count += 1;
             *count
         } else {
-            context.attempts.push((stage, substage.clone(), 1));
+            context
+                .attempts
+                .push((stage, substage.clone(), logical_group.map(str::to_owned), 1));
             1
         };
         context.serial += 1;
@@ -604,6 +640,8 @@ pub struct PipelineRunner {
     invocation_access: Option<super::access::InvocationAccess>,
     artifact_recorder: super::artifacts::ArtifactRecorder,
     inputs: Option<super::inputs::GenerationInputs>,
+    camera_grouping_policy_version: std::sync::RwLock<Option<u32>>,
+    ordinary_image_preparation_version: std::sync::RwLock<Option<u32>>,
     generation_policy: std::sync::RwLock<Option<super::generation_policy::GenerationPolicy>>,
     reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
     image_matching_strategy: crate::project::ImageMatchingStrategy,
@@ -654,14 +692,20 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         state: &mut PipelineStateFile,
     ) -> Result<()> {
-        self.artifact_recorder
+        let activity = self.observed_activity("正在保存生成检查点");
+        let result = self
+            .artifact_recorder
             .record(
                 paths,
                 state,
                 self.execution_run_id,
                 &self.process_manager.child_token(),
             )
-            .await
+            .await;
+        if result.is_ok() {
+            activity.finish();
+        }
+        result
     }
 
     pub fn with_inputs(mut self, inputs: Option<super::inputs::GenerationInputs>) -> Self {
@@ -684,6 +728,12 @@ impl PipelineRunner {
             artifact_recorder: Default::default(),
             reshoot_options: None,
             inputs: None,
+            camera_grouping_policy_version: std::sync::RwLock::new(Some(
+                super::inputs::CAMERA_GROUPING_POLICY_VERSION,
+            )),
+            ordinary_image_preparation_version: std::sync::RwLock::new(Some(
+                super::inputs::ORDINARY_IMAGE_PREPARATION_VERSION,
+            )),
             generation_policy: std::sync::RwLock::new(None),
             video_projection: crate::video::panorama::VideoProjection::Auto,
             image_matching_strategy: crate::project::ImageMatchingStrategy::default(),
@@ -787,6 +837,36 @@ impl PipelineRunner {
             }
         }
         Ok(())
+    }
+
+    pub fn with_camera_grouping_policy_version(mut self, version: Option<u32>) -> Self {
+        *self
+            .camera_grouping_policy_version
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = version;
+        self
+    }
+
+    fn camera_grouping_policy_version(&self) -> Option<u32> {
+        *self
+            .camera_grouping_policy_version
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn with_ordinary_image_preparation_version(mut self, version: Option<u32>) -> Self {
+        *self
+            .ordinary_image_preparation_version
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = version;
+        self
+    }
+
+    fn ordinary_image_preparation_version(&self) -> Option<u32> {
+        *self
+            .ordinary_image_preparation_version
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn with_generation_policy(
@@ -1289,6 +1369,18 @@ impl PipelineRunner {
         mut self,
         intent: Option<crate::project::creation::ProjectCreationIntent>,
     ) -> Self {
+        if let Some(intent) = &intent {
+            *self
+                .camera_grouping_policy_version
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                intent.camera_grouping_policy_version;
+            *self
+                .ordinary_image_preparation_version
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                intent.ordinary_image_preparation_version;
+        }
         self.creation_intent = intent;
         self
     }
@@ -1808,8 +1900,9 @@ impl PipelineRunner {
             );
         });
         let cancellation = self.process_manager.child_token();
+        let ordinary_preparation = self.ordinary_image_preparation_version();
         let prepared = crate::presets::spawn_pipeline_blocking(move || {
-            prepare_scanned_image_sequence(
+            prepare_scanned_image_sequence_with_preparation(
                 scan,
                 &frames,
                 &colmap_frames,
@@ -1817,6 +1910,7 @@ impl PipelineRunner {
                 ImageSequenceNaming::Primary,
                 Some(observer),
                 Some(&cancellation),
+                ordinary_preparation,
             )
         })
         .await
@@ -2304,6 +2398,7 @@ impl PipelineRunner {
                 )
                 .await;
         }
+        validate_legacy_v1_preparation_policy(self.ordinary_image_preparation_version())?;
         let source = self.inspect_reshoot_source(source_project_id).await?;
         if !source.eligible {
             return Err(SplatError::Process(
@@ -2422,6 +2517,10 @@ impl PipelineRunner {
     }
 
     pub async fn resume(&self, project_id: uuid::Uuid) -> Result<PipelineResult> {
+        // A caller may reuse a runner without a run UUID. Continuation is a
+        // fresh validation boundary even then; never import an earlier call's
+        // in-memory evidence instead of checking saved artifacts.
+        self.artifact_recorder.invalidate();
         let context = PreparationContext::new(Some(project_id), None);
         *self
             .preparation_context
@@ -2796,6 +2895,9 @@ impl PipelineRunner {
         attempt: String,
         warning: Option<String>,
     ) -> Result<PipelineResult> {
+        self.events.source(None);
+        let activity =
+            self.application_activity(PipelineStage::Exporting, "正在校验并发布 final.ply", None);
         // Freeze the facts before publication. A crash here must not send the
         // next continuation back through training-data preparation or Brush.
         let info = inspect_gaussian_ply(candidate)?;
@@ -2821,8 +2923,6 @@ impl PipelineRunner {
         }
         state.validated_output = Some(output.clone());
         manager.write_state(&paths.state, state).await?;
-        self.events
-            .stage(PipelineStage::Exporting, 0., "正在校验并发布 final.ply");
         let publication = crate::pipeline::publication::publish_candidate(
             &paths.project,
             &paths
@@ -2874,6 +2974,7 @@ impl PipelineRunner {
         )
         .await?;
         self.record_final_metrics(&publication.output);
+        drop(activity);
         self.events.stage(
             PipelineStage::Exporting,
             1.,
@@ -2898,6 +2999,15 @@ impl PipelineRunner {
         let transaction_path = paths
             .work
             .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
+        // Do not create a publishing lifecycle for tasks with no transaction.
+        let _activity = if tokio::fs::try_exists(&transaction_path).await? {
+            self.events.source(None);
+            // A transaction may still prove that training must be rebuilt.
+            // Its inspection must not jump the new run to 98% before that is known.
+            Some(self.observed_activity("正在恢复结果发布"))
+        } else {
+            None
+        };
         // Prepared/installed transactions have not committed yet. Validate
         // reshoot connectivity before reconciliation can install or commit;
         // committed historical output remains authoritative and unchanged.
@@ -3152,6 +3262,7 @@ impl PipelineRunner {
             self.apply_collection_focal_preflight(&project_manager, &paths, &mut state)
                 .await?;
         }
+        let normalization_activity = self.observed_activity("正在检查可复用结果");
         let artifacts_changed = if state.inputs.is_some() {
             crate::pipeline::artifacts::normalize_collection_cancellable(
                 &paths,
@@ -3190,6 +3301,8 @@ impl PipelineRunner {
             normalize_checkpoints(&paths, &mut state).await?;
             before != serde_json::to_vec(&state)?
         };
+        normalization_activity.finish();
+        drop(normalization_activity);
         if artifacts_changed {
             self.retry_preparation_step(
                 &paths,
@@ -3265,6 +3378,16 @@ impl PipelineRunner {
             .generation_policy
             .write()
             .unwrap_or_else(|p| p.into_inner()) = state.generation_policy;
+        *self
+            .camera_grouping_policy_version
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            state.camera_grouping_policy_version;
+        *self
+            .ordinary_image_preparation_version
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            state.ordinary_image_preparation_version;
         let lifecycle = self.lifecycle.clone();
         let project_manager = project_manager.with_checkpoint_observer(Arc::new(move |state| {
             if let Some(observer) = &lifecycle {
@@ -3430,6 +3553,12 @@ impl PipelineRunner {
         migrated_state.inputs = Some(crate::pipeline::inputs::InputCheckpoint::new(
             crate::pipeline::inputs::GenerationInputs::Materials { items: vec![item] },
         ));
+        if let Some(checkpoint) = &mut migrated_state.inputs {
+            checkpoint.camera_grouping_policy_version =
+                migrated_state.camera_grouping_policy_version;
+            checkpoint.ordinary_image_preparation_version =
+                migrated_state.ordinary_image_preparation_version;
+        }
         // The state write is the migration switch. Snapshot construction and
         // metadata validation complete first, so an interrupted attempt either
         // remains V2 or has a fully usable immutable snapshot.
@@ -3460,6 +3589,7 @@ impl PipelineRunner {
                 .run_reshoot_v2(project_manager, paths, metadata, state, acceleration)
                 .await;
         }
+        validate_legacy_v1_preparation_policy(state.ordinary_image_preparation_version)?;
         let provenance = metadata
             .reshoot
             .clone()
@@ -3634,14 +3764,20 @@ impl PipelineRunner {
             project_manager.write_state(&paths.state, &state).await?;
         }
 
+        let ordinary_preparation = (metadata.input_type == ProjectInputType::Images)
+            .then_some(state.ordinary_image_preparation_version)
+            .flatten();
         if checkpoint.supplemental_frames_complete
             && (checkpoint.colmap_input_version != Some(COLMAP_INPUT_VERSION)
-                || validate_reshoot_image_sequence(
+                || validate_image_sequence_with_preparation(
                     &paths.frames,
                     &paths.colmap_frames,
                     &reshoot_masks,
                     checkpoint.reshoot_frame_count,
                     checkpoint.has_alpha,
+                    ImageSequenceNaming::Reshoot,
+                    None,
+                    ordinary_preparation,
                 )
                 .is_err())
         {
@@ -3652,12 +3788,15 @@ impl PipelineRunner {
             state.brush_complete = false;
         }
         let prepared = if checkpoint.supplemental_frames_complete {
-            validate_reshoot_image_sequence(
+            validate_image_sequence_with_preparation(
                 &paths.frames,
                 &paths.colmap_frames,
                 &reshoot_masks,
                 checkpoint.reshoot_frame_count,
                 checkpoint.has_alpha,
+                ImageSequenceNaming::Reshoot,
+                None,
+                ordinary_preparation,
             )?
         } else {
             remove_reshoot_images(&paths.frames).await?;
@@ -3723,7 +3862,7 @@ impl PipelineRunner {
                     });
                     let cancellation = self.process_manager.child_token();
                     crate::presets::spawn_pipeline_blocking(move || {
-                        prepare_scanned_image_sequence(
+                        prepare_scanned_image_sequence_with_preparation(
                             scan,
                             &frames,
                             &colmap_frames,
@@ -3731,6 +3870,7 @@ impl PipelineRunner {
                             ImageSequenceNaming::Reshoot,
                             Some(observer),
                             Some(&cancellation),
+                            ordinary_preparation,
                         )
                     })
                     .await
@@ -4629,7 +4769,7 @@ impl PipelineRunner {
                     PipelineStage::Reconstructing,
                     PipelineEngine::Colmap,
                     Some(prepared.extracted_frames),
-                    ObserverMode::Mapper,
+                    ObserverMode::mapper_for_projection(state.panorama.is_some()),
                 )),
                 gpu_index,
             )
@@ -5628,7 +5768,7 @@ impl PipelineRunner {
                 PipelineStage::ValidatingReconstruction,
                 PipelineEngine::Colmap,
                 Some(prepared.extracted_frames),
-                ObserverMode::Mapper,
+                ObserverMode::mapper_for_projection(state.panorama.is_some()),
             )),
             gpu_index,
         )
@@ -5651,8 +5791,106 @@ impl PipelineRunner {
         expected_total: Option<u64>,
         mode: ObserverMode,
     ) -> ProcessObserver {
+        let feature = if mode == ObserverMode::BracketProgress {
+            expected_total.filter(|total| *total > 0).map(|total| {
+                let source = self
+                    .events
+                    .context
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .source_id
+                    .clone()
+                    .unwrap_or_default();
+                let key = format!("single-feature:{source}");
+                FeatureProgressScope::new([(key.clone(), total)]).group(key)
+            })
+        } else {
+            None
+        };
+        self.process_observer_with_feature(stage, engine, expected_total, mode, feature)
+    }
+
+    fn feature_process_observer(
+        &self,
+        stage: PipelineStage,
+        scope: &FeatureProgressScope,
+        logical_group: String,
+    ) -> ProcessObserver {
+        let feature = scope.group(logical_group);
+        self.process_observer_with_feature(
+            stage,
+            PipelineEngine::Colmap,
+            feature.expected(),
+            ObserverMode::BracketProgress,
+            Some(feature),
+        )
+    }
+
+    fn complete_feature_progress(&self, stage: PipelineStage, scope: &FeatureProgressScope) {
+        if self.process_manager.child_token().is_cancelled() {
+            return;
+        }
+        if let Some((current, total)) = scope.validated_complete() {
+            self.events.send(
+                stage,
+                Some(PipelineEngine::System),
+                EventKind::Progress,
+                EventLevel::Info,
+                Some(1.0),
+                false,
+                format!("正在分析画面（{current}/{total}）"),
+                Some(current),
+                Some(total),
+                Some("images"),
+            );
+        }
+    }
+
+    fn complete_feature_group(
+        &self,
+        stage: PipelineStage,
+        scope: &FeatureProgressScope,
+        key: String,
+    ) {
+        if self.process_manager.child_token().is_cancelled() {
+            return;
+        }
+        let operation = self
+            .events
+            .context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .current
+            .clone();
+        if let Some((current, total)) =
+            operation.and_then(|operation| scope.group(key).validated(operation.id))
+        {
+            self.events.send(
+                stage,
+                Some(PipelineEngine::System),
+                EventKind::Progress,
+                EventLevel::Info,
+                Some((current as f32 / total as f32).min(0.999)),
+                false,
+                format!("正在分析画面（{current}/{total}）"),
+                Some(current),
+                Some(total),
+                Some("images"),
+            );
+        }
+    }
+
+    fn process_observer_with_feature(
+        &self,
+        stage: PipelineStage,
+        engine: PipelineEngine,
+        expected_total: Option<u64>,
+        mode: ObserverMode,
+        feature: Option<FeatureGroupProgress>,
+    ) -> ProcessObserver {
         let events = self.events.clone();
         let mapper_count = Arc::new(AtomicU64::new(0));
+        let mapper_estimate = Arc::new(std::sync::Mutex::new(MapperProgressEstimate::default()));
         let runtime = Arc::new(std::sync::Mutex::new(RuntimeTracker::new()));
         let matching_notice_elapsed = Arc::new(AtomicU64::new(0));
         let process_active = Arc::new(AtomicBool::new(false));
@@ -5661,14 +5899,20 @@ impl PipelineRunner {
         let acceleration = self.current_acceleration.clone();
         let effectiveness = self.effectiveness.clone();
         let artifact_recorder = self.artifact_recorder.clone();
-        let preparation_notice = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let display = Arc::new(std::sync::Mutex::new(EngineDisplayGate::default()));
+        let quiet_visible_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let runtime_signature = Arc::new(AtomicU64::new(0));
         let diagnostic_logs = self.diagnostic_logs.clone();
         let project = self.active_project.clone();
         let run_id = self.execution_run_id;
         Arc::new(move |update| {
             let mut scoped = events.clone();
             if matches!(update, ProcessUpdate::Started { .. }) {
-                scoped = events.begin_process(stage);
+                scoped = if let Some(feature) = &feature {
+                    events.begin_process_with_key(stage, Some(feature.key()))
+                } else {
+                    events.begin_process(stage)
+                };
                 *operation.lock().unwrap_or_else(|p| p.into_inner()) =
                     scoped.bound_operation.clone();
             } else {
@@ -5676,6 +5920,31 @@ impl PipelineRunner {
                     operation.lock().unwrap_or_else(|p| p.into_inner()).clone();
             }
             let events = scoped;
+            if matches!(
+                &update,
+                ProcessUpdate::Line { .. }
+                    | ProcessUpdate::Heartbeat { .. }
+                    | ProcessUpdate::Resources(_)
+            ) && events.bound_operation.as_ref().is_some_and(|bound| {
+                events
+                    .context
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .current
+                    .as_ref()
+                    .map(|current| current.id)
+                    != Some(bound.id)
+            }) {
+                return;
+            }
+            let emit_display = |event: EngineDisplay| {
+                let owner = if feature.is_some() && event.kind == EventKind::Progress {
+                    PipelineEngine::System
+                } else {
+                    engine
+                };
+                event.emit(&events, stage, owner);
+            };
             match update {
                 ProcessUpdate::LogOpened { path, offset } => {
                     let root = project
@@ -5727,18 +5996,33 @@ impl PipelineRunner {
                 }
                 ProcessUpdate::Exited { .. } => {
                     process_active.store(false, Ordering::Relaxed);
+                    let now = Instant::now();
+                    let pending = display
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .flush(now, true);
+                    for event in pending {
+                        emit_display(event);
+                    }
+                    let mut tracker = runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    tracker.snapshot.phase = "stopped".into();
+                    events.runtime(stage, engine, tracker.refresh(now));
                 }
                 ProcessUpdate::Started { process_id } => {
-                    if engine == PipelineEngine::Colmap && mode != ObserverMode::TrainingPreparation
-                    {
-                        artifact_recorder.invalidate();
+                    if engine == PipelineEngine::Colmap {
+                        mode.invalidate_colmap_artifacts(&artifact_recorder);
                     }
                     let mut tracker = runtime
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *tracker = RuntimeTracker::new();
                     mapper_count.store(0, Ordering::Relaxed);
+                    *mapper_estimate.lock().unwrap_or_else(|p| p.into_inner()) =
+                        MapperProgressEstimate::default();
                     matching_notice_elapsed.store(0, Ordering::Relaxed);
+                    *display.lock().unwrap_or_else(|p| p.into_inner()) =
+                        EngineDisplayGate::default();
+                    *quiet_visible_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     process_active.store(true, Ordering::Relaxed);
                     tracker.snapshot.process_id = process_id;
                     if mode == ObserverMode::Brush {
@@ -5749,18 +6033,53 @@ impl PipelineRunner {
                     if mode != ObserverMode::Brush {
                         tracker.snapshot.phase = "running".into();
                     }
+                    let baseline = feature
+                        .as_ref()
+                        .and_then(|feature| feature.begin(events.bound_operation.as_ref()?.id));
+                    let baseline_progress = baseline
+                        .map(|(current, total)| (current as f32 / total as f32).min(0.999))
+                        .or_else(|| {
+                            (mode == ObserverMode::OrdinaryMapper
+                                && expected_total.is_some_and(|total| total > 0))
+                            .then_some(0.0)
+                        });
                     events.send(
                         stage,
                         Some(engine),
                         EventKind::Stage,
                         EventLevel::Info,
-                        None,
-                        true,
+                        baseline_progress,
+                        baseline_progress.is_none(),
                         format!("进程已启动 · PID {process_id}"),
-                        None,
-                        expected_total,
-                        None,
+                        baseline.map(|(current, _)| current),
+                        if feature.is_some() {
+                            baseline.map(|(_, total)| total)
+                        } else {
+                            expected_total
+                        },
+                        baseline.map(|_| "images"),
                     );
+                    if let Some((current, total)) = baseline {
+                        let ready = display.lock().unwrap_or_else(|p| p.into_inner()).submit(
+                            EngineDisplay {
+                                kind: EventKind::Progress,
+                                level: EventLevel::Info,
+                                progress: Some((current as f32 / total as f32).min(0.999)),
+                                message: format!("正在分析画面（{current}/{total}）"),
+                                current: Some(current),
+                                total: Some(total),
+                                unit: Some("images"),
+                                deduplicate_count: true,
+                            },
+                            Instant::now(),
+                            true,
+                        );
+                        for event in ready {
+                            emit_display(event);
+                        }
+                    }
+                    runtime_signature
+                        .store(runtime_line_signature(&tracker.snapshot), Ordering::Relaxed);
                     events.runtime(stage, engine, tracker.refresh(Instant::now()));
                 }
                 ProcessUpdate::Resources(sample) => {
@@ -5771,6 +6090,8 @@ impl PipelineRunner {
                         return;
                     }
                     tracker.snapshot.resources = Some(sample);
+                    runtime_signature
+                        .store(runtime_line_signature(&tracker.snapshot), Ordering::Relaxed);
                     events.runtime(stage, engine, tracker.refresh(Instant::now()));
                 }
                 ProcessUpdate::Heartbeat { elapsed_ms } => {
@@ -5778,17 +6099,45 @@ impl PipelineRunner {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let snapshot = tracker.refresh(Instant::now());
-                    let quiet_ms = snapshot.last_output_age_ms;
+                    let raw_quiet_ms = snapshot.last_output_age_ms;
+                    runtime_signature.store(runtime_line_signature(&snapshot), Ordering::Relaxed);
                     events.runtime(stage, engine, snapshot);
-                    if mode == ObserverMode::Matching
-                        && process_active.load(Ordering::Relaxed)
+                    drop(tracker);
+                    let now = Instant::now();
+                    let pending = display
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .flush(now, false);
+                    for event in pending {
+                        emit_display(event);
+                    }
+                    let quiet_ms = if mode == ObserverMode::Matching {
+                        raw_quiet_ms
+                    } else {
+                        let visible = display.lock().unwrap_or_else(|p| p.into_inner()).last_sent;
+                        let mut previous =
+                            quiet_visible_at.lock().unwrap_or_else(|p| p.into_inner());
+                        if *previous != visible {
+                            matching_notice_elapsed.store(0, Ordering::Relaxed);
+                            *previous = visible;
+                        }
+                        visible.map_or(elapsed_ms, |at| now.duration_since(at).as_millis() as u64)
+                    };
+                    if process_active.load(Ordering::Relaxed)
                         && !cancellation.is_cancelled()
                         && matching_quiet_notice_due(&matching_notice_elapsed, elapsed_ms, quiet_ms)
                     {
-                        let message = format!(
+                        let message = if mode == ObserverMode::Matching {
+                            format!(
                             "图像匹配进程仍在运行，最近 {} 秒无新输出。此步骤可能耗时较长，请耐心等待",
                             quiet_ms / 1000
-                        );
+                        )
+                        } else {
+                            format!(
+                                "{}。此步骤可能耗时较长，请耐心等待",
+                                engine_quiet_step(stage, mode)
+                            )
+                        };
                         events.send(
                             stage,
                             Some(PipelineEngine::System),
@@ -5807,7 +6156,9 @@ impl PipelineRunner {
                     if line.is_empty() {
                         return;
                     }
-                    matching_notice_elapsed.store(0, Ordering::Relaxed);
+                    if mode == ObserverMode::Matching {
+                        matching_notice_elapsed.store(0, Ordering::Relaxed);
+                    }
                     let brush = mode == ObserverMode::Brush;
                     let actual = {
                         let mut tracker = runtime
@@ -5823,26 +6174,37 @@ impl PipelineRunner {
                                 tracker.enrich_device(acceleration);
                             }
                         }
-                        events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                        if brush {
+                            let signature = runtime_line_signature(&tracker.snapshot);
+                            if runtime_signature.swap(signature, Ordering::Relaxed) != signature {
+                                events.runtime(stage, engine, tracker.refresh(Instant::now()));
+                            }
+                        }
                         actual
                     };
-                    if mode == ObserverMode::Matching {
-                        if let Some(activity) = matching_activity(&line) {
-                            events.send(
-                                stage,
-                                Some(engine),
-                                EventKind::Progress,
-                                EventLevel::Info,
-                                None,
-                                true,
-                                friendly_engine_line(&line),
-                                None,
-                                None,
-                                Some(activity),
-                            );
+                    let level = engine_line_level(&line);
+                    if level != EventLevel::Info {
+                        let ready = display.lock().unwrap_or_else(|p| p.into_inner()).submit(
+                            EngineDisplay {
+                                kind: EventKind::Log,
+                                level,
+                                progress: None,
+                                message: friendly_engine_line(&line),
+                                current: None,
+                                total: expected_total,
+                                unit: None,
+                                deduplicate_count: false,
+                            },
+                            Instant::now(),
+                            true,
+                        );
+                        for event in ready {
+                            emit_display(event);
                         }
+                        return;
                     }
                     let parsed = match mode {
+                        ObserverMode::Generic => None,
                         ObserverMode::Ffmpeg => parse_ffmpeg_frame(&line).map(|current| {
                             (
                                 current,
@@ -5868,7 +6230,7 @@ impl PipelineRunner {
                                     format!("正在准备训练图片 {current}/{total}"),
                                 )
                             }),
-                        ObserverMode::Mapper => {
+                        ObserverMode::Mapper | ObserverMode::OrdinaryMapper => {
                             parse_mapper_progress(&line, &mapper_count, expected_total)
                         }
                         ObserverMode::Brush => actual.map(|(current, total)| {
@@ -5879,93 +6241,118 @@ impl PipelineRunner {
                             )
                         }),
                     };
-                    if let Some((current, total, message)) = parsed {
-                        if mode == ObserverMode::TrainingPreparation {
-                            let now = Instant::now();
-                            let mut previous =
-                                preparation_notice.lock().unwrap_or_else(|p| p.into_inner());
-                            let boundary = current == 1 || total == Some(current);
-                            if !boundary
-                                && previous.is_some_and(|last| {
-                                    now.duration_since(last) < std::time::Duration::from_secs(1)
+                    let native_boundary = parsed.as_ref().is_some_and(|(current, total, _)| {
+                        *current <= 1 || *total == Some(*current)
+                    });
+                    let parsed = if let Some(feature) = &feature {
+                        parsed.and_then(|(current, total, _)| {
+                            feature
+                                .report(events.bound_operation.as_ref()?.id, current, total?)
+                                .map(|(current, total)| {
+                                    (
+                                        current,
+                                        Some(total),
+                                        format!("正在分析画面（{current}/{total}）"),
+                                    )
                                 })
-                            {
-                                return;
-                            }
-                            *previous = Some(now);
-                        }
-                        let progress = total
-                            .filter(|value| *value > 0)
-                            .filter(|_| {
-                                !matches!(
-                                    mode,
-                                    ObserverMode::Matching
-                                        | ObserverMode::Mapper
-                                        | ObserverMode::TrainingPreparation
-                                )
-                            })
-                            .map(|value| current as f32 / value as f32);
-                        events.send(
-                            stage,
-                            Some(engine),
-                            EventKind::Progress,
-                            EventLevel::Info,
-                            progress.map(|value| {
-                                if brush {
-                                    value.min(0.99)
+                        })
+                    } else {
+                        parsed
+                    };
+                    if let Some((current, total, message)) = parsed {
+                        let progress = if mode == ObserverMode::OrdinaryMapper {
+                            mapper_estimate
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .observe(&line, current, total)
+                        } else {
+                            total
+                                .filter(|value| *value > 0)
+                                .filter(|_| {
+                                    !matches!(
+                                        mode,
+                                        ObserverMode::Matching
+                                            | ObserverMode::Mapper
+                                            | ObserverMode::TrainingPreparation
+                                    )
+                                })
+                                .map(|value| current as f32 / value as f32)
+                        };
+                        let mapper_activity = mode.is_mapper()
+                            && (line
+                                .to_ascii_lowercase()
+                                .contains("global bundle adjustment")
+                                || line.to_ascii_lowercase().contains("retriangulation"));
+                        let ready = display.lock().unwrap_or_else(|p| p.into_inner()).submit(
+                            EngineDisplay {
+                                kind: EventKind::Progress,
+                                level: EventLevel::Info,
+                                progress: progress.map(|value| {
+                                    if brush {
+                                        value.min(0.99)
+                                    } else {
+                                        value.min(0.999)
+                                    }
+                                }),
+                                message,
+                                current: Some(current),
+                                total,
+                                unit: Some(if brush {
+                                    "steps"
+                                } else if mode == ObserverMode::Matching {
+                                    matching_unit(&line)
+                                } else if mode.is_mapper() {
+                                    "registeredImages"
                                 } else {
-                                    value.min(0.999)
-                                }
-                            }),
-                            progress.is_none(),
-                            message,
-                            Some(current),
-                            total,
-                            Some(if brush {
-                                "steps"
-                            } else if mode == ObserverMode::Matching {
-                                matching_unit(&line)
-                            } else if mode == ObserverMode::Mapper {
-                                "registeredImages"
-                            } else {
-                                "images"
-                            }),
-                        );
-                    } else if mode == ObserverMode::Brush {
-                        events.send(
-                            stage,
-                            Some(engine),
-                            EventKind::Log,
-                            if line.contains(" WARN ") {
-                                EventLevel::Warning
-                            } else if line.contains(" ERROR ")
-                                || line.contains("panicked at")
-                                || line.starts_with("Error:")
-                            {
-                                EventLevel::Error
-                            } else {
-                                EventLevel::Info
+                                    "images"
+                                }),
+                                deduplicate_count: !mapper_activity,
                             },
-                            None,
-                            true,
-                            friendly_engine_line(&line),
-                            None,
-                            expected_total,
-                            None,
+                            Instant::now(),
+                            !mapper_activity && native_boundary,
                         );
-                    } else if is_useful_line(&line) {
-                        events.send(
-                            stage,
-                            Some(engine),
-                            EventKind::Log,
-                            EventLevel::Info,
-                            None,
-                            true,
-                            friendly_engine_line(&line),
-                            None,
-                            expected_total,
-                            None,
+                        for event in ready {
+                            emit_display(event);
+                        }
+                    } else if let Some(activity) = (mode == ObserverMode::Matching)
+                        .then(|| matching_activity(&line))
+                        .flatten()
+                    {
+                        let ready = display.lock().unwrap_or_else(|p| p.into_inner()).submit(
+                            EngineDisplay {
+                                kind: EventKind::Progress,
+                                level,
+                                progress: None,
+                                message: friendly_engine_line(&line),
+                                current: None,
+                                total: None,
+                                unit: Some(activity),
+                                deduplicate_count: false,
+                            },
+                            Instant::now(),
+                            false,
                         );
+                        for event in ready {
+                            emit_display(event);
+                        }
+                    } else if mode == ObserverMode::Brush || is_useful_line(&line) {
+                        let ready = display.lock().unwrap_or_else(|p| p.into_inner()).submit(
+                            EngineDisplay {
+                                kind: EventKind::Log,
+                                level,
+                                progress: None,
+                                message: friendly_engine_line(&line),
+                                current: None,
+                                total: expected_total,
+                                unit: None,
+                                deduplicate_count: false,
+                            },
+                            Instant::now(),
+                            engine_final_line(&line),
+                        );
+                        for event in ready {
+                            emit_display(event);
+                        }
                     }
                 }
             }
@@ -5973,14 +6360,328 @@ impl PipelineRunner {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObserverMode {
+    Generic,
     Ffmpeg,
     BracketProgress,
     Matching,
     TrainingPreparation,
     Mapper,
+    /// Only callers that have established the whole reconstruction has no ERP
+    /// cameras may opt in. The default Mapper remains count-only/unknown.
+    OrdinaryMapper,
     Brush,
+}
+
+impl ObserverMode {
+    fn invalidate_colmap_artifacts(self, recorder: &super::artifacts::ArtifactRecorder) {
+        match self.colmap_write() {
+            Some(write) => recorder.invalidate_colmap(write),
+            // Unknown commands cannot promise that upstream inputs are read-only.
+            None => recorder.invalidate(),
+        }
+    }
+
+    fn colmap_write(self) -> Option<super::artifacts::ColmapWrite> {
+        use super::artifacts::ColmapWrite;
+        match self {
+            Self::BracketProgress | Self::Matching => Some(ColmapWrite::Database),
+            Self::Mapper | Self::OrdinaryMapper => Some(ColmapWrite::Reconstruction),
+            Self::TrainingPreparation => Some(ColmapWrite::TrainingDataset),
+            _ => None,
+        }
+    }
+
+    fn is_mapper(self) -> bool {
+        matches!(self, Self::Mapper | Self::OrdinaryMapper)
+    }
+    fn mapper_for_projection(has_erp: bool) -> Self {
+        if has_erp {
+            Self::Mapper
+        } else {
+            Self::OrdinaryMapper
+        }
+    }
+}
+
+/// A conservative work estimate, not a registration percentage or an elapsed
+/// time prediction. Reserve the final 10% for BA/model validation. Never sum
+/// disconnected submodels, and reset this state on every real process start.
+#[derive(Default)]
+struct MapperProgressEstimate {
+    best_single_model: Option<u64>,
+}
+
+impl MapperProgressEstimate {
+    fn observe(&mut self, line: &str, current: u64, total: Option<u64>) -> Option<f32> {
+        let total = total.filter(|total| *total > 0)?;
+        if current > total {
+            return None;
+        }
+        let lower = line.to_ascii_lowercase();
+        let ba = lower.contains("retriangulation") || lower.contains("global bundle adjustment");
+        let reported = line.contains("num_reg_frames=") || line.contains("num_reg_frames =");
+        if reported && !ba && current > 0 {
+            self.best_single_model = Some(self.best_single_model.unwrap_or(0).max(current));
+        }
+        // A known-input process can expose its zero estimate before the first
+        // registration report. This is not a fabricated registered-image count.
+        Some((self.best_single_model.unwrap_or(0) as f32 / total as f32) * 0.90)
+    }
+}
+
+struct EngineDisplay {
+    kind: EventKind,
+    level: EventLevel,
+    progress: Option<f32>,
+    message: String,
+    current: Option<u64>,
+    total: Option<u64>,
+    unit: Option<&'static str>,
+    deduplicate_count: bool,
+}
+
+impl EngineDisplay {
+    fn counter(&self) -> Option<(u64, Option<u64>, Option<&'static str>)> {
+        self.deduplicate_count
+            .then_some((self.current?, self.total, self.unit))
+    }
+
+    fn emit(self, events: &EventSink, stage: PipelineStage, engine: PipelineEngine) {
+        events.send(
+            stage,
+            Some(engine),
+            self.kind,
+            self.level,
+            self.progress,
+            self.progress.is_none(),
+            self.message,
+            self.current,
+            self.total,
+            self.unit,
+        );
+    }
+}
+
+/// Keep at most one delayed count and one informational line. Errors and final
+/// milestones are never throttled; disk logs remain complete and unfiltered.
+#[derive(Default)]
+struct EngineDisplayGate {
+    last_sent: Option<Instant>,
+    last_counter: Option<(u64, Option<u64>, Option<&'static str>)>,
+    last_counter_progress: Option<f32>,
+    last_activity: Option<&'static str>,
+    pending_progress: Option<EngineDisplay>,
+    pending_log: Option<EngineDisplay>,
+}
+
+impl EngineDisplayGate {
+    fn due(&self, now: Instant) -> bool {
+        self.last_sent
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1))
+    }
+
+    fn sent(&mut self, event: &EngineDisplay, now: Instant) {
+        self.last_sent = Some(now);
+        if let Some(counter) = event.counter() {
+            self.last_counter = Some(counter);
+            self.last_counter_progress = event.progress;
+        }
+        if event.kind == EventKind::Progress && event.current.is_none() {
+            self.last_activity = event.unit;
+        }
+    }
+
+    fn submit(&mut self, event: EngineDisplay, now: Instant, force: bool) -> Vec<EngineDisplay> {
+        if event.counter().is_some_and(|counter| {
+            self.last_counter == Some(counter) && self.last_counter_progress == event.progress
+        }) {
+            return vec![];
+        }
+        let activity_changed = event.kind == EventKind::Progress
+            && event.current.is_none()
+            && event.unit.is_some()
+            && event.unit != self.last_activity;
+        let first_counter = event.counter().is_some_and(|counter| {
+            self.last_counter
+                .is_none_or(|previous| previous.2 != counter.2)
+        });
+        if force || activity_changed || first_counter || event.level != EventLevel::Info {
+            let mut ready = self.pending_progress.take().into_iter().collect::<Vec<_>>();
+            self.pending_log = None;
+            // A newer count supersedes, rather than duplicates, a pending count.
+            if event.current.is_some() {
+                ready.clear();
+            }
+            ready.push(event);
+            for event in &ready {
+                self.sent(event, now);
+            }
+            return ready;
+        }
+        if event.kind == EventKind::Progress {
+            self.pending_log = None;
+            if self.due(now) {
+                self.pending_progress = None;
+                self.sent(&event, now);
+                vec![event]
+            } else {
+                self.pending_progress = Some(event);
+                vec![]
+            }
+        } else if self.due(now) {
+            if let Some(progress) = self.pending_progress.take() {
+                self.pending_log = Some(event);
+                self.sent(&progress, now);
+                vec![progress]
+            } else {
+                self.pending_log = None;
+                self.sent(&event, now);
+                vec![event]
+            }
+        } else {
+            self.pending_log = Some(event);
+            vec![]
+        }
+    }
+
+    fn flush(&mut self, now: Instant, force: bool) -> Vec<EngineDisplay> {
+        if !force && !self.due(now) {
+            return vec![];
+        }
+        let mut ready = self.pending_progress.take().into_iter().collect::<Vec<_>>();
+        if force || ready.is_empty() {
+            ready.extend(self.pending_log.take());
+        }
+        for event in &ready {
+            self.sent(event, now);
+        }
+        ready
+    }
+}
+
+fn runtime_line_signature(snapshot: &RuntimeSnapshot) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (
+        &snapshot.phase,
+        &snapshot.device,
+        &snapshot.backend,
+        &snapshot.config,
+    )
+        .hash(&mut hash);
+    snapshot
+        .training
+        .as_ref()
+        .map(|training| {
+            (
+                training.iteration,
+                training.total,
+                training.start_iter,
+                training.lod,
+                training.splat_count,
+                training.psnr.map(f64::to_bits),
+                training.ssim.map(f64::to_bits),
+            )
+        })
+        .hash(&mut hash);
+    hash.finish()
+}
+
+fn engine_line_level(line: &str) -> EventLevel {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // A level token belongs to the logger header, not to metric prose such
+    // as "Mean reprojection error 0.12" in an otherwise normal BA message.
+    let bracketed = lower
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'));
+    let mut fields = bracketed
+        .map_or(lower.as_str(), |(header, _)| header)
+        .split_whitespace();
+    let first = fields.next().unwrap_or("");
+    let timestamp = first
+        .get(..4)
+        .is_some_and(|year| year.bytes().all(|byte| byte.is_ascii_digit()))
+        && first.contains('-')
+        && first.contains('t');
+    let structured_level = if bracketed.is_some() && ["error", "warn", "warning"].contains(&first) {
+        Some(first)
+    } else if timestamp {
+        fields.next()
+    } else {
+        None
+    };
+    let glog = lower
+        .split_whitespace()
+        .next()
+        .filter(|prefix| {
+            matches!(prefix.len(), 5 | 9) && prefix.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+        })
+        .and_then(|prefix| prefix.chars().next());
+    if matches!(glog, Some('e' | 'f'))
+        || structured_level == Some("error")
+        || trimmed.starts_with("ERROR ")
+        || lower.starts_with("error:")
+        || lower.starts_with("fatal ")
+        || [
+            "check failed:",
+            "fatal error",
+            "fatal:",
+            "panicked at",
+            "wgpu error:",
+            "out of memory",
+            "buffertoobig",
+            "failed to create any sparse model",
+            "failed to read",
+            "cannot open database",
+            "export failed after",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        EventLevel::Error
+    } else if glog == Some('w')
+        || matches!(structured_level, Some("warn" | "warning"))
+        || trimmed.starts_with("WARN ")
+        || lower.starts_with("warning:")
+        || lower.starts_with("warn:")
+        || ["deprecated pixel format"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+    {
+        EventLevel::Warning
+    } else {
+        EventLevel::Info
+    }
+}
+
+fn engine_final_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "training loop completed",
+        "done training!",
+        "export succeeded",
+        "export failed after",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn engine_quiet_step(stage: PipelineStage, mode: ObserverMode) -> &'static str {
+    if mode == ObserverMode::TrainingPreparation {
+        return "正在准备训练图片";
+    }
+    match stage {
+        PipelineStage::ExtractingFrames => "画面准备",
+        PipelineStage::ExtractingFeatures => "特征提取",
+        PipelineStage::Matching => "图像匹配",
+        PipelineStage::Reconstructing | PipelineStage::ValidatingReconstruction => "相机重建",
+        PipelineStage::TrainingSplats => "Splat 训练",
+        PipelineStage::Exporting => "结果导出",
+        _ => "正在处理",
+    }
 }
 
 fn parse_undistortion_progress(line: &str) -> Option<(u64, u64)> {
@@ -6008,25 +6709,20 @@ fn parse_ffmpeg_frame(line: &str) -> Option<u64> {
 }
 
 fn parse_bracket_progress(line: &str) -> Option<(u64, u64)> {
-    if !line.contains("Processed file [") && !line.contains("Processed image [") {
-        return None;
-    }
-    parse_counter_brackets(line)
+    ["Processed file [", "Processed image ["]
+        .iter()
+        .find_map(|marker| parse_counter_after(line, marker))
 }
 
 fn parse_matching_progress(line: &str) -> Option<(u64, u64)> {
-    if ![
+    [
         "Matching block [",
         "Matching image [",
         "Processing image [",
         "Indexing image [",
     ]
     .iter()
-    .any(|marker| line.contains(marker))
-    {
-        return None;
-    }
-    parse_counter_brackets(line)
+    .find_map(|marker| parse_counter_after(line, marker))
 }
 
 fn matching_unit(line: &str) -> &'static str {
@@ -6041,6 +6737,11 @@ fn matching_unit(line: &str) -> &'static str {
 
 fn matching_activity(line: &str) -> Option<&'static str> {
     let lower = line.to_ascii_lowercase();
+    if lower.contains("skip")
+        && (lower.contains("loop detection") || lower.contains("loop closure"))
+    {
+        return None;
+    }
     if lower.contains("vocabulary tree")
         || lower.contains("loop detection")
         || lower.contains("loop closure")
@@ -6055,10 +6756,8 @@ fn matching_activity(line: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_counter_brackets(line: &str) -> Option<(u64, u64)> {
-    let open = line.find('[')?;
-    let close = line[open + 1..].find(']')? + open + 1;
-    let value = &line[open + 1..close];
+fn parse_counter_after(line: &str, marker: &str) -> Option<(u64, u64)> {
+    let value = line.split_once(marker)?.1.split_once(']')?.0;
     let (current, total) = value.split_once('/')?;
     let current = current.trim().parse().ok()?;
     let total = total.trim().parse().ok()?;
@@ -6070,6 +6769,7 @@ fn parse_mapper_progress(
     counter: &AtomicU64,
     expected_total: Option<u64>,
 ) -> Option<(u64, Option<u64>, String)> {
+    let expected_total = expected_total.filter(|total| *total > 0);
     if line.contains("Registering initial image pair")
         || line.contains("Initializing with image pair")
     {
@@ -6079,6 +6779,13 @@ fn parse_mapper_progress(
     let reported_count = value_after(line, "num_reg_frames=")
         .or_else(|| value_after(line, "num_reg_frames ="))
         .and_then(|value| value.parse::<u64>().ok());
+    let has_reported_count = line.contains("num_reg_frames=") || line.contains("num_reg_frames =");
+    if has_reported_count && reported_count.is_none() {
+        return None;
+    }
+    if reported_count.is_some_and(|current| expected_total.is_some_and(|total| current > total)) {
+        return None;
+    }
     let lower = line.to_ascii_lowercase();
     if lower.contains("retriangulation") || lower.contains("global bundle adjustment") {
         if let Some(current) = reported_count {
@@ -6099,12 +6806,11 @@ fn parse_mapper_progress(
 
 fn value_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let value = line.split_once(marker)?.1;
-    Some(
-        value
-            .split_whitespace()
-            .next()?
-            .trim_matches(|ch: char| !ch.is_ascii_digit()),
-    )
+    let value = value
+        .split_whitespace()
+        .next()?
+        .trim_end_matches([')', ']', ',', ';']);
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())).then_some(value)
 }
 
 fn is_useful_line(line: &str) -> bool {
@@ -6116,10 +6822,15 @@ fn is_useful_line(line: &str) -> bool {
         "elapsed",
         "warning",
         "error",
+        "failed",
+        "cannot",
+        "unable to",
         "writing",
         "loading",
         "matching",
         "loop detection",
+        "aligning",
+        "transforming",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -6206,6 +6917,18 @@ async fn count_image_files(directory: &Path) -> Result<u64> {
     })
     .await
     .map_err(|error| SplatError::Process(format!("无法统计输入画面：{error}")))?
+}
+
+fn validate_legacy_v1_preparation_policy(version: Option<u32>) -> Result<()> {
+    // V1 has no per-source preparation manifest. It can preserve its saved
+    // legacy pixels, but cannot claim that copied historical inputs follow a
+    // newer derivative policy. Modern reshoots use the shared input executor.
+    if version.is_some() {
+        return Err(SplatError::Process(
+            legacy_work_order::UNRESTORABLE_RECIPE.into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn ensure_reshoot_input_is_new(
@@ -6610,6 +7333,13 @@ async fn archive_incompatible_colmap_input_cache(
     Ok(())
 }
 
+pub(super) fn ordinary_sfm_preparation_policies(
+    project: &Path,
+    state: &PipelineStateFile,
+) -> Result<std::collections::BTreeMap<String, Option<u32>>> {
+    inputs_runner::source_preparation_policies(project, state)
+}
+
 async fn validate_current_colmap_input_snapshot(
     project: &Path,
     state: &PipelineStateFile,
@@ -6661,8 +7391,32 @@ async fn validate_current_colmap_input_snapshot(
     let colmap_frames = project.join("work/colmap_frames");
     let masks = project.join("work/masks");
     let has_alpha = frame_state.has_alpha;
+    let policies = ordinary_sfm_preparation_policies(project, state)?;
+    let versioned = state.inputs.is_some() || policies.values().any(Option::is_some);
+    if versioned && policies.len() as u64 != expected_count {
+        return Err(SplatError::Process(
+            "原项目的输入图片记录与已准备图片数量不一致".into(),
+        ));
+    }
     crate::presets::spawn_pipeline_blocking(move || {
-        if let Some(names) = expected_names {
+        if versioned {
+            if expected_names.as_ref().is_some_and(|names| {
+                names.iter().collect::<std::collections::BTreeSet<_>>()
+                    != policies.keys().collect::<std::collections::BTreeSet<_>>()
+            }) {
+                return Err(SplatError::Process(
+                    "原项目的输入图片记录与已准备图片数量不一致".into(),
+                ));
+            }
+            validate_versioned_colmap_image_snapshot(
+                &frames,
+                &colmap_frames,
+                &masks,
+                &policies,
+                has_alpha,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        } else if let Some(names) = expected_names {
             validate_prepared_image_names(&frames, &colmap_frames, &masks, &names, has_alpha)
         } else {
             validate_prepared_image_sequence(
@@ -6676,6 +7430,98 @@ async fn validate_current_colmap_input_snapshot(
     })
     .await
     .map_err(|error| SplatError::Process(format!("校验 COLMAP 图片快照失败：{error}")))?
+}
+
+fn validate_versioned_colmap_image_snapshot(
+    frames: &Path,
+    colmap_frames: &Path,
+    masks: &Path,
+    policies: &std::collections::BTreeMap<String, Option<u32>>,
+    require_masks: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<crate::video::PreparedImageSequence> {
+    let expected = policies
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.is_empty()
+        || expected
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != expected.len()
+    {
+        return Err(SplatError::Process(
+            "Prepared image names are unsafe or duplicated".into(),
+        ));
+    }
+    for directory in [frames, colmap_frames] {
+        let actual = crate::video::list_images(directory)?
+            .into_iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| SplatError::InvalidPath(path.clone()))
+            })
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        if actual != expected {
+            return Err(SplatError::Process(
+                "Prepared image set does not match the saved image names".into(),
+            ));
+        }
+    }
+    let mut mask_count = 0;
+    let mut has_alpha = false;
+    for (name, policy) in policies {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let frame = crate::reconstruction::direct_input::image_path(frames, name)?;
+        let counterpart = crate::reconstruction::direct_input::image_path(colmap_frames, name)?;
+        let mask = masks.join(format!("{name}.png"));
+        let header = crate::video::image_projection::inspect(&frame)?;
+        let mask_exists = match std::fs::symlink_metadata(&mask) {
+            Ok(metadata) if metadata.file_type().is_file() => true,
+            Ok(_) => return Err(SplatError::InvalidPath(mask)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        has_alpha |= header.alpha;
+        match policy {
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION) => {
+                crate::video::image_sequence::validate_ordinary_sfm_derivatives(
+                    &frame,
+                    &counterpart,
+                    &mask,
+                    cancel,
+                )?;
+            }
+            None => {
+                crate::video::image_sequence::validate_colmap_frame_copy(&frame, &counterpart)?;
+                if require_masks || header.alpha || mask_exists {
+                    let dimensions = if (5..=8).contains(&header.orientation) {
+                        (header.height, header.width)
+                    } else {
+                        (header.width, header.height)
+                    };
+                    crate::video::image_sequence::validate_binary_mask(&mask, dimensions)?;
+                }
+            }
+            Some(_) => {
+                return Err(SplatError::Process(
+                    "Unsupported source image preparation policy".into(),
+                ))
+            }
+        }
+        mask_count += u64::from(mask_exists);
+    }
+    Ok(crate::video::PreparedImageSequence {
+        image_count: policies.len() as u64,
+        mask_count,
+        has_alpha,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6923,13 +7769,20 @@ async fn prepared_frames_from_checkpoint(
             let colmap_frames_dir = paths.colmap_frames.clone();
             let masks_dir = paths.masks.clone();
             let has_alpha = frames.has_alpha;
+            let ordinary_preparation = (state.panorama.is_none()
+                && state.video_projection == crate::video::panorama::VideoProjection::Perspective)
+                .then_some(state.ordinary_image_preparation_version)
+                .flatten();
             let prepared = crate::presets::spawn_pipeline_blocking(move || {
-                validate_prepared_image_sequence(
+                validate_image_sequence_with_preparation(
                     &frames_dir,
                     &colmap_frames_dir,
                     &masks_dir,
                     extracted_frames,
                     has_alpha,
+                    ImageSequenceNaming::Primary,
+                    None,
+                    ordinary_preparation,
                 )
                 .map(|prepared| (prepared, image_sequence))
             })
@@ -7578,6 +8431,79 @@ pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_v1_keeps_saved_none_and_refuses_to_relabel_mixed_source_pixels() {
+        let mut state = PipelineStateFile::created_for(Quality::Fast, ProjectInputType::Images);
+        state.brush_training.oom_retry_used = true;
+        let before = serde_json::to_value(&state).unwrap();
+        validate_legacy_v1_preparation_policy(state.ordinary_image_preparation_version).unwrap();
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        state.ordinary_image_preparation_version =
+            Some(super::super::inputs::ORDINARY_IMAGE_PREPARATION_VERSION);
+        let before = serde_json::to_value(&state).unwrap();
+        let error = validate_legacy_v1_preparation_policy(state.ordinary_image_preparation_version)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(legacy_work_order::UNRESTORABLE_RECIPE));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_new_unversioned_v1_request_stops_before_source_access_or_project_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects-not-created");
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        );
+        let error = match runner
+            .generate_incremental_reshoot(
+                uuid::Uuid::new_v4(),
+                &root.path().join("missing-input"),
+                ReshootInputType::Images,
+                &projects,
+                Quality::Fast,
+            )
+            .await
+        {
+            Ok(_) => panic!("V1 must not adopt a global derivative version for mixed inputs"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains(legacy_work_order::UNRESTORABLE_RECIPE));
+        assert!(!projects.exists());
+    }
+
+    #[test]
+    fn a_reserved_camera_policy_overrides_new_runner_defaults_without_upgrading_old_creation() {
+        use uuid::Uuid;
+        for version in [
+            None,
+            Some(super::super::inputs::CAMERA_GROUPING_POLICY_VERSION),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let intent = crate::project::creation::ProjectCreationIntent {
+                ordinary_image_preparation_version: version,
+                camera_grouping_policy_version: version,
+                ba_policy_version: None,
+                brush_execution_options: None,
+                intent_id: Uuid::new_v4(),
+                project_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                creating_run_id: Uuid::new_v4(),
+                project_path: root.path().join("reserved"),
+                request_identity: "reserved".into(),
+            };
+            let runner =
+                PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {})
+                    .with_creation_intent(Some(intent));
+            assert_eq!(runner.camera_grouping_policy_version(), version);
+            assert_eq!(runner.ordinary_image_preparation_version(), version);
+        }
+    }
 
     fn write_valid_brush_candidate(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -10767,6 +11693,328 @@ mod tests {
     }
 
     #[test]
+    fn engine_display_gate_limits_updates_and_keeps_the_last_count_and_final_line() {
+        let count = |current| EngineDisplay {
+            kind: EventKind::Progress,
+            level: EventLevel::Info,
+            progress: None,
+            message: format!("count {current}"),
+            current: Some(current),
+            total: Some(100),
+            unit: Some("images"),
+            deduplicate_count: true,
+        };
+        let log = |message: &str, level| EngineDisplay {
+            kind: EventKind::Log,
+            level,
+            progress: None,
+            message: message.into(),
+            current: None,
+            total: None,
+            unit: None,
+            deduplicate_count: false,
+        };
+        let at = Instant::now();
+        let mut gate = EngineDisplayGate::default();
+        assert_eq!(gate.submit(count(1), at, true).len(), 1);
+        for current in 2..=5 {
+            assert!(gate
+                .submit(
+                    count(current),
+                    at + std::time::Duration::from_millis(100),
+                    false
+                )
+                .is_empty());
+        }
+        assert!(gate
+            .submit(log("Elapsed time: 1s", EventLevel::Info), at, false)
+            .is_empty());
+        assert!(gate
+            .flush(at + std::time::Duration::from_millis(999), false)
+            .is_empty());
+        let ready = gate.flush(at + std::time::Duration::from_secs(1), true);
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].current, Some(5));
+        assert_eq!(ready[1].message, "Elapsed time: 1s");
+        assert_eq!(
+            gate.submit(count(100), at + std::time::Duration::from_secs(1), true)
+                .len(),
+            1
+        );
+        assert!(gate
+            .submit(count(100), at + std::time::Duration::from_secs(1), true)
+            .is_empty());
+        assert_eq!(
+            gate.submit(log("Check failed: camera", EventLevel::Error), at, false)
+                .len(),
+            1
+        );
+        let mut fresh = EngineDisplayGate::default();
+        assert_eq!(
+            fresh
+                .submit(log("Training config", EventLevel::Info), at, false)
+                .len(),
+            1
+        );
+        // The first native report may already be step 60 (or any count), not
+        // step one. Starting/retrying must expose it immediately.
+        assert_eq!(
+            fresh
+                .submit(count(60), at + std::time::Duration::from_millis(10), false)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_failures_keep_their_level_and_do_not_become_counts_or_duplicate_messages() {
+        for metric in [
+            "Initial reprojection error 0.12",
+            "Final reprojection error 0.08",
+            "Mean reprojection error 0.12",
+            "Mean error 0.12",
+            "Initial error 0.12",
+            "I20261111 12:00:00.000000 12 bundle_adjustment.cc:1] Mean reprojection error 0.12",
+            "[2026-11-11T04:00:00Z INFO bundle_adjustment] Final reprojection error 0.08",
+            "Initial warning count 0",
+        ] {
+            assert_eq!(engine_line_level(metric), EventLevel::Info, "{metric}");
+        }
+        for error in [
+            "[ERROR] native failure",
+            "[ERROR brush_process] native failure",
+            "[2026-11-11T04:00:00Z ERROR brush_process] native failure",
+            "2026-11-11T04:00:00Z ERROR brush_process: native failure",
+            "ERROR native failure",
+        ] {
+            assert_eq!(engine_line_level(error), EventLevel::Error, "{error}");
+        }
+        for warning in [
+            "[WARN] native warning",
+            "[2026-11-11T04:00:00Z WARN brush_process] native warning",
+        ] {
+            assert_eq!(engine_line_level(warning), EventLevel::Warning, "{warning}");
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let output = captured.clone();
+        let runner = PipelineRunner::new(default_engine_paths(None), move |event| {
+            output.lock().unwrap().push(event)
+        });
+        let observer = runner.process_observer(
+            PipelineStage::Matching,
+            PipelineEngine::Colmap,
+            Some(10),
+            ObserverMode::Matching,
+        );
+        observer(ProcessUpdate::Started { process_id: 42 });
+        for line in [
+            "Loop detection: Indexing image [1/10]",
+            "Failed to create any sparse model",
+            "F20261111 12:00:00.000000 12 mapper.cc:1] Check failed: camera_id > 0",
+            "wgpu error: Out of Memory",
+            "W20261111 12:00:00.000000 12 mapper.cc:2] warning: Processed image [9/10]",
+        ] {
+            observer(ProcessUpdate::Line {
+                stream: crate::process::ProcessStream::Stderr,
+                line: line.into(),
+            });
+        }
+        observer(ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stderr,
+            line: "Loading database".into(),
+        });
+        observer(ProcessUpdate::Exited {
+            executable: PathBuf::from("colmap"),
+            exit_code: Some(1),
+        });
+        let events = captured.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message.contains("Loop detection: Indexing"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::Progress)
+                .count(),
+            1
+        );
+        for marker in ["Failed to create", "Check failed:", "Out of Memory"] {
+            let event = events
+                .iter()
+                .find(|event| event.message.contains(marker))
+                .unwrap();
+            assert_eq!(event.kind, EventKind::Log);
+            assert_eq!(event.level, EventLevel::Error);
+            assert!(event.current.is_none() && event.stage_progress.is_none());
+        }
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.message.contains("warning:"))
+                .unwrap()
+                .level,
+            EventLevel::Warning
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.message == "Loading database")
+                .unwrap()
+                .level,
+            EventLevel::Info
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.stage == PipelineStage::Matching));
+    }
+
+    #[test]
+    fn real_ordinary_and_alpha_log_excerpts_keep_marker_counts_and_unknown_matching_percentage() {
+        // De-identified excerpts from the successful 285-image Balanced and
+        // 251-image Alpha Fast runs. No source paths, names or coordinates.
+        for (total, feature, indexed, matched) in [
+            (285, "I20261111 11:45:34.366609 45884 feature_extraction.cc:270] Processed file [285/285]",
+                "I20261111 11:49:51.560301 18164 pairing.cc:372] Indexing image [285/285]",
+                "I20261111 11:53:32.660749 18164 pairing.cc:333] Processing image [285/285]"),
+            (251, "I20261110 10:17:11.142657 28220 feature_extraction.cc:270] Processed file [251/251]",
+                "I20261110 10:18:03.845498 16184 pairing.cc:372] Indexing image [251/251]",
+                "I20261110 10:19:07.375516 16184 pairing.cc:333] Processing image [251/251]"),
+        ] {
+            assert_eq!(parse_bracket_progress(feature), Some((total, total)));
+            let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+            let output = captured.clone();
+            let runner = PipelineRunner::new(default_engine_paths(None), move |event| output.lock().unwrap().push(event));
+            let observer = runner.process_observer(PipelineStage::Matching, PipelineEngine::Colmap, Some(total), ObserverMode::Matching);
+            observer(ProcessUpdate::Started { process_id: 42 });
+            for line in ["Generating image pairs with vocabulary tree...", indexed, matched] {
+                observer(ProcessUpdate::Line { stream: crate::process::ProcessStream::Stderr, line: line.into() });
+            }
+            let events = captured.lock().unwrap();
+            for unit in ["matchingIndexImages", "matchingImages"] {
+                let event = events.iter().find(|event| event.unit.as_deref() == Some(unit)).unwrap();
+                assert_eq!((event.current, event.total), (Some(total), Some(total)));
+                assert!(event.indeterminate && event.stage_progress.is_none());
+            }
+            assert_eq!(events.iter().filter(|event| event.kind == EventKind::Progress).count(), 3);
+        }
+        assert_eq!(
+            parse_bracket_progress("[prefix] Processed file [23/90]"),
+            Some((23, 90))
+        );
+        assert_eq!(
+            parse_matching_progress("[prefix] Indexing image [7/90]"),
+            Some((7, 90))
+        );
+        assert!(parse_matching_progress("Indexing image [91/90]").is_none());
+        assert!(parse_matching_progress("Indexing image [1/0]").is_none());
+        assert!(matching_activity("Skipping loop detection").is_none());
+    }
+
+    #[test]
+    fn engine_runtime_deduplicates_noise_but_preserves_final_state_and_visible_quiet_notices() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
+        let output = captured.clone();
+        let runner = PipelineRunner::new(default_engine_paths(None), move |event| {
+            output.lock().unwrap().push(event)
+        });
+        let observer = runner.process_observer(
+            PipelineStage::Reconstructing,
+            PipelineEngine::Colmap,
+            None,
+            ObserverMode::Generic,
+        );
+        observer(ProcessUpdate::Started { process_id: 42 });
+        for _ in 0..100 {
+            observer(ProcessUpdate::Line {
+                stream: crate::process::ProcessStream::Stdout,
+                line: "uninteresting native detail".into(),
+            });
+        }
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == EventKind::Runtime)
+                .count(),
+            1
+        );
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 15_000 });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 16_000 });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 45_000 });
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.message == "相机重建。此步骤可能耗时较长，请耐心等待")
+                .count(),
+            2
+        );
+        observer(ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stderr,
+            line: "Warning: native warning".into(),
+        });
+        observer(ProcessUpdate::Heartbeat { elapsed_ms: 60_000 });
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.message == "相机重建。此步骤可能耗时较长，请耐心等待")
+                .count(),
+            2
+        );
+        observer(ProcessUpdate::Exited {
+            executable: PathBuf::from("colmap"),
+            exit_code: Some(0),
+        });
+        let brush = runner.process_observer(
+            PipelineStage::TrainingSplats,
+            PipelineEngine::Brush,
+            Some(100),
+            ObserverMode::Brush,
+        );
+        brush(ProcessUpdate::Started { process_id: 43 });
+        for _ in 0..100 {
+            brush(ProcessUpdate::Line {
+                stream: crate::process::ProcessStream::Stdout,
+                line: "Training config: total_iters=100 start_iter=0".into(),
+            });
+        }
+        brush(ProcessUpdate::Line {
+            stream: crate::process::ProcessStream::Stdout,
+            line: "Training progress: iteration=30 total=100 lod=0".into(),
+        });
+        brush(ProcessUpdate::Exited {
+            executable: PathBuf::from("brush"),
+            exit_code: Some(0),
+        });
+        let events = captured.lock().unwrap();
+        let brush_runtime = events
+            .iter()
+            .filter(|event| event.engine == Some(PipelineEngine::Brush))
+            .filter_map(|event| event.runtime.as_ref())
+            .collect::<Vec<_>>();
+        assert!(brush_runtime.len() <= 4);
+        assert_eq!(
+            brush_runtime
+                .last()
+                .unwrap()
+                .training
+                .as_ref()
+                .unwrap()
+                .iteration,
+            Some(30)
+        );
+        assert!(events.iter().any(|event| event.current == Some(30)));
+    }
+
+    #[test]
     fn matching_notices_are_system_logs_without_progress_and_stop_on_exit_or_cancel() {
         let received = Arc::new(std::sync::Mutex::new(Vec::<PipelineEvent>::new()));
         let out = received.clone();
@@ -10859,22 +12107,36 @@ mod tests {
         );
         observer(ProcessUpdate::Started { process_id: 42 });
         let mut expected_index_lines = 0;
+        let mut last_index_count = None;
         for line in source.lines().filter(|line| {
             parse_matching_progress(line).is_some() || matching_activity(line).is_some()
         }) {
             expected_index_lines += usize::from(line.contains("Indexing image ["));
+            if line.contains("Indexing image [") {
+                last_index_count = parse_matching_progress(line);
+            }
             observer(ProcessUpdate::Line {
                 stream: crate::process::ProcessStream::Stderr,
                 line: line.into(),
             });
         }
+        observer(ProcessUpdate::Exited {
+            executable: PathBuf::from("colmap"),
+            exit_code: Some(0),
+        });
         let captured = captured.lock().unwrap();
         let indices: Vec<_> = captured
             .iter()
             .filter(|e| e.unit.as_deref() == Some("matchingIndexImages"))
             .collect();
         assert!(expected_index_lines > 0);
-        assert_eq!(indices.len(), expected_index_lines);
+        assert!(!indices.is_empty() && indices.len() <= expected_index_lines);
+        assert_eq!(
+            indices
+                .last()
+                .map(|event| (event.current.unwrap(), event.total.unwrap())),
+            last_index_count
+        );
         assert!(indices
             .iter()
             .all(|e| e.current.is_some() && e.stage_progress.is_none() && e.indeterminate));

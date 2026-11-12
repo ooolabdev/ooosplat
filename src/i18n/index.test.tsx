@@ -262,3 +262,32 @@ describe("interface language", () => {
     expect(document.documentElement.lang).toBe("en");
   });
 });
+it('translates only known application activity labels, counts and quiet suffixes', () => {
+  for (const [label, english] of [
+    ['正在检查可复用结果', 'Checking reusable results'],
+    ['正在检查图片焦距信息', 'Checking image focal-length metadata'],
+    ['正在恢复结果发布', 'Resuming result publication'],
+    ['正在准备训练图片', 'Preparing training images'],
+    ['正在保存生成检查点', 'Saving generation checkpoint'],
+  ]) {
+    expect(localizePipelineMessage('en', `${label}：2/10`)).toBe(`${english}: 2/10`);
+    expect(localizePipelineMessage('en', `${label}：2/10。此步骤可能耗时较长，请耐心等待`))
+      .toBe(`${english}: 2/10. This step may take a while. Please wait.`);
+  }
+  const raw = '[engine] 正在准备训练图片：2/10。此步骤可能耗时较长，请耐心等待';
+  expect(localizePipelineMessage('en', raw)).toBe(raw);
+  expect(localizePipelineMessage('en', '日志暂时无法更新，正在重新读取')).toBe('Logs could not be updated. Reading again.');
+});
+
+it('reuses the existing stage translations for engine quiet activity labels', () => {
+  for (const [label, key] of [
+    ['画面准备', 'stage.frames'], ['特征提取', 'stage.features'], ['图像匹配', 'stage.matching'],
+    ['相机重建', 'stage.reconstruction'], ['Splat 训练', 'stage.training'], ['结果导出', 'stage.export'],
+    ['正在处理', 'progress.processing'],
+  ] as const) {
+    expect(localizePipelineMessage('en', `${label}。此步骤可能耗时较长，请耐心等待`))
+      .toBe(`${translate('en', key)}. This step may take a while. Please wait.`);
+  }
+  const raw = '[native] 相机重建。此步骤可能耗时较长，请耐心等待';
+  expect(localizePipelineMessage('en', raw)).toBe(raw);
+});

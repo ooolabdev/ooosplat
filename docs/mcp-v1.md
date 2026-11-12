@@ -1,6 +1,6 @@
 # OOOSplat MCP v1
 
-MCP v1 lets a **local** AI Agent operate the running OOOSplat desktop app. It uses the same Rust TaskService and PipelineRunner as manual generation, resume and reshoot. Submitted tasks belong to the backend; unsubmitted drafts remain in the frontend workspace. There is no separate training CLI, automatic Agent retry, public listener, arbitrary file reader or shell tool.
+MCP v1 lets a **local** AI Agent operate the running OOOSplat desktop app. It uses the same Rust TaskService and artifact-driven processing flow as first generation, reshoot and Continue generation in the GUI. The work order stays in the existing project state file; there is no additional Ticket file. Submitted tasks belong to the backend; unsubmitted drafts remain in the frontend workspace. MCP does not create a separate training runner, automatic Agent retry, public listener, arbitrary file reader or shell tool. The existing diagnostic CLI is separate; independent CLI lifecycle commands are deferred.
 
 ## Enable and connect
 
@@ -43,11 +43,11 @@ All tools have input/output JSON Schemas and structured results. MCP fields use 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `get_app_status` | `{}` | App/engine versions, capabilities, active task, start availability and recommended polling interval |
-| `inspect_generation_input` | Required `input_path`, `quality`; optional `generation_policy`, `source_project_id` | Cached lightweight input analysis, source identity, estimated frame plan, GPS summary and bilingual questions |
+| `inspect_generation_input` | `input_path` **or** ordered `inputs`, plus `quality`; optional `generation_policy`, `source_project_id` | Cached per-source analysis, identities, estimated plans, GPS summary and bilingual source-bound questions |
 | `inspect_reshoot_input` | Required `source_project_id`, authorized `input_path`, `quality` | Read-only source/input analysis, projection, identities, warm-start availability |
-| `create_generation_task` | Required `input_path`, `quality`, `client_request_id`; optional `preflight_id`, `input_source_identity`, `answers`, `generation_policy`, `source_project_id`; legacy `reshoot_options` retained | Persisted task only after all required answers; generation has not started |
-| `start_task` | Required `task_id`; optional `retry_failed_run_id` | Start a created task or explicitly retry the identified failed run |
-| `resume_task` | Required `task_id`, `expected_run_id` | Resume cancelled/interrupted work using its saved recipe and checkpoint |
+| `create_generation_task` | Required `input_path` **or** `inputs`, `quality`, `client_request_id`; optional preflight identity, answers, policy and reshoot source; legacy `reshoot_options` retained | Persisted task only after all required answers; generation has not started |
+| `start_task` | Required `task_id`; optional `retry_failed_run_id` | Start a created task; the legacy run-ID field aliases the same continuation flow as `resume_task` |
+| `resume_task` | Required `task_id`, `expected_run_id` | Continue failed/cancelled/interrupted work, preserving its saved actual recipe and consumed remedy allowances |
 | `list_tasks` | Optional `cursor`, `limit` (default 50, maximum 100) | Tasks, `next_cursor`, `has_more` |
 | `get_task_status` | Required `task_id` | State, stage, progress, frozen/actual configuration, time, errors, run identities and local artifacts |
 | `read_task_logs` | Required `task_id`; optional `run_id`, `sources`, `cursor`, `tail_lines`, `max_bytes` | Bounded text chunks, cursor, truncation/reset flags and registered sources |
@@ -69,7 +69,13 @@ created → starting → running → completed / failed
                  cancelling → cancelled
 ```
 
-After an app restart, leftover active states become `interrupted`. No job is automatically restarted. `resume_task` requires the last run ID and a readable checkpoint containing completed work, and preserves its saved recipe. Missing work returns `NO_RESUMABLE_CHECKPOINT`; mismatched runs return `STALE_RUN_ID`. Failed runs use `start_task.retry_failed_run_id` for explicit manual retry, not resume; completed tasks cannot restart. New reshoots require explicit answers; see [Reshoot v2](RESHOOT_V2.md). Nested `generation_policy` and legacy `reshoot_options` retain application camelCase field names; outer MCP fields and `answers` use snake_case.
+After an app restart, leftover active states become `interrupted`. No job is automatically restarted. `resume_task` accepts `failed`, `cancelled` and `interrupted` with the matching last run ID. It validates existing artifacts and executes only missing, unfinished or incompatible work, using the saved policy, actual recipe, reshoot route and consumed remedy allowances. An existing project's unreadable or corrupt state is an error, not permission to guess defaults. If no project was created yet, the saved original request/configuration can re-enter preparation; having no completed cache alone does not prevent continuation. Mismatched runs return `STALE_RUN_ID`; active and completed tasks cannot restart.
+
+`start_task.retry_failed_run_id` remains a compatibility alias for that same continuation behavior, including cancelled/interrupted tasks. It no longer restores initial parameters, upgrades the strategy or renews automatic-remedy allowances. Every explicit continuation creates a new run with `kind: "continue"`; historical `resume`/`retry` records are not rewritten. A consumed allowance does not block the user's explicit next execution, but prevents another automatic point-cap reduction or reshoot-plan fallback. A valid training candidate only needs publication recovery, and a committed matching result never starts Brush again. Unfinished Brush training restarts from its recorded initialization; this is not optimizer-state resumption.
+
+Continuation checks access for the work actually needed. Proven project-local candidate/Commit recovery does not require the original media to remain present; preparation, Bridge, source GPS or other external reads still enforce the current invocation's authorized roots and input identity. Saved paths are not permanent authorization. Legacy single-path requests adapt to the same per-source preflight rather than imposing a folded global-projection equality rule. In the GUI, explicit Continue generation turns off the local automatic queue and runs only that task; MCP never takes over GUI drafts.
+
+中文：失败、取消和中断统一使用“继续生成”，保留保存的实际参数、方案和已消耗补救次数。Agent须明确请求并带回最新运行标识，不因停止原因不同而选择不同重试规则，也不因轮询或重连自动启动任务。新建补拍仍需用户回答必要问题，见[补拍说明](RESHOOT_V2.md)。Nested `generation_policy` and legacy `reshoot_options` retain application camelCase field names; outer MCP fields and `answers` use snake_case.
 
 `progress` is an observed stage percentage when actual counters are available; `estimated_progress` is the existing overall stage estimate. These are different measurements. `runtime` contains the latest existing engine runtime snapshot when available. ETA is an estimate based on observed training rate and becomes null when unavailable. `actual_configuration` contains resolved frame/resolution/Brush settings as the Runner saves checkpoints, without transferring large frame lists.
 
@@ -77,7 +83,7 @@ Completed results contain only local paths, sizes and model metadata. PLY conten
 
 ## Input preflight and answers / 素材预检与回答
 
-Call `inspect_generation_input` first. It shares GUI header-only analysis, projection detection, planning and hardware caches; changing quality or sampling replans without another metadata scan/FFprobe. `input` contains measured metadata; `plan_is_estimate: true` labels the plan and duration estimate. `max_splats` is null: a preflight cannot know a budget that depends on the final sparse reconstruction. This upgrade does not change recipes or resolve existing panorama High entry-point differences; use saved actual parameters, not a predicted cap.
+Call `inspect_generation_input` first. It shares GUI header-only analysis, projection detection and planning caches; changing quality or FPS replans without another metadata scan/FFprobe. `input` contains measured metadata; `plan_is_estimate: true` labels estimated frame counts and duration. `max_splats` is null until the final reconstruction exists. Saved actual parameters, not an estimated cap, describe execution. New ordered-input runs containing ERP training faces use the panorama recipe and the authoritative sparse-point budget in Detailed.
 
 先预检，再由 Agent 向用户询问返回的 `questions`，不弹桌面确认框。每题包含稳定的 `key`、`options[].value` 及 `zh-CN`／`en` 文案；没有预选答案。用户已明确给出的答案可复用，缺失答案不能由 Agent 猜测。创建时带回同一 `preflight_id`、`input_source_identity`、配置和答案。
 
@@ -93,30 +99,59 @@ Call `inspect_generation_input` first. It shares GUI header-only analysis, proje
 
 Missing answers return `{ "error": { "code": "CONFIRMATION_REQUIRED", "message": "…", "details": { "preflight_id": "…", "input_source_identity": "…", "questions": [] } } }` with the unanswered questions, **without creating a task**. Stale/expired preflight, changed input or changed source/configuration returns `INPUT_CHANGED`; inspect again and ask any affected questions. Creation and start both check input identity. Old calls without a preflight still perform admission checks; no-question inputs remain compatible, but ambiguous inputs are not silently treated as ordinary.
 
-`generation_policy` accepts saved versions 1–3; new admission/manual retry resolves the current version 3, while interrupted resumes keep their saved policy. Nested options include `autoRetryEnabled` and optional `frameSamplingRatio` (0.001–1). Manual sampling keeps the existing Bridge v3 extra-frame budget; disabling automatic retry does not disable normal bridge backfill. No training parameters are changed here.
+`generation_policy` accepts saved versions 1–6; new admission resolves version 6, while every continuation retains the saved version and actual snapshot regardless of the previous stop reason. The legacy global `frameSamplingFps` remains a retained-target rate (at least 0.1) and cannot accompany `frameSamplingRatio`. For v5 and v6 material inputs, optional `frameRemovalFps` belongs on each video item and means frames removed per second; it is a manual override, not the quality default. Omit it to make Fast/Balanced/Detailed retain 6/8/12 FPS. Version 6 accepts zero to retain every source frame and limits removal so the retained target is at least `min(source FPS, max(1 FPS, 30 / duration))`; a 30 FPS source at the upper endpoint reports 30 FPS and 100% retention. Created/continued v5 tasks retain their 0.1 minimum and old range, while unsubmitted v5 GUI drafts migrate to v6. A manually changed source has a frozen extra 20% Bridge budget, one joint Bridge round and no transfer between clips. Automatic retry remains independent of normal backfill.
+
+### Ordered sources / 有序多素材
+
+`inputs` is an application-shaped tagged object. Nested input/policy keys retain camelCase; question and answer keys use snake_case. Each source needs a unique stable `id`. Image-folder and loose-image members are authorized individually, including canonical-path checks. `inputs` and legacy `input_path` cannot both be supplied. Keep the same ordered list, quality, policy and preflight identity when creating; changed content/configuration returns `INPUT_CHANGED` without starting work.
+
+```json
+{"name":"inspect_generation_input","arguments":{"quality":"balanced","generation_policy":{"version":6},"inputs":{"mode":"materials","items":[{"id":"clip","source":{"kind":"video","path":"E:/Inputs/orbit.mov"}},{"id":"photos","source":{"kind":"imageFolder","path":"E:/Inputs/photos"}}]}}}
+{"name":"create_generation_task","arguments":{"quality":"balanced","client_request_id":"multi-01","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","generation_policy":{"version":6},"inputs":{"mode":"materials","items":[{"id":"clip","source":{"kind":"video","path":"E:/Inputs/orbit.mov"}},{"id":"photos","source":{"kind":"imageFolder","path":"E:/Inputs/photos"}}]},"answers":{"inputs":{"photos":{"input_projection":"equirectangular","image_order":"sequential"}}}}}
+```
+
+以上仅示意用户明确确认了疑似全景、且该图片集超过100张并已排序的情况。逐项使用返回的 `questions[].source_id` 绑定 `answers.inputs[id]`；小图集用 `small_images:true`，普通补拍来源用 `camera_relation`。原模型情况仍在 `answers.model_condition`。先询问用户，不凭示例填答案；ERP来源无需拍摄设置答案。旧单路径请求仍使用其兼容的扁平答案结构。
+
+Ask only applicable questions and bind answers to source IDs. Projection, image order, small-image warning acceptance and reshoot camera relation are per-source; model condition is task-wide. Existing single-path clients retain their flat answer shape. Missing answers do not create a backend task. No desktop confirmation dialog or MCP-specific queue is added.
+
+### COLMAP imports paused / 暂停 COLMAP 导入
+
+GUI、MCP、CLI 均暂停新的 COLMAP 文件／文件夹导入和直接训练。`inspect_generation_input`、`create_generation_task` 的新 COLMAP 请求返回 `UNSUPPORTED_INPUT`，原因为 `colmap_disabled`；其他不支持的输入使用 `unsupported_input`。拒绝发生在新任务创建前，不启动 COLMAP 或 Brush，也不计为生成失败。`get_app_status.capabilities` 不再声明 `colmap_direct_training`，Agent 不应建议或发起这类新请求。
+
+New COLMAP direct-training imports are temporarily unavailable in every entry point. Preflight and task creation return `UNSUPPORTED_INPUT` with reason `colmap_disabled`; other unsupported input formats use `unsupported_input`. No task or engine is started. The capability is no longer advertised. Existing idempotent requests can still return their original task, and existing-task continuation retains its saved configuration. Do not work around the restriction by presenting a COLMAP directory as an image folder.
+
+“已完成→导入”仍支持高斯模型，但新导入不再关联附带的 COLMAP，也不因此开放补拍。已保存的 COLMAP 类型、历史关联和既有补拍能力继续兼容；正常生成内部的 COLMAP、旧任务状态中的导入重建标记及共享执行器不变。详见[输入边界与验收](MULTI_INPUTS.md)及[CLI说明](CLI.md)。
 
 GPS is a non-blocking summary (`pending`, `checked`, `unavailable`; nullable `detected`). No coordinates, geographic origin or per-image GPS manifest are returned. Status exposes actual projection/matching, bounded sampling/backfill summaries, initial/final Brush settings, controlled retries, actual reshoot path and GPS adoption/fallback status. Each run returns its last eight Brush executions in order, with a truncation flag; device/VRAM/driver remain null unless supported by that execution's evidence. Raw device identifiers and raw config/log blobs are not returned in these summaries.
 
 ### 中文调用示例：疑似全景图片
 
 ```json
-{"name":"inspect_generation_input","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","generation_policy":{"version":3,"autoRetryEnabled":true}}}
-{"name":"create_generation_task","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","client_request_id":"panorama-01","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","generation_policy":{"version":3,"autoRetryEnabled":true},"answers":{"input_projection":"equirectangular","image_order":"sequential"}}}
+{"name":"inspect_generation_input","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","generation_policy":{"version":6,"autoRetryEnabled":true}}}
+{"name":"create_generation_task","arguments":{"input_path":"E:\\Media\\panorama-images","quality":"high","client_request_id":"panorama-01","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","generation_policy":{"version":6,"autoRetryEnabled":true},"answers":{"input_projection":"equirectangular","image_order":"sequential"}}}
 {"name":"start_task","arguments":{"task_id":"TASK_UUID"}}
 ```
 
 上述答案仅示意用户已明确选择完整全景、超过100张且按顺序排列的情况；按实际问题回答。少于30张的新任务还需确认 `small_images: true`。
 
-### English example: reshoot and resume
+### English example: reshoot and continuation
 
 ```json
 {"name":"inspect_generation_input","arguments":{"input_path":"E:\\Media\\supplement","quality":"balanced","source_project_id":"SOURCE_UUID"}}
 {"name":"create_generation_task","arguments":{"input_path":"E:\\Media\\supplement","quality":"balanced","client_request_id":"reshoot-01","source_project_id":"SOURCE_UUID","preflight_id":"PREFLIGHT_UUID","input_source_identity":"RETURNED_IDENTITY","answers":{"model_condition":"good","camera_relation":"different","image_order":"exhaustive"}}}
-{"name":"resume_task","arguments":{"task_id":"TASK_UUID","expected_run_id":"CANCELLED_OR_INTERRUPTED_RUN_UUID"}}
-{"name":"start_task","arguments":{"task_id":"FAILED_TASK_UUID","retry_failed_run_id":"FAILED_RUN_UUID"}}
+{"name":"start_task","arguments":{"task_id":"TASK_UUID"}}
 ```
 
-Ask the returned questions first; these values are examples, not defaults. Resume/retry examples refer to different lifecycle states, not steps to run unconditionally.
+After that task stops as failed, cancelled or interrupted, use either of these alternatives with its latest run ID:
+
+```json
+{"name":"resume_task","arguments":{"task_id":"TASK_UUID","expected_run_id":"LAST_FAILED_CANCELLED_OR_INTERRUPTED_RUN_UUID"}}
+{"name":"start_task","arguments":{"task_id":"TASK_UUID","retry_failed_run_id":"LAST_FAILED_CANCELLED_OR_INTERRUPTED_RUN_UUID"}}
+```
+
+Ask the returned questions first; these values are examples, not defaults. The last two calls illustrate alternative current and legacy entry points for the same continuation action, not steps to run in sequence. After either is accepted, poll the returned new run ID; the old run ID cannot launch it a second time.
+
+中文：创建后先调用不带运行标识的 `start_task`。任务失败、取消或中断后，用最新 `run_id` 调用 `resume_task.expected_run_id`；旧客户端也可传给 `start_task.retry_failed_run_id`，二者等价，不能连续调用两次。继续生成不重复收集已保存的问题答案，不升级策略、不重置配方或补救额度。技术运行记录更新为 `continue`，停止原因及旧运行历史仍保留。
 
 ## Saved model exports / 已保存模型导出
 
@@ -198,7 +233,13 @@ node node_modules/typescript/bin/tsc -b
 
 The official rmcp client integration test starts the real token-free HTTP transport, discovers tools, calls the original generation tools, disconnects/reconnects and checks Host/Origin, path and cursor rejection paths, including compatibility with obsolete Authorization headers. The reshoot inspection tool is schema-checked separately, not a demonstrated MCP-to-GPU end-to-end run. Lifecycle tests use a deliberately controlled executor where noted; the early-engine-failure test uses the actual Runner. Existing Windows process tests exercise real descendant termination. These tests do **not** demonstrate GPU training or a complete COLMAP/Brush/PLY generation. GPU end-to-end generation and macOS/Linux runtime behavior require separate platform runs.
 
-## 本次交付与验证记录
+## 本轮验证 / Current verification — 2026-11-10
+
+前端全量80个文件、798项测试及7项诊断协议测试、前端构建、完整 Rust 测试（755库＋1 CLI）、格式及全目标 Clippy `-D warnings` 通过。36项 Rust 测试忽略，3项因 Windows 符号链接权限限制（1314）过滤。MCP 回归覆盖公开 Schema 隐藏 COLMAP 模式、工具暂停说明及旧原始请求解析后明确拒绝。Edge 的24组中英文／缩放／视口弹窗检查通过，含键盘和焦点恢复；bicycle只读准入与底层模型检查、范围及记录见[统一输入验证](MULTI_INPUTS.md)。原生桌面文件选择／拖放和 macOS／Linux 实机交互尚未验收，不以历史直接训练测试证明新导入可用。
+
+Frontend tests, diagnostic-protocol tests, the production build, the full Rust suite (755 library plus one CLI test), formatting, all-target Clippy with `-D warnings`, and the 24-case Edge dialog matrix passed. Three Windows symlink-permission tests were filtered. MCP tests verify hidden public COLMAP schemas, tool notices, and explicit rejection of compatible legacy raw requests. Read-only bicycle admission/model checks are recorded in the unified-input notes. Native desktop picker/drop interaction and macOS/Linux device checks remain unverified. Historical direct-training tests do not advertise a currently available new-import path.
+
+## 历史交付与验证记录
 
 - 分支：`feat/mcp-v1`，基于 `test/colmap-brush-upgrade` 并保留原有工作。任务期间仓库已有的提交也未回退。
 - 共享服务与日志：`src-tauri/src/tasks/{mod,logs,tests}.rs`；本地协议、授权及 Schema：`src-tauri/src/mcp/{mod,schema,tests}.rs`。

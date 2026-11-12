@@ -2456,6 +2456,67 @@ describe("App preview workspace", () => {
     expect(mocks.startInputsPipeline).not.toHaveBeenCalled();
   });
 
+  it('shows a mixed-dimension image-set error inside its input and blocks generation and automatic queueing', async () => {
+    mocks.selectMaterialPaths.mockResolvedValueOnce(['E:/Photos/consistent', 'E:/Photos/mixed']);
+    const mismatch = '视频无效：图片序列分辨率不一致：E:/Photos/mixed/second.png 为 1024×768，预期 800×600';
+    mocks.inspectMaterialInputs.mockResolvedValueOnce({
+      materials: [{ id: 'source-1', identity: 'consistent-identity', video: null,
+        imageSequence: { imageCount: 30, width: 800, height: 600, hasAlpha: false, requiresLargeSequenceConfirmation: false },
+        plan: { estimatedFrames: 30 }, projectionDetection: { sourceIdentity: 'consistent-identity', requiresChoice: false, supportedErp: false, confirmedErp: false, reason: '', previewJpeg: [] } }],
+      colmap: null, errors: { 'source-2': mismatch },
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>('.material-input-menu button:first-child')!.click());
+    await flush();
+    const failure = container.querySelector('.material-inspector [role="alert"]')!;
+    expect(failure.textContent).toContain('图片序列分辨率不一致');
+    expect(failure.textContent).toContain('1024×768');
+    expect(failure.textContent).toContain('800×600');
+    expect(container.querySelectorAll('.material-item')).toHaveLength(2);
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')!.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click());
+    await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
+    expect(container.querySelector('.queue-input-notice')).not.toBeNull();
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+    expect(mocks.startInputsPipeline).not.toHaveBeenCalled();
+    expect(mocks.startPipeline).not.toHaveBeenCalled();
+    expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
+  });
+
+  it('allows different dimensions across separate internally consistent image sources', async () => {
+    mocks.selectMaterialPaths.mockResolvedValueOnce(['E:/Photos/camera-one', 'E:/Photos/camera-two']);
+    mocks.inspectMaterialInputs.mockResolvedValueOnce({
+      materials: [[800, 600], [1024, 768]].map(([width, height], index) => ({
+        id: `source-${index + 1}`, identity: `camera-${index + 1}-identity`, video: null,
+        imageSequence: { imageCount: 30, width, height, hasAlpha: false, requiresLargeSequenceConfirmation: false },
+        dimensions: [[width, height]], plan: { estimatedFrames: 30 },
+        projectionDetection: { sourceIdentity: `camera-${index + 1}-identity`, requiresChoice: false, supportedErp: false, confirmedErp: false, reason: '', previewJpeg: [] },
+      })), colmap: null, errors: {},
+    });
+    mocks.startInputsPipeline.mockImplementationOnce(() => new Promise(() => undefined));
+    await act(async () => container.querySelector<HTMLButtonElement>('.material-input-menu button:first-child')!.click());
+    await flush();
+    expect(container.querySelectorAll('.material-item')).toHaveLength(2);
+    expect(container.querySelector('.material-inspector [role="alert"]')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')!.disabled).toBe(false);
+    expect(container.querySelector('.material-inspector')?.textContent).toContain('800 × 600');
+    await act(async () => container.querySelectorAll<HTMLButtonElement>('.material-row-main')[1].click());
+    expect(container.querySelector('.material-inspector')?.textContent).toContain('1024 × 768');
+    await act(async () => container.querySelector<HTMLButtonElement>('.queue-toggle')!.click());
+    await flush();
+    expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('true');
+    expect(container.querySelector('.queue-input-notice')).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click());
+    await flush();
+    expect(mocks.startInputsPipeline).toHaveBeenCalledTimes(1);
+    expect(mocks.startInputsPipeline.mock.calls[0][0]).toMatchObject({ mode: 'materials', items: [
+      { id: 'source-1', identity: 'camera-1-identity', projection: 'perspective' },
+      { id: 'source-2', identity: 'camera-2-identity', projection: 'perspective' },
+    ] });
+    expect(container.querySelector('.preflight-dialog')).toBeNull();
+  });
+
   it('hides the reshoot plan and inherited-setting badge in a running legacy project detail', async () => {
     const running: ProjectSummary = { ...project, id: '22222222-2222-2222-2222-222222222222', status: 'running', finalPly: null };
     mocks.getProjectTaskDetail.mockResolvedValue({

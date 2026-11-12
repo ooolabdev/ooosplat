@@ -43,30 +43,29 @@ export function RuntimePanel({ snapshot, running, waitingMessage }: { snapshot: 
     return () => window.clearInterval(timer);
   }, [running]);
 
-  if (!snapshot) return <div className="runtime-panel" role="status">
-    <div className="runtime-heading"><strong>{t('runtime.waiting')}</strong><span>—</span></div>
-    <p className="runtime-note">{waitingMessage || t('runtime.waitingHint')}</p>
-    <dl className="runtime-metrics runtime-resources"><div><dt>{t('runtime.cpu')}</dt><dd>—</dd></div><div><dt>{t('runtime.memory')}</dt><dd>—</dd></div></dl>
-  </div>;
-
   const unavailable = t("runtime.unavailable");
   const number = (value: number) => value.toLocaleString(locale, { maximumFractionDigits: 1 });
-  const training = snapshot.training;
+  const training = snapshot?.training;
   const current = training?.iteration;
   const total = training?.total;
   const percent = current != null && total != null && total > 0
     ? Math.min(100, current / total * 100)
     : null;
-  const outputAge = runtimeOutputAgeMs(snapshot, running, now);
-  const resources = snapshot.resources;
+  const stopped = snapshot?.phase === 'stopped';
+  const processRunning = running && snapshot != null && !stopped;
+  const outputAge = snapshot ? runtimeOutputAgeMs(snapshot, processRunning, now) : 0;
+  // A resource response can arrive after its process has exited. It must not
+  // be presented as the new process's sample, even during a same-stage switch.
+  const resources = !stopped && snapshot?.resources?.processId === snapshot?.processId ? snapshot?.resources : null;
+  const pendingResources = t(stopped ? 'runtime.stopped' : 'runtime.sampling');
   const stale = resources != null && now - Date.parse(resources.sampledAt) > 6_000;
-  const speedVisible = running && outputAge <= 10_000 && snapshot.phase === "training";
-  const remainingSeconds = liveTrainingRemainingSeconds(snapshot, running, now);
+  const speedVisible = processRunning && outputAge <= 10_000 && snapshot?.phase === "training";
+  const remainingSeconds = liveTrainingRemainingSeconds(snapshot, processRunning, now);
 
-  return <div className="runtime-panel">
+  return <div className="runtime-panel" role={!snapshot ? 'status' : undefined} aria-busy={running && !stopped && !resources}>
     <div className="runtime-heading">
-      <strong>{t(phases[snapshot.phase] ?? "runtime.running")}</strong>
-      <span>{running ? t("runtime.process", { pid: snapshot.processId }) : t("runtime.stopped")}</span>
+      <strong>{t(!snapshot ? 'runtime.waiting' : snapshot.phase === 'stopped' ? 'runtime.stopped' : phases[snapshot.phase] ?? "runtime.running")}</strong>
+      <span>{snapshot ? processRunning ? t("runtime.process", { pid: snapshot.processId }) : t("runtime.stopped") : '—'}</span>
     </div>
     {training && <>
       <div className="runtime-step-heading">
@@ -80,13 +79,14 @@ export function RuntimePanel({ snapshot, running, waitingMessage }: { snapshot: 
         <div><dt>{t("runtime.remaining")}</dt><dd>{remainingSeconds != null ? formatClockDuration(remainingSeconds) : "—"}</dd></div>
       </dl>
     </>}
-    <p className={`runtime-output ${running && outputAge > 10_000 ? "quiet" : ""}`}>
-      {t("runtime.output")}: {t("runtime.secondsAgo", { value: Math.floor(outputAge / 1_000) })}
-      {running && outputAge > 10_000 && <span>{t("runtime.silent")}</span>}
+    <p className={`runtime-output ${processRunning && outputAge > 10_000 ? "quiet" : ""}`}>
+      {snapshot ? <>{t("runtime.output")}: {t("runtime.secondsAgo", { value: Math.floor(outputAge / 1_000) })}
+        {processRunning && outputAge > 10_000 && <span>{t("runtime.silent")}</span>}</>
+        : waitingMessage || t('runtime.waitingHint')}
     </p>
     <dl className={`runtime-metrics runtime-resources ${stale ? "stale" : ""}`}>
-      <div><dt>{t("runtime.cpu")}</dt><dd>{resources?.cpuPercent != null ? `${number(resources.cpuPercent)}%` : !resources || resources.memoryBytes != null ? t("runtime.sampling") : unavailable}</dd></div>
-      <div><dt>{t("runtime.memory")}</dt><dd>{resources?.memoryBytes != null ? `${number(resources.memoryBytes / 1024 / 1024)} MiB` : unavailable}</dd></div>
+      <div><dt>{t("runtime.cpu")}</dt><dd>{resources?.cpuPercent != null ? `${number(resources.cpuPercent)}%` : !resources || resources.memoryBytes != null ? pendingResources : unavailable}</dd></div>
+      <div><dt>{t("runtime.memory")}</dt><dd>{resources?.memoryBytes != null ? `${number(resources.memoryBytes / 1024 / 1024)} MiB` : !resources ? pendingResources : unavailable}</dd></div>
     </dl>
     {stale && <p className="runtime-note">{t("runtime.stale")}</p>}
     <div className="runtime-gpus">
@@ -95,17 +95,17 @@ export function RuntimePanel({ snapshot, running, waitingMessage }: { snapshot: 
         <span title={gpu.uuid}>{gpu.name}</span>
         <b>{gpu.utilizationPercent == null ? unavailable : `${number(gpu.utilizationPercent)}%`}</b>
         <span>{gpu.memoryUsedMib == null ? unavailable : `${number(gpu.memoryUsedMib)} MiB`} / {gpu.memoryTotalMib == null ? unavailable : `${number(gpu.memoryTotalMib)} MiB`}</span>
-      </div>) : <p>{resources?.gpuStatus === "unsupported" ? t("runtime.unsupported") : resources ? unavailable : t("runtime.sampling")}</p>}
+      </div>) : <div className="runtime-gpu runtime-gpu-placeholder"><span>{resources?.gpuStatus === "unsupported" ? t("runtime.unsupported") : resources ? unavailable : pendingResources}</span><b>—</b><span>—</span></div>}
     </div>
-    {(training || snapshot.device || Object.keys(snapshot.config).length > 0) && <details className="runtime-details">
+    {(training || snapshot?.device || Object.keys(snapshot?.config ?? {}).length > 0) && <details className="runtime-details">
       <summary>{t("runtime.details")}</summary>
       <dl>
-        <div><dt>{t("runtime.device")}</dt><dd>{snapshot.device ?? unavailable}{snapshot.backend && ` · ${snapshot.backend}`}</dd></div>
+        <div><dt>{t("runtime.device")}</dt><dd>{snapshot?.device ?? unavailable}{snapshot?.backend && ` · ${snapshot.backend}`}</dd></div>
         {training && <>
           <div><dt>{t("runtime.splats")}</dt><dd>{training.splatCount == null ? unavailable : number(training.splatCount)}</dd></div>
           <div><dt>PSNR / SSIM</dt><dd>{training.psnr?.toFixed(2) ?? "—"} / {training.ssim?.toFixed(4) ?? "—"}</dd></div>
         </>}
-        {Object.entries(snapshot.config).filter(([key]) => key in settings).map(([key, value]) => <div key={key}><dt>{t(settings[key])}</dt><dd>{value}</dd></div>)}
+        {Object.entries(snapshot?.config ?? {}).filter(([key]) => key in settings).map(([key, value]) => <div key={key}><dt>{t(settings[key])}</dt><dd>{value}</dd></div>)}
       </dl>
     </details>}
   </div>;

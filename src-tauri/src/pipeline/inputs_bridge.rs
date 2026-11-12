@@ -247,6 +247,17 @@ impl PipelineRunner {
         .await?;
         let mut updated = c.clone();
         let mut additions = vec![];
+        let feature_progress = FeatureProgressScope::new(
+            c.sources
+                .iter()
+                .filter(|source| source.id != "__source" && !source.bridge_frames.is_empty())
+                .map(|source| {
+                    (
+                        format!("joint-bridge:{}", source.id),
+                        source.bridge_frames.len() as u64,
+                    )
+                }),
+        );
         let started = Instant::now();
         let mut extracted_count = 0u64;
         let result = async {
@@ -270,6 +281,7 @@ impl PipelineRunner {
                 if s.bridge_frames.is_empty() {
                     continue;
                 }
+                self.events.source(Some(&s.id));
                 let input = match &c.request {
                     GenerationInputs::Materials { items } => items
                         .iter()
@@ -370,7 +382,17 @@ impl PipelineRunner {
                     .camera_id;
                 let feature_list = p.colmap.join(format!("source-{index}-new.txt"));
                 write_image_list(&feature_list, &new_names).await?;
-                let preset = quality.preset();
+                let panorama_width = if s.projection == VideoProjection::Equirectangular {
+                    Some(
+                        crate::video::image_projection::inspect(
+                            &p.colmap_frames.join(&new_names[0]),
+                        )?
+                        .width,
+                    )
+                } else {
+                    None
+                };
+                let (max_size, max_features) = collection_feature_limits(quality, panorama_width);
                 let masks = feature_masks_for_group(
                     &p,
                     &new_names,
@@ -389,20 +411,25 @@ impl PipelineRunner {
                         existing_camera_id: Some(camera),
                         camera_params: None,
                         ordinary_images: false,
-                        max_size: preset.planned_sfm_max_image_size,
-                        max_features: preset.planned_sfm_max_features,
+                        max_size,
+                        max_features,
                     },
                     paths.logs.join("joint-bridge-features.log"),
                     &self.process_manager,
-                    Some(self.process_observer(
+                    Some(self.feature_process_observer(
                         PipelineStage::ExtractingFeatures,
-                        PipelineEngine::Colmap,
-                        Some(new_names.len() as u64),
-                        ObserverMode::BracketProgress,
+                        &feature_progress,
+                        format!("joint-bridge:{}", s.id),
                     )),
                     accel.gpu_index(),
                 )
                 .await?;
+                self.complete_feature_group(
+                    PipelineStage::ExtractingFeatures,
+                    &feature_progress,
+                    format!("joint-bridge:{}", s.id),
+                );
+                self.events.source(None);
                 s.names.extend(new_names.clone());
                 let mut ordered = s
                     .panorama_records
@@ -1250,6 +1277,7 @@ mod tests {
         checkpoint.sources.push(SourceCheckpoint {
             id: "clip".into(),
             identity,
+            ordinary_image_preparation_version: None,
             camera_ids: vec![7],
             camera_assignment: None,
             projection: VideoProjection::Perspective,

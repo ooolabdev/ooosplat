@@ -261,14 +261,14 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .runtime-metrics dt { font-size: 11px; color: var(--muted); }
 .runtime-metrics dd { margin: 4px 0 0; font-size: 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .runtime-metrics small { font-size: 10px; color: var(--muted); }
-.runtime-output { margin: 11px 0; }
+.runtime-output { margin: 11px 0; min-height: 1.6em; }
 .runtime-output span { display: block; margin-top: 4px; }
 .runtime-output.quiet { color: var(--amber); }
 .runtime-resources { padding-top: 11px; border-top: 1px solid var(--line); }
 .runtime-resources.stale { color: var(--muted); }
-.runtime-gpus { margin-top: 12px; }
+.runtime-gpus { margin-top: 12px; min-height: 64px; }
 .runtime-gpus p { font-size: 12px; margin: 6px 0; }
-.runtime-gpu { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; margin-top: 8px; font-size: 12px; }
+.runtime-gpu { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; margin-top: 8px; font-size: 12px; min-height: 36px; align-content: start; }
 .runtime-gpu span { overflow-wrap: anywhere; }
 .runtime-gpu > span:last-child { grid-column: 1 / -1; font-variant-numeric: tabular-nums; color: var(--muted); }
 .runtime-details { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; }
@@ -303,7 +303,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .stage-timeline li.failed > span { background: var(--red); border-color: var(--red); box-shadow: 0 0 0 4px rgba(176,74,64,.1); }
 .stage-timeline li.cancelled > span { background: var(--amber); border-color: var(--amber); box-shadow: 0 0 0 4px rgba(199,131,20,.1); }
 .stage-timeline li small { color: var(--blue); font: 600 10px/1 "Cascadia Mono", monospace; }
-.log-toolbar { padding: 9px 0; display: flex; justify-content: space-between; color: var(--muted); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 650; }
+.log-toolbar { padding: 9px 0; display: flex; justify-content: space-between; color: var(--muted); border-top: 1px solid var(--line); font-size: 11px; font-weight: 650; }
 .log-toolbar small { color: var(--faint); font-weight: 400; }
 .live-log { height: 220px; overflow: auto; background: #202735; color: #dce3ee; font: 11px/1.6 "Cascadia Mono", "Microsoft YaHei UI", monospace; }
 .log-line { padding: 6px 9px; display: grid; grid-template-columns: 70px 60px minmax(0,1fr); gap: 8px; border-bottom: 1px solid rgba(255,255,255,.055); }
@@ -461,6 +461,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .source-analysis-error { display: flex; align-items: flex-start; gap: 9px; color: var(--red); }
 .source-analysis-error > svg { flex-shrink: 0; margin-top: 2px; }
 .source-analysis-error > div { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.source-dimension-error { overflow-wrap: anywhere; }
 .media-retry { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 5px; min-height: 34px; padding: 0 10px; border: 1px solid var(--line-dark); background: transparent; color: var(--ink); white-space: nowrap; cursor: pointer; font: 600 11px var(--font-sans); }
 .queue-input-notice { margin: 8px 14px; color: var(--amber); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .preflight-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 24px; background: #17203366; }
@@ -1074,3 +1075,5 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
   .material-order-options { grid-template-columns: 1fr; }
   .colmap-path { grid-template-columns: 1fr; gap: 2px; }
 }
+.legacy-source-log > summary { cursor: pointer; color: inherit; padding: 7px 10px; font-family: var(--font-mono, monospace); }
+.legacy-source-log { border-top: 1px solid #384252; }

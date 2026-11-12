@@ -15,32 +15,57 @@ pub(super) struct Dataset {
 
 const DATASET_DERIVATION_VERSION: u32 = 2;
 
+#[cfg(test)]
 fn registered_pixel_identity(
+    pixels: Vec<(String, PathBuf)>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    registered_pixel_identity_observed(pixels, cancel, None)
+}
+
+fn registered_pixel_identity_observed(
     mut pixels: Vec<(String, PathBuf)>,
     cancel: &tokio_util::sync::CancellationToken,
+    observer: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 ) -> Result<String> {
     use sha2::{Digest, Sha256};
     pixels.sort_by(|a, b| a.0.cmp(&b.0));
     let mut digest = Sha256::new();
-    for (name, path) in pixels {
+    let total = pixels.len() as u64;
+    for (index, (name, path)) in pixels.into_iter().enumerate() {
         digest.update((name.len() as u64).to_le_bytes());
         digest.update(name.as_bytes());
         digest.update(crate::video::panorama::fingerprint_cancellable(
             &path, cancel,
         )?);
+        if let Some(observer) = observer {
+            observer(index as u64 + 1, total);
+        }
     }
     Ok(format!("{:x}", digest.finalize()))
 }
 
 struct PreparationProgress<'a> {
     events: &'a EventSink,
+    activity: super::application_activity::ApplicationActivity,
     total: u64,
     last: Option<Instant>,
 }
 impl<'a> PreparationProgress<'a> {
-    fn new(events: &'a EventSink, total: usize) -> Self {
+    fn new(
+        events: &'a EventSink,
+        total: usize,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Self {
         let mut progress = Self {
             events,
+            activity: super::application_activity::ApplicationActivity::new(
+                events,
+                PipelineStage::TrainingSplats,
+                cancel,
+                "正在准备训练图片",
+                None,
+            ),
             total: total as u64,
             last: None,
         };
@@ -48,6 +73,7 @@ impl<'a> PreparationProgress<'a> {
         progress
     }
     fn update(&mut self, current: u64) {
+        self.activity.touch();
         if current != self.total && self.last.is_some_and(|last| last.elapsed().as_secs() < 1) {
             return;
         }
@@ -98,6 +124,19 @@ fn prune(model: &mut Model, keep: impl Fn(&ColmapCamera) -> bool) {
     for p in &mut model.points {
         p.track.retain(|(id, _)| ids.contains(id));
     }
+}
+
+/// Partition the already parsed and validated authority. Both projections
+/// retain the exact poses, observations and sparse point properties; only
+/// camera/image membership and the corresponding tracks are filtered.
+fn training_model_subset(authority: &Model, erp: bool) -> Model {
+    let mut model = Model {
+        cameras: authority.cameras.clone(),
+        images: authority.images.clone(),
+        points: authority.points.clone(),
+    };
+    prune(&mut model, |camera| (camera.model_id == 17) == erp);
+    model
 }
 impl PipelineRunner {
     pub(super) async fn input_dataset(
@@ -159,6 +198,12 @@ impl PipelineRunner {
             None,
         );
         let root = paths.brush.join("dataset");
+        self.events.training_substage("trainingValidation");
+        let verification = Arc::new(self.application_activity(
+            PipelineStage::TrainingSplats,
+            "正在校验训练图片和相机数据",
+            Some(authority.images.len() as u64),
+        ));
         let model_identity = super::gps_runner::model_identity(model)?;
         let legacy_key = serde_json::to_string(&(
             &model_identity,
@@ -185,8 +230,13 @@ impl PipelineRunner {
             .map(|image| (image.pose.name.clone(), paths.frames.join(&image.pose.name)))
             .collect::<Vec<_>>();
         let cancel = self.process_manager.child_token();
+        let progress = verification.clone();
         let content_identity = crate::presets::spawn_pipeline_blocking(move || {
-            registered_pixel_identity(pixels, &cancel)
+            registered_pixel_identity_observed(
+                pixels,
+                &cancel,
+                Some(&|current, total| progress.update(current, total)),
+            )
         })
         .await
         .map_err(|error| SplatError::Process(error.to_string()))??;
@@ -256,6 +306,7 @@ impl PipelineRunner {
                                     })
                             })
                         {
+                            verification.finish();
                             self.events.training_substage("trainingValidation");
                             self.events.stage(
                                 PipelineStage::TrainingSplats,
@@ -268,6 +319,11 @@ impl PipelineRunner {
                 }
             }
         }
+        verification.finish();
+        drop(verification);
+        self.events.training_substage("trainingPreparation");
+        self.events
+            .stage(PipelineStage::TrainingSplats, 0., "正在准备训练图片");
         // Invalidate before writing any derived pixel/model file. A cancelled or
         // partially failed rebuild must never regain an old completed signature.
         if signature.exists() {
@@ -281,8 +337,7 @@ impl PipelineRunner {
             .await?;
         }
         tokio::fs::create_dir_all(root.join("images")).await?;
-        let mut normal = read_model(model)?;
-        prune(&mut normal, |c| c.model_id != 17);
+        let normal = training_model_subset(&authority, false);
         let mut derived = Model {
             cameras: vec![],
             images: vec![],
@@ -295,7 +350,11 @@ impl PipelineRunner {
                     .cameras
                     .iter()
                     .all(|camera| matches!(camera.model_id, 0 | 1 | 2 | 3 | 4 | 6));
-            let mut progress = PreparationProgress::new(&self.events, normal.images.len());
+            let mut progress = PreparationProgress::new(
+                &self.events,
+                normal.images.len(),
+                &self.process_manager.child_token(),
+            );
             if native {
                 for (index, image) in normal.images.iter().enumerate() {
                     if self.process_manager.child_token().is_cancelled() {
@@ -401,14 +460,19 @@ impl PipelineRunner {
             }
         }
         if has_erp {
-            self.events.training_substage("panoramaTrainingPreparation");
+            self.events.training_substage("trainingPreparation");
             self.events
                 .stage(PipelineStage::TrainingSplats, 0., "正在准备训练图片");
-            let mut sphere = read_model(model)?;
-            prune(&mut sphere, |c| c.model_id == 17);
+            let mut sphere = training_model_subset(&authority, true);
             let aliases = paths.work.join("sphere-training-images");
             tokio::fs::create_dir_all(&aliases).await?;
             let mut source_names = HashMap::new();
+            let aliases_progress = self.application_activity(
+                PipelineStage::TrainingSplats,
+                "正在准备训练图片",
+                Some(sphere.images.len() as u64),
+            );
+            let aliases_total = sphere.images.len() as u64;
             // Old sphere observations do not refer to the six derived pinhole views.
             for (index, i) in sphere.images.iter_mut().enumerate() {
                 i.observations.clear();
@@ -416,7 +480,9 @@ impl PipelineRunner {
                 tokio::fs::copy(paths.frames.join(&i.pose.name), aliases.join(&name)).await?;
                 source_names.insert(name.clone(), i.pose.name.clone());
                 i.pose.name = name;
+                aliases_progress.update(index as u64 + 1, aliases_total);
             }
+            aliases_progress.finish();
             for p in &mut sphere.points {
                 p.track.clear();
             }
@@ -441,7 +507,11 @@ impl PipelineRunner {
                     })
                 })
                 .collect::<Vec<_>>();
+            self.events.training_substage("panoramaTrainingPreparation");
+            self.events
+                .stage(PipelineStage::TrainingSplats, 0., "正在准备训练图片");
             let events = self.events.clone();
+            let face_activity = self.observed_activity("正在准备训练图片");
             let panorama_images = records
                 .iter()
                 .all(|record| record.timestamp_seconds.is_none());
@@ -456,6 +526,7 @@ impl PipelineRunner {
                     true,
                     &cancel,
                     |update| {
+                        face_activity.touch();
                         if let panorama::TrainingCacheUpdate::Faces {
                             completed, total, ..
                         } = update
@@ -506,7 +577,14 @@ impl PipelineRunner {
                 .filter(|row| row["face"] == "front")
                 .filter_map(|row| Some((row["image_name"].as_str()?, row["erp_name"].as_str()?)))
                 .collect::<HashMap<_, _>>();
-            for i in &mut faces.images {
+            self.events.training_substage("trainingPreparation");
+            let copy_progress = self.application_activity(
+                PipelineStage::TrainingSplats,
+                "正在准备训练图片",
+                Some(faces.images.len() as u64),
+            );
+            let copy_total = faces.images.len() as u64;
+            for (index, i) in faces.images.iter_mut().enumerate() {
                 next_image = next_image
                     .checked_add(1)
                     .ok_or_else(|| SplatError::Process("Image ID overflow".into()))?;
@@ -526,7 +604,9 @@ impl PipelineRunner {
                     );
                 }
                 i.pose.name = name;
+                copy_progress.update(index as u64 + 1, copy_total);
             }
+            copy_progress.finish();
             derived.cameras.extend(faces.cameras);
             derived.images.extend(faces.images);
         }
@@ -664,6 +744,54 @@ fn project(c: &ColmapCamera, x: f64, y: f64) -> Result<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_subsets_reuse_authority_without_changing_model_bytes_or_source_identity() {
+        for mixed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let input = crate::reconstruction::direct_input::tests::fixture(root.path(), mixed);
+            let source_identity = super::super::gps_runner::model_identity(&input.model).unwrap();
+            let authority = read_model(&input.model).unwrap();
+            let source_tracks = authority
+                .points
+                .iter()
+                .map(|point| point.track.clone())
+                .collect::<Vec<_>>();
+            let source_image_count = authority.images.len();
+            for erp in [false, true] {
+                let mut previous = read_model(&input.model).unwrap();
+                prune(&mut previous, |camera| (camera.model_id == 17) == erp);
+                let reused = training_model_subset(&authority, erp);
+                assert_eq!(reused.images.len(), previous.images.len());
+                assert_eq!(reused.cameras.len(), previous.cameras.len());
+                assert_eq!(reused.points.len(), previous.points.len());
+                if reused.images.is_empty() {
+                    continue;
+                }
+                let expected_root = root.path().join(format!("reparsed-{erp}"));
+                let reused_root = root.path().join(format!("reused-{erp}"));
+                previous.write(&expected_root).unwrap();
+                reused.write(&reused_root).unwrap();
+                assert_eq!(
+                    super::super::gps_runner::model_identity(&expected_root).unwrap(),
+                    super::super::gps_runner::model_identity(&reused_root).unwrap(),
+                );
+            }
+            assert_eq!(authority.images.len(), source_image_count);
+            assert_eq!(
+                authority
+                    .points
+                    .iter()
+                    .map(|point| point.track.clone())
+                    .collect::<Vec<_>>(),
+                source_tracks
+            );
+            assert_eq!(
+                super::super::gps_runner::model_identity(&input.model).unwrap(),
+                source_identity
+            );
+        }
+    }
 
     #[test]
     fn rebuilt_identical_pixels_keep_the_recipe_identity_but_changed_pixels_do_not() {

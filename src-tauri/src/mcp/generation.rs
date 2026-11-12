@@ -433,7 +433,8 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
             legacy["reshootOptions"] = serde_json::to_value(options)?;
             legacy["source_project_id"] = json!(request.source_project_id);
         }
-        if old.request_parameters == Some(crate::tasks::generation_parameters(Some(legacy))?)
+        if crate::tasks::camera_grouping_request_intent(&old.request_parameters)
+            == Some(crate::tasks::generation_parameters(Some(legacy))?)
             && request.preflight_id.is_none()
             && request.input_source_identity.is_none()
             && serde_json::to_value(&request.answers)? == serde_json::to_value(Answers::default())?

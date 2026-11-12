@@ -112,7 +112,38 @@ describe("app store", () => {
     expect(useAppStore.getState().liveTask?.elapsed_ms).toBe(16_000);
   });
 
-  it("rejects older events after a runtime-only batch and advances snapshots after merging their logs", () => {
+  it('does not merge a delayed old task/run snapshot into the current live run', () => {
+    const task = { task_id: 'task', run_id: 'new', status: 'running', sequence: 5, stage: 'matching',
+      progress: null, estimated_progress: 40, elapsed_ms: 1000, updated_at: new Date().toISOString(), result: null } as SharedTask;
+    useAppStore.getState().receiveTaskBatch(task, [{ ...event(5, 40), taskId: 'task', runId: 'new' }], true);
+    const current = useAppStore.getState();
+    useAppStore.getState().receiveTaskBatch({ ...task, run_id: 'old', status: 'failed' }, [
+      { ...event(10, 100), taskId: 'task', runId: 'old', message: 'old execution' },
+    ], false);
+    expect(useAppStore.getState()).toBe(current);
+  });
+
+  it('keeps known feature progress through empty same-operation updates but resets for an actual new process', () => {
+    const known = { ...event(1, 25), kind: 'stage' as const, stage: 'extractingFeatures',
+      operation: { id: 1, attempt: 1, sourceId: 'images' }, current: 18, total: 90, unit: 'images', stageProgress: 20,
+    };
+    useAppStore.getState().receiveEvent(known);
+    useAppStore.getState().receiveEvent({ ...known, sequence: 2, kind: 'progress', current: null, total: null, unit: null,
+      progress: 99, stageProgress: null, indeterminate: true });
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: 18, total: 90, stageProgress: 20, indeterminate: false });
+    expect(useAppStore.getState().progress).toBe(25);
+    for (const [index, kind] of (['log', 'heartbeat', 'capability'] as const).entries()) {
+      useAppStore.getState().receiveEvent({ ...known, sequence: index + 3, kind, progress: 100, current: null, total: null, stage: 'completed' });
+      expect(useAppStore.getState().latestEvent).toMatchObject({ current: 18, total: 90, stageProgress: 20 });
+      expect(useAppStore.getState().progress).toBe(25);
+    }
+    useAppStore.getState().receiveEvent({ ...known, sequence: 6, kind: 'stage', operation: { id: 2, attempt: 1, sourceId: 'next' },
+      current: null, total: null, unit: null, progress: 25, stageProgress: null, indeterminate: true });
+    expect(useAppStore.getState().latestEvent).toMatchObject({ current: null, total: null, stageProgress: null, indeterminate: true });
+    expect(useAppStore.getState().latestRuntime).toBeNull();
+  });
+
+  it("backfills history behind a runtime watermark without rewinding state", () => {
     const task = { task_id: "task-1", run_id: "run-1", status: "running", sequence: 10, estimated_progress: 42,
       elapsed_ms: 15_000, updated_at: new Date().toISOString(), result: null } as SharedTask;
     const snapshot: RuntimeSnapshot = { processId: 42, phase: "running", updatedAt: task.updated_at,
@@ -120,13 +151,14 @@ describe("app store", () => {
     useAppStore.getState().receiveTaskBatch(task, [{ ...event(10, 42), taskId: task.task_id,
       runId: task.run_id, kind: "runtime", runtime: snapshot }], true);
     useAppStore.getState().receiveTaskBatch(task, [{ ...event(9, 42), taskId: task.task_id, runId: task.run_id }], false);
-    expect(useAppStore.getState().events).toHaveLength(0);
+    expect(useAppStore.getState().events.map(item => item.sequence)).toEqual([9]);
     expect(useAppStore.getState().lastEventSequence).toBe(10);
+    expect(useAppStore.getState().latestRuntime).toEqual(snapshot);
     useAppStore.getState().receiveTaskBatch({ ...task, sequence: 20 }, [
       { ...event(11, 42), taskId: task.task_id, runId: task.run_id },
       { ...event(12, 42), taskId: task.task_id, runId: task.run_id },
     ], false);
-    expect(useAppStore.getState().events.map(item => item.sequence)).toEqual([11, 12]);
+    expect(useAppStore.getState().events.map(item => item.sequence)).toEqual([9, 11, 12]);
     expect(useAppStore.getState().lastEventSequence).toBe(20);
   });
 

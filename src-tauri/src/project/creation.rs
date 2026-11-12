@@ -7,6 +7,10 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCreationIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_image_preparation_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_grouping_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ba_policy_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brush_execution_options: Option<crate::project::metadata::BrushExecutionOptions>,
@@ -33,6 +37,12 @@ impl ProjectCreationIntent {
         if let Some(version) = task.ba_policy_version {
             intent["baPolicyVersion"] = serde_json::json!(version);
         }
+        if let Some(version) = task.camera_grouping_policy_version {
+            intent["cameraGroupingPolicyVersion"] = serde_json::json!(version);
+        }
+        if let Some(version) = task.ordinary_image_preparation_version {
+            intent["ordinaryImagePreparationVersion"] = serde_json::json!(version);
+        }
         let identity = serde_json::to_vec(&intent)?;
         let project_id = Uuid::new_v4();
         let name = if task.source_project_id.is_some() {
@@ -57,6 +67,8 @@ impl ProjectCreationIntent {
             })
             .collect();
         Ok(Self {
+            ordinary_image_preparation_version: task.ordinary_image_preparation_version,
+            camera_grouping_policy_version: task.camera_grouping_policy_version,
             ba_policy_version: task.ba_policy_version,
             brush_execution_options: task.brush_execution_options,
             intent_id: Uuid::new_v4(),

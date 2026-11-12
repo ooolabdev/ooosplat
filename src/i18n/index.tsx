@@ -409,6 +409,7 @@ const zhCN = {
   "progress.log": "任务日志",
   "progress.logCount": "最近 {count} / 500 条",
   "progress.logsTruncated": "部分日志未在此处显示，完整内容保存在项目日志中。",
+  "progress.logsRetrying": "日志暂时无法更新，正在重新读取",
   "progress.terminating": "正在终止任务",
   "progress.cancel": "取消任务并终止所有进程",
   "progress.cancelError": "无法终止任务：{detail}",
@@ -878,6 +879,7 @@ const zhCN = {
 export type TranslationKey = keyof typeof zhCN;
 
 const en: Record<TranslationKey, string> = {
+  "progress.logsRetrying": "Logs could not be updated. Reading again.",
   "input.unsupportedTitle": "Unsupported input",
   "input.colmapDisabled": "Importing COLMAP files or folders is temporarily unavailable.",
   "input.unsupportedSelection": "The selected file or folder is unsupported. Choose a file type supported by this input.",
@@ -1391,6 +1393,10 @@ const reshootCacheEnglish: Record<string, string> = {
 };
 
 const exactPipelineEnglish: Record<string, string> = {
+  "正在检查可复用结果": "Checking reusable results",
+  "正在检查图片焦距信息": "Checking image focal-length metadata",
+  "正在恢复结果发布": "Resuming result publication",
+  "日志暂时无法更新，正在重新读取": "Logs could not be updated. Reading again.",
   "补拍素材未能与原场景建立联系，已停止生成。": "The reshoot inputs could not be connected to the original scene. Generation has stopped.",
   "外部进程执行失败：补拍素材未能与原场景建立联系，已停止生成。": "The reshoot inputs could not be connected to the original scene. Generation has stopped.",
   "补拍画面没有成功加入原项目。请确保新旧素材有足够重叠。": "The reshoot images could not be added to the original project. Make sure the new and original captures overlap sufficiently.",
@@ -1502,8 +1508,43 @@ const exactPipelineEnglish: Record<string, string> = {
   "外部项目包含多个相机，不能进行同相机增量补拍": "The external project uses multiple cameras and cannot be used for same-camera incremental reshoot.",
 };
 
+const activityLabels: Record<string, string> = {
+    "画面准备": en['stage.frames'],
+    "特征提取": en['stage.features'],
+    "图像匹配": en['stage.matching'],
+    "相机重建": en['stage.reconstruction'],
+    "Splat 训练": en['stage.training'],
+    "结果导出": en['stage.export'],
+    "正在处理": en['progress.processing'],
+    "正在检查可复用结果": "Checking reusable results",
+    "正在检查图片焦距信息": "Checking image focal-length metadata",
+    "正在恢复结果发布": "Resuming result publication",
+    "正在建立画面链接或复制": "Linking or copying frames",
+    "正在检测 Alpha 并生成 Mask": "Checking alpha and generating masks",
+    "正在补全不透明 Mask": "Completing opaque masks",
+    "正在准备原项目文件": "Preparing original project files",
+    "正在准备补拍画面": "Preparing reshoot frames",
+    "正在整理补拍画面": "Organizing reshoot frames",
+    "正在检查画面与蒙版": "Checking images and masks",
+    "正在准备全景图片": "Preparing panorama images",
+    "正在准备训练图片": "Preparing training images",
+    "正在校验图片与 Mask": "Validating images and masks",
+    "正在校验训练图片和相机数据": "Validating training images and cameras",
+    "正在保存生成检查点": "Saving generation checkpoint",
+    "正在准备原模型训练副本": "Preparing the original model training snapshot",
+    "正在校验并发布 final.ply": "Validating and publishing final.ply",
+};
+
 export function localizePipelineMessage(locale: Locale, message: string): string {
   if (locale === "zh-CN") return message;
+  const quietSuffix = "。此步骤可能耗时较长，请耐心等待";
+  const activity = message.endsWith(quietSuffix) ? message.slice(0, -quietSuffix.length) : message;
+  const count = activity.match(/^(.+)：([\d,]+)\/([\d,]+)$/);
+  const label = count ? count[1] : activity;
+  if (Object.hasOwn(activityLabels, label)) {
+    const translated = `${activityLabels[label]}${count ? `: ${count[2]}/${count[3]}` : ''}`;
+    return message.endsWith(quietSuffix) ? translate(locale, 'progress.activeLongWait', { label: translated }) : translated;
+  }
   const retryPreparationContext = "\n重试准备上下文：";
   const retryPreparationIndex = message.indexOf(retryPreparationContext);
   if (retryPreparationIndex >= 0) {
@@ -1521,6 +1562,7 @@ export function localizePipelineMessage(locale: Locale, message: string): string
   const exact = exactPipelineEnglish[message];
   if (exact) return exact;
   const patterns: Array<[RegExp, (...values: string[]) => string]> = [
+    [/^(?:视频无效：)?图片序列分辨率不一致：([\s\S]+) 为 (\d+)×(\d+)，预期 (\d+)×(\d+)$/, (path, width, height, expectedWidth, expectedHeight) => `Image sequence dimensions do not match: ${path} is ${width}×${height}; expected ${expectedWidth}×${expectedHeight}`],
     [/^(.*?)补拍画面已加入 ([\d,]+)\/([\d,]+) 张，部分新增画面未能找到与原场景的联系，效果可能受影响。$/, (prefix, registered, prepared) => `${prefix.endsWith('：') ? `${prefix.slice(0, -1)}: ` : prefix}${en['reshoot.lowRegistration'].replace('{registered}', registered).replace('{prepared}', prepared)}`],
     [/^部分素材未能参与生成：(.+)。本次仅使用已连接到同一场景的素材。$/,names=>en['inputs.unused'].replace('{names}',names)],
     [/^帮助命令退出码：([^\n]+)\n([\s\S]*)$/, (code, detail) => `Engine check exit code: ${code}\n${detail}`],

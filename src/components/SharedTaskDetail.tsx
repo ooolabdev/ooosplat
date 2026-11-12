@@ -1,19 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useState } from 'react';
 import { CircleAlert, LoaderCircle, Play } from 'lucide-react';
-import { cancelSharedTask, startGuiTask, readSharedTaskLogs } from '../lib/backend';
+import { cancelSharedTask, startGuiTask } from '../lib/backend';
 import { pipelineErrorMessage, taskFailureContext } from '../lib/pipelineError';
 import { liveTrainingRemainingSeconds } from '../lib/runtimeEstimate';
 import { taskCanContinue, taskIsActive, type SharedTask } from '../types/tasks';
 import type { ColmapAccelerationStatus, ProjectSummary } from '../types/pipeline';
-import { localizePipelineMessage, useI18n } from '../i18n';
+import { useI18n } from '../i18n';
 import { taskProjectSummary } from '../app/taskPresentation';
 import { useTaskProjectDetail } from '../app/useTaskProjectDetail';
 import { useProgressMessage } from '../app/useProgressMessage';
 import { isProgressEvent } from '../lib/progressState';
 import { useTaskElapsed } from '../app/useTaskElapsed';
+import { useTaskActivityLog } from '../app/useTaskActivityLog';
 import { CompactError } from './CompactError';
 import { TaskConfiguration } from './TaskConfiguration';
-import { TaskProgress, type TaskLogLine } from './TaskProgress';
+import { TaskProgress } from './TaskProgress';
 import { ProjectResultStats } from './ProjectResultStats';
 import { InputAdoptionWarning } from './InputAdoptionWarning';
 
@@ -29,46 +30,15 @@ interface Props {
   externalError?: string | null;
 }
 
-function boundLogLines(lines: TaskLogLine[]) {
-  let bytes = 0;
-  const result: TaskLogLine[] = [];
-  for (let index = lines.length - 1; index >= 0 && result.length < 500; index--) {
-    bytes += lines[index].text.length;
-    if (bytes > 256 * 1024) break;
-    result.push(lines[index]);
-  }
-  return result.reverse();
-}
-
 export function SharedTaskDetail({ task, project: metadata, acceleration = null, onResume, showRuntimePanel = true, canStart = true, canContinue = canStart, onBeforeContinue, externalError }: Props) {
   const { locale, t } = useI18n();
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [fileLogs, setFileLogs] = useState<TaskLogLine[]>([]);
   const detail = useTaskProjectDetail(task);
   const project = taskProjectSummary(task, metadata ?? detail?.project);
   const active = taskIsActive(task);
   const elapsedMs = useTaskElapsed(task);
-  useEffect(() => {
-    let disposed = false, pending = false, number = 0;
-    let cursor: string | undefined;
-    setFileLogs([]);
-    const read = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const page = await readSharedTaskLogs(task.task_id, task.run_id, cursor);
-        if (disposed) return;
-        cursor = page.next_cursor ?? undefined;
-        const lines = page.entries.flatMap(entry => entry.text.split(/\r?\n/).filter(Boolean).map(text => ({ key: `file:${number++}`, source: entry.source, text })));
-        setFileLogs(current => boundLogLines([...(page.cursor_reset ? [] : current), ...lines]));
-      } catch { /* Tasks can fail before any registered engine log exists. */ }
-      finally { pending = false; }
-    };
-    void read();
-    const timer = window.setInterval(() => void read(), 15000);
-    return () => { disposed = true; window.clearInterval(timer); };
-  }, [task.task_id, task.run_id, task.status]);
+  const activity = useTaskActivityLog(task.task_id, task.run_id, active, task.recent_events, locale);
   const action = async (fn: () => Promise<unknown> | void) => {
     setBusy(true); setActionError(null);
     try { await fn(); } catch (error) { setActionError(pipelineErrorMessage(error) ?? t('error.generic')); }
@@ -79,14 +49,6 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
   const stage = task.error?.failed_stage ?? (['failed', 'cancelled', 'interrupted'].includes(task.status)
     ? [...events].reverse().find(event => isProgressEvent(event) && !['failed', 'cancelled', 'completed'].includes(event.stage))?.stage ?? detail?.stage
     : task.stage) ?? null;
-  const logs = useMemo(() => {
-    const rawKeys = new Set(fileLogs.map(line => `${line.source}:${line.text.trim()}`));
-    const eventLogs = events.filter(event => !['heartbeat', 'runtime'].includes(event.kind) && !rawKeys.has(`${event.engine}:${event.message.trim()}`)).map(event => ({
-      key: `event:${event.sequence}`, source: event.engine, timestamp: event.timestamp, level: event.level,
-      text: event.kind === 'log' && event.engine !== 'system' ? event.message : localizePipelineMessage(locale, event.message),
-    }));
-    return boundLogLines([...fileLogs, ...eventLogs]);
-  }, [events, fileLogs, locale]);
   const continuable = taskCanContinue(task);
   const inheritedRun = task.runs?.find(run => run.run_id === task.run_id)?.kind;
   const error = actionError ?? externalError ?? task.error?.message;
@@ -102,6 +64,6 @@ export function SharedTaskDetail({ task, project: metadata, acceleration = null,
     {task.status === 'created' && <button className="primary-action" type="button" disabled={busy || !canStart} onClick={() => void action(() => startGuiTask(task.task_id))}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('generate.start')}</button>}
     {continuable && !task.project_id && task.run_id && <button className="primary-action" type="button" disabled={busy || !canContinue} onClick={() => { onBeforeContinue?.(); void action(() => startGuiTask(task.task_id, task.run_id!)); }}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('project.continue')}</button>}
     {continuable && project && onResume && task.run_id && <button className="primary-action" type="button" disabled={busy || !canContinue} onClick={() => { onBeforeContinue?.(); void action(() => onResume(project, task.run_id!)); }}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} fill="currentColor" />}{t('project.continue')}</button>}
-    <TaskProgress importedReconstruction={detail?.inputs?.importedReconstruction ?? task.imported_reconstruction} progressKey={`${task.task_id}:${task.run_id ?? 'pending'}`} operationAttempt={task.operation?.attempt} substage={task.substage} status={task.status} stage={stage} progress={task.display_progress ?? task.estimated_progress} stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={logs} logsTruncated={(task.dropped_event_count ?? 0) > 0} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
+    <TaskProgress importedReconstruction={detail?.inputs?.importedReconstruction ?? task.imported_reconstruction} progressKey={`${task.task_id}:${task.run_id ?? 'pending'}`} operationAttempt={task.operation?.attempt} substage={task.substage} progressUnit={task.unit} status={task.status} stage={stage} progress={task.display_progress ?? task.estimated_progress} stageProgress={task.progress} elapsedMs={elapsedMs} message={message} runtime={runtime} showRuntimePanel={showRuntimePanel} remainingSeconds={active ? liveTrainingRemainingSeconds(runtime ?? null, true, Date.now()) : null} logs={activity.logs} rawLogs={activity.rawLogs} logsUnavailable={activity.unavailable} logsTruncated={activity.journalPersisted && ((task.dropped_event_count ?? 0) > 0 || activity.truncated)} cancelling={busy || task.status === 'cancelling'} onCancel={task.run_id ? () => void action(() => cancelSharedTask(task.task_id, task.run_id!)) : undefined} />
   </section>;
 }

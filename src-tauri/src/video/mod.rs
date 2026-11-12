@@ -4,6 +4,7 @@ pub mod gps;
 pub mod image_projection;
 pub mod image_sequence;
 pub mod panorama;
+mod png_camera_metadata;
 pub mod probe;
 pub(crate) mod temporary_png_focal_workaround;
 

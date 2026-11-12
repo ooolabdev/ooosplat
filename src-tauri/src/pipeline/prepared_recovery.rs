@@ -372,6 +372,7 @@ mod tests {
         let saved = SourceCheckpoint {
             id: "video".into(),
             identity: "identity".into(),
+            ordinary_image_preparation_version: None,
             camera_ids: vec![7],
             camera_assignment: None,
             projection: VideoProjection::Perspective,

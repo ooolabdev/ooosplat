@@ -429,6 +429,7 @@ fn source_checkpoint(
     SourceCheckpoint {
         id: id.into(),
         identity,
+        ordinary_image_preparation_version: None,
         camera_ids: camera_ids.into_iter().collect(),
         camera_assignment: None,
         projection,
@@ -904,6 +905,15 @@ impl PipelineRunner {
         );
         source.video = state.video.clone();
         source.image_sequence = state.image_sequence.clone();
+        if metadata.input_type == ProjectInputType::Images
+            && source.projection == VideoProjection::Perspective
+            && state.panorama.is_none()
+            && state.video_projection == VideoProjection::Perspective
+        {
+            // Only the newly prepared ordinary-photo batch uses this task's
+            // policy. Frozen historical source batches retain their own one.
+            source.ordinary_image_preparation_version = state.ordinary_image_preparation_version;
+        }
         if !reshoot {
             source.frames = state.frames.clone();
         }
@@ -928,6 +938,8 @@ impl PipelineRunner {
         };
         let mut checkpoint =
             InputCheckpoint::new(GenerationInputs::Materials { items: vec![item] });
+        checkpoint.camera_grouping_policy_version = working.camera_grouping_policy_version;
+        checkpoint.ordinary_image_preparation_version = working.ordinary_image_preparation_version;
         checkpoint.sources = sources;
         let registered = model
             .images

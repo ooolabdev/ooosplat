@@ -8,6 +8,9 @@ use crate::{
     process::{ProcessManager, ProcessObserver, ProcessSpec},
 };
 
+mod initialization;
+#[cfg(test)]
+mod initialization_runtime_tests;
 mod vocabulary;
 
 pub const LOCKED_VERSION: &str = "4.2.1";
@@ -216,7 +219,7 @@ pub(crate) async fn run_colmap(
 async fn run_mapper_with_ceres_fallback(
     executable: &Path,
     caspar_args: Vec<OsString>,
-    mut ceres_args: Vec<OsString>,
+    ceres_args: Vec<OsString>,
     output: &Path,
     working_directory: &Path,
     log_path: PathBuf,
@@ -224,6 +227,57 @@ async fn run_mapper_with_ceres_fallback(
     observer: Option<ProcessObserver>,
     selection: &super::colmap_ba::BaSelection,
 ) -> Result<()> {
+    let used_caspar = Box::pin(run_mapper_with_ceres_fallback_once(
+        executable,
+        caspar_args.clone(),
+        ceres_args.clone(),
+        output,
+        working_directory,
+        log_path.clone(),
+        manager,
+        observer.clone(),
+        selection,
+    ))
+    .await?;
+    let (actual_args, actual_selection) = if selection.gpu_index.is_some() && !used_caspar {
+        let mut args = ceres_args.clone();
+        super::colmap_ba::append_explicit_ceres_options(&mut args);
+        (
+            args,
+            super::colmap_ba::ceres_selection("Ceres retained after Caspar compatibility fallback"),
+        )
+    } else {
+        (caspar_args, selection.clone())
+    };
+    Box::pin(recover_mapper_initialization(
+        executable,
+        actual_args,
+        ceres_args,
+        output,
+        working_directory,
+        log_path,
+        manager,
+        observer,
+        actual_selection,
+    ))
+    .await
+}
+
+/// BA compatibility fallback for exactly one geometric initialization attempt.
+/// The return value freezes the backend actually used, so a later seed search
+/// cannot accidentally re-enable a Caspar backend already disabled in session.
+#[allow(clippy::too_many_arguments)]
+async fn run_mapper_with_ceres_fallback_once(
+    executable: &Path,
+    caspar_args: Vec<OsString>,
+    mut ceres_args: Vec<OsString>,
+    output: &Path,
+    working_directory: &Path,
+    log_path: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    selection: &super::colmap_ba::BaSelection,
+) -> Result<bool> {
     guard_mapper_output(output, working_directory, &ceres_args)?;
     let result = run_colmap(
         executable,
@@ -235,10 +289,10 @@ async fn run_mapper_with_ceres_fallback(
     )
     .await;
     let Some(index) = selection.gpu_index else {
-        return result;
+        return result.map(|()| false);
     };
     let caspar_error = match result {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(true),
         Err(error) if should_retry_mapper_with_ceres(selection, &error) => error,
         Err(error) => return Err(error),
     };
@@ -249,15 +303,13 @@ async fn run_mapper_with_ceres_fallback(
         "Caspar mapper process failed; Ceres fallback activated",
     )
     .await;
-    if let Err(error) = append_log(
+    append_explanation(
         &log_path,
         &format!(
             "[OOOSplat] Global Caspar mapper failed; resetting mapper output and retrying once with local/global Ceres: {caspar_error}\n"
         ),
     )
-    .await {
-        return Err(error.with_previous_attempt(caspar_error));
-    }
+    .await;
     tracing::warn!(
         "Global Caspar mapper failed on GPU {}; retrying once with Ceres: {}",
         index,
@@ -281,19 +333,173 @@ async fn run_mapper_with_ceres_fallback(
     .await
     {
         Ok(()) => {
-            if let Err(error) = append_log(
+            append_explanation(
                 &log_path,
                 "[OOOSplat] Ceres fallback completed successfully; Caspar is disabled for this engine/GPU for the remainder of the application process.\n",
             )
-            .await {
-                return Err(error.with_previous_attempt(caspar_error));
-            }
-            Ok(())
+            .await;
+            Ok(false)
         }
         // Cancellation/start/IO failures retain their own type; an earlier
         // Caspar failure must not override the final attempt's outcome.
         Err(error) => Err(error.with_previous_attempt(caspar_error)),
     }
+}
+
+/// Recover only a demonstrably invalid cold initialization. An existing
+/// reconstruction, fixed calibration, pose prior, or explicit seed is never
+/// replaced by this compatibility path. All original numeric tolerances and
+/// per-source camera assignments remain untouched.
+#[allow(clippy::too_many_arguments)]
+async fn recover_mapper_initialization(
+    executable: &Path,
+    mut actual_args: Vec<OsString>,
+    ceres_args: Vec<OsString>,
+    output: &Path,
+    working_directory: &Path,
+    log_path: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+    mut selection: super::colmap_ba::BaSelection,
+) -> Result<()> {
+    if !actual_args.first().is_some_and(|arg| arg == "mapper")
+        || actual_args.iter().any(|arg| {
+            arg == "--input_path"
+                || arg
+                    .to_str()
+                    .is_some_and(|arg| arg.starts_with("--input_path="))
+        })
+    {
+        return Ok(());
+    }
+    let output = resolved_path(output, working_directory)?;
+    let checked_output = output.clone();
+    let cancel = manager.child_token();
+    let check_cancel = cancel.clone();
+    let Some(mut best) = crate::presets::spawn_pipeline_blocking(move || {
+        initialization::assess_output(&checked_output, &check_cancel)
+    })
+    .await
+    .map_err(|error| SplatError::Process(format!("Mapper output inspection failed: {error}")))??
+    else {
+        // The ordinary output validator retains its existing missing-model
+        // error. Do not turn a malformed/no-output result into new work here.
+        return Ok(());
+    };
+    if best.valid_intrinsics {
+        return Ok(());
+    }
+    let args = actual_args.clone();
+    let working = working_directory.to_path_buf();
+    let check_cancel = cancel.clone();
+    let Some(seeds) = crate::presets::spawn_pipeline_blocking(move || {
+        let Some(request) = initialization::eligible_request(&args, &working)? else {
+            return Ok(None);
+        };
+        initialization::select_seed_images(&request, &check_cancel).map(Some)
+    })
+    .await
+    .map_err(|error| {
+        SplatError::Process(format!("Mapper initialization inspection failed: {error}"))
+    })??
+    else {
+        return Ok(());
+    };
+    if !initialization::should_recover(&best, seeds.input_images) {
+        return Ok(());
+    }
+    append_explanation(
+        &log_path,
+        &format!(
+            "[OOOSplat] Invalid cold Mapper intrinsics with {}/{} registered images; checking at most {} deterministic first-image initializations. Original images, masks, matches and geometric thresholds are unchanged.\n",
+            best.registered_images, seeds.input_images, seeds.seeds.len()
+        ),
+    )
+    .await;
+    for (index, seed) in seeds.seeds.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let attempt = initialization::create_attempt_output(&output)?;
+        let args = initialization::recovery_args(&actual_args, &attempt, seed)?;
+        let ceres = initialization::recovery_args(&ceres_args, &attempt, seed)?;
+        append_explanation(
+            &log_path,
+            &format!(
+                "[OOOSplat] Initialization check {}/{}: first image ID {}. BA remains parallel; no fixed second image or relaxed geometric threshold.\n",
+                index + 1, initialization::MAX_RECOVERY_SEEDS, seed
+            ),
+        )
+        .await;
+        let used_caspar = Box::pin(run_mapper_with_ceres_fallback_once(
+            executable,
+            args,
+            ceres,
+            &attempt,
+            working_directory,
+            log_path.clone(),
+            manager,
+            observer.clone(),
+            &selection,
+        ))
+        .await?;
+        if selection.gpu_index.is_some() && !used_caspar {
+            actual_args = ceres_args.clone();
+            super::colmap_ba::append_explicit_ceres_options(&mut actual_args);
+            selection = super::colmap_ba::ceres_selection(
+                "Ceres retained after Caspar compatibility fallback",
+            );
+        }
+        let checked_attempt = attempt.clone();
+        let check_cancel = cancel.clone();
+        let candidate = crate::presets::spawn_pipeline_blocking(move || {
+            initialization::assess_recovery_output(&checked_attempt, &check_cancel)
+        })
+        .await
+        .map_err(|error| {
+            SplatError::Process(format!("Mapper output inspection failed: {error}"))
+        })??;
+        if let Some(candidate) = candidate {
+            let checked_output = output.clone();
+            let previous = best.clone();
+            let check_cancel = cancel.clone();
+            let promoted = crate::presets::spawn_pipeline_blocking(move || {
+                initialization::promote_if_better(
+                    &checked_output,
+                    &previous,
+                    &candidate,
+                    &check_cancel,
+                )
+            })
+            .await
+            .map_err(|error| {
+                SplatError::Process(format!("Mapper model admission failed: {error}"))
+            })??;
+            if let Some(promoted) = promoted {
+                best = promoted;
+                append_explanation(
+                    &log_path,
+                    &format!(
+                        "[OOOSplat] Valid initialization adopted: {}/{} registered images. Previous model outputs are preserved.\n",
+                        best.registered_images, seeds.input_images
+                    ),
+                )
+                .await;
+            }
+        }
+        if best.valid_intrinsics && best.registered_images >= seeds.input_images {
+            return Ok(());
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
+    if !best.valid_intrinsics {
+        return Err(SplatError::Process(
+            "COLMAP initialization produced invalid camera parameters; bounded alternative initializations did not produce a better valid reconstruction".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolved_path(path: &Path, working_directory: &Path) -> Result<PathBuf> {
@@ -502,6 +708,15 @@ async fn append_log(path: &Path, message: &str) -> Result<()> {
         .write_all(message.as_bytes())
         .await?;
     Ok(())
+}
+
+/// Application explanations must not veto a compatible engine execution or
+/// turn a successful reconstruction into an I/O failure. Raw process logging
+/// and model/database writes deliberately retain their existing error policy.
+async fn append_explanation(path: &Path, message: &str) {
+    if let Err(error) = append_log(path, message).await {
+        tracing::warn!(%error, "Could not append the COLMAP explanation");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1125,7 +1340,7 @@ async fn with_ba_policy(
     } else {
         super::colmap_ba::append_explicit_ceres_options(&mut args);
     }
-    append_log(log, &format!("[OOOSplat] {}\n", selection.detail)).await?;
+    append_explanation(log, &format!("[OOOSplat] {}\n", selection.detail)).await;
     tracing::info!("{}", selection.detail);
     Ok((args, selection))
 }
@@ -1514,6 +1729,56 @@ pub async fn retrieve_reshoot_pairs(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<Vec<(String, String)>> {
+    retrieve_restricted_pairs(
+        executable, database, old_names, new_names, candidates, false, log, manager, observer,
+    )
+    .await
+}
+
+/// Native 0.7.1 sequential loop detection queries every tenth image, using
+/// fifty candidates and one vocabulary neighbor. Restrict the index to one
+/// collection source: other videos must not become implicit temporal peers.
+pub async fn retrieve_source_loop_pairs(
+    executable: &Path,
+    database: &Path,
+    source_names: &[String],
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<Vec<(String, String)>> {
+    let (ordered, queries) = sequential_loop_query_names(source_names);
+    let mut pairs = retrieve_restricted_pairs(
+        executable, database, &ordered, &queries, 50, true, log, manager, observer,
+    )
+    .await?;
+    pairs.retain(|(first, second)| first != second);
+    // The shared retriever reports (indexed candidate, query); native loop
+    // matching sends (query, retrieved candidate) to the verifier.
+    Ok(pairs
+        .into_iter()
+        .map(|(candidate, query)| (query, candidate))
+        .collect())
+}
+
+fn sequential_loop_query_names(source_names: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut ordered = source_names.to_vec();
+    ordered.sort();
+    let queries = ordered.iter().step_by(10).cloned().collect();
+    (ordered, queries)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retrieve_restricted_pairs(
+    executable: &Path,
+    database: &Path,
+    old_names: &[String],
+    new_names: &[String],
+    candidates: u32,
+    sequential_loop: bool,
+    log: PathBuf,
+    manager: &ProcessManager,
+    observer: Option<ProcessObserver>,
+) -> Result<Vec<(String, String)>> {
     use crate::process::ProcessUpdate;
     use std::{
         collections::HashSet,
@@ -1553,27 +1818,21 @@ pub async fn retrieve_reshoot_pairs(
             observer(update);
         }
     });
-    run_colmap(
-        executable,
-        vec![
-            "vocab_tree_retriever".into(),
-            "--database_path".into(),
-            database.into(),
-            "--vocab_tree_path".into(),
-            vocab.into(),
-            "--database_image_list_path".into(),
-            old_list.into(),
-            "--query_image_list_path".into(),
-            new_list.into(),
-            "--num_images".into(),
-            candidates.to_string().into(),
-        ],
-        directory,
-        log,
-        manager,
-        Some(collector),
-    )
-    .await?;
+    let mut args = vec![
+        "vocab_tree_retriever".into(),
+        "--database_path".into(),
+        database.into(),
+        "--vocab_tree_path".into(),
+        vocab.into(),
+        "--database_image_list_path".into(),
+        old_list.into(),
+        "--query_image_list_path".into(),
+        new_list.into(),
+        "--num_images".into(),
+        candidates.to_string().into(),
+    ];
+    append_sequential_loop_retrieval_options(&mut args, sequential_loop);
+    run_colmap(executable, args, directory, log, manager, Some(collector)).await?;
     let result = std::mem::take(&mut pairs.lock().expect("retrieval collector").2);
     if result.is_empty() && !new_names.is_empty() && !old_names.is_empty() {
         return Err(SplatError::Process(
@@ -1581,6 +1840,19 @@ pub async fn retrieve_reshoot_pairs(
         ));
     }
     Ok(result)
+}
+
+fn append_sequential_loop_retrieval_options(args: &mut Vec<OsString>, sequential_loop: bool) {
+    if sequential_loop {
+        args.extend([
+            "--num_neighbors".into(),
+            "1".into(),
+            "--num_checks".into(),
+            "64".into(),
+            "--num_images_after_verification".into(),
+            "0".into(),
+        ]);
+    }
 }
 
 pub struct ReshootMapperOptions<'a> {
@@ -1653,6 +1925,40 @@ pub async fn map_reshoot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequential_loop_retrieval_matches_native_071_without_changing_cross_source_defaults() {
+        let source = (0..53)
+            .rev()
+            .map(|index| format!("frame_{index:04}.png"))
+            .collect::<Vec<_>>();
+        let (ordered, queries) = sequential_loop_query_names(&source);
+        assert_eq!(ordered.len(), 53);
+        assert_eq!(
+            queries,
+            [
+                "frame_0000.png",
+                "frame_0010.png",
+                "frame_0020.png",
+                "frame_0030.png",
+                "frame_0040.png",
+                "frame_0050.png",
+            ]
+        );
+        let mut cross_source = vec![OsString::from("vocab_tree_retriever")];
+        append_sequential_loop_retrieval_options(&mut cross_source, false);
+        assert_eq!(cross_source, [OsString::from("vocab_tree_retriever")]);
+        let mut within_source = cross_source.clone();
+        append_sequential_loop_retrieval_options(&mut within_source, true);
+        let within_source = strings(within_source);
+        for pair in [
+            ["--num_neighbors", "1"],
+            ["--num_checks", "64"],
+            ["--num_images_after_verification", "0"],
+        ] {
+            assert!(within_source.windows(2).any(|args| args == pair));
+        }
+    }
 
     fn feature_database_fixture(root: &Path) -> (PathBuf, rusqlite::Connection) {
         let path = root.join("features.db");
@@ -2170,6 +2476,70 @@ mod tests {
             assert_eq!(std::fs::read(base.join("seed")).unwrap(), b"seed unchanged");
             assert!(!output.join("partial").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn explanatory_log_failure_does_not_turn_successful_ceres_into_failure() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("blocked-explanation.log");
+        std::fs::create_dir(&blocked).unwrap();
+        append_explanation(&blocked, "[OOOSplat] BA selection\n").await;
+
+        let (executable, prefix) = fallback_script(root.path(), 0);
+        let output = root.path().join("native");
+        std::fs::create_dir(&output).unwrap();
+        let database = root.path().join("database.db");
+        std::fs::write(&database, b"database unchanged").unwrap();
+        let log = root.path().join("colmap.log");
+        let redirected = log.clone();
+        let moved = root.path().join("completed-colmap.log");
+        let exits = Arc::new(AtomicUsize::new(0));
+        let seen = exits.clone();
+        let manager = ProcessManager::new().with_lifecycle(Arc::new(move |event| {
+            if matches!(event, crate::process::ProcessUpdate::Exited { .. })
+                && seen.fetch_add(1, Ordering::Relaxed) == 1
+            {
+                // The Ceres raw writer remains valid; only the subsequent
+                // application explanation is made unwritable.
+                std::fs::rename(&redirected, &moved).unwrap();
+                std::fs::create_dir(&redirected).unwrap();
+            }
+        }));
+        let flags = vec![
+            "--output_path".into(),
+            output.clone().into_os_string(),
+            "--database_path".into(),
+            database.clone().into_os_string(),
+        ];
+        let mut caspar = prefix.clone();
+        caspar.push("CASPAR".into());
+        caspar.extend(flags.clone());
+        let mut ceres = prefix;
+        ceres.push("CERES".into());
+        ceres.extend(flags);
+        run_mapper_with_ceres_fallback(
+            &executable,
+            caspar,
+            ceres,
+            &output,
+            root.path(),
+            log,
+            &manager,
+            None,
+            &super::super::colmap_ba::BaSelection {
+                gpu_index: Some(0),
+                detail: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(exits.load(Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read(database).unwrap(), b"database unchanged");
+        assert!(!output.join("partial").exists());
     }
 
     #[tokio::test]
@@ -2721,6 +3091,21 @@ mod tests {
         assert!(!original
             .iter()
             .any(|arg| arg == "--ImageReader.camera_params"));
+        for (flag, value) in [
+            ("--ImageReader.camera_model", "SIMPLE_RADIAL"),
+            ("--ImageReader.single_camera", "1"),
+            ("--image_list_path", "chosen.txt"),
+            ("--FeatureExtraction.use_gpu", "1"),
+            ("--FeatureExtraction.gpu_index", "0"),
+            ("--FeatureExtraction.max_image_size", "1600"),
+            ("--SiftExtraction.max_num_features", "8192"),
+            ("--ImageReader.mask_path", "../masks"),
+        ] {
+            assert!(
+                original.windows(2).any(|pair| pair == [flag, value]),
+                "{flag}"
+            );
+        }
         // The builder must not reinterpret or replace an explicit calibration.
         let explicit = "1234.5,400,300,-0.01";
         let mut overridden = args(Some(explicit));

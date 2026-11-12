@@ -12,6 +12,22 @@ mod gps_resume_validation;
 #[path = "inputs_runner_tests.rs"]
 mod tests;
 
+/// Match the 0.7.1 per-projection feature limits. ERP preparation has its own
+/// width budget; applying the ordinary-photo limit a second time would discard
+/// spherical detail before matching. Native-resolution High ERP inputs keep the
+/// historical 4096-pixel feature cap, independently of training resolution.
+fn collection_feature_limits(quality: Quality, panorama_width: Option<u32>) -> (u32, u32) {
+    let preset = quality.preset();
+    let max_size = panorama_width.map_or(preset.planned_sfm_max_image_size, |width| {
+        width.min(match quality {
+            Quality::Fast => 2048,
+            Quality::Balanced => 3072,
+            Quality::High => 4096,
+        })
+    });
+    (max_size, preset.planned_sfm_max_features)
+}
+
 fn bind_collection_training_recipe(
     state: &mut PipelineStateFile,
     dataset_identity: String,
@@ -48,6 +64,8 @@ struct FrozenReshootSourceBatch {
     panorama_records: Vec<PanoramaFrameRecord>,
     #[serde(default)]
     video: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ordinary_image_preparation_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +92,200 @@ fn default_true() -> bool {
     true
 }
 
+fn validate_batch_preparation(batch: &FrozenReshootSourceBatch) -> Result<()> {
+    if batch
+        .ordinary_image_preparation_version
+        .is_some_and(|version| {
+            version != ORDINARY_IMAGE_PREPARATION_VERSION
+                || batch.video
+                || batch.projection != VideoProjection::Perspective
+        })
+    {
+        return Err(SplatError::Process(
+            "Unsupported source image preparation policy".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn frozen_source_batches(
+    project: &Path,
+    state: &PipelineStateFile,
+    source: &SourceCheckpoint,
+) -> Result<Vec<FrozenReshootSourceBatch>> {
+    let fallback = || FrozenReshootSourceBatch {
+        id: source.id.clone(),
+        identity: source.identity.clone(),
+        names: source.names.clone(),
+        projection: source.projection,
+        camera_ids: source.camera_ids.clone(),
+        panorama_records: source.panorama_records.clone(),
+        video: source.video.is_some(),
+        ordinary_image_preparation_version: source.ordinary_image_preparation_version,
+    };
+    if source.id != "__source" {
+        let batch = fallback();
+        validate_batch_preparation(&batch)?;
+        return Ok(vec![batch]);
+    }
+    // The current task's policy never describes its inherited seed. A saved
+    // source snapshot, not a filename prefix or the newest global version,
+    // owns the historical per-batch preparation semantics.
+    if source.ordinary_image_preparation_version.is_some() {
+        return Err(SplatError::Process(
+            "Invalid inherited image preparation policy".into(),
+        ));
+    }
+    let Some(identity) = state
+        .reshoot
+        .as_ref()
+        .and_then(|value| value.snapshot_v3_identity.as_deref())
+    else {
+        let snapshot_recorded = state
+            .reshoot
+            .as_ref()
+            .is_some_and(|value| value.snapshot_v3_ready);
+        let manifest_exists =
+            match std::fs::symlink_metadata(project.join("work/reshoot-snapshot-v3/snapshot.json"))
+            {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+        if snapshot_recorded || manifest_exists {
+            return Err(SplatError::Process(
+                "Reshoot snapshot source mapping is inconsistent".into(),
+            ));
+        }
+        return Ok(vec![fallback()]);
+    };
+    let root = project.join("work/reshoot-snapshot-v3");
+    let manifest =
+        crate::pipeline::reshoot_snapshot::load_bound_snapshot_metadata(&root, identity)?;
+    let asset = manifest
+        .assets
+        .iter()
+        .find(|asset| asset.relative_path == "source/context.json")
+        .ok_or_else(|| {
+            SplatError::Process("Reshoot snapshot source mapping is inconsistent".into())
+        })?;
+    let context_path = root.join("source/context.json");
+    let metadata = std::fs::symlink_metadata(&context_path)?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != asset.file_size
+        || crate::video::panorama::fingerprint(&context_path)? != asset.sha256
+    {
+        return Err(SplatError::Process(
+            "Reshoot snapshot source mapping is inconsistent".into(),
+        ));
+    }
+    let context: FrozenReshootSourceContext =
+        serde_json::from_slice(&std::fs::read(context_path)?)?;
+    let expected = source
+        .names
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != source.names.len()
+        || context
+            .names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
+        || context.names.len() != source.names.len()
+    {
+        return Err(SplatError::Process(
+            "Reshoot snapshot source mapping is inconsistent".into(),
+        ));
+    }
+    if context.source_batches.is_empty() {
+        // Old contexts did not record policies. They retain old copy/binary
+        // semantics rather than inheriting the current task's new default.
+        return Ok(vec![fallback()]);
+    }
+    let mut mapped = std::collections::BTreeSet::new();
+    for batch in &context.source_batches {
+        validate_batch_preparation(batch)?;
+        if batch.names.is_empty() || batch.names.iter().any(|name| !mapped.insert(name)) {
+            return Err(SplatError::Process(
+                "Reshoot snapshot source mapping is inconsistent".into(),
+            ));
+        }
+    }
+    if mapped != expected {
+        return Err(SplatError::Process(
+            "Reshoot snapshot source mapping is inconsistent".into(),
+        ));
+    }
+    Ok(context.source_batches)
+}
+
+pub(super) fn source_preparation_policies(
+    project: &Path,
+    state: &PipelineStateFile,
+) -> Result<std::collections::BTreeMap<String, Option<u32>>> {
+    let mut policies = std::collections::BTreeMap::new();
+    if let Some(inputs) = &state.inputs {
+        if inputs.ordinary_image_preparation_version != state.ordinary_image_preparation_version
+            || inputs
+                .ordinary_image_preparation_version
+                .is_some_and(|version| version != ORDINARY_IMAGE_PREPARATION_VERSION)
+        {
+            return Err(SplatError::Process(
+                "Unsupported source image preparation policy".into(),
+            ));
+        }
+        for source in &inputs.sources {
+            if source.id != "__source"
+                && source.ordinary_image_preparation_version.is_some()
+                && source.ordinary_image_preparation_version
+                    != inputs.ordinary_image_preparation_version
+            {
+                return Err(SplatError::Process(
+                    "Unsupported source image preparation policy".into(),
+                ));
+            }
+            for batch in frozen_source_batches(project, state, source)? {
+                for name in batch.names {
+                    crate::reconstruction::direct_input::image_path(
+                        &project.join("work/frames"),
+                        &name,
+                    )?;
+                    if policies
+                        .insert(name, batch.ordinary_image_preparation_version)
+                        .is_some()
+                    {
+                        return Err(SplatError::Process(
+                            "Prepared image names are unsafe or duplicated".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        if state
+            .ordinary_image_preparation_version
+            .is_some_and(|version| version != ORDINARY_IMAGE_PREPARATION_VERSION)
+        {
+            return Err(SplatError::Process(
+                "Unsupported source image preparation policy".into(),
+            ));
+        }
+        let policy = (state.input_type == ProjectInputType::Images
+            && state.panorama.is_none()
+            && state.video_projection == VideoProjection::Perspective)
+            .then_some(state.ordinary_image_preparation_version)
+            .flatten();
+        for path in crate::video::list_images(&project.join("work/frames"))? {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| SplatError::InvalidPath(path.clone()))?;
+            policies.insert(name.to_owned(), policy);
+        }
+    }
+    Ok(policies)
+}
+
 pub(super) struct FrozenReshootSource {
     manifest: crate::pipeline::reshoot_snapshot::ReshootSnapshotV3,
     context: FrozenReshootSourceContext,
@@ -92,9 +304,12 @@ impl PipelineRunner {
         metadata: &mut ProjectMetadata,
         state: &mut PipelineStateFile,
     ) -> Result<FrozenReshootSource> {
+        self.events.source(Some("__source"));
+        let _source_check =
+            self.application_activity(PipelineStage::ExtractingFrames, "正在检查可复用结果", None);
         use crate::pipeline::reshoot_snapshot::{
-            verify_snapshot, ReshootSnapshotBuilder, SnapshotAssetInput, SnapshotAssetRole,
-            RESHOOT_SNAPSHOT_MANIFEST,
+            verify_snapshot_observed, ReshootSnapshotBuilder, SnapshotAssetInput,
+            SnapshotAssetRole, RESHOOT_SNAPSHOT_MANIFEST,
         };
 
         let provenance = metadata
@@ -104,7 +319,26 @@ impl PipelineRunner {
         let snapshot_root = paths.work.join("reshoot-snapshot-v3");
         let manifest_path = snapshot_root.join(RESHOOT_SNAPSHOT_MANIFEST);
         let manifest = if manifest_path.is_file() {
-            let snapshot = verify_snapshot(&snapshot_root)?;
+            let root = snapshot_root.clone();
+            let activity = self.application_activity(
+                PipelineStage::ExtractingFrames,
+                "正在检查可复用结果",
+                None,
+            );
+            let cancellation = self.process_manager.child_token();
+            let snapshot = crate::presets::spawn_pipeline_blocking(move || {
+                let result = verify_snapshot_observed(
+                    &root,
+                    &cancellation,
+                    Some(&|current, total| activity.update(current, total)),
+                );
+                if result.is_ok() {
+                    activity.finish();
+                }
+                result
+            })
+            .await
+            .map_err(|error| SplatError::Process(error.to_string()))??;
             if snapshot.source_project_id != Some(provenance.source_project_id)
                 || state
                     .reshoot
@@ -170,41 +404,44 @@ impl PipelineRunner {
                 .as_ref()
                 .and_then(|state| state.inputs.as_ref())
                 .is_none_or(|inputs| inputs.reshoot_eligible);
-            let source_batches = source
-                .state
-                .as_ref()
-                .and_then(|state| state.inputs.as_ref())
-                .map(|inputs| {
-                    inputs
-                        .sources
-                        .iter()
-                        .map(|batch| FrozenReshootSourceBatch {
-                            id: batch.id.clone(),
-                            identity: batch.identity.clone(),
-                            names: batch.names.clone(),
-                            projection: batch.projection,
-                            camera_ids: batch.camera_ids.clone(),
-                            panorama_records: batch.panorama_records.clone(),
-                            video: batch.video.is_some(),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .filter(|batches| !batches.is_empty())
-                .unwrap_or_else(|| {
-                    vec![FrozenReshootSourceBatch {
-                        id: "__source".into(),
-                        identity: source_identity.clone(),
-                        names: names.clone(),
-                        projection: if source_model_has_erp {
-                            VideoProjection::Equirectangular
-                        } else {
-                            VideoProjection::Perspective
-                        },
-                        camera_ids: Vec::new(),
-                        panorama_records: panorama_records.clone(),
-                        video: source.metadata.input_type == ProjectInputType::Video,
-                    }]
+            let mut source_batches = Vec::new();
+            if let Some(source_state) = &source.state {
+                if let Some(inputs) = &source_state.inputs {
+                    for batch in &inputs.sources {
+                        source_batches.extend(frozen_source_batches(
+                            &source.root,
+                            source_state,
+                            batch,
+                        )?);
+                    }
+                }
+            }
+            if source_batches.is_empty() {
+                source_batches.push(FrozenReshootSourceBatch {
+                    id: "__source".into(),
+                    identity: source_identity.clone(),
+                    names: names.clone(),
+                    projection: if source_model_has_erp {
+                        VideoProjection::Equirectangular
+                    } else {
+                        VideoProjection::Perspective
+                    },
+                    camera_ids: Vec::new(),
+                    panorama_records: panorama_records.clone(),
+                    video: source.metadata.input_type == ProjectInputType::Video,
+                    ordinary_image_preparation_version: source
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.ordinary_image_preparation_version)
+                        .filter(|_| {
+                            source.metadata.input_type == ProjectInputType::Images
+                                && !source_model_has_erp
+                        }),
                 });
+            }
+            for batch in &source_batches {
+                validate_batch_preparation(batch)?;
+            }
             let context = FrozenReshootSourceContext {
                 source_identity: source_identity.clone(),
                 names: names.clone(),
@@ -278,7 +515,20 @@ impl PipelineRunner {
                     relative_path: PathBuf::from("gps/manifest.json"),
                 });
             }
-            let result = builder.build(&self.process_manager.child_token()).await;
+            let activity = self.application_activity(
+                PipelineStage::ExtractingFrames,
+                "正在准备原项目文件",
+                None,
+            );
+            let result = builder
+                .build_observed(
+                    &self.process_manager.child_token(),
+                    Some(&|current, total| activity.update(current, total)),
+                )
+                .await;
+            if result.is_ok() {
+                activity.finish();
+            }
             let _ = tokio::fs::remove_file(context_source).await;
             result?
         };
@@ -372,11 +622,12 @@ impl PipelineRunner {
             ));
         }
         let manager = manager.with_creation_intent(self.creation_intent.clone());
-        crate::pipeline::inputs::validate(
+        crate::pipeline::inputs::validate_for_camera_policy(
             &self.engines,
             &inputs,
             quality,
             self.policy().unwrap_or_default(),
+            self.camera_grouping_policy_version(),
         )
         .await?;
         inputs.authorized_paths()?;
@@ -415,6 +666,13 @@ impl PipelineRunner {
         let mut state = manager.read_state(&paths.state).await?;
         state.generation_policy = Some(self.policy().unwrap_or_default());
         state.planner_enabled = true;
+        state.camera_grouping_policy_version = self.camera_grouping_policy_version();
+        state.ordinary_image_preparation_version = self.ordinary_image_preparation_version();
+        if let Some(checkpoint) = state.inputs.as_mut() {
+            checkpoint.camera_grouping_policy_version = state.camera_grouping_policy_version;
+            checkpoint.ordinary_image_preparation_version =
+                state.ordinary_image_preparation_version;
+        }
         if let Some(InputCheckpoint {
             request: GenerationInputs::Materials { items },
             ..
@@ -705,6 +963,7 @@ impl PipelineRunner {
                             checkpoint.sources = vec![SourceCheckpoint {
                                 id: "imported".into(),
                                 identity: info.identity.clone(),
+                                ordinary_image_preparation_version: None,
                                 camera_ids: model
                                     .images
                                     .iter()
@@ -834,6 +1093,7 @@ impl PipelineRunner {
                                 checkpoint.sources.push(SourceCheckpoint {
                                     id: "__source".into(),
                                     identity: source_identity.clone(),
+                                    ordinary_image_preparation_version: None,
                                     camera_ids: original.cameras.iter().map(|c| c.id).collect(),
                                     camera_assignment: None,
                                     projection: model_projection(&original),
@@ -952,6 +1212,7 @@ impl PipelineRunner {
                                 let mut source = SourceCheckpoint {
                                     id: item.id.clone(),
                                     identity: a.identity.clone(),
+                                    ordinary_image_preparation_version: None,
                                     camera_ids: vec![],
                                     camera_assignment: None,
                                     projection: resolved,
@@ -1100,18 +1361,24 @@ impl PipelineRunner {
                                     let cancel = self.process_manager.child_token();
                                     let erp = resolved == VideoProjection::Equirectangular;
                                     let quality = metadata.quality;
-                                    let progress = metadata.reshoot.as_ref().map(|_| {
-                                        super::reshoot_runner::ReshootProgress::new(
-                                            &self.events,
-                                            PipelineStage::ExtractingFrames,
-                                            &cancel,
-                                            "正在准备补拍画面",
-                                            Some(files.len() as u64),
-                                        )
-                                    });
+                                    let preparation_version =
+                                        checkpoint.ordinary_image_preparation_version;
+                                    self.events
+                                        .panorama_phase
+                                        .store(u64::from(erp), Ordering::Relaxed);
+                                    self.events.panorama_images.store(true, Ordering::Relaxed);
+                                    let progress = self.application_activity(
+                                        PipelineStage::ExtractingFrames,
+                                        if metadata.reshoot.is_some() {
+                                            "正在准备补拍画面"
+                                        } else {
+                                            "正在准备训练图片"
+                                        },
+                                        Some(files.len() as u64),
+                                    );
                                     let names =
                                         crate::presets::spawn_pipeline_blocking(move || {
-                                            prepare_images(
+                                            prepare_images_with_preparation(
                                                 &files,
                                                 &prefix,
                                                 &out,
@@ -1120,7 +1387,8 @@ impl PipelineRunner {
                                                 erp,
                                                 quality,
                                                 &cancel,
-                                                progress.as_ref(),
+                                                Some(&progress),
+                                                preparation_version,
                                             )
                                         })
                                         .await
@@ -1145,6 +1413,8 @@ impl PipelineRunner {
                                         });
                                     }
                                     source.names = names;
+                                    source.ordinary_image_preparation_version =
+                                        (!erp).then_some(preparation_version).flatten();
                                 }
                                 if item.source.identity()? != a.identity {
                                     return Err(SplatError::Process("INPUT_CHANGED".into()));
@@ -1730,12 +2000,6 @@ impl PipelineRunner {
                             None,
                         );
                         manager.write_state(&paths.state, &state).await?;
-                        self.events.stage(
-                            PipelineStage::TrainingSplats,
-                            1.,
-                            "训练图片准备完成，即将启动训练",
-                        );
-                        self.events.training_substage("training");
                         let mut attempt = paths.clone();
                         let training_attempt = state
                             .reshoot
@@ -1784,6 +2048,12 @@ impl PipelineRunner {
                                 SplatError::Process("Missing completed Brush output".into())
                             })?)
                         } else {
+                            self.events.stage(
+                                PipelineStage::TrainingSplats,
+                                1.,
+                                "训练图片准备完成，即将启动训练",
+                            );
+                            self.events.training_substage("training");
                             self.train_brush_with_oom_retry(
                                 manager,
                                 &attempt,
@@ -2053,6 +2323,7 @@ impl PipelineRunner {
         paths: &ProjectPaths,
         state: &mut PipelineStateFile,
     ) -> Result<()> {
+        let activity = self.observed_activity("正在检查图片焦距信息");
         let pending = state
             .inputs
             .as_ref()
@@ -2072,7 +2343,10 @@ impl PipelineRunner {
             .await?
             {
                 Some(records) => records,
-                None => return Ok(()),
+                None => {
+                    activity.finish();
+                    return Ok(());
+                }
             },
         };
         if state.inputs.as_ref().is_some_and(|checkpoint| {
@@ -2084,6 +2358,7 @@ impl PipelineRunner {
                 .as_mut()
                 .unwrap()
                 .temporary_png_focal_active_records = Some(records);
+            activity.finish();
             return Ok(());
         }
         self.persist_collection_focal_update(manager, paths, state, records)
@@ -2104,6 +2379,7 @@ impl PipelineRunner {
                 .unwrap()
                 .temporary_png_focal_active_records = active;
         }
+        activity.finish();
         Ok(())
     }
 
@@ -2236,15 +2512,36 @@ impl PipelineRunner {
             tokio::fs::copy(paths.colmap.join("base-database.db"), &db).await?;
             super::reshoot_runner::sync_refined_cameras(&db, &paths.colmap.join("base-model"))?;
         }
-        let preset = state.preset.preset();
+        let quality = state.preset;
         let reshoot_plan = execution_plan_is_reshoot(c);
         let groupings = c
             .sources
             .iter()
             .map(|source| {
-                crate::pipeline::focal_preflight::collection_feature_groups(paths, c, source)
+                if source.id == "__source" {
+                    Ok(None)
+                } else {
+                    crate::pipeline::focal_preflight::collection_feature_groups(paths, c, source)
+                        .map(Some)
+                }
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut display_groups = Vec::new();
+        for (source, grouping) in c.sources.iter().zip(&groupings) {
+            if source.id == "__source" {
+                continue;
+            }
+            let Some(grouping) = grouping else {
+                continue;
+            };
+            for (group_index, group) in grouping.groups.iter().enumerate() {
+                display_groups.push((
+                    format!("collection:{}:{group_index}", source.id),
+                    group.len() as u64,
+                ));
+            }
+        }
+        let feature_progress = FeatureProgressScope::new(display_groups);
         let focal_records = c
             .temporary_png_focal_active_records
             .clone()
@@ -2266,6 +2563,9 @@ impl PipelineRunner {
             if s.id == "__source" {
                 continue;
             }
+            let Some(grouping) = grouping else {
+                continue;
+            };
             self.events.source(Some(&s.id));
             let reused = grouping.existing_camera_id;
             let groups = grouping.groups;
@@ -2289,6 +2589,8 @@ impl PipelineRunner {
                 };
                 let ordinary_images =
                     ordinary_image_sources.contains(&s.id) && s.video.is_none() && dims.is_none();
+                let (max_size, max_features) =
+                    collection_feature_limits(quality, dims.map(|(width, _)| width));
                 let camera_params = if ordinary_images && reused.is_none() {
                     focal_records
                         .iter()
@@ -2315,20 +2617,24 @@ impl PipelineRunner {
                         existing_camera_id: reused,
                         camera_params: camera_params.as_deref(),
                         ordinary_images,
-                        max_size: preset.planned_sfm_max_image_size,
-                        max_features: preset.planned_sfm_max_features,
+                        max_size,
+                        max_features,
                     },
                     paths.logs.join("colmap.log"),
                     &self.process_manager,
-                    Some(self.process_observer(
+                    Some(self.feature_process_observer(
                         PipelineStage::ExtractingFeatures,
-                        PipelineEngine::Colmap,
-                        Some(group.len() as u64),
-                        ObserverMode::BracketProgress,
+                        &feature_progress,
+                        format!("collection:{}:{gi}", s.id),
                     )),
                     accel.gpu_index(),
                 )
                 .await?;
+                self.complete_feature_group(
+                    PipelineStage::ExtractingFeatures,
+                    &feature_progress,
+                    format!("collection:{}:{gi}", s.id),
+                );
             }
         }
         let connection =
@@ -2348,12 +2654,122 @@ impl PipelineRunner {
             }
             source.camera_ids = cameras.into_iter().collect();
         }
+        // Finish our own reader before taking exclusive change evidence for
+        // the database. The recorder must distinguish an external writer from
+        // a connection retained across this await.
+        drop(connection);
         state.inputs = Some(c.clone());
         state.features_complete = true;
         self.record_collection_artifacts(paths, state).await?;
         manager.write_state(&paths.state, state).await?;
+        self.complete_feature_progress(PipelineStage::ExtractingFeatures, &feature_progress);
         Ok(())
     }
+    /// A native matcher is safe only when its database represents one input.
+    /// Running it over a collection would invent temporal neighbors between
+    /// video batches or replace the deliberately bounded cross-source search.
+    fn collection_native_matcher(
+        c: &InputCheckpoint,
+    ) -> Option<crate::project::ImageMatchingStrategy> {
+        let GenerationInputs::Materials { items } = &c.request else {
+            return None;
+        };
+        let ([item], [source]) = (items.as_slice(), c.sources.as_slice()) else {
+            return None;
+        };
+        if source.id == "__source" || source.id != item.id {
+            return None;
+        }
+        Some(if source.video.is_some() {
+            crate::project::ImageMatchingStrategy::Sequential
+        } else {
+            item.image_matching_strategy
+        })
+    }
+
+    fn collection_source_matching_names(
+        database: &Path,
+        source: &SourceCheckpoint,
+    ) -> Result<Vec<String>> {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| SplatError::Process(error.to_string()))?;
+        let expected = source
+            .names
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if expected.len() != source.names.len() {
+            return Err(SplatError::Process("Duplicate source image name".into()));
+        }
+        let mut statement = connection
+            .prepare("SELECT name FROM images ORDER BY image_id")
+            .map_err(|error| SplatError::Process(error.to_string()))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| SplatError::Process(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| SplatError::Process(error.to_string()))?
+            .into_iter()
+            .filter(|name| expected.contains(name))
+            .collect::<Vec<_>>();
+        if names.len() != source.names.len() {
+            return Err(SplatError::Process(
+                "Source matching image names do not match the feature database".into(),
+            ));
+        }
+        Ok(names)
+    }
+
+    fn write_collection_source_pairs(
+        writer: &mut impl std::io::Write,
+        image_id_order: &[String],
+        sequential: bool,
+    ) -> Result<()> {
+        if sequential {
+            // SequentialPairGenerator orders by filename and, by default,
+            // uses quadratic overlap: 1, 2, 4, ..., 512 for overlap=10.
+            let mut ordered = image_id_order.iter().collect::<Vec<_>>();
+            ordered.sort();
+            for (index, name) in ordered.iter().enumerate() {
+                for exponent in 0..10 {
+                    let Some(other) = ordered.get(index + (1usize << exponent)) else {
+                        break;
+                    };
+                    writeln!(writer, "{name} {other}")?;
+                }
+            }
+        } else {
+            // ExhaustivePairGenerator's native 50-image blocks intentionally
+            // reverse some pairs. Preserve both its block traversal and pair
+            // orientation instead of a different row-major upper triangle.
+            const BLOCK: usize = 50;
+            for start1 in (0..image_id_order.len()).step_by(BLOCK) {
+                for start2 in (0..image_id_order.len()).step_by(BLOCK) {
+                    let end1 = image_id_order.len().min(start1 + BLOCK);
+                    let end2 = image_id_order.len().min(start2 + BLOCK);
+                    for index1 in start1..end1 {
+                        for index2 in start2..end2 {
+                            let local1 = index1 % BLOCK;
+                            let local2 = index2 % BLOCK;
+                            if (index1 > index2 && local1 <= local2)
+                                || (index1 < index2 && local1 < local2)
+                            {
+                                writeln!(
+                                    writer,
+                                    "{} {}",
+                                    image_id_order[index1], image_id_order[index2]
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn collection_matches(
         &self,
         paths: &ProjectPaths,
@@ -2367,6 +2783,42 @@ impl PipelineRunner {
         self.events
             .stage(PipelineStage::Matching, 0., "正在匹配图像");
         let db = paths.colmap.join("database.db");
+        if let Some(strategy) = Self::collection_native_matcher(c) {
+            // Preserve the 0.7.1 native block order, sequential overlap and
+            // periodic vocabulary queries instead of routing a single input
+            // through matches_importer with a different candidate sequence.
+            let observer = Some(self.process_observer(
+                PipelineStage::Matching,
+                PipelineEngine::Colmap,
+                None,
+                ObserverMode::Matching,
+            ));
+            return match strategy {
+                crate::project::ImageMatchingStrategy::Sequential => {
+                    colmap::match_sequential(
+                        &self.engines.colmap,
+                        &db,
+                        paths.logs.join("colmap.log"),
+                        &self.process_manager,
+                        observer,
+                        accel.gpu_index(),
+                        quality.loop_detection_enabled(true),
+                    )
+                    .await
+                }
+                crate::project::ImageMatchingStrategy::Exhaustive => {
+                    colmap::match_exhaustive(
+                        &self.engines.colmap,
+                        &db,
+                        paths.logs.join("colmap.log"),
+                        &self.process_manager,
+                        observer,
+                        accel.gpu_index(),
+                    )
+                    .await
+                }
+            };
+        }
         let path = paths.colmap.join("input-pairs.txt");
         let mut pairs = std::io::BufWriter::new(std::fs::File::create(&path)?);
         let items = match &c.request {
@@ -2385,16 +2837,8 @@ impl PipelineRunner {
                         item.image_matching_strategy
                             == crate::project::ImageMatchingStrategy::Sequential
                     });
-            for (index, name) in a.names.iter().enumerate() {
-                for other in
-                    a.names
-                        .iter()
-                        .skip(index + 1)
-                        .take(if sequential { 10 } else { usize::MAX })
-                {
-                    writeln!(pairs, "{name} {other}")?;
-                }
-            }
+            let ordered_names = Self::collection_source_matching_names(&db, a)?;
+            Self::write_collection_source_pairs(&mut pairs, &ordered_names, sequential)?;
             for b in c.sources.iter().take(i) {
                 if a.names.len().saturating_mul(b.names.len()) <= 20_000 {
                     for x in &a.names {
@@ -2425,13 +2869,10 @@ impl PipelineRunner {
                 }
             }
             if sequential && quality.loop_detection_enabled(true) {
-                let list = paths.colmap.join(format!("loop-{i}.txt"));
-                write_image_list(&list, &a.names).await?;
-                colmap::match_reshoot_candidates(
+                let matches = colmap::retrieve_source_loop_pairs(
                     &self.engines.colmap,
                     &db,
-                    &list,
-                    50,
+                    &a.names,
                     paths.logs.join("colmap.log"),
                     &self.process_manager,
                     Some(self.process_observer(
@@ -2440,9 +2881,11 @@ impl PipelineRunner {
                         None,
                         ObserverMode::Matching,
                     )),
-                    accel.gpu_index(),
                 )
                 .await?;
+                for (first, second) in matches {
+                    writeln!(pairs, "{first} {second}")?;
+                }
             }
         }
         pairs.flush()?;
@@ -2649,6 +3092,9 @@ impl PipelineRunner {
             || c.execution_plan
                 .as_ref()
                 .is_some_and(|plan| plan.source_has_erp);
+        // This describes the entire reconstruction, including a frozen ERP
+        // source, not whichever newly prepared source last set UI context.
+        let mapper_observer_mode = ObserverMode::mapper_for_projection(erp);
         if !erp && !execution_plan_is_reshoot(c) {
             return (if let Some(base) = input {
                 colmap::map_from_existing(
@@ -2665,7 +3111,7 @@ impl PipelineRunner {
                         PipelineStage::Reconstructing,
                         PipelineEngine::Colmap,
                         Some(names.len() as u64),
-                        ObserverMode::Mapper,
+                        mapper_observer_mode,
                     )),
                     accel.gpu_index(),
                 )
@@ -2684,7 +3130,7 @@ impl PipelineRunner {
                         PipelineStage::Reconstructing,
                         PipelineEngine::Colmap,
                         Some(names.len() as u64),
-                        ObserverMode::Mapper,
+                        mapper_observer_mode,
                     )),
                     accel.gpu_index(),
                 )
@@ -2729,7 +3175,7 @@ impl PipelineRunner {
                 PipelineStage::Reconstructing,
                 PipelineEngine::Colmap,
                 Some(names.len() as u64),
-                ObserverMode::Mapper,
+                mapper_observer_mode,
             )),
         )
         .await
@@ -2965,6 +3411,7 @@ async fn feature_masks_for_group(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn prepare_images(
     files: &[PathBuf],
     prefix: &str,
@@ -2976,6 +3423,24 @@ fn prepare_images(
     cancel: &tokio_util::sync::CancellationToken,
     progress: Option<&super::reshoot_runner::ReshootProgress>,
 ) -> Result<Vec<String>> {
+    prepare_images_with_preparation(
+        files, prefix, frames, rgb, masks, erp, quality, cancel, progress, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_images_with_preparation(
+    files: &[PathBuf],
+    prefix: &str,
+    frames: &Path,
+    rgb: &Path,
+    masks: &Path,
+    erp: bool,
+    quality: Quality,
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: Option<&super::reshoot_runner::ReshootProgress>,
+    preparation_version: Option<u32>,
+) -> Result<Vec<String>> {
     use image::ImageDecoder;
     let mut names = vec![];
     for (i, path) in files.iter().enumerate() {
@@ -2984,13 +3449,14 @@ fn prepare_images(
         }
         if !erp {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
-            let name = super::reshoot_runner::normalize_image(
+            let name = super::reshoot_runner::normalize_image_with_preparation(
                 path,
                 frames,
                 rgb,
                 masks,
                 &format!("{prefix}{i:010}.{ext}"),
                 cancel,
+                preparation_version,
             )?;
             let h = crate::video::image_projection::inspect(&frames.join(&name))?;
             let mask = masks.join(format!("{name}.png"));

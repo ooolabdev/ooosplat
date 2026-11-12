@@ -1,5 +1,520 @@
 use super::*;
 
+#[test]
+fn collection_feature_limits_match_071_for_ordinary_and_erp_inputs() {
+    for (quality, ordinary, panorama, features) in [
+        (Quality::Fast, 1200, 2048, 4096),
+        (Quality::Balanced, 1600, 3072, 8192),
+        (Quality::High, 3200, 4096, 16384),
+    ] {
+        assert_eq!(
+            collection_feature_limits(quality, None),
+            (ordinary, features)
+        );
+        assert_eq!(
+            collection_feature_limits(quality, Some(8192)),
+            (panorama, features),
+        );
+        assert_eq!(
+            collection_feature_limits(quality, Some(1024)),
+            (1024, features),
+        );
+    }
+}
+
+fn matching_item(id: &str, strategy: crate::project::ImageMatchingStrategy) -> MaterialInput {
+    MaterialInput {
+        id: id.into(),
+        source: InputSource::ImageFolder {
+            path: PathBuf::from(id),
+        },
+        identity: Some(format!("saved-{id}")),
+        projection: VideoProjection::Perspective,
+        image_matching_strategy: strategy,
+        camera_relation: None,
+        confirmed_small_images: true,
+        confirmed_image_order: true,
+        frame_removal_fps: None,
+    }
+}
+
+#[test]
+fn single_input_matching_restores_native_071_without_crossing_source_boundaries() {
+    use crate::project::ImageMatchingStrategy::{Exhaustive, Sequential};
+    for strategy in [Exhaustive, Sequential] {
+        let mut checkpoint = InputCheckpoint::new(GenerationInputs::Materials {
+            items: vec![matching_item("first", strategy)],
+        });
+        checkpoint.sources.push(preparation_source(
+            "first",
+            &["first.png", "second.png"],
+            None,
+        ));
+        assert_eq!(
+            PipelineRunner::collection_native_matcher(&checkpoint),
+            Some(strategy)
+        );
+        checkpoint.sources[0].projection = VideoProjection::Equirectangular;
+        assert_eq!(
+            PipelineRunner::collection_native_matcher(&checkpoint),
+            Some(strategy)
+        );
+        checkpoint.sources[0].video = Some(VideoInfo {
+            duration: 1.,
+            width: 4,
+            height: 2,
+            fps: 30.,
+            total_frames: 30,
+            codec: "test".into(),
+            rotation: 0,
+            pixel_format: "rgb24".into(),
+            has_alpha: false,
+        });
+        assert_eq!(
+            PipelineRunner::collection_native_matcher(&checkpoint),
+            Some(Sequential)
+        );
+        checkpoint
+            .sources
+            .push(preparation_source("__source", &["old.png"], None));
+        assert_eq!(PipelineRunner::collection_native_matcher(&checkpoint), None);
+        checkpoint.sources.pop();
+        checkpoint.sources[0].id = "__source".into();
+        assert_eq!(PipelineRunner::collection_native_matcher(&checkpoint), None);
+        checkpoint.sources[0].id = "first".into();
+        if let GenerationInputs::Materials { items } = &mut checkpoint.request {
+            items.push(matching_item("second", strategy));
+        }
+        assert_eq!(PipelineRunner::collection_native_matcher(&checkpoint), None);
+    }
+}
+
+#[test]
+fn collection_sequential_pairs_use_native_filename_order_and_quadratic_overlap() {
+    let names = (0..35)
+        .rev()
+        .map(|index| format!("frame_{index:04}.png"))
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    PipelineRunner::write_collection_source_pairs(&mut bytes, &names, true).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let first = text
+        .lines()
+        .filter(|line| line.starts_with("frame_0000.png "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first,
+        [
+            "frame_0000.png frame_0001.png",
+            "frame_0000.png frame_0002.png",
+            "frame_0000.png frame_0004.png",
+            "frame_0000.png frame_0008.png",
+            "frame_0000.png frame_0016.png",
+            "frame_0000.png frame_0032.png",
+        ]
+    );
+    assert!(!text
+        .lines()
+        .any(|line| line == "frame_0000.png frame_0003.png"));
+}
+
+#[test]
+fn collection_exhaustive_pairs_preserve_native_blocks_orientation_and_unique_coverage() {
+    let names = (0..90)
+        .map(|index| format!("frame_{index:04}.png"))
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    PipelineRunner::write_collection_source_pairs(&mut bytes, &names, false).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4005);
+    assert_eq!(lines[0], "frame_0000.png frame_0001.png");
+    assert_eq!(lines[1224], "frame_0048.png frame_0049.png");
+    assert_eq!(lines[1225], "frame_0000.png frame_0051.png");
+    assert!(lines.contains(&"frame_0050.png frame_0000.png"));
+    assert!(!lines.contains(&"frame_0000.png frame_0050.png"));
+    let unique = lines
+        .iter()
+        .map(|line| {
+            let (first, second) = line.split_once(' ').unwrap();
+            assert_ne!(first, second);
+            if first < second {
+                (first, second)
+            } else {
+                (second, first)
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), 4005);
+}
+
+#[test]
+fn collection_pair_order_uses_real_database_ids_and_refuses_missing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("database.db");
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE images(image_id INTEGER PRIMARY KEY,name TEXT UNIQUE);
+        INSERT INTO images VALUES(20,'first.png'),(10,'second.png'),(30,'other-source.png');",
+        )
+        .unwrap();
+    drop(database);
+    let source = preparation_source("one", &["first.png", "second.png"], None);
+    assert_eq!(
+        PipelineRunner::collection_source_matching_names(&path, &source).unwrap(),
+        ["second.png", "first.png"]
+    );
+    let missing = preparation_source("one", &["first.png", "missing.png"], None);
+    assert!(PipelineRunner::collection_source_matching_names(&path, &missing).is_err());
+    let duplicate = preparation_source("one", &["first.png", "first.png"], None);
+    assert!(PipelineRunner::collection_source_matching_names(&path, &duplicate).is_err());
+}
+
+fn preparation_source(id: &str, names: &[&str], version: Option<u32>) -> SourceCheckpoint {
+    SourceCheckpoint {
+        id: id.into(),
+        identity: format!("saved-{id}"),
+        ordinary_image_preparation_version: version,
+        camera_ids: vec![1],
+        camera_assignment: None,
+        projection: VideoProjection::Perspective,
+        names: names.iter().map(|name| (*name).into()).collect(),
+        originals: vec![],
+        video: None,
+        image_sequence: None,
+        dimensions: vec![],
+        working_dimensions: None,
+        frames: None,
+        panorama_records: vec![],
+        adopted: 0,
+        bridge_frames: vec![],
+    }
+}
+
+fn preparation_state(sources: Vec<SourceCheckpoint>) -> PipelineStateFile {
+    let mut state = PipelineStateFile::created_for(Quality::Fast, ProjectInputType::Images);
+    state.ordinary_image_preparation_version = Some(ORDINARY_IMAGE_PREPARATION_VERSION);
+    let mut inputs = InputCheckpoint::new(GenerationInputs::Materials { items: vec![] });
+    inputs.ordinary_image_preparation_version = state.ordinary_image_preparation_version;
+    inputs.prepared = true;
+    let count = sources.iter().map(|source| source.names.len() as u64).sum();
+    inputs.sources = sources;
+    state.inputs = Some(inputs);
+    state.frames = Some(FrameState {
+        extracted_frames: Some(count),
+        has_alpha: true,
+        colmap_input_version: Some(COLMAP_INPUT_VERSION),
+        ..Default::default()
+    });
+    state
+}
+
+fn write_preparation_frame(paths: &ProjectPaths, name: &str, version: Option<u32>) {
+    for directory in [&paths.frames, &paths.colmap_frames, &paths.masks] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let pixels = image::RgbaImage::from_fn(4, 2, |x, _| {
+        image::Rgba([200, 100, 50, [0, 64, 128, 255][x as usize]])
+    });
+    let frame = paths.frames.join(name);
+    pixels.save(&frame).unwrap();
+    let mask = paths.masks.join(format!("{name}.png"));
+    if version.is_some() {
+        crate::video::image_sequence::write_ordinary_sfm_derivatives(
+            &image::DynamicImage::ImageRgba8(pixels),
+            &paths.colmap_frames.join(name),
+            &mask,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+    } else {
+        std::fs::copy(&frame, paths.colmap_frames.join(name)).unwrap();
+        image::GrayImage::from_fn(4, 2, |x, _| image::Luma([if x < 2 { 0 } else { 255 }]))
+            .save(mask)
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn source_snapshot_deep_validation_keeps_old_binary_and_new_soft_derivatives_separate() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ProjectPaths::existing(uuid::Uuid::nil(), root.path().into());
+    write_preparation_frame(&paths, "old.png", None);
+    write_preparation_frame(&paths, "new.png", Some(1));
+    let state = preparation_state(vec![
+        preparation_source("old", &["old.png"], None),
+        preparation_source("new", &["new.png"], Some(1)),
+    ]);
+    let original = std::fs::read(paths.frames.join("new.png")).unwrap();
+    validate_current_colmap_input_snapshot(&paths.project, &state)
+        .await
+        .unwrap();
+    let policies = ordinary_sfm_preparation_policies(&paths.project, &state).unwrap();
+    assert_eq!(policies["old.png"], None);
+    assert_eq!(policies["new.png"], Some(1));
+    // A new task's global policy cannot make an inherited old soft Mask legal.
+    image::GrayImage::from_pixel(4, 2, image::Luma([64]))
+        .save(paths.masks.join("old.png.png"))
+        .unwrap();
+    assert!(
+        validate_current_colmap_input_snapshot(&paths.project, &state)
+            .await
+            .is_err()
+    );
+    write_preparation_frame(&paths, "old.png", None);
+    let mut changed = image::open(paths.colmap_frames.join("new.png"))
+        .unwrap()
+        .to_rgb8();
+    changed.put_pixel(0, 0, image::Rgb([1, 2, 3]));
+    changed.save(paths.colmap_frames.join("new.png")).unwrap();
+    assert!(
+        validate_current_colmap_input_snapshot(&paths.project, &state)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(paths.frames.join("new.png")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn source_preparation_policy_rejects_unknown_video_erp_and_unversioned_authorizations() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ProjectPaths::existing(uuid::Uuid::nil(), root.path().into());
+    write_preparation_frame(&paths, "new.png", Some(1));
+    let state = preparation_state(vec![preparation_source("new", &["new.png"], Some(1))]);
+    assert!(ordinary_sfm_preparation_policies(&paths.project, &state).is_ok());
+    for mutation in ["unknown", "erp", "video", "old-global", "inherited"] {
+        let mut changed = state.clone();
+        let inputs = changed.inputs.as_mut().unwrap();
+        match mutation {
+            "unknown" => inputs.sources[0].ordinary_image_preparation_version = Some(2),
+            "erp" => inputs.sources[0].projection = VideoProjection::Equirectangular,
+            "video" => {
+                inputs.sources[0].video = Some(VideoInfo {
+                    width: 4,
+                    height: 2,
+                    fps: 30.,
+                    duration: 1.,
+                    total_frames: 30,
+                    codec: "test".into(),
+                    rotation: 0,
+                    pixel_format: "rgba".into(),
+                    has_alpha: true,
+                })
+            }
+            "old-global" => {
+                changed.ordinary_image_preparation_version = None;
+                inputs.ordinary_image_preparation_version = None;
+            }
+            "inherited" => inputs.sources[0].id = "__source".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            ordinary_sfm_preparation_policies(&paths.project, &changed).is_err(),
+            "{mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inherited_preparation_policies_are_bound_to_frozen_batches_and_remain_header_only() {
+    use crate::pipeline::reshoot_snapshot::{
+        ReshootSnapshotBuilder, SnapshotAssetInput, SnapshotAssetRole,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let paths = ProjectPaths::existing(uuid::Uuid::nil(), root.path().into());
+    for (name, version) in [
+        ("old.png", None),
+        ("new.png", Some(1)),
+        ("third.png", Some(1)),
+    ] {
+        write_preparation_frame(&paths, name, version);
+    }
+    let batches = vec![
+        FrozenReshootSourceBatch {
+            id: "old-video".into(),
+            identity: "old".into(),
+            names: vec!["old.png".into()],
+            projection: VideoProjection::Perspective,
+            camera_ids: vec![1],
+            panorama_records: vec![],
+            video: true,
+            ordinary_image_preparation_version: None,
+        },
+        FrozenReshootSourceBatch {
+            id: "new-photos".into(),
+            identity: "new".into(),
+            names: vec!["new.png".into()],
+            projection: VideoProjection::Perspective,
+            camera_ids: vec![2],
+            panorama_records: vec![],
+            video: false,
+            ordinary_image_preparation_version: Some(1),
+        },
+    ];
+    assert!(serde_json::to_value(&batches[0])
+        .unwrap()
+        .get("ordinaryImagePreparationVersion")
+        .is_none());
+    let context = FrozenReshootSourceContext {
+        source_identity: "source-identity".into(),
+        names: vec!["old.png".into(), "new.png".into()],
+        panorama_records: vec![],
+        source_batches: batches,
+        reshoot_eligible: true,
+        generation_policy: None,
+        configuration: None,
+        gps: None,
+        transform: Default::default(),
+    };
+    let context_file = root.path().join("source-context.json");
+    std::fs::write(&context_file, serde_json::to_vec(&context).unwrap()).unwrap();
+    let model = root.path().join("model");
+    std::fs::create_dir(&model).unwrap();
+    std::fs::write(
+        model.join("cameras.txt"),
+        "1 SIMPLE_RADIAL 4 2 4 2 1 0\n2 SIMPLE_RADIAL 4 2 4 2 1 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        model.join("images.txt"),
+        "1 1 0 0 0 0 0 0 1 old.png\n\n2 1 0 0 0 0 0 0 2 new.png\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        model.join("points3D.txt"),
+        "# no points needed for source policy metadata\n",
+    )
+    .unwrap();
+    let snapshot = ReshootSnapshotBuilder::new(paths.work.join("reshoot-snapshot-v3"))
+        .model(&model)
+        .asset(SnapshotAssetInput {
+            role: SnapshotAssetRole::Other,
+            source: context_file,
+            relative_path: "source/context.json".into(),
+        })
+        .build(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let inherited = preparation_source("__source", &["old.png", "new.png"], None);
+    let mut state = preparation_state(vec![
+        inherited,
+        preparation_source("latest", &["third.png"], Some(1)),
+    ]);
+    state.reshoot = Some(crate::project::ReshootState {
+        snapshot_v3_ready: true,
+        snapshot_v3_identity: Some(snapshot.content_identity.clone()),
+        ..Default::default()
+    });
+    let policies = ordinary_sfm_preparation_policies(&paths.project, &state).unwrap();
+    assert_eq!(policies["old.png"], None);
+    assert_eq!(policies["new.png"], Some(1));
+    assert_eq!(policies["third.png"], Some(1));
+    validate_current_colmap_input_snapshot(&paths.project, &state)
+        .await
+        .unwrap();
+    let flattened = frozen_source_batches(
+        &paths.project,
+        &state,
+        &state.inputs.as_ref().unwrap().sources[0],
+    )
+    .unwrap();
+    assert_eq!(flattened.len(), 2);
+    assert!(flattened.iter().all(|batch| batch.id != "__source"));
+    assert_eq!(flattened[0].ordinary_image_preparation_version, None);
+    assert_eq!(flattened[1].ordinary_image_preparation_version, Some(1));
+    // Policy selection authenticates metadata, but never decodes image pixels
+    // during the cheap source preflight. Deep validation still rejects damage.
+    let original = std::fs::read(paths.frames.join("new.png")).unwrap();
+    std::fs::write(paths.frames.join("new.png"), b"not a pixel stream").unwrap();
+    assert_eq!(
+        ordinary_sfm_preparation_policies(&paths.project, &state).unwrap(),
+        policies
+    );
+    assert!(
+        validate_current_colmap_input_snapshot(&paths.project, &state)
+            .await
+            .is_err()
+    );
+    std::fs::write(paths.frames.join("new.png"), original).unwrap();
+    let mut changed = state.clone();
+    changed.reshoot.as_mut().unwrap().snapshot_v3_identity = Some("a".repeat(64));
+    assert!(ordinary_sfm_preparation_policies(&paths.project, &changed).is_err());
+    changed.reshoot.as_mut().unwrap().snapshot_v3_identity = None;
+    assert!(ordinary_sfm_preparation_policies(&paths.project, &changed).is_err());
+    let mut changed = state;
+    changed.inputs.as_mut().unwrap().sources[0].names.pop();
+    assert!(ordinary_sfm_preparation_policies(&paths.project, &changed).is_err());
+}
+
+#[tokio::test]
+async fn ordinary_transparent_preparation_reports_real_counts_and_preserves_source_pixels() {
+    let root = tempfile::tempdir().unwrap();
+    let frames = root.path().join("frames");
+    let rgb = root.path().join("colmap_frames");
+    let masks = root.path().join("masks");
+    for path in [&frames, &rgb, &masks] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let mut originals = Vec::new();
+    for index in 0..3 {
+        let path = root.path().join(format!("image-{index}.png"));
+        image::RgbaImage::from_fn(8, 6, |x, _| {
+            image::Rgba([12, 34, 56, if x < 4 { 0 } else { 255 }])
+        })
+        .save(&path)
+        .unwrap();
+        let content = std::fs::read(&path).unwrap();
+        originals.push((path, content));
+    }
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events = captured.clone();
+    let runner = PipelineRunner::new(EnginePaths::from_root("not-used"), move |event| {
+        events.lock().unwrap().push(event)
+    });
+    runner.events.source(Some("transparent-images"));
+    let progress =
+        runner.application_activity(PipelineStage::ExtractingFrames, "正在准备训练图片", Some(3));
+    let names = prepare_images(
+        &originals.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
+        "batch-",
+        &frames,
+        &rgb,
+        &masks,
+        false,
+        Quality::High,
+        &runner.process_manager.child_token(),
+        Some(&progress),
+    )
+    .unwrap();
+    progress.finish();
+    assert_eq!(names.len(), 3);
+    for ((source, bytes), name) in originals.iter().zip(&names) {
+        assert_eq!(&std::fs::read(source).unwrap(), bytes);
+        assert_eq!(&std::fs::read(frames.join(name)).unwrap(), bytes);
+        assert_eq!(&std::fs::read(rgb.join(name)).unwrap(), bytes);
+        let mask = image::open(masks.join(format!("{name}.png")))
+            .unwrap()
+            .to_luma8();
+        assert_eq!(mask.dimensions(), (8, 6));
+        assert_eq!(mask.get_pixel(0, 0).0, [0]);
+        assert_eq!(mask.get_pixel(7, 0).0, [255]);
+    }
+    let events = captured.lock().unwrap();
+    assert!(events.iter().any(|event| event.message.ends_with("0/3")));
+    assert!(events.iter().any(|event| event.message.ends_with("3/3")));
+    assert!(events.iter().all(|event| event
+        .operation
+        .as_ref()
+        .and_then(|op| op.source_id.as_deref())
+        == Some("transparent-images")
+        && event.stage == PipelineStage::ExtractingFrames
+        && event.stage_progress.is_none()));
+}
+
 #[tokio::test]
 async fn shared_image_preparation_records_source_before_engine_failure_and_restores_without_originals(
 ) {
@@ -202,6 +717,7 @@ fn source_mask_requirement_preserves_alpha_when_old_frame_fields_default_to_fals
     let mut source = SourceCheckpoint {
         id: "video".into(),
         identity: "saved".into(),
+        ordinary_image_preparation_version: None,
         camera_ids: vec![],
         camera_assignment: None,
         projection: VideoProjection::Equirectangular,
@@ -367,6 +883,7 @@ async fn a_validated_candidate_continues_to_publication_without_engines_or_dispo
     checkpoint.sources.push(SourceCheckpoint {
         id: "imported".into(),
         identity: "snapshot".into(),
+        ordinary_image_preparation_version: None,
         camera_ids: vec![1],
         camera_assignment: None,
         projection: VideoProjection::Perspective,

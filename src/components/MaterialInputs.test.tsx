@@ -122,6 +122,25 @@ describe('unified input controls', () => {
         await act(async () => host.querySelector<HTMLButtonElement>('.material-remove')!.click());
         expect(remove).toHaveBeenCalledWith('v');
     });
+    it.each(['zh-CN', 'en'] as const)('keeps a mixed-dimension source explanation and dimensions visible without a generic engine summary (%s)', async locale => {
+        localStorage.setItem('ooo-splat-language', locale);
+        const ready = { ...input, items: input.items.map(item => ({ ...item, projection: 'perspective' as const })) };
+        const mismatch = '视频无效：图片序列分辨率不一致：E:/Projects/COLMAP/very-long-project-name/work/colmap_frames/source_10.png 为 1024×768，预期 800×600';
+        await act(async () => root.render(<LanguageProvider><MaterialInputs inputs={ready} analyses={{ v: analysis }}
+            errors={{ p: mismatch }} checking={false} disabled={false}/></LanguageProvider>));
+        expectOnlyExpanded('p');
+        const failure = host.querySelector('.material-inspector [role="alert"]')!;
+        expect(failure.querySelector('.source-dimension-error')?.textContent).toBe(locale === 'en'
+            ? 'Image sequence dimensions do not match: E:/Projects/COLMAP/very-long-project-name/work/colmap_frames/source_10.png is 1024×768; expected 800×600'
+            : mismatch.replace(/^视频无效：/, ''));
+        expect(failure.textContent).toContain('1024×768');
+        expect(failure.textContent).toContain('800×600');
+        expect(failure.textContent).not.toMatch(/COLMAP 处理失败|COLMAP processing failed/);
+        expect(failure.querySelector('.compact-error')).toBeNull();
+        expect(document.querySelector('[role="tooltip"]')).toBeNull();
+        expect(host.querySelectorAll('.material-row')[0].classList.contains('ready')).toBe(true);
+        expect(host.querySelectorAll('.material-row')[1].classList.contains('error')).toBe(true);
+    });
     it('keeps exactly one inspector directly below the selected row and lets users leave an unanswered item', async () => {
         const analyses = { v: analysis };
         await act(async () => root.render(<LanguageProvider><MaterialInputs inputs={input} analyses={analyses}

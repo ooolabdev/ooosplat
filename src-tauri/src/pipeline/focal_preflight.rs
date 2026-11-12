@@ -110,9 +110,10 @@ pub(crate) fn begin_collection_focal_update(
     true
 }
 
-/// Shared by policy preflight and the actual COLMAP extraction call. Ordinary
-/// photos initialize independent cameras; videos and ERP initialize one camera
-/// per source unless a strictly compatible old camera is explicitly reused.
+/// Shared by policy preflight and the actual COLMAP extraction call. The saved
+/// policy keeps old photo tasks independent. New photo tasks share a camera
+/// within each source only after checking the actual prepared pixel dimensions;
+/// videos, ERP and explicit compatible old-camera reuse keep their own rules.
 pub(crate) fn collection_feature_groups(
     paths: &ProjectPaths,
     checkpoint: &InputCheckpoint,
@@ -184,6 +185,11 @@ pub(crate) fn collection_feature_groups(
         || existing_camera_id.is_some()
     {
         vec![source.names.clone()]
+    } else if checkpoint.camera_grouping_policy_version
+        == Some(super::inputs::CAMERA_GROUPING_POLICY_VERSION)
+    {
+        validate_shared_source_dimensions(paths, source)?;
+        vec![source.names.clone()]
     } else {
         source.names.iter().map(|name| vec![name.clone()]).collect()
     };
@@ -191,6 +197,45 @@ pub(crate) fn collection_feature_groups(
         existing_camera_id,
         groups,
     })
+}
+
+fn validate_shared_source_dimensions(
+    paths: &ProjectPaths,
+    source: &SourceCheckpoint,
+) -> Result<()> {
+    let mut expected = None;
+    for name in &source.names {
+        let path = crate::reconstruction::direct_input::image_path(&paths.colmap_frames, name)?;
+        let header = crate::video::image_projection::inspect(&path)?;
+        // The shared reader exposes EXIF-oriented dimensions. Camera dimensions
+        // describe the actual encoded work pixels, not an untrusted source or
+        // analysis summary. Normally preparation has already removed rotation.
+        let current = if (5..=8).contains(&header.orientation) {
+            (header.height, header.width)
+        } else {
+            (header.width, header.height)
+        };
+        if let Some((width, height)) = expected {
+            if current != (width, height) {
+                return Err(SplatError::InvalidVideo(format!(
+                    "图片序列分辨率不一致：{} 为 {}×{}，预期 {}×{}",
+                    path.display(),
+                    current.0,
+                    current.1,
+                    width,
+                    height,
+                )));
+            }
+        } else {
+            expected = Some(current);
+        }
+    }
+    if expected.is_none() {
+        return Err(SplatError::InvalidVideo(
+            "图片序列文件夹中至少需要 2 张 JPG、JPEG 或 PNG 图片".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ordinary_image_source(checkpoint: &InputCheckpoint, source: &SourceCheckpoint) -> bool {
@@ -243,22 +288,31 @@ pub(crate) async fn inspect_collection_focal(
             if manager.child_token().is_cancelled() {
                 return Err(SplatError::Cancelled);
             }
-            let focal = workaround::detect_image_names(
-                executable,
-                manager,
-                Request {
-                    images: &paths.colmap_frames,
-                    image_list: None,
-                    ordinary_images: true,
-                    camera_model: "SIMPLE_RADIAL",
-                    single_camera: true,
-                    explicit_params: None,
-                    existing_camera_id: None,
-                    calibrated: false,
-                },
-                names,
-            )
-            .await;
+            let request = Request {
+                images: &paths.colmap_frames,
+                image_list: None,
+                ordinary_images: true,
+                camera_model: "SIMPLE_RADIAL",
+                single_camera: true,
+                explicit_params: None,
+                existing_camera_id: None,
+                calibrated: false,
+            };
+            let focal = match source.ordinary_image_preparation_version {
+                Some(version) => {
+                    workaround::detect_derived_image_names(
+                        executable,
+                        manager,
+                        request,
+                        names,
+                        &paths.frames,
+                        &paths.masks,
+                        version,
+                    )
+                    .await
+                }
+                None => workaround::detect_image_names(executable, manager, request, names).await,
+            };
             if manager.child_token().is_cancelled() {
                 return Err(SplatError::Cancelled);
             }
@@ -297,6 +351,7 @@ mod tests {
         checkpoint.sources.push(SourceCheckpoint {
             id: "images".into(),
             identity: "source-identity".into(),
+            ordinary_image_preparation_version: None,
             camera_ids: vec![],
             camera_assignment: None,
             projection,
@@ -340,6 +395,177 @@ mod tests {
         assert_eq!(
             groups,
             collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap()
+        );
+    }
+
+    fn write_work_images(paths: &ProjectPaths, names: &[String], width: u32, height: u32) {
+        std::fs::create_dir_all(&paths.colmap_frames).unwrap();
+        for name in names {
+            image::RgbImage::new(width, height)
+                .save(paths.colmap_frames.join(name))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn saved_shared_policy_initializes_one_camera_for_the_whole_photo_source() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(Uuid::new_v4(), root.path().into());
+        for source in [
+            InputSource::ImageFolder {
+                path: "images".into(),
+            },
+            InputSource::Images {
+                paths: vec!["a.png".into(), "b.png".into()],
+            },
+        ] {
+            let mut state = state(source, VideoProjection::Perspective);
+            let checkpoint = state.inputs.as_mut().unwrap();
+            checkpoint.camera_grouping_policy_version = Some(1);
+            write_work_images(&paths, &checkpoint.sources[0].names, 4, 6);
+            let grouped =
+                collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
+            assert_eq!(grouped.existing_camera_id, None);
+            assert_eq!(grouped.groups, vec![checkpoint.sources[0].names.clone()]);
+            state.features_complete = false;
+            let checkpoint = state.inputs.as_ref().unwrap();
+            assert_eq!(
+                grouped,
+                collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_photo_cameras_never_merge_different_sources_or_require_equal_source_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(Uuid::new_v4(), root.path().into());
+        let mut state = state(
+            InputSource::ImageFolder {
+                path: "first".into(),
+            },
+            VideoProjection::Perspective,
+        );
+        let checkpoint = state.inputs.as_mut().unwrap();
+        checkpoint.camera_grouping_policy_version = Some(1);
+        let mut second = checkpoint.sources[0].clone();
+        second.id = "second".into();
+        second.identity = "another-source".into();
+        second.names = vec!["second_2.png".into(), "second_10.png".into()];
+        write_work_images(&paths, &checkpoint.sources[0].names, 4, 6);
+        write_work_images(&paths, &second.names, 8, 6);
+        checkpoint.sources.push(second);
+        let groups = checkpoint
+            .sources
+            .iter()
+            .map(|source| collection_feature_groups(&paths, checkpoint, source).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(groups[0].groups, vec![checkpoint.sources[0].names.clone()]);
+        assert_eq!(groups[1].groups, vec![checkpoint.sources[1].names.clone()]);
+        assert!(groups
+            .iter()
+            .all(|group| group.existing_camera_id.is_none()));
+        assert!(!groups[0].groups[0]
+            .iter()
+            .any(|name| groups[1].groups[0].contains(name)));
+    }
+
+    #[test]
+    fn shared_photo_policy_rejects_mixed_real_work_dimensions_not_just_stale_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(Uuid::new_v4(), root.path().into());
+        let mut state = state(
+            InputSource::ImageFolder {
+                path: "images".into(),
+            },
+            VideoProjection::Perspective,
+        );
+        let checkpoint = state.inputs.as_mut().unwrap();
+        checkpoint.camera_grouping_policy_version = Some(1);
+        checkpoint.sources[0].working_dimensions = Some([4, 6]);
+        checkpoint.sources[0].dimensions = vec![[4, 6], [4, 6]];
+        write_work_images(&paths, &checkpoint.sources[0].names, 4, 6);
+        image::RgbImage::new(5, 6)
+            .save(paths.colmap_frames.join(&checkpoint.sources[0].names[1]))
+            .unwrap();
+        let error =
+            collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap_err();
+        assert!(matches!(error, SplatError::InvalidVideo(_)));
+        assert!(error.to_string().contains("图片序列分辨率不一致"));
+        assert!(error.to_string().contains("5×6，预期 4×6"));
+        assert!(!paths.colmap.join("database.db").exists());
+        checkpoint.camera_grouping_policy_version = None;
+        assert_eq!(
+            collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0])
+                .unwrap()
+                .groups
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn different_or_unsure_reshoot_settings_keep_new_sources_shared_but_not_the_old_camera() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(Uuid::new_v4(), root.path().into());
+        for relation in [CameraRelation::Different, CameraRelation::Unsure] {
+            let mut state = state(
+                InputSource::ImageFolder {
+                    path: "new-images".into(),
+                },
+                VideoProjection::Perspective,
+            );
+            let checkpoint = state.inputs.as_mut().unwrap();
+            checkpoint.camera_grouping_policy_version = Some(1);
+            let mut plan = super::super::execution_plan::ExecutionPlan::normal();
+            plan.matching = MatchPlan::ReshootCrossSource;
+            checkpoint.execution_plan = Some(plan);
+            if let GenerationInputs::Materials { items } = &mut checkpoint.request {
+                items[0].camera_relation = Some(relation);
+            }
+            write_work_images(&paths, &checkpoint.sources[0].names, 4, 6);
+            let grouped =
+                collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
+            assert_eq!(grouped.existing_camera_id, None);
+            assert_eq!(grouped.groups, vec![checkpoint.sources[0].names.clone()]);
+        }
+    }
+
+    #[test]
+    fn saved_shared_policy_does_not_change_video_erp_or_old_source_grouping() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(Uuid::new_v4(), root.path().into());
+        let mut state = state(
+            InputSource::ImageFolder {
+                path: "images".into(),
+            },
+            VideoProjection::Perspective,
+        );
+        let checkpoint = state.inputs.as_mut().unwrap();
+        checkpoint.camera_grouping_policy_version = Some(1);
+        checkpoint.sources[0].projection = VideoProjection::Equirectangular;
+        let erp = collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
+        assert_eq!(erp.groups, vec![checkpoint.sources[0].names.clone()]);
+        checkpoint.sources[0].projection = VideoProjection::Perspective;
+        checkpoint.sources[0].video = Some(crate::video::VideoInfo {
+            width: 4,
+            height: 6,
+            total_frames: 60,
+            fps: 30.0,
+            duration: 2.0,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        });
+        let video = collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
+        assert_eq!(video.groups, vec![checkpoint.sources[0].names.clone()]);
+        checkpoint.sources[0].id = "__source".into();
+        assert!(
+            collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0])
+                .unwrap()
+                .groups
+                .is_empty()
         );
     }
 
@@ -434,6 +660,13 @@ mod tests {
         let groups = collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
         assert_eq!(groups.existing_camera_id, Some(1));
         assert_eq!(groups.groups, vec![checkpoint.sources[0].names.clone()]);
+        let mut shared_checkpoint = checkpoint.clone();
+        shared_checkpoint.camera_grouping_policy_version = Some(1);
+        assert_eq!(
+            groups,
+            collection_feature_groups(&paths, &shared_checkpoint, &shared_checkpoint.sources[0])
+                .unwrap(),
+        );
         assert!(inspect_collection_focal(
             Path::new("missing-engine"),
             &ProcessManager::new(),
@@ -450,6 +683,14 @@ mod tests {
         let groups = collection_feature_groups(&paths, checkpoint, &checkpoint.sources[0]).unwrap();
         assert_eq!(groups.existing_camera_id, None);
         assert_eq!(groups.groups.len(), 2);
+        let mut shared_checkpoint = checkpoint.clone();
+        shared_checkpoint.camera_grouping_policy_version = Some(1);
+        assert!(collection_feature_groups(
+            &paths,
+            &shared_checkpoint,
+            &shared_checkpoint.sources[0]
+        )
+        .is_err());
     }
 
     #[test]

@@ -210,6 +210,28 @@ async fn scalar_and_ordered_admission_share_inspection_without_repeated_headers(
     image::RgbImage::new(8, 6)
         .save(directory.join("2.png"))
         .unwrap();
+    let rejected = inspect(
+        &tools,
+        InspectRequest {
+            input_path: directory.to_string_lossy().into(),
+            quality: Quality::Fast,
+            generation_policy: None,
+            source_project_id: None,
+        },
+    )
+    .await
+    .err()
+    .expect("mixed dimensions must fail before confirmation");
+    assert!(rejected.message.contains("图片序列分辨率不一致"));
+    let rejected = materials::inspect(&tools, json!({
+        "inputs":{"mode":"materials","items":[{"id":"input","source":{"kind":"imageFolder","path":directory}}]},
+        "quality":"fast"
+    })).await.unwrap_err();
+    assert!(rejected.message.contains("图片序列分辨率不一致"));
+    assert!(tools.tasks.all().await.unwrap().is_empty());
+    image::RgbImage::new(4, 3)
+        .save(directory.join("2.png"))
+        .unwrap();
     let scalar = inspect(
         &tools,
         InspectRequest {

@@ -131,6 +131,15 @@ pub struct ArtifactRecorder {
     cache: Arc<Mutex<CaptureCache>>,
 }
 
+/// The writer's actual output boundary, not the UI's current parent stage.
+/// Bridge and GPS can run matching under a reconstruction parent stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ColmapWrite {
+    Database,
+    Reconstruction,
+    TrainingDataset,
+}
+
 impl ArtifactRecorder {
     pub async fn record(
         &self,
@@ -163,6 +172,26 @@ impl ArtifactRecorder {
     pub fn invalidate(&self) {
         *self.cache.lock().unwrap_or_else(|p| p.into_inner()) = CaptureCache::default();
     }
+
+    /// Keep evidence for immutable upstream assets within this invocation.
+    /// Every retained entry still checks file identities before reuse. A fresh
+    /// recorder/run and explicit unknown writers always start without evidence.
+    pub(super) fn invalidate_colmap(&self, write: ColmapWrite) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if write == ColmapWrite::Database {
+            cache.database = None;
+        }
+        cache.stages.retain(|stage, _| match write {
+            ColmapWrite::Database | ColmapWrite::Reconstruction => *stage == PREPARED,
+            ColmapWrite::TrainingDataset => matches!(*stage, PREPARED | RECONSTRUCTION),
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture_counts(&self) -> (BTreeMap<&'static str, u64>, u64) {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        (cache.stage_captures.clone(), cache.database_captures)
+    }
 }
 
 #[derive(Default)]
@@ -188,13 +217,25 @@ struct CachedDatabase {
     file: ArtifactFile,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct FileStamp {
     path: PathBuf,
     canonical_path: PathBuf,
     directory: bool,
     length: u64,
     modified: std::time::SystemTime,
+    /// A same-path replacement or an in-place hard-link write must not reuse
+    /// a live-run validation merely because size/mtime were restored.
+    change_identity: Option<FileChangeIdentity>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileChangeIdentity {
+    device: u64,
+    file: u64,
+    change_time: (i64, i64),
+    #[cfg(windows)]
+    usn: i64,
 }
 
 impl CaptureCache {
@@ -216,7 +257,7 @@ impl CaptureCache {
     ) -> Result<ArtifactManifest> {
         let stamp = file_stamps(roots, cancel)?;
         if let Some(cached) = self.stages.get(stage) {
-            if cached.key == key && cached.stamp == stamp {
+            if cached.key == key && reliable_stamps(&stamp) && cached.stamp == stamp {
                 return Ok(cached.manifest.clone());
             }
         }
@@ -248,19 +289,18 @@ impl CaptureCache {
         cancel: &CancellationToken,
     ) -> Result<(DatabaseSummary, ArtifactFile)> {
         let path = paths.colmap.join("database.db");
-        let roots = [path.clone()];
-        let stamp = file_stamps(&roots, cancel)?;
+        let stamp = database_stamps(&path, cancel)?;
         if let Some(cached) = &self.database {
-            if cached.stamp == stamp {
+            if reliable_stamps(&stamp) && cached.stamp == stamp {
                 return Ok((cached.summary.clone(), cached.file.clone()));
             }
         }
         let summary = validate_database_cancellable(&path, cancel)?;
         let file = describe_file_cancellable(&paths.project, &path, true, cancel)?;
         check_cancel(cancel)?;
-        if file_stamps(&roots, cancel)? != stamp {
+        if database_stamps(&path, cancel)? != stamp {
             self.database = None;
-            return Err(untrusted_artifact());
+            return Err(database_in_use("COLMAP database changed during validation"));
         }
         #[cfg(test)]
         {
@@ -305,6 +345,12 @@ fn file_stamps(roots: &[PathBuf], cancel: &CancellationToken) -> Result<Vec<File
             directory,
             length: metadata.len(),
             modified: metadata.modified()?,
+            change_identity: file_change_identity(&path, &metadata).map_err(|error| {
+                error.with_io_diagnostic(format!(
+                    "artifact_validation_operation=read_change_identity\npath_role={}",
+                    artifact_path_role(&path, directory)
+                ))
+            })?,
         });
         if directory {
             for entry in std::fs::read_dir(&path)? {
@@ -314,6 +360,203 @@ fn file_stamps(roots: &[PathBuf], cancel: &CancellationToken) -> Result<Vec<File
     }
     result.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(result)
+}
+
+fn artifact_path_role(path: &Path, directory: bool) -> &'static str {
+    let name = path.file_name().and_then(|name| name.to_str());
+    if directory {
+        "artifact_directory"
+    } else if name == Some("database.db") {
+        "colmap_database"
+    } else if name.is_some_and(|name| name.ends_with("-wal") || name.ends_with("-journal")) {
+        "database_sidecar"
+    } else {
+        "artifact_file"
+    }
+}
+
+fn reliable_stamps(stamps: &[FileStamp]) -> bool {
+    !stamps.is_empty() && stamps.iter().all(|stamp| stamp.change_identity.is_some())
+}
+
+fn file_change_identity(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<Option<FileChangeIdentity>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Ok((metadata.ino() != 0).then_some(FileChangeIdentity {
+            device: metadata.dev(),
+            file: metadata.ino(),
+            change_time: (metadata.ctime(), metadata.ctime_nsec()),
+        }))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
+        };
+        use windows_sys::Win32::System::{
+            Ioctl::{FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA},
+            IO::DeviceIoControl,
+        };
+        let _ = metadata;
+        let handle = std::fs::OpenOptions::new()
+            // Attribute-only handles do not participate in Windows' data
+            // sharing checks. READ_DATA excludes a currently open writer; no
+            // pixel bytes are read by this short-lived metadata handle.
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_READ_DATA)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle.as_raw_handle() as _, &mut info) } == 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(1 | 50 | 87) => Ok(None),
+                _ => Err(error.into()),
+            };
+        }
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle() as _,
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(1 | 50 | 87) => Ok(None),
+                _ => Err(error.into()),
+            };
+        }
+        // Windows change timestamps can remain identical across fast writes,
+        // even after every writer closes. A journal USN supplies the change
+        // sequence; a still-open writer was excluded by the handle above.
+        let request = READ_FILE_USN_DATA {
+            MinMajorVersion: 2,
+            MaxMajorVersion: 2,
+        };
+        let mut buffer = [0_u8; 4096];
+        let mut returned = 0_u32;
+        if unsafe {
+            DeviceIoControl(
+                handle.as_raw_handle() as _,
+                FSCTL_READ_FILE_USN_DATA,
+                (&request as *const READ_FILE_USN_DATA).cast(),
+                std::mem::size_of::<READ_FILE_USN_DATA>() as u32,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                // Journal support/permission is optional for this optimization.
+                // File-open and genuine storage errors retain their I/O source.
+                Some(1 | 5 | 38 | 50 | 87 | 1178 | 1179 | 1181) => Ok(None),
+                _ => Err(error.into()),
+            };
+        }
+        let file = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        let Some(usn) = file_usn_record(&buffer, returned, file) else {
+            return Ok(None);
+        };
+        Ok(
+            (file != 0 && basic.ChangeTime > 0).then_some(FileChangeIdentity {
+                device: u64::from(info.dwVolumeSerialNumber),
+                file,
+                change_time: (basic.ChangeTime, 0),
+                usn,
+            }),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata);
+        // A platform without a reliable change identity still validates deeply,
+        // but cannot take the same-invocation shortcut.
+        Ok(None)
+    }
+}
+
+/// The requested USN_RECORD_V2 has a fixed prefix followed by a variable file
+/// name. Parse only the versioned fixed prefix, without assuming alignment.
+#[cfg(any(windows, test))]
+fn file_usn_record(buffer: &[u8], returned: u32, expected_file: u64) -> Option<i64> {
+    let bytes = buffer.get(..usize::try_from(returned).ok()?)?;
+    if bytes.len() < 60 {
+        return None;
+    }
+    let length = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let major = u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?);
+    let minor = u16::from_le_bytes(bytes.get(6..8)?.try_into().ok()?);
+    let file = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+    let usn = i64::from_le_bytes(bytes.get(24..32)?.try_into().ok()?);
+    (major == 2
+        && minor == 0
+        && length >= 60
+        && length <= bytes.len()
+        && file == expected_file
+        && expected_file != 0
+        && usn > 0)
+        .then_some(usn)
+}
+
+fn database_in_use(message: &str) -> SplatError {
+    SplatError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, message))
+}
+
+fn database_stamps(path: &Path, cancel: &CancellationToken) -> Result<Vec<FileStamp>> {
+    check_cancel(cancel)?;
+    let mut roots = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > 0 => {
+                // Immutable SQLite would ignore pending sidecar writes. This is
+                // an operational busy condition, not proof of a corrupt cache.
+                return Err(database_in_use(
+                    "COLMAP database has pending sidecar writes",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        roots.push(sidecar);
+    }
+    let stamps = match file_stamps(&roots, cancel) {
+        Err(SplatError::InvalidPath(invalid)) if invalid != path => {
+            return Err(database_in_use(
+                "COLMAP database sidecar is not a regular file",
+            ));
+        }
+        result => result?,
+    };
+    // file_stamps also observes a sidecar that appeared after the first check.
+    if stamps
+        .iter()
+        .any(|stamp| stamp.path != path && (stamp.directory || stamp.length > 0))
+    {
+        return Err(database_in_use(
+            "COLMAP database has pending sidecar writes",
+        ));
+    }
+    Ok(stamps)
 }
 
 pub fn record_collection_artifacts(
@@ -551,6 +794,9 @@ fn normalize_collection_inner(
     let Some(mut checkpoint) = state.inputs.clone() else {
         return Ok(false);
     };
+    // A contradictory saved policy is not a disposable cache miss. Reject it
+    // before candidate fast paths or invalidation can reinterpret old cameras.
+    validate_collection_camera_policy(state, &checkpoint)?;
     let before = normalization_state(state, &checkpoint)?;
     let previous = state.artifact_manifests.clone();
     let usable_previous = previous.version == ARTIFACT_MANIFEST_VERSION;
@@ -1618,11 +1864,11 @@ fn candidate_recipe_identity(state: &PipelineStateFile) -> Result<String> {
     let legacy_identity = format!("{:x}", Sha256::digest(bytes));
     // Do not append even a serialized None to the old tuple. Its exact hash
     // remains authoritative for existing completed candidates.
-    match (
+    let identity = match (
         state.brush_training.execution_options,
         state.brush_training.legacy_dataset_identity.as_ref(),
     ) {
-        (None, None) => Ok(legacy_identity),
+        (None, None) => legacy_identity,
         (options, legacy_dataset) => {
             if let Some(options) = options {
                 options.alpha_mode()?;
@@ -1634,9 +1880,13 @@ fn candidate_recipe_identity(state: &PipelineStateFile) -> Result<String> {
                 legacy_dataset,
                 &state.brush_training.legacy_initialization_sha256,
             ))?;
-            Ok(format!("{:x}", Sha256::digest(bytes)))
+            format!("{:x}", Sha256::digest(bytes))
         }
-    }
+    };
+    // None is byte-for-byte compatible with every historical candidate. New
+    // camera policies must be bound even for the legacy single-path executor.
+    let identity = bind_camera_policy_identity(&identity, state.camera_grouping_policy_version)?;
+    bind_ordinary_preparation_identity(&identity, state.ordinary_image_preparation_version)
 }
 
 /// Legacy replay uses its already prepared pixels rather than the modern
@@ -1780,128 +2030,139 @@ fn validate_database_cancellable(
     cancel: &CancellationToken,
 ) -> Result<DatabaseSummary> {
     check_cancel(cancel)?;
-    let connection = open_immutable_database(path)?;
-    let integrity: String = connection
-        .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
-        .map_err(database_error)?;
-    if integrity != "ok" {
-        return Err(untrusted_artifact());
-    }
+    let initial_stamp = database_stamps(path, cancel)?;
+    // Finish all SQLite readers before opening the exclusive-against-writers
+    // change-evidence handles. Never relax their sharing rules to hide a reader
+    // owned by this validation operation (or a genuinely active external writer).
+    let summary = {
+        let connection = open_immutable_database(path)?;
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+            .map_err(database_error)?;
+        if integrity != "ok" {
+            return Err(untrusted_artifact());
+        }
+        check_cancel(cancel)?;
+        let cameras = scalar_set(
+            &connection,
+            "SELECT camera_id FROM cameras ORDER BY camera_id",
+        )?;
+        if cameras.is_empty() {
+            return Err(untrusted_artifact());
+        }
+        let mut images = BTreeMap::new();
+        let mut image_ids = BTreeSet::new();
+        let mut statement = connection
+            .prepare("SELECT image_id,name,camera_id FROM images ORDER BY image_id")
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(database_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (id, name, camera) = row.map_err(database_error)?;
+            if id <= 0
+                || name.is_empty()
+                || !cameras.contains(&camera)
+                || !image_ids.insert(id)
+                || images.insert(name, (id, camera)).is_some()
+            {
+                return Err(untrusted_artifact());
+            }
+        }
+        if images.is_empty() {
+            return Err(untrusted_artifact());
+        }
+
+        let keypoints = matrix_rows(&connection, "keypoints", 4, cancel, |cols| {
+            matches!(cols, 2 | 4 | 6)
+        })?;
+        let descriptors = matrix_rows(&connection, "descriptors", 1, cancel, |cols| cols == 128)?;
+        if keypoints.len() != images.len()
+            || descriptors.len() != images.len()
+            || keypoints.keys().any(|id| !image_ids.contains(id))
+            || descriptors.keys().any(|id| !image_ids.contains(id))
+            || keypoints.iter().any(|(id, row)| {
+                descriptors
+                    .get(id)
+                    .is_none_or(|descriptor| descriptor.rows != row.rows)
+            })
+        {
+            return Err(untrusted_artifact());
+        }
+
+        let mut feature_hash = Sha256::new();
+        hash_label(&mut feature_hash, "artifact-features-v1");
+        for (name, (id, camera)) in &images {
+            check_cancel(cancel)?;
+            hash_i64(&mut feature_hash, *id);
+            hash_i64(&mut feature_hash, *camera);
+            hash_label(&mut feature_hash, name);
+            hash_matrix(&mut feature_hash, &keypoints[id]);
+            hash_matrix(&mut feature_hash, &descriptors[id]);
+        }
+        let feature_identity = format!("{:x}", feature_hash.finalize());
+
+        const MAX_IMAGE_ID: i64 = 2_147_483_647;
+        let mut matches_hash = Sha256::new();
+        hash_label(&mut matches_hash, "artifact-matches-v1");
+        hash_label(&mut matches_hash, &feature_identity);
+        let mut match_count = 0_u64;
+        let mut statement = connection
+            .prepare("SELECT pair_id,rows,cols,data FROM matches ORDER BY pair_id")
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })
+            .map_err(database_error)?;
+        for row in rows {
+            check_cancel(cancel)?;
+            let (pair, row_count, cols, data) = row.map_err(database_error)?;
+            let first = pair / MAX_IMAGE_ID;
+            let second = pair % MAX_IMAGE_ID;
+            let bytes = data.unwrap_or_default();
+            if pair <= 0
+                || first <= 0
+                || second <= 0
+                || first == second
+                || !image_ids.contains(&first)
+                || !image_ids.contains(&second)
+                || row_count < 0
+                || cols != 2
+                || matrix_byte_len(row_count, cols, 4) != Some(bytes.len())
+            {
+                return Err(untrusted_artifact());
+            }
+            match_count = match_count.saturating_add(row_count as u64);
+            hash_i64(&mut matches_hash, pair);
+            hash_i64(&mut matches_hash, row_count);
+            hash_i64(&mut matches_hash, cols);
+            matches_hash.update(&bytes);
+        }
+        DatabaseSummary {
+            images,
+            feature_identity,
+            matching_identity: format!("{:x}", matches_hash.finalize()),
+            match_count,
+        }
+    };
     check_cancel(cancel)?;
-    let cameras = scalar_set(
-        &connection,
-        "SELECT camera_id FROM cameras ORDER BY camera_id",
-    )?;
-    if cameras.is_empty() {
-        return Err(untrusted_artifact());
+    if database_stamps(path, cancel)? != initial_stamp {
+        return Err(database_in_use("COLMAP database changed during validation"));
     }
-    let mut images = BTreeMap::new();
-    let mut image_ids = BTreeSet::new();
-    let mut statement = connection
-        .prepare("SELECT image_id,name,camera_id FROM images ORDER BY image_id")
-        .map_err(database_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(database_error)?;
-    for row in rows {
-        check_cancel(cancel)?;
-        let (id, name, camera) = row.map_err(database_error)?;
-        if id <= 0
-            || name.is_empty()
-            || !cameras.contains(&camera)
-            || !image_ids.insert(id)
-            || images.insert(name, (id, camera)).is_some()
-        {
-            return Err(untrusted_artifact());
-        }
-    }
-    if images.is_empty() {
-        return Err(untrusted_artifact());
-    }
-
-    let keypoints = matrix_rows(&connection, "keypoints", 4, cancel, |cols| {
-        matches!(cols, 2 | 4 | 6)
-    })?;
-    let descriptors = matrix_rows(&connection, "descriptors", 1, cancel, |cols| cols == 128)?;
-    if keypoints.len() != images.len()
-        || descriptors.len() != images.len()
-        || keypoints.keys().any(|id| !image_ids.contains(id))
-        || descriptors.keys().any(|id| !image_ids.contains(id))
-        || keypoints.iter().any(|(id, row)| {
-            descriptors
-                .get(id)
-                .is_none_or(|descriptor| descriptor.rows != row.rows)
-        })
-    {
-        return Err(untrusted_artifact());
-    }
-
-    let mut feature_hash = Sha256::new();
-    hash_label(&mut feature_hash, "artifact-features-v1");
-    for (name, (id, camera)) in &images {
-        check_cancel(cancel)?;
-        hash_i64(&mut feature_hash, *id);
-        hash_i64(&mut feature_hash, *camera);
-        hash_label(&mut feature_hash, name);
-        hash_matrix(&mut feature_hash, &keypoints[id]);
-        hash_matrix(&mut feature_hash, &descriptors[id]);
-    }
-    let feature_identity = format!("{:x}", feature_hash.finalize());
-
-    const MAX_IMAGE_ID: i64 = 2_147_483_647;
-    let mut matches_hash = Sha256::new();
-    hash_label(&mut matches_hash, "artifact-matches-v1");
-    hash_label(&mut matches_hash, &feature_identity);
-    let mut match_count = 0_u64;
-    let mut statement = connection
-        .prepare("SELECT pair_id,rows,cols,data FROM matches ORDER BY pair_id")
-        .map_err(database_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
-            ))
-        })
-        .map_err(database_error)?;
-    for row in rows {
-        check_cancel(cancel)?;
-        let (pair, row_count, cols, data) = row.map_err(database_error)?;
-        let first = pair / MAX_IMAGE_ID;
-        let second = pair % MAX_IMAGE_ID;
-        let bytes = data.unwrap_or_default();
-        if pair <= 0
-            || first <= 0
-            || second <= 0
-            || first == second
-            || !image_ids.contains(&first)
-            || !image_ids.contains(&second)
-            || row_count < 0
-            || cols != 2
-            || matrix_byte_len(row_count, cols, 4) != Some(bytes.len())
-        {
-            return Err(untrusted_artifact());
-        }
-        match_count = match_count.saturating_add(row_count as u64);
-        hash_i64(&mut matches_hash, pair);
-        hash_i64(&mut matches_hash, row_count);
-        hash_i64(&mut matches_hash, cols);
-        matches_hash.update(&bytes);
-    }
-    Ok(DatabaseSummary {
-        images,
-        feature_identity,
-        matching_identity: format!("{:x}", matches_hash.finalize()),
-        match_count,
-    })
+    Ok(summary)
 }
 
 #[derive(Debug)]
@@ -2140,6 +2401,7 @@ fn source_identity(
     state: &PipelineStateFile,
     checkpoint: &crate::pipeline::inputs::InputCheckpoint,
 ) -> Result<String> {
+    validate_collection_camera_policy(state, checkpoint)?;
     let sources = checkpoint
         .sources
         .iter()
@@ -2153,7 +2415,108 @@ fn source_identity(
         )
     });
     let bytes = serde_json::to_vec(&(sources, snapshot))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    let identity = bind_camera_policy_identity(
+        &format!("{:x}", Sha256::digest(bytes)),
+        checkpoint.camera_grouping_policy_version,
+    )?;
+    let identity = bind_ordinary_preparation_identity(
+        &identity,
+        checkpoint.ordinary_image_preparation_version,
+    )?;
+    let versions = checkpoint
+        .sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .ordinary_image_preparation_version
+                .map(|version| (&source.id, version))
+        })
+        .collect::<Vec<_>>();
+    if versions.is_empty() {
+        Ok(identity)
+    } else {
+        let bytes = serde_json::to_vec(&("ordinary-source-preparation-v1", identity, versions))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+fn validate_collection_camera_policy(
+    state: &PipelineStateFile,
+    checkpoint: &crate::pipeline::inputs::InputCheckpoint,
+) -> Result<()> {
+    if state.ordinary_image_preparation_version != checkpoint.ordinary_image_preparation_version {
+        return Err(SplatError::Process(
+            "Saved ordinary image preparation policy does not match the input checkpoint".into(),
+        ));
+    }
+    for source in &checkpoint.sources {
+        if source.ordinary_image_preparation_version.is_some()
+            && (source.id == "__source"
+                || source.video.is_some()
+                || source.projection != crate::video::panorama::VideoProjection::Perspective
+                || source.ordinary_image_preparation_version
+                    != checkpoint.ordinary_image_preparation_version)
+        {
+            return Err(SplatError::Process(
+                "Saved source image preparation policy is inconsistent".into(),
+            ));
+        }
+    }
+    for version in std::iter::once(checkpoint.ordinary_image_preparation_version)
+        .chain(
+            checkpoint
+                .sources
+                .iter()
+                .map(|source| source.ordinary_image_preparation_version),
+        )
+        .flatten()
+    {
+        if version != super::inputs::ORDINARY_IMAGE_PREPARATION_VERSION {
+            return Err(SplatError::Process(
+                "Unsupported saved ordinary image preparation version".into(),
+            ));
+        }
+    }
+    if state.camera_grouping_policy_version != checkpoint.camera_grouping_policy_version {
+        return Err(SplatError::Process(
+            "Saved camera grouping policy does not match the input checkpoint".into(),
+        ));
+    }
+    if checkpoint
+        .camera_grouping_policy_version
+        .is_some_and(|version| version != crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+    {
+        return Err(SplatError::Process(
+            "Unsupported saved camera grouping policy version".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn bind_camera_policy_identity(identity: &str, version: Option<u32>) -> Result<String> {
+    match version {
+        None => Ok(identity.into()),
+        Some(version) if version == crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION => {
+            let bytes = serde_json::to_vec(&("camera-grouping-policy-v1", identity, version))?;
+            Ok(format!("{:x}", Sha256::digest(bytes)))
+        }
+        Some(_) => Err(SplatError::Process(
+            "Unsupported saved camera grouping policy version".into(),
+        )),
+    }
+}
+
+fn bind_ordinary_preparation_identity(identity: &str, version: Option<u32>) -> Result<String> {
+    match version {
+        None => Ok(identity.into()),
+        Some(version) if version == super::inputs::ORDINARY_IMAGE_PREPARATION_VERSION => {
+            let bytes = serde_json::to_vec(&("ordinary-image-preparation-v1", identity, version))?;
+            Ok(format!("{:x}", Sha256::digest(bytes)))
+        }
+        Some(_) => Err(SplatError::Process(
+            "Unsupported saved ordinary image preparation version".into(),
+        )),
+    }
 }
 
 fn attempt_label(run_id: Option<Uuid>) -> String {
@@ -2211,6 +2574,225 @@ fn hash_label(hash: &mut Sha256, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_preparation_identity_preserves_legacy_and_binds_each_saved_source() {
+        for reshoot in [false, true] {
+            let mut fixture = fixture(reshoot);
+            let legacy_source =
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap();
+            let legacy_candidate = candidate_recipe_identity(&fixture.state).unwrap();
+            assert_eq!(
+                bind_ordinary_preparation_identity(&legacy_source, None).unwrap(),
+                legacy_source
+            );
+            fixture.state.ordinary_image_preparation_version = Some(1);
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .ordinary_image_preparation_version = Some(1);
+            let versioned_source =
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap();
+            assert_ne!(versioned_source, legacy_source);
+            let source = fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .sources
+                .iter_mut()
+                .find(|source| source.id != "__source" && source.video.is_none())
+                .unwrap();
+            source.ordinary_image_preparation_version = Some(1);
+            assert_ne!(
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap(),
+                versioned_source
+            );
+            assert_ne!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                legacy_candidate
+            );
+            let restored: PipelineStateFile =
+                serde_json::from_slice(&serde_json::to_vec(&fixture.state).unwrap()).unwrap();
+            assert_eq!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                candidate_recipe_identity(&restored).unwrap()
+            );
+            fixture.state.ordinary_image_preparation_version = None;
+            let checkpoint = fixture.state.inputs.as_mut().unwrap();
+            checkpoint.ordinary_image_preparation_version = None;
+            for source in &mut checkpoint.sources {
+                source.ordinary_image_preparation_version = None;
+            }
+            assert_eq!(
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap(),
+                legacy_source
+            );
+            assert_eq!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                legacy_candidate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn contradictory_ordinary_preparation_policies_preserve_saved_results() {
+        for (state_version, checkpoint_version) in
+            [(None, Some(1)), (Some(1), None), (Some(2), Some(2))]
+        {
+            let mut fixture = fixture(false);
+            fixture.state.ordinary_image_preparation_version = state_version;
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .ordinary_image_preparation_version = checkpoint_version;
+            let before = serde_json::to_value(&fixture.state).unwrap();
+            let candidate = std::fs::read(&fixture.candidate).unwrap();
+            assert!(
+                normalize_collection(&fixture.paths, &mut fixture.state, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+            assert_eq!(std::fs::read(&fixture.candidate).unwrap(), candidate);
+        }
+    }
+
+    #[test]
+    fn camera_policy_binds_new_sources_and_candidates_but_preserves_legacy_hashes() {
+        for reshoot in [false, true] {
+            let mut fixture = fixture(reshoot);
+            let checkpoint = fixture.state.inputs.as_ref().unwrap();
+            let sources = checkpoint
+                .sources
+                .iter()
+                .map(|source| (&source.id, &source.identity))
+                .collect::<Vec<_>>();
+            let snapshot = fixture.state.reshoot.as_ref().map(|reshoot| {
+                (
+                    reshoot.source_snapshot_complete,
+                    reshoot.snapshot_v3_ready,
+                    reshoot.snapshot_v3_identity.as_deref(),
+                )
+            });
+            let old_hash = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(sources, snapshot)).unwrap())
+            );
+            assert_eq!(
+                source_identity(&fixture.state, checkpoint).unwrap(),
+                old_hash
+            );
+            let old_candidate = candidate_recipe_identity(&fixture.state).unwrap();
+            fixture.state.camera_grouping_policy_version = Some(1);
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .camera_grouping_policy_version = Some(1);
+            assert_ne!(
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap(),
+                old_hash
+            );
+            assert_ne!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                old_candidate
+            );
+            let restored: PipelineStateFile =
+                serde_json::from_slice(&serde_json::to_vec(&fixture.state).unwrap()).unwrap();
+            assert_eq!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                candidate_recipe_identity(&restored).unwrap()
+            );
+            fixture.state.camera_grouping_policy_version = None;
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .camera_grouping_policy_version = None;
+            assert_eq!(
+                source_identity(&fixture.state, fixture.state.inputs.as_ref().unwrap()).unwrap(),
+                old_hash
+            );
+            assert_eq!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                old_candidate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn contradictory_camera_policies_fail_without_relabelling_or_invalidating_saved_results()
+    {
+        for (state_version, input_version) in [(None, Some(1)), (Some(1), None), (Some(2), Some(2))]
+        {
+            let mut fixture = fixture(false);
+            fixture.state.camera_grouping_policy_version = state_version;
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .camera_grouping_policy_version = input_version;
+            let before = serde_json::to_value(&fixture.state).unwrap();
+            let candidate = std::fs::read(&fixture.candidate).unwrap();
+            assert!(
+                normalize_collection(&fixture.paths, &mut fixture.state, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+            assert_eq!(std::fs::read(&fixture.candidate).unwrap(), candidate);
+            assert!(candidate_recipe_identity(&fixture.state).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_camera_policy_never_promotes_old_or_unmanifested_feature_caches() {
+        for missing_manifest in [false, true] {
+            let mut fixture = fixture(false);
+            let candidate = std::fs::read(&fixture.candidate).unwrap();
+            let database = std::fs::read(fixture.paths.colmap.join("database.db")).unwrap();
+            fixture.state.camera_grouping_policy_version = Some(1);
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .camera_grouping_policy_version = Some(1);
+            if missing_manifest {
+                fixture.state.artifact_manifests = Default::default();
+            }
+            assert!(
+                normalize_collection(&fixture.paths, &mut fixture.state, None)
+                    .await
+                    .unwrap()
+            );
+            assert!(!fixture.state.features_complete);
+            assert!(!fixture.state.matching_complete);
+            assert!(!fixture.state.reconstruction_complete);
+            assert!(!fixture.state.brush_complete);
+            assert!(!fixture
+                .state
+                .artifact_manifests
+                .entries
+                .contains_key(FEATURES));
+            // Normalization marks a durable archive requirement; it never
+            // deletes or edits an old candidate/database to fit a new policy.
+            assert_eq!(std::fs::read(&fixture.candidate).unwrap(), candidate);
+            assert_eq!(
+                std::fs::read(fixture.paths.colmap.join("database.db")).unwrap(),
+                database
+            );
+        }
+    }
+
     #[test]
     fn collection_observations_never_change_source_or_candidate_recipe_identity() {
         use crate::pipeline::effectiveness::{
@@ -2425,6 +3007,7 @@ mod tests {
         checkpoint.sources.push(SourceCheckpoint {
             id: "source".into(),
             identity: "identity".into(),
+            ordinary_image_preparation_version: None,
             camera_ids: vec![],
             camera_assignment: None,
             projection: crate::video::panorama::VideoProjection::Perspective,
@@ -2904,6 +3487,303 @@ mod tests {
         assert_eq!(std::fs::read(&candidate).unwrap(), before);
     }
 
+    #[test]
+    fn live_stamps_detect_same_named_replacement_with_restored_size_and_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("asset");
+        let replacement = root.path().join("replacement");
+        std::fs::write(&path, b"before").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cancel = CancellationToken::new();
+        let before = file_stamps(std::slice::from_ref(&path), &cancel).unwrap();
+        // Create the replacement while the original still exists so a native
+        // file ID cannot be recycled immediately from the old allocation.
+        std::fs::write(&replacement, b"after!").unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = file_stamps(std::slice::from_ref(&path), &cancel).unwrap();
+        assert_eq!(before[0].length, after[0].length);
+        assert_eq!(before[0].modified, after[0].modified);
+        assert!(before != after || !reliable_stamps(&before));
+    }
+
+    #[test]
+    fn live_cache_rechecks_hard_link_writes_even_when_size_and_mtime_are_restored() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("asset");
+        let alias = root.path().join("alias");
+        std::fs::write(&path, b"before").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cancel = CancellationToken::new();
+        let mut cache = CaptureCache::default();
+        let captures = std::cell::Cell::new(0_u64);
+        let capture = || {
+            captures.set(captures.get() + 1);
+            make_manifest("run", "upstream", captures.get(), None, vec![])
+        };
+        cache
+            .stage(
+                PREPARED,
+                vec![],
+                std::slice::from_ref(&path),
+                &cancel,
+                capture,
+            )
+            .unwrap();
+        for iteration in 0..16 {
+            {
+                let mut writer = File::options().write(true).open(&alias).unwrap();
+                writer
+                    .write_all(format!("{iteration:06}").as_bytes())
+                    .unwrap();
+                writer.set_modified(modified).unwrap();
+            }
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 6);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+            cache
+                .stage(
+                    PREPARED,
+                    vec![],
+                    std::slice::from_ref(&path),
+                    &cancel,
+                    capture,
+                )
+                .unwrap();
+            assert_eq!(captures.get(), iteration + 2);
+        }
+    }
+
+    #[test]
+    fn a_platform_without_reliable_change_evidence_cannot_reuse_a_live_stamp() {
+        assert!(!reliable_stamps(&[]));
+        assert!(!reliable_stamps(&[FileStamp {
+            path: "asset".into(),
+            canonical_path: "asset".into(),
+            directory: false,
+            length: 10,
+            modified: std::time::UNIX_EPOCH,
+            change_identity: None,
+        }]));
+    }
+
+    #[test]
+    fn file_usn_records_require_the_requested_version_identity_and_positive_sequence() {
+        let mut record = [0_u8; 64];
+        record[..4].copy_from_slice(&64_u32.to_le_bytes());
+        record[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        record[8..16].copy_from_slice(&77_u64.to_le_bytes());
+        record[24..32].copy_from_slice(&99_i64.to_le_bytes());
+        assert_eq!(file_usn_record(&record, 64, 77), Some(99));
+        assert!(file_usn_record(&record, 59, 77).is_none());
+        assert!(file_usn_record(&record, 65, 77).is_none());
+        assert!(file_usn_record(&record, 64, 78).is_none());
+        let original = record;
+        for major in [0_u16, 3] {
+            record = original;
+            record[4..6].copy_from_slice(&major.to_le_bytes());
+            assert!(file_usn_record(&record, 64, 77).is_none());
+        }
+        for sequence in [0_i64, -1] {
+            record = original;
+            record[24..32].copy_from_slice(&sequence.to_le_bytes());
+            assert!(file_usn_record(&record, 64, 77).is_none());
+        }
+        record = original;
+        record[..4].copy_from_slice(&65_u32.to_le_bytes());
+        assert!(file_usn_record(&record, 64, 77).is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_database_writer_is_rejected_with_safe_context_without_replacing_state() {
+        let mut fixture = fixture(false);
+        let recorder = ArtifactRecorder::default();
+        let cancel = CancellationToken::new();
+        let run = Some(Uuid::new_v4());
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        let before = serde_json::to_value(&fixture.state).unwrap();
+        let database = fixture.paths.colmap.join("database.db");
+        let writer = File::options().write(true).open(&database).unwrap();
+        let error = recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.io_error().unwrap().raw_os_error(), Some(32));
+        let detail = error.to_string();
+        assert!(detail.contains("artifact_validation_operation=read_change_identity"));
+        assert!(detail.contains("path_role=colmap_database"));
+        assert!(!detail.contains(&fixture.paths.project.to_string_lossy().to_string()));
+        assert!(!invalid_artifact_error(&error));
+        assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+        drop(writer);
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn readonly_database_statements_do_not_prevent_strict_validation() {
+        let fixture = fixture(false);
+        let database = fixture.paths.colmap.join("database.db");
+        let connection = open_immutable_database(&database).unwrap();
+        let mut statement = connection.prepare("SELECT image_id FROM images").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        let summary = validate_database(&database).unwrap();
+        assert_eq!(summary.images.len(), 1);
+        assert!(!database_stamps(&database, &CancellationToken::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn change_identity_context_uses_only_safe_artifact_roles() {
+        for (name, directory, expected) in [
+            ("database.db", false, "colmap_database"),
+            ("database.db-wal", false, "database_sidecar"),
+            ("database.db-journal", false, "database_sidecar"),
+            ("private-image.png", false, "artifact_file"),
+            ("private-folder", true, "artifact_directory"),
+        ] {
+            assert_eq!(artifact_path_role(Path::new(name), directory), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_open_image_writer_keeps_original_io_error_and_never_replaces_saved_state() {
+        use std::io::Write;
+        let mut fixture = fixture(false);
+        let recorder = ArtifactRecorder::default();
+        let run = Some(Uuid::new_v4());
+        let cancel = CancellationToken::new();
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        let frame = fixture.paths.frames.join("normal.png");
+        let pixels = std::fs::read(&frame).unwrap();
+        let modified = std::fs::metadata(&frame).unwrap().modified().unwrap();
+        let native_before = file_stamps(std::slice::from_ref(&frame), &cancel).unwrap();
+        let before = serde_json::to_value(&fixture.state).unwrap();
+        let captures = recorder.cache.lock().unwrap().stage_captures[PREPARED];
+        let mut writer = File::options().write(true).open(&frame).unwrap();
+        writer.write_all(&pixels).unwrap();
+        writer.set_modified(modified).unwrap();
+        let error = recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.io_error().unwrap().raw_os_error(), Some(32));
+        assert!(!invalid_artifact_error(&error));
+        assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+        drop(writer);
+        let native_after = file_stamps(std::slice::from_ref(&frame), &cancel).unwrap();
+        if let (Some(before), Some(after)) = (
+            &native_before[0].change_identity,
+            &native_after[0].change_identity,
+        ) {
+            assert_ne!(before.usn, after.usn);
+        }
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.cache.lock().unwrap().stage_captures[PREPARED],
+            captures + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_database_sidecars_cannot_bypass_a_live_cache_or_replace_saved_evidence() {
+        for suffix in ["-wal", "-journal"] {
+            for directory in [false, true] {
+                let mut fixture = fixture(false);
+                let recorder = ArtifactRecorder::default();
+                let run = Some(Uuid::new_v4());
+                let cancel = CancellationToken::new();
+                recorder
+                    .record(&fixture.paths, &mut fixture.state, run, &cancel)
+                    .await
+                    .unwrap();
+                let before = serde_json::to_value(&fixture.state).unwrap();
+                let sidecar = fixture.paths.colmap.join(format!("database.db{suffix}"));
+                if directory {
+                    std::fs::create_dir(&sidecar).unwrap();
+                } else {
+                    std::fs::write(&sidecar, b"pending writes").unwrap();
+                }
+                let error = recorder
+                    .record(&fixture.paths, &mut fixture.state, run, &cancel)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.io_error().unwrap().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(!invalid_artifact_error(&error));
+                assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_resume_treats_uncheckpointed_database_as_busy_not_corrupt() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_complete = false;
+        let before = serde_json::to_value(&fixture.state).unwrap();
+        std::fs::write(fixture.paths.colmap.join("database.db-wal"), b"pending").unwrap();
+        let error = normalize_collection(&fixture.paths, &mut fixture.state, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(serde_json::to_value(&fixture.state).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn empty_checkpointed_database_sidecars_are_allowed_without_changing_manifest_identity() {
+        let mut fixture = fixture(false);
+        let recorder = ArtifactRecorder::default();
+        let run = Some(Uuid::new_v4());
+        let cancel = CancellationToken::new();
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        let before = fixture.state.artifact_manifests.clone();
+        for suffix in ["-wal", "-journal"] {
+            std::fs::write(
+                fixture.paths.colmap.join(format!("database.db{suffix}")),
+                [],
+            )
+            .unwrap();
+        }
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(fixture.state.artifact_manifests, before);
+    }
+
     #[tokio::test]
     async fn recorder_reuses_verified_upstream_and_only_captures_new_dataset() {
         let mut fixture = fixture(false);
@@ -2936,6 +3816,98 @@ mod tests {
             deep.entries[FEATURES].files[0],
             deep.entries[MATCHING].files[0]
         );
+    }
+
+    #[tokio::test]
+    async fn colmap_writers_recheck_their_outputs_without_rescanning_unchanged_prepared_assets() {
+        for reshoot in [false, true] {
+            let mut fixture = fixture(reshoot);
+            let recorder = ArtifactRecorder::default();
+            let run = Some(Uuid::new_v4());
+            let cancel = CancellationToken::new();
+            recorder
+                .record(&fixture.paths, &mut fixture.state, run, &cancel)
+                .await
+                .unwrap();
+            let expected = fixture.state.artifact_manifests.clone();
+            for (write, expected_database, expected_model, expected_dataset) in [
+                (ColmapWrite::Database, 2, 2, 2),
+                (ColmapWrite::Reconstruction, 2, 3, 3),
+                (ColmapWrite::TrainingDataset, 2, 3, 4),
+            ] {
+                recorder.invalidate_colmap(write);
+                recorder
+                    .record(&fixture.paths, &mut fixture.state, run, &cancel)
+                    .await
+                    .unwrap();
+                let (stages, database) = recorder.capture_counts();
+                assert_eq!(database, expected_database);
+                assert_eq!(stages[PREPARED], 1);
+                assert_eq!(stages[RECONSTRUCTION], expected_model);
+                assert_eq!(stages[TRAINING_DATASET], expected_dataset);
+                assert_eq!(stages[BRUSH_CANDIDATE], expected_dataset);
+                assert_eq!(fixture.state.artifact_manifests, expected);
+            }
+            // An unknown writer still discards all invocation-local evidence.
+            recorder.invalidate();
+            recorder
+                .record(&fixture.paths, &mut fixture.state, run, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(recorder.capture_counts().1, 1);
+            assert_eq!(fixture.state.artifact_manifests, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_prepared_evidence_does_not_hide_a_changed_file_after_colmap() {
+        let mut fixture = fixture(false);
+        let recorder = ArtifactRecorder::default();
+        let run = Some(Uuid::new_v4());
+        let cancel = CancellationToken::new();
+        recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .unwrap();
+        let previous = fixture.state.artifact_manifests.clone();
+        recorder.invalidate_colmap(ColmapWrite::Database);
+        std::fs::write(fixture.paths.frames.join("normal.png"), b"not an image").unwrap();
+        assert!(recorder
+            .record(&fixture.paths, &mut fixture.state, run, &cancel)
+            .await
+            .is_err());
+        assert_eq!(fixture.state.artifact_manifests, previous);
+    }
+
+    #[tokio::test]
+    async fn recorder_never_imports_its_previous_run_or_another_recorders_validation_evidence() {
+        let mut fixture = fixture(false);
+        let recorder = ArtifactRecorder::default();
+        let cancel = CancellationToken::new();
+        let first = Some(Uuid::new_v4());
+        recorder
+            .record(&fixture.paths, &mut fixture.state, first, &cancel)
+            .await
+            .unwrap();
+        let next = Some(Uuid::new_v4());
+        recorder
+            .record(&fixture.paths, &mut fixture.state, next, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.cache.lock().unwrap().owner.as_ref().unwrap().1,
+            next
+        );
+        let (stages, database) = recorder.capture_counts();
+        assert_eq!(stages[PREPARED], 1);
+        assert_eq!(database, 1);
+        let fresh = ArtifactRecorder::default();
+        fresh
+            .record(&fixture.paths, &mut fixture.state, next, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(fresh.capture_counts().1, 1);
+        assert_eq!(fresh.capture_counts().0[PREPARED], 1);
     }
 
     #[tokio::test]

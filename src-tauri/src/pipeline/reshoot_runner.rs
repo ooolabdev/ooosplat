@@ -5,116 +5,13 @@ use crate::pipeline::reshoot::*;
 use crate::reconstruction::colmap_model::read_cameras;
 use crate::video::panorama::{self, VideoProjection};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-/// Application-side work only. Engine processes keep their existing observers.
-/// Counts are log messages, never synthetic stage percentages or iterations.
-struct PreparationClock {
-    activity: Instant,
-    logged: Instant,
-    notice: Option<Instant>,
-}
-
-impl PreparationClock {
-    fn quiet_notice(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.activity) < Duration::from_secs(15)
-            || self
-                .notice
-                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(30))
-        {
-            return false;
-        }
-        self.notice = Some(now);
-        true
-    }
-}
-
-pub(super) struct ReshootProgress {
-    events: EventSink,
-    stage: PipelineStage,
-    label: &'static str,
-    clock: Arc<std::sync::Mutex<PreparationClock>>,
-    cancel: tokio_util::sync::CancellationToken,
-    timer: tokio::task::JoinHandle<()>,
-}
-
-impl ReshootProgress {
-    pub(super) fn new(
-        events: &EventSink,
-        stage: PipelineStage,
-        cancel: &tokio_util::sync::CancellationToken,
-        label: &'static str,
-        total: Option<u64>,
-    ) -> Self {
-        let mut scoped = events.clone();
-        scoped.bound_operation = events
-            .context
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .current
-            .clone();
-        let now = Instant::now();
-        let clock = Arc::new(std::sync::Mutex::new(PreparationClock {
-            activity: now,
-            logged: now,
-            notice: None,
-        }));
-        let timer_clock = clock.clone();
-        let timer_events = scoped.clone();
-        let timer_cancel = cancel.clone();
-        let timer = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = timer_cancel.cancelled() => break,
-                    _ = interval.tick() => {
-                        if timer_clock.lock().unwrap_or_else(|p| p.into_inner()).quiet_notice(Instant::now()) {
-                            reshoot_log(&timer_events, stage, "补拍处理仍在进行，当前步骤可能耗时较长，请耐心等待");
-                        }
-                    }
-                }
-            }
-        });
-        let value = Self {
-            events: scoped,
-            stage,
-            label,
-            clock,
-            cancel: cancel.clone(),
-            timer,
-        };
-        value.log(total.map_or_else(|| label.to_owned(), |n| format!("{label}：0/{n}")));
-        value
-    }
-
-    fn log(&self, message: String) {
-        if !self.cancel.is_cancelled() {
-            reshoot_log(&self.events, self.stage, message);
-        }
-    }
-
-    pub(super) fn update(&self, current: u64, total: u64) {
-        let now = Instant::now();
-        let mut clock = self.clock.lock().unwrap_or_else(|p| p.into_inner());
-        clock.activity = now;
-        clock.notice = None;
-        let log = current == total || now.duration_since(clock.logged) >= Duration::from_secs(1);
-        if log {
-            clock.logged = now;
-        }
-        drop(clock);
-        if log {
-            self.log(format!("{}：{current}/{total}", self.label));
-        }
-    }
-}
-
-impl Drop for ReshootProgress {
-    fn drop(&mut self) {
-        self.timer.abort();
-    }
-}
+pub(super) use super::application_activity::ApplicationActivity as ReshootProgress;
+#[cfg(test)]
+use super::application_activity::PreparationClock;
 
 pub(super) async fn copy_reshoot_file(
     source: &Path,
@@ -469,6 +366,10 @@ async fn internal_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Res
         .await
         .map_err(|error| invalid(&error.to_string()))?;
     let colmap_images = resolved.colmap_images;
+    // Input analysis remains header-only. The saved per-source policy selects
+    // compatible pixel/mask shapes here; exact premultiplication is checked by
+    // execution/cache validation, not by decoding every source during input.
+    let preparation_policies = ordinary_sfm_preparation_policies(&root, &state)?;
     for image in &names {
         let counterpart = colmap_images.join(
             image
@@ -481,6 +382,36 @@ async fn internal_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Res
             return Err(invalid(
                 "原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。",
             ));
+        }
+        let name = image
+            .strip_prefix(&images)
+            .map_err(|_| invalid("Invalid image name"))?
+            .to_string_lossy();
+        if preparation_policies.get(name.as_ref()).copied().flatten()
+            == Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION)
+        {
+            if counterpart_header.alpha {
+                return Err(invalid(
+                    "原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。",
+                ));
+            }
+            let mask = masks.join(format!("{name}.png"));
+            let exists = match std::fs::symlink_metadata(&mask) {
+                Ok(metadata) if metadata.file_type().is_file() => true,
+                Ok(_) => return Err(SplatError::InvalidPath(mask)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if header.alpha || exists {
+                let mask_header = crate::video::image_projection::inspect(&mask)?;
+                if mask_header.alpha
+                    || (mask_header.width, mask_header.height) != (header.width, header.height)
+                {
+                    return Err(invalid(
+                        "原项目缺少 COLMAP 专用图片，无法安全进行增量补拍。",
+                    ));
+                }
+            }
         }
     }
     let cameras = read_cameras(&model)?;
@@ -960,7 +891,26 @@ pub(super) fn normalize_image(
     name: &str,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String> {
+    normalize_image_with_preparation(source, frames, colmap, masks, name, cancel, None)
+}
+
+pub(super) fn normalize_image_with_preparation(
+    source: &Path,
+    frames: &Path,
+    colmap: &Path,
+    masks: &Path,
+    name: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+    preparation_version: Option<u32>,
+) -> Result<String> {
     use image::ImageDecoder;
+    if preparation_version.is_some_and(|version| {
+        version != crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION
+    }) {
+        return Err(invalid(
+            "Unsupported saved ordinary image preparation version",
+        ));
+    }
     if cancel.is_cancelled() {
         return Err(SplatError::Cancelled);
     }
@@ -974,6 +924,23 @@ pub(super) fn normalize_image(
         name.into()
     };
     let target = frames.join(&name);
+    let original = std::fs::canonicalize(source)?;
+    // Only unlink generated destinations; never overwrite an existing hard
+    // link that may still refer to the user's original image.
+    for output in [
+        &target,
+        &colmap.join(&name),
+        &masks.join(format!("{name}.png")),
+    ] {
+        if std::fs::canonicalize(output).ok().as_ref() == Some(&original) {
+            return Err(SplatError::InvalidPath(output.to_path_buf()));
+        }
+        match std::fs::remove_file(output) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     if header.alpha || header.orientation != 1 {
         let mut reader = image::ImageReader::open(source)?.with_guessed_format()?;
         let mut limits = image::Limits::default();
@@ -986,8 +953,28 @@ pub(super) fn normalize_image(
         decoded.apply_orientation(orientation);
         if header.orientation != 1 {
             decoded.save(&target).map_err(|e| invalid(&e.to_string()))?;
+        } else if preparation_version
+            == Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION)
+        {
+            // Training pixels are immutable; the derived SfM writer always
+            // uses a distinct, unlinked destination.
+            if std::fs::hard_link(source, &target).is_err() {
+                std::fs::copy(source, &target)?;
+            }
         } else {
             std::fs::copy(source, &target)?;
+        }
+        if preparation_version == Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION)
+            && header.alpha
+        {
+            crate::video::image_sequence::write_ordinary_sfm_derivatives_from_source(
+                (header.orientation == 1).then_some(source),
+                &decoded,
+                &colmap.join(&name),
+                &masks.join(format!("{name}.png")),
+                cancel,
+            )?;
+            return Ok(name);
         }
         let rgba = decoded.to_rgba8();
         let mask = image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
@@ -1705,6 +1692,13 @@ impl PipelineRunner {
             } else {
                 recipe.new_names.iter().map(|n| vec![n.clone()]).collect()
             };
+            let feature_progress =
+                FeatureProgressScope::new(groups.iter().enumerate().map(|(index, group)| {
+                    (
+                        format!("legacy-reshoot:{}:{index}", recipe.batch_id),
+                        group.len() as u64,
+                    )
+                }));
             for (index, group) in groups.iter().enumerate() {
                 if cancel.is_cancelled() {
                     return Err(SplatError::Cancelled);
@@ -1746,15 +1740,19 @@ impl PipelineRunner {
                     },
                     paths.logs.join("colmap.log"),
                     &self.process_manager,
-                    Some(self.process_observer(
+                    Some(self.feature_process_observer(
                         PipelineStage::ExtractingFeatures,
-                        PipelineEngine::Colmap,
-                        Some(group.len() as u64),
-                        ObserverMode::BracketProgress,
+                        &feature_progress,
+                        format!("legacy-reshoot:{}:{index}", recipe.batch_id),
                     )),
                     acceleration.gpu_index(),
                 )
                 .await?;
+                self.complete_feature_group(
+                    PipelineStage::ExtractingFeatures,
+                    &feature_progress,
+                    format!("legacy-reshoot:{}:{index}", recipe.batch_id),
+                );
             }
             checkpoint.supplemental_features_complete = true;
             save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
@@ -1836,7 +1834,7 @@ impl PipelineRunner {
                         PipelineStage::Reconstructing,
                         PipelineEngine::Colmap,
                         Some(names.len() as u64),
-                        ObserverMode::Mapper,
+                        ObserverMode::mapper_for_projection(is_panorama),
                     )),
                 )
                 .await?;

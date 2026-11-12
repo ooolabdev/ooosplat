@@ -1,4 +1,5 @@
 //! Application-owned task registry. Transports never own a generation future.
+mod activity;
 pub mod cli_guard;
 pub mod logs;
 mod notifications;
@@ -147,6 +148,10 @@ impl TaskRun {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_image_preparation_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_grouping_policy_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ba_policy_version: Option<u32>,
     /// None on tasks created before common Alpha execution semantics.
@@ -364,6 +369,58 @@ fn sync_saved_generation_policy(
     Ok(())
 }
 
+pub(crate) fn camera_grouping_request_intent(parameters: &Option<Value>) -> Option<Value> {
+    parameters.clone().map(|mut value| {
+        if let Some(object) = value.as_object_mut() {
+            // Internal execution policy is not a caller's generation choice.
+            object.remove("cameraGroupingPolicyVersion");
+            object.remove("ordinaryImagePreparationVersion");
+        }
+        value
+    })
+}
+
+fn sync_saved_camera_grouping_policy(
+    parameters: &mut Option<Value>,
+    version: Option<u32>,
+) -> Result<()> {
+    if parameters.is_none() && version.is_none() {
+        return Ok(());
+    }
+    let object = parameters
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| ServiceError::new("INVALID_DATA", "Invalid saved generation parameters"))?;
+    if let Some(version) = version {
+        object.insert("cameraGroupingPolicyVersion".into(), Value::from(version));
+    } else {
+        object.remove("cameraGroupingPolicyVersion");
+    }
+    Ok(())
+}
+
+fn sync_saved_ordinary_image_preparation(
+    parameters: &mut Option<Value>,
+    version: Option<u32>,
+) -> Result<()> {
+    if parameters.is_none() && version.is_none() {
+        return Ok(());
+    }
+    let object = parameters
+        .get_or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| ServiceError::new("INVALID_DATA", "Invalid saved generation parameters"))?;
+    if let Some(version) = version {
+        object.insert(
+            "ordinaryImagePreparationVersion".into(),
+            Value::from(version),
+        );
+    } else {
+        object.remove("ordinaryImagePreparationVersion");
+    }
+    Ok(())
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
     #[serde(default)]
@@ -394,6 +451,7 @@ pub struct TaskService {
     pub(crate) diagnostics: Arc<crate::diagnostics::DiagnosticService>,
     emitter: Arc<SyncMutex<Option<Emit>>>,
     notifications: Arc<SyncMutex<notifications::PendingNotifications>>,
+    activity_journals: Arc<SyncMutex<BTreeMap<(Uuid, Uuid), activity::Journal>>>,
     #[cfg(test)]
     pub(crate) executor: Arc<SyncMutex<Option<TestExecutor>>>,
     #[cfg(test)]
@@ -420,6 +478,7 @@ impl TaskService {
             diagnostics: Arc::new(Default::default()),
             emitter: Arc::new(SyncMutex::new(None)),
             notifications: Arc::new(SyncMutex::new(Default::default())),
+            activity_journals: Arc::new(SyncMutex::new(Default::default())),
             #[cfg(test)]
             executor: Arc::new(SyncMutex::new(None)),
             #[cfg(test)]
@@ -462,6 +521,66 @@ impl TaskService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    fn activity_journal(&self, task: Uuid, run: Uuid) -> activity::Journal {
+        self.activity_journals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry((task, run))
+            .or_insert_with(activity::Journal::new)
+            .clone()
+    }
+
+    fn register_activity_log(&self, task: Uuid, run: Uuid, log: logs::RegisteredLog) {
+        if let Some(record) = self
+            .records()
+            .tasks
+            .get_mut(&task)
+            .and_then(|task| task.runs.iter_mut().find(|record| record.run_id == run))
+        {
+            logs::insert_registered(&mut record.logs, log);
+        }
+    }
+
+    fn bind_activity_journal(&self, task: Uuid, run: Uuid, project: PathBuf) {
+        let header = {
+            let registry = self.records();
+            let Some(record) = registry.tasks.get(&task) else {
+                return;
+            };
+            let Some(execution) = record.runs.iter().find(|entry| entry.run_id == run) else {
+                return;
+            };
+            activity::RunHeader {
+                activity_version: 1,
+                task_id: task,
+                run_id: run,
+                project_id: record.project_id,
+                started_at: execution.started_at,
+            }
+        };
+        let service = self.clone();
+        self.activity_journal(task, run).bind(
+            project,
+            header,
+            Arc::new(move |log| {
+                service.register_activity_log(task, run, log);
+            }),
+        );
+    }
+
+    fn refresh_activity_logs(&self) {
+        let snapshots: Vec<_> = self
+            .activity_journals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|(&(task, run), journal)| journal.snapshot().map(|log| (task, run, log)))
+            .collect();
+        for (task, run, log) in snapshots {
+            self.register_activity_log(task, run, log);
+        }
     }
 
     /// Lifecycle callers hold `gate` through persistence and notification.
@@ -723,6 +842,7 @@ impl TaskService {
     }
     pub async fn get(&self, id: Uuid) -> Result<TaskRecord> {
         self.initialize().await?;
+        self.refresh_activity_logs();
         self.records()
             .tasks
             .get(&id)
@@ -731,6 +851,7 @@ impl TaskService {
     }
     pub async fn all(&self) -> Result<Vec<TaskRecord>> {
         self.initialize().await?;
+        self.refresh_activity_logs();
         let mut tasks: Vec<_> = self.records().tasks.values().cloned().collect();
         tasks.sort_by(|a, b| {
             b.created_at
@@ -794,7 +915,11 @@ impl TaskService {
                     .canonicalized()?;
             *value = serde_json::to_value(inputs)?;
         }
-        let parameters = Some(parameters);
+        let mut parameters = Some(parameters);
+        // A client cannot select an internal camera policy. Only a brand-new
+        // admitted task receives the current version after idempotency checks.
+        sync_saved_camera_grouping_policy(&mut parameters, None)?;
+        sync_saved_ordinary_image_preparation(&mut parameters, None)?;
         let _legacy_planner_enabled = planner_enabled;
         let planner_enabled = true;
         let _gate = self.gate.lock().await;
@@ -813,7 +938,7 @@ impl TaskService {
                 .find(|t| t.client_request_id.as_ref() == Some(key))
                 .cloned()
             {
-                return if old.request_parameters == parameters {
+                return if camera_grouping_request_intent(&old.request_parameters) == parameters {
                     Ok(old)
                 } else {
                     Err(ServiceError::new(
@@ -828,6 +953,14 @@ impl TaskService {
                 return Ok(t);
             }
         }
+        sync_saved_camera_grouping_policy(
+            &mut parameters,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+        )?;
+        sync_saved_ordinary_image_preparation(
+            &mut parameters,
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION),
+        )?;
         if let Some(value) = parameters.as_ref().and_then(|p| p.get("inputs")) {
             let inputs =
                 serde_json::from_value::<crate::pipeline::inputs::GenerationInputs>(value.clone())?;
@@ -845,6 +978,49 @@ impl TaskService {
             .transpose()?;
         if let Some(inputs) = &inputs {
             inputs.check_identities()?;
+        }
+        let camera_policy = Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
+        let policy = parameters
+            .as_ref()
+            .and_then(|value| value.get("generationPolicy"))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(inputs) = &inputs {
+            crate::pipeline::inputs::validate_camera_grouping_inputs(
+                inputs,
+                quality,
+                policy,
+                camera_policy,
+            )
+            .await?;
+        } else if input.is_dir() {
+            // Legacy single-directory new requests still enter the current
+            // shared-source policy. This only inspects cached image headers,
+            // not video metadata or generation engines.
+            let inputs = crate::pipeline::inputs::GenerationInputs::Materials {
+                items: vec![crate::pipeline::inputs::MaterialInput {
+                    id: "input".into(),
+                    source: crate::pipeline::inputs::InputSource::ImageFolder {
+                        path: input.clone(),
+                    },
+                    identity: None,
+                    projection: Default::default(),
+                    image_matching_strategy: Default::default(),
+                    camera_relation: None,
+                    confirmed_small_images: false,
+                    confirmed_image_order: false,
+                    frame_removal_fps: None,
+                }],
+            };
+            crate::pipeline::inputs::validate_camera_grouping_inputs(
+                &inputs,
+                quality,
+                policy,
+                camera_policy,
+            )
+            .await?;
         }
         if inputs.is_none()
             && !input.is_dir()
@@ -879,6 +1055,10 @@ impl TaskService {
             .transpose()?;
         let now = Utc::now();
         let task = TaskRecord {
+            ordinary_image_preparation_version:
+                Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION),
+            camera_grouping_policy_version:
+                Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
             ba_policy_version: Some(crate::pipeline::ba_policy::VERSION),
             brush_execution_options: Some(Default::default()),
             creation_intent: None,
@@ -1043,6 +1223,8 @@ impl TaskService {
                 }
             }
             let task = TaskRecord {
+                ordinary_image_preparation_version: checkpoint.ordinary_image_preparation_version,
+                camera_grouping_policy_version: checkpoint.camera_grouping_policy_version,
                 ba_policy_version: checkpoint.ba_policy_version,
                 brush_execution_options: checkpoint.brush_training.execution_options,
                 creation_intent: checkpoint.creation.as_ref().map(|c| c.intent.clone()),
@@ -1132,6 +1314,9 @@ impl TaskService {
                     existing.status = task.status;
                     existing.stage = task.stage;
                     existing.actual_configuration = task.actual_configuration;
+                    existing.camera_grouping_policy_version = task.camera_grouping_policy_version;
+                    existing.ordinary_image_preparation_version =
+                        task.ordinary_image_preparation_version;
                     existing.generation_policy = task.generation_policy;
                     // A continuation retains controlled retries already spent
                     // on this work order, even across process/run boundaries.
@@ -1475,6 +1660,16 @@ impl TaskService {
                     .await);
             }
             task.quality = saved.preset;
+            task.camera_grouping_policy_version = saved.camera_grouping_policy_version;
+            task.ordinary_image_preparation_version = saved.ordinary_image_preparation_version;
+            sync_saved_ordinary_image_preparation(
+                &mut task.request_parameters,
+                saved.ordinary_image_preparation_version,
+            )?;
+            sync_saved_camera_grouping_policy(
+                &mut task.request_parameters,
+                saved.camera_grouping_policy_version,
+            )?;
             task.ba_policy_version = saved.ba_policy_version;
             task.planner_enabled = saved.planner_enabled;
             if let Some(configuration) = saved.configuration.as_ref() {
@@ -1512,7 +1707,14 @@ impl TaskService {
                     access.authorize_inputs(&inputs)?;
                 }
                 let policy = task.generation_policy.unwrap_or_default();
-                crate::pipeline::inputs::validate(&engines, &inputs, task.quality, policy).await?;
+                crate::pipeline::inputs::validate_for_camera_policy(
+                    &engines,
+                    &inputs,
+                    task.quality,
+                    policy,
+                    task.camera_grouping_policy_version,
+                )
+                .await?;
             }
             if task.source.as_deref() == Some("mcp") {
                 if let (Some(source), Some(expected)) = (
@@ -1704,6 +1906,8 @@ impl TaskService {
             })
             .with_effectiveness_tracker(effectiveness)
             .with_invocation_access(self.invocation_access.clone())
+            .with_camera_grouping_policy_version(task.camera_grouping_policy_version)
+            .with_ordinary_image_preparation_version(task.ordinary_image_preparation_version)
             .with_generation_policy(if !continuing || task.project_id.is_none() {
                 policy
             } else {
@@ -1753,6 +1957,8 @@ impl TaskService {
             let mut registry = self.records();
             let t = registry.tasks.get_mut(&id).expect("task");
             t.quality = task.quality;
+            t.camera_grouping_policy_version = task.camera_grouping_policy_version;
+            t.ordinary_image_preparation_version = task.ordinary_image_preparation_version;
             t.ba_policy_version = task.ba_policy_version;
             t.creation_intent = task.creation_intent.clone();
             t.planner_enabled = task.planner_enabled;
@@ -1894,6 +2100,7 @@ impl TaskService {
         run: Uuid,
         metadata: crate::project::ProjectMetadata,
     ) -> Result<()> {
+        let project = metadata.project_path.clone();
         let _gate = self.gate.lock().await;
         {
             let mut records = self.records();
@@ -1922,6 +2129,7 @@ impl TaskService {
             task.revision += 1;
         }
         self.persist().await?;
+        self.bind_activity_journal(id, run, project);
         self.notify(id);
         Ok(())
     }
@@ -1930,7 +2138,7 @@ impl TaskService {
         // A single lock orders record updates, queued events, and emitted snapshots.
         // In particular, an old run cannot enqueue after a new run's notification.
         let mut pending = self.notifications.lock().unwrap_or_else(|p| p.into_inner());
-        let immediate = {
+        let (immediate, project) = {
             let mut registry = self.records();
             let Some(t) = registry.tasks.get_mut(&id) else {
                 return;
@@ -1954,7 +2162,10 @@ impl TaskService {
                 .operation
                 .as_ref()
                 .zip(t.operation.as_ref())
-                .is_some_and(|(incoming, current)| incoming.id < current.id)
+                .is_some_and(|(incoming, current)| {
+                    incoming.id < current.id
+                        || (incoming.id == current.id && incoming.source_id != current.source_id)
+                })
                 || (!lifecycle
                     && event
                         .operation
@@ -1997,24 +2208,59 @@ impl TaskService {
             }
             t.updated_at = event.timestamp;
             t.elapsed_ms = t.elapsed_offset_ms.saturating_add(event.elapsed_ms);
-            t.estimated_progress = Some(
-                t.estimated_progress
-                    .unwrap_or(0.0)
-                    .max(event.progress.min(99.9)),
-            );
             let progress_event = matches!(
                 event.kind,
                 crate::pipeline::EventKind::Stage | crate::pipeline::EventKind::Progress
             ) && t.stage == Some(event.stage);
             if progress_event {
-                t.current = event.current;
-                t.total = event.total;
-                t.unit = event.unit.clone();
-                t.progress = if event.indeterminate {
-                    None
+                let same_measurement = !stage_changed
+                    && event.substage == t.substage
+                    && event
+                        .operation
+                        .as_ref()
+                        .zip(t.operation.as_ref())
+                        .is_some_and(|(incoming, current)| {
+                            incoming.id == current.id && incoming.source_id == current.source_id
+                        })
+                    && event
+                        .unit
+                        .as_ref()
+                        .is_none_or(|unit| t.unit.as_ref() == Some(unit))
+                    && event.current.is_none_or(|value| t.current == Some(value))
+                    && event.total.is_none_or(|value| t.total == Some(value));
+                // Missing fields within the same operation are not a reset.
+                // A lifecycle boundary already cleared the previous operation
+                // above; an explicit counter-unit change is also a boundary.
+                if same_measurement {
+                    t.current = event.current.or(t.current);
+                    t.total = event.total.or(t.total);
+                    t.unit = event.unit.clone().or(t.unit.clone());
                 } else {
-                    event.stage_progress
-                };
+                    t.current = event.current;
+                    t.total = event.total;
+                    t.unit = event.unit.clone();
+                }
+                if let Some(progress) = event
+                    .stage_progress
+                    .filter(|value| !event.indeterminate && value.is_finite())
+                {
+                    t.progress = Some(progress.clamp(0.0, 100.0));
+                } else if !same_measurement {
+                    t.progress = None;
+                }
+                // Logs, heartbeats and resource samples cannot advance the
+                // overall percentage, even if they carry a stale mapped value.
+                if event.progress.is_finite()
+                    && (stage_changed
+                        || (!event.indeterminate
+                            && event.stage_progress.is_some_and(f32::is_finite)))
+                {
+                    t.estimated_progress = Some(
+                        t.estimated_progress
+                            .unwrap_or(0.0)
+                            .max(event.progress.clamp(0.0, 99.9)),
+                    );
+                }
             }
             if let Some(runtime) = event
                 .runtime
@@ -2038,8 +2284,16 @@ impl TaskService {
                     t.recent_events.remove(0);
                 }
             }
-            starting || stage_changed || event.kind == crate::pipeline::EventKind::Capability
+            (
+                starting || stage_changed || event.kind == crate::pipeline::EventKind::Capability,
+                t.project_path.clone(),
+            )
         };
+        let journal = self.activity_journal(id, run);
+        journal.push(&event);
+        if let Some(project) = project {
+            self.bind_activity_journal(id, run, project);
+        }
         pending.task(id, Some(run)).push(event);
         if immediate {
             // Runner callbacks are synchronous. A lifecycle operation in progress
@@ -2087,12 +2341,7 @@ impl TaskService {
                     if let Some(root) = &t.project_path {
                         if let Ok(log) = logs::register(&root.join("logs"), &path, offset) {
                             let logs = &mut t.runs.last_mut().expect("run").logs;
-                            match logs.get(&log.source) {
-                                Some(existing) if existing.file_id == log.file_id => {}
-                                _ => {
-                                    logs.insert(log.source.clone(), log);
-                                }
-                            }
+                            logs::insert_registered(logs, log);
                         }
                     }
                 }
@@ -2131,6 +2380,16 @@ impl TaskService {
         runner: Arc<PipelineRunner>,
         result: crate::error::Result<PipelineResult>,
     ) {
+        let journal = self
+            .activity_journals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(id, run));
+        if let Some(journal) = journal {
+            if let Some(log) = journal.close().await {
+                self.register_activity_log(id, run, log);
+            }
+        }
         let _gate = self.gate.lock().await;
         let context = runner.failure_context();
         let (executions, current_execution) = {

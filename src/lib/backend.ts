@@ -330,5 +330,11 @@ async function waitForSharedTask(receipt: StartReceipt): Promise<PipelineResult>
   });
 }
 
-export interface TaskLogPage { entries: Array<{ source: string; text: string; partial_line: boolean }>; next_cursor: string | null; has_more: boolean; cursor_reset: boolean; reset_reason: string | null }
+export interface TaskLogPage {
+  entries: Array<{ source: string; text: string; partial_line: boolean }>;
+  next_cursor: string | null; has_more: boolean; cursor_reset: boolean; reset_reason: string | null;
+  activity_events?: PipelineEvent[] | null;
+  activity_journal_persisted?: boolean;
+  truncated?: boolean;
+}
 export async function readSharedTaskLogs(taskId: string, runId: string | null, cursor?: string): Promise<TaskLogPage> { return invoke("read_shared_task_logs", { request: { task_id: taskId, run_id: runId, cursor, max_bytes: 32768 } }); }

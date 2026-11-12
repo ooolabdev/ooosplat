@@ -24,7 +24,7 @@ export function useProgressMessage(status: string, stage: string | null, events:
   if (Object.hasOwn(terminalLabels, status)) return t(terminalLabels[status]);
   if (status === 'cancelling') return t('progress.terminating');
   if (status !== 'running') return t(status === 'analyzing' ? 'generate.analyzing' : 'progress.preparing');
-  const latestStage = events.at(-1)?.stage;
+  const latestStage = [...events].reverse().find(isProgressEvent)?.stage;
   const terminalStage = latestStage && Object.hasOwn(terminalLabels, latestStage) ? latestStage : stage;
   if (terminalStage && Object.hasOwn(terminalLabels, terminalStage)) return t(terminalLabels[terminalStage]);
   const latestPhaseEvent = [...events].reverse().find(event => event.stage === stage && isProgressEvent(event));
@@ -35,12 +35,21 @@ export function useProgressMessage(status: string, stage: string | null, events:
   if (substage === 'panoramaImagesPreparation' && count) return t('progress.panoramaImagesPreparing', { current: formatNumber(count.current), total: formatNumber(count.total) });
   if (substage === 'panoramaImagesReconstruction' && count) return t('progress.panoramaImagesRegistered', { current: formatNumber(count.current), total: formatNumber(count.total) });
   if (stage === 'reconstructing') {
-    const label = count
-      ? substage === 'panoramaReconstruction'
+    // Ordinary Mapper counters belong to its current visual submodel. Starting
+    // another initialization legitimately resets them; they are not a task-wide
+    // completed-image count. Keep those observations in events/logs and show
+    // only the independently supplied stage estimate in the timeline.
+    const label = substage === 'panoramaReconstruction'
+      ? count
         ? t('progress.registeredCount', { current: formatNumber(count.current), total: formatNumber(count.total) })
-        : t('progress.activeCount', { label: t('progress.activeReconstruction'), current: formatNumber(count.current), total: formatNumber(count.total) })
-      : t(substage === 'panoramaReconstruction' ? 'progress.panoramaReconstruction' : 'progress.activeReconstruction');
+        : t('progress.panoramaReconstruction')
+      : t('progress.activeReconstruction');
     return t('progress.activeLongWait', { label });
+  }
+  if (stage === 'validatingReconstruction' && source?.unit === 'registeredImages' && !substage?.startsWith('panorama')) {
+    // Legacy Bridge runs its ordinary Mapper under the validation parent node.
+    // Its local submodel resets have the same meaning as the primary Mapper's.
+    return t('progress.activeLongWait', { label: t('progress.activeValidation') });
   }
   if (substage === 'trainingValidation') return t('progress.trainingValidating');
   if (substage === 'trainingCheckpoint') return t('progress.trainingCheckpoint');

@@ -3,6 +3,7 @@ import { getSharedTasks, onTaskUpdate } from '../lib/backend';
 import { mergeTask, taskIsActive, type SharedTask } from '../types/tasks';
 import { useAppStore } from '../stores/appStore';
 import type { PipelineEvent } from '../types/pipeline';
+import { mergeActivityEvents } from '../lib/taskActivity';
 
 interface TaskRefreshSummary { hasActiveTask: boolean }
 
@@ -21,7 +22,7 @@ export function useSharedTasks() {
       const state = useAppStore.getState();
       if (taskIsActive(task)) {
         const reset = tracked?.task !== task.task_id || tracked.run !== task.run_id || state.phase !== 'running';
-        if (!reset && tracked && tracked.revision >= task.revision) return;
+        if (!reset && tracked && tracked.revision > task.revision) return;
         state.receiveTaskBatch(task, events, reset);
         tracked = { task: task.task_id, run: task.run_id, revision: task.revision };
       } else if ((tracked?.task === task.task_id && tracked.run === task.run_id)
@@ -31,25 +32,23 @@ export function useSharedTasks() {
       }
     };
     const apply = (task: SharedTask, batch: PipelineEvent[], dropped: number) => {
-      if (disposed || (cache[task.task_id]?.revision ?? -1) >= task.revision) return;
+      if (disposed) return;
       const events = batch.filter(event => (!event.taskId || event.taskId === task.task_id)
         && (!event.runId || event.runId === task.run_id)).sort((a, b) => a.sequence - b.sequence);
       const previous = cache[task.task_id];
       const sameRun = previous?.run_id === task.run_id;
-      const history = sameRun ? previous.recent_events : [];
-      const seen = new Set(history.map(event => event.sequence));
-      const appended = events.filter(event => {
-        if (['runtime', 'heartbeat'].includes(event.kind) || seen.has(event.sequence)) return false;
-        seen.add(event.sequence);
-        return true;
-      });
       task = { ...task,
-        recent_events: appended.length ? [...history, ...appended].sort((a, b) => a.sequence - b.sequence).slice(-500) : history,
-        dropped_event_count: (sameRun ? previous.dropped_event_count ?? 0 : 0) + dropped,
+        recent_events: mergeActivityEvents(sameRun ? previous.recent_events : [], [...(task.recent_events ?? []), ...events],
+          { taskId: task.task_id, runId: task.run_id, allowUnbound: true }),
+        dropped_event_count: (sameRun ? previous.dropped_event_count ?? 0 : 0)
+          + ((previous?.revision ?? -1) < task.revision ? dropped : 0),
       };
-      cache = mergeTask(cache, task);
+      const merged = mergeTask(cache, task);
+      if (merged === cache) return;
+      cache = merged;
       setTasks(cache);
-      phase(task, events);
+      const current = cache[task.task_id];
+      phase(current, [...current.recent_events, ...events]);
     };
     const refresh = async () => {
       if (disposed) return null;

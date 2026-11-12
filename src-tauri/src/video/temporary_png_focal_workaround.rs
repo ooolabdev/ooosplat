@@ -13,7 +13,113 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    sync::OnceLock,
+    time::SystemTime,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RuntimeIdentity {
+    executable: PathBuf,
+    size: u64,
+    modified: SystemTime,
+    package_digest: [u8; 32],
+}
+
+static RUNTIME_CHECKS: OnceLock<tokio::sync::Mutex<BTreeMap<RuntimeIdentity, bool>>> =
+    OnceLock::new();
+
+fn runtime_identity(executable: &Path) -> Option<RuntimeIdentity> {
+    let executable = std::fs::canonicalize(executable).ok()?;
+    let metadata = std::fs::metadata(&executable).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let root = executable.parent()?.parent()?;
+    let mut digest = Sha256::new();
+    for name in ["BUILD-INFO.json", "BUNDLED-COMPONENTS.json"] {
+        let mut bytes = Vec::new();
+        File::open(root.join(name))
+            .ok()?
+            .take(METADATA_BUDGET as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > METADATA_BUDGET {
+            return None;
+        }
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Some(RuntimeIdentity {
+        executable,
+        size: metadata.len(),
+        modified: metadata.modified().ok()?,
+        package_digest: digest.finalize().into(),
+    })
+}
+
+async fn affected_runtime(executable: &Path, manager: &ProcessManager) -> Option<bool> {
+    if manager.child_token().is_cancelled() {
+        return None;
+    }
+    let path = executable.to_owned();
+    let identity = tokio::task::spawn_blocking(move || runtime_identity(&path))
+        .await
+        .ok()??;
+    let checked_identity = identity.clone();
+    cached_runtime_check(identity, &manager.child_token(), async {
+        let help = manager
+            .run(ProcessSpec {
+                executable: executable.to_path_buf(),
+                args: vec!["feature_extractor".into(), "-h".into()],
+                working_directory: executable.parent().map(Path::to_path_buf),
+                log_path: None,
+                observer: None,
+            })
+            .await
+            .ok()?;
+        if !help.success || manager.child_token().is_cancelled() {
+            return None;
+        }
+        let check = executable.to_owned();
+        let after = tokio::task::spawn_blocking(move || runtime_identity(&check))
+            .await
+            .ok()??;
+        if after != checked_identity {
+            return None;
+        }
+        Some(affected_banner(&format!(
+            "{}\n{}",
+            help.stdout, help.stderr
+        )))
+    })
+    .await
+}
+
+async fn cached_runtime_check(
+    identity: RuntimeIdentity,
+    cancel: &tokio_util::sync::CancellationToken,
+    probe: impl std::future::Future<Output = Option<bool>>,
+) -> Option<bool> {
+    // Serialize only this small capability check, not image metadata/decode work.
+    // Keeping the guard through the probe also deduplicates concurrent groups.
+    let mut cache = RUNTIME_CHECKS.get_or_init(Default::default).lock().await;
+    if cancel.is_cancelled() {
+        return None;
+    }
+    if let Some(value) = cache.get(&identity) {
+        return Some(*value);
+    }
+    let affected = probe.await?;
+    if cancel.is_cancelled() {
+        return None;
+    }
+    cache.retain(|key, _| key.executable != identity.executable);
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(identity, affected);
+    Some(affected)
+}
 
 const ENABLED: bool = true;
 const POLICY_VERSION: u32 = 1;
@@ -82,7 +188,7 @@ pub(crate) async fn detect(
     manager: &ProcessManager,
     request: Request<'_>,
 ) -> Option<FocalOverride> {
-    detect_selected(executable, manager, request, None).await
+    detect_selected(executable, manager, request, None, None).await
 }
 
 /// Inspect the same in-memory image group that will become COLMAP's
@@ -94,7 +200,41 @@ pub(crate) async fn detect_image_names(
     request: Request<'_>,
     image_names: &[String],
 ) -> Option<FocalOverride> {
-    detect_selected(executable, manager, request, Some(image_names.to_vec())).await
+    detect_selected(
+        executable,
+        manager,
+        request,
+        Some(image_names.to_vec()),
+        None,
+    )
+    .await
+}
+
+/// A versioned ordinary-photo derivative retains its original metadata in the
+/// same-named immutable prepared frame. Read only that first frame's known XMP
+/// path, and require an exact pixel/Alpha mapping before using its focal value.
+/// The resulting checkpoint still identifies the actual COLMAP input bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn detect_derived_image_names(
+    executable: &Path,
+    manager: &ProcessManager,
+    request: Request<'_>,
+    image_names: &[String],
+    prepared_frames: &Path,
+    masks: &Path,
+    preparation_version: u32,
+) -> Option<FocalOverride> {
+    if preparation_version != crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION {
+        return None;
+    }
+    detect_selected(
+        executable,
+        manager,
+        request,
+        Some(image_names.to_vec()),
+        Some((prepared_frames.to_path_buf(), masks.to_path_buf())),
+    )
+    .await
 }
 
 async fn detect_selected(
@@ -102,6 +242,7 @@ async fn detect_selected(
     manager: &ProcessManager,
     request: Request<'_>,
     image_names: Option<Vec<String>>,
+    derivative_metadata: Option<(PathBuf, PathBuf)>,
 ) -> Option<FocalOverride> {
     if !ENABLED || !request.eligible() {
         return None;
@@ -121,23 +262,65 @@ async fn detect_selected(
     })
     .await
     .ok()??;
-    let help = manager
-        .run(ProcessSpec {
-            executable: executable.to_path_buf(),
-            args: vec!["feature_extractor".into(), "-h".into()],
-            working_directory: executable.parent().map(Path::to_path_buf),
-            log_path: None,
-            observer: None,
-        })
-        .await
-        .ok()?;
-    if !help.success || !affected_banner(&format!("{}\n{}", help.stdout, help.stderr)) {
+    if !affected_runtime(executable, manager).await? {
         return None;
     }
     // Hash only after both runtime identity and the full PNG/XMP path match.
-    tokio::task::spawn_blocking(move || read_candidate(&name, &path))
-        .await
-        .ok()?
+    let cancel = manager.child_token();
+    tokio::task::spawn_blocking(move || match derivative_metadata {
+        Some((frames, masks)) => read_derived_candidate(&name, &path, &frames, &masks, &cancel),
+        None => read_candidate(&name, &path),
+    })
+    .await
+    .ok()?
+}
+
+fn unchanged_file_sha256(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer).ok()?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    let after = file.metadata().ok()?;
+    if before.len() != after.len() || before.modified().ok()? != after.modified().ok()? {
+        return None;
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
+fn read_derived_candidate(
+    name: &str,
+    work_image: &Path,
+    frames: &Path,
+    masks: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<FocalOverride> {
+    let original = frames.join(name);
+    let mut focal = read_candidate(name, &original)?;
+    let work_sha256 = unchanged_file_sha256(work_image)?;
+    // This extra decode is limited to a positive hit on the already-confirmed
+    // PNG/XMP bug. No new all-image scan or metadata fallback is introduced.
+    crate::video::image_sequence::validate_ordinary_sfm_derivatives(
+        &original,
+        work_image,
+        &masks.join(format!("{name}.png")),
+        cancel,
+    )
+    .ok()?;
+    if cancel.is_cancelled()
+        || unchanged_file_sha256(&original)? != focal.checkpoint.sha256
+        || unchanged_file_sha256(work_image)? != work_sha256
+    {
+        return None;
+    }
+    focal.checkpoint.sha256 = work_sha256;
+    Some(focal)
 }
 
 fn affected_banner(help: &str) -> bool {
@@ -610,6 +793,78 @@ fn read_candidate(name: &str, path: &Path) -> Option<FocalOverride> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn version_confirmation_is_deduplicated_but_failures_and_cancellation_are_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let identity = RuntimeIdentity {
+            executable: root.path().join("engine"),
+            size: 10,
+            modified: SystemTime::now(),
+            package_digest: [1; 32],
+        };
+        let calls = AtomicUsize::new(0);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for _ in 0..90 {
+            assert_eq!(
+                cached_runtime_check(identity.clone(), &cancel, async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Some(true)
+                })
+                .await,
+                Some(true)
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let changed = RuntimeIdentity {
+            package_digest: [2; 32],
+            ..identity.clone()
+        };
+        assert_eq!(
+            cached_runtime_check(changed.clone(), &cancel, async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                None
+            })
+            .await,
+            None
+        );
+        assert_eq!(
+            cached_runtime_check(changed.clone(), &cancel, async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(false)
+            })
+            .await,
+            Some(false)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            cached_runtime_check(changed, &cancelled, async {
+                panic!("cancelled check must not launch a process")
+            })
+            .await,
+            None
+        );
+        let fresh = RuntimeIdentity {
+            package_digest: [3; 32],
+            ..identity
+        };
+        let during = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            cached_runtime_check(fresh.clone(), &during, async {
+                during.cancel();
+                Some(true)
+            })
+            .await,
+            None
+        );
+        assert_eq!(
+            cached_runtime_check(fresh, &cancel, async { Some(false) }).await,
+            Some(false)
+        );
+    }
+
     fn xml(extra: &str) -> String {
         format!(
             r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><r:RDF xmlns:r="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><r:Description xmlns:e="http://ns.adobe.com/exif/1.0/" xmlns:t="http://ns.adobe.com/tiff/1.0/" t:ImageWidth="8192" t:ImageLength="5464" e:FocalLength="100/1" e:FocalPlaneXResolution="8192000/1419" e:FocalPlaneResolutionUnit="2" {extra}/></r:RDF></x:xmpmeta>"#
@@ -665,6 +920,121 @@ mod tests {
         let result = read_candidate("first.png", &path);
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         result
+    }
+
+    fn derived_fixture(extra: &str, exif: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let frames = root.path().join("frames");
+        let work = root.path().join("colmap_frames");
+        let masks = root.path().join("masks");
+        for directory in [&frames, &work, &masks] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let decoded = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(2, 1, |x, _| {
+            image::Rgba([200, 100, 50, if x == 0 { 64 } else { 128 }])
+        }));
+        let source = frames.join("first.png");
+        decoded.save(&source).unwrap();
+        let encoded = std::fs::read(&source).unwrap();
+        let mut with_metadata = encoded[..33].to_vec();
+        let mut text = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        text.extend(
+            xml(extra)
+                .replace("ImageWidth=\"8192\"", "ImageWidth=\"2\"")
+                .replace("ImageLength=\"5464\"", "ImageLength=\"1\"")
+                .as_bytes(),
+        );
+        chunk(&mut with_metadata, b"iTXt", &text);
+        if exif {
+            chunk(&mut with_metadata, b"eXIf", b"uncertain");
+        }
+        with_metadata.extend(&encoded[33..]);
+        std::fs::write(&source, with_metadata).unwrap();
+        crate::video::image_sequence::write_ordinary_sfm_derivatives(
+            &decoded,
+            &work.join("first.png"),
+            &masks.join("first.png.png"),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        (root, frames, work, masks)
+    }
+
+    #[test]
+    fn derived_png_uses_only_verified_original_xmp_but_binds_actual_work_bytes() {
+        let (_root, frames, work, masks) = derived_fixture("", false);
+        let source = frames.join("first.png");
+        let actual = work.join("first.png");
+        let source_before = std::fs::read(&source).unwrap();
+        let work_before = std::fs::read(&actual).unwrap();
+        assert!(read_candidate("first.png", &actual).is_none());
+        let detected = read_derived_candidate(
+            "first.png",
+            &actual,
+            &frames,
+            &masks,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        assert!((detected.checkpoint.camera_params[0] - 22728.65980253445).abs() < 0.01);
+        assert_eq!(&detected.checkpoint.camera_params[1..], &[1., 0.5, 0.]);
+        assert_eq!(
+            detected.checkpoint.sha256,
+            unchanged_file_sha256(&actual).unwrap()
+        );
+        assert_ne!(
+            detected.checkpoint.sha256,
+            unchanged_file_sha256(&source).unwrap()
+        );
+        assert_eq!(std::fs::read(source).unwrap(), source_before);
+        assert_eq!(std::fs::read(actual).unwrap(), work_before);
+    }
+
+    #[test]
+    fn derived_png_rejects_unproven_pixels_masks_dimensions_or_cancelled_checks() {
+        for mutation in ["pixels", "mask", "dimensions", "cancel"] {
+            let (_root, frames, work, masks) = derived_fixture("", false);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            match mutation {
+                "pixels" => image::RgbImage::new(2, 1)
+                    .save(work.join("first.png"))
+                    .unwrap(),
+                "mask" => image::GrayImage::new(2, 1)
+                    .save(masks.join("first.png.png"))
+                    .unwrap(),
+                "dimensions" => image::RgbImage::new(4, 2)
+                    .save(work.join("first.png"))
+                    .unwrap(),
+                "cancel" => cancel.cancel(),
+                _ => unreachable!(),
+            }
+            assert!(
+                read_derived_candidate(
+                    "first.png",
+                    &work.join("first.png"),
+                    &frames,
+                    &masks,
+                    &cancel
+                )
+                .is_none(),
+                "{mutation}"
+            );
+        }
+        for (extra, exif) in [
+            ("e:FocalLengthIn35mmFilm=\"100\"", false),
+            ("t:Orientation=\"6\"", false),
+            ("", true),
+        ] {
+            let (_root, frames, work, masks) = derived_fixture(extra, exif);
+            assert!(read_derived_candidate(
+                "first.png",
+                &work.join("first.png"),
+                &frames,
+                &masks,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .is_none());
+        }
     }
 
     #[test]

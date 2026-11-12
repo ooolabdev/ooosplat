@@ -1,5 +1,6 @@
 import type { PipelineEvent, PipelineResult, Quality } from './pipeline';
-import { nextOverallPercent } from '../lib/progressState';
+import { nextOverallPercent, retainOperationProgress } from '../lib/progressState';
+import { mergeActivityEvents } from '../lib/taskActivity';
 export type TaskStatus = 'created' | 'starting' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export interface SharedTask {
   gps_assistance?: import('./inputs').GpsAssistanceSummary | null;
@@ -35,14 +36,26 @@ export const taskCanContinue = (task: Pick<SharedTask, 'status' | 'project_delet
 
 /** Revisions are monotonic across executions; a delayed snapshot cannot undo a newer event. */
 export function mergeTask(tasks: Record<string, SharedTask>, incoming: SharedTask): Record<string, SharedTask> {
-  if ((tasks[incoming.task_id]?.revision ?? -1) >= incoming.revision) return tasks;
   const previous = tasks[incoming.task_id];
   const sameRun = previous != null && previous.run_id === incoming.run_id;
+  if (sameRun && previous.operation && incoming.operation && previous.operation.id === incoming.operation.id
+    && (previous.operation.sourceId ?? null) !== (incoming.operation.sourceId ?? null)) return tasks;
+  const history = mergeActivityEvents(sameRun ? previous.recent_events : [], incoming.recent_events ?? [],
+    { taskId: incoming.task_id, runId: incoming.run_id, allowUnbound: true });
+  if ((previous?.revision ?? -1) >= incoming.revision) {
+    // An old snapshot may fill a history gap, but cannot rewind status or
+    // contribute events from an obsolete execution.
+    return sameRun && history !== previous.recent_events
+      ? { ...tasks, [incoming.task_id]: { ...previous, recent_events: history } } : tasks;
+  }
+  const observed = retainOperationProgress(sameRun ? { ...previous, taskId: previous.task_id, runId: previous.run_id, value: previous.progress } : null,
+    { ...incoming, taskId: incoming.task_id, runId: incoming.run_id, value: incoming.progress });
   const task = {
     ...incoming,
+    current: observed.current ?? null, total: observed.total ?? null, unit: observed.unit ?? null, progress: observed.value,
     display_progress: nextOverallPercent(sameRun ? previous.display_progress ?? previous.estimated_progress ?? 0 : 0,
       incoming.estimated_progress, incoming.status === 'completed'),
-    recent_events: sameRun && incoming.recent_events.length === 0 ? previous.recent_events : incoming.recent_events,
+    recent_events: history,
     dropped_event_count: incoming.dropped_event_count ?? (sameRun ? previous.dropped_event_count : 0),
   };
   return { ...tasks, [incoming.task_id]: task };

@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import type { ColmapAccelerationStatus, EngineStatus, FramePlan, ImageSequenceInfo, InputType, PipelineEvent, PipelineResult, ProjectSummary, Quality, RunPhase, RuntimeEstimate, RuntimeSnapshot, VideoInfo } from "../types/pipeline";
 import type { SharedTask } from "../types/tasks";
-import { changesOperation, isProgressEvent, staleOperation } from '../lib/progressState';
+import { changesOperation, isProgressEvent, retainEventProgress, staleOperation } from '../lib/progressState';
+import { mergeActivityEvents } from '../lib/taskActivity';
 
 interface AppState {
   inputPath: string | null;
@@ -64,14 +65,18 @@ function reduceEvents(state: AppState, batch: PipelineEvent[]): AppState {
     }
     logs ??= state.events.slice();
     logs.push(event);
-    const terminal = event.stage === "failed" || event.stage === "cancelled";
+    const terminal = isProgressEvent(event) && (event.stage === "failed" || event.stage === "cancelled");
     const progressEvent = isProgressEvent(event) || terminal;
+    const observed = progressEvent ? retainEventProgress(next.latestEvent, event) : event;
+    const measuredProgress = event.kind === 'stage' || (isProgressEvent(event)
+      && !event.indeterminate && event.stageProgress != null && Number.isFinite(event.stageProgress));
     next = {
       ...next,
       latestRuntime: !terminal && changesOperation(next.latestEvent, event) ? null : next.latestRuntime,
-      latestEvent: progressEvent ? event : next.latestEvent,
+      latestEvent: progressEvent ? observed : next.latestEvent,
       lastEventSequence: event.sequence,
-      progress: terminal ? next.progress : Math.max(next.progress, Math.min(event.stage === 'completed' ? 100 : 99.9, event.progress)),
+      progress: terminal || !measuredProgress || !Number.isFinite(event.progress)
+        ? next.progress : Math.max(next.progress, Math.min(event.stage === 'completed' ? 100 : 99.9, event.progress)),
       progressMessage: progressEvent ? event.message : next.progressMessage,
       taskColmapAcceleration: event.acceleration ?? next.taskColmapAcceleration,
     };
@@ -144,18 +149,23 @@ export const useAppStore = create<AppState>((set) => ({
   beginRun: () => set(newRunState),
   receiveEvent: (event) => set((state) => reduceEvents(state, [event])),
   receiveTaskBatch: (task, events, reset) => set((state) => {
+    if (!reset && state.liveTask && (state.liveTask.task_id !== task.task_id || state.liveTask.run_id !== task.run_id)) return state;
     const ordered = events.filter(event => (!event.taskId || event.taskId === task.task_id)
       && (!event.runId || event.runId === task.run_id)).sort((a, b) => a.sequence - b.sequence);
     const next = reduceEvents(reset ? { ...state, ...newRunState } : state, ordered);
-    const latestEvent: PipelineEvent | null = task.stage ? {
+    const history = mergeActivityEvents(next.events, [...(task.recent_events ?? []), ...ordered],
+      { taskId: task.task_id, runId: task.run_id, allowUnbound: true });
+    const snapshotEvent: PipelineEvent | null = task.stage ? {
       sequence: task.sequence ?? next.lastEventSequence, timestamp: task.updated_at, kind: 'progress', level: 'info',
       engine: next.latestEvent?.engine ?? null, elapsedMs: task.elapsed_ms, acceleration: null, message: '',
       stage: task.stage, substage: task.substage, operation: task.operation,
       progress: task.estimated_progress ?? next.progress, stageProgress: task.progress,
       indeterminate: task.progress == null, current: task.current, total: task.total, unit: task.unit ?? null,
     } : next.latestEvent;
+    const latestEvent = snapshotEvent ? retainEventProgress(next.latestEvent, snapshotEvent) : null;
     return {
       ...next,
+      events: history,
       latestEvent,
       phase: ["starting", "running", "cancelling"].includes(task.status) ? "running"
         : task.status === "completed" || task.status === "failed" || task.status === "cancelled" ? task.status : "idle",

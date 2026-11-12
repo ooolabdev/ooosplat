@@ -160,6 +160,14 @@ impl ProjectManager {
         };
         self.write_metadata(&paths.metadata, &metadata).await?;
         let mut state = PipelineStateFile::created_for(quality, input_type);
+        state.camera_grouping_policy_version = self.creation_intent.as_ref().map_or(
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+            |intent| intent.camera_grouping_policy_version,
+        );
+        state.ordinary_image_preparation_version = self.creation_intent.as_ref().map_or(
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION),
+            |intent| intent.ordinary_image_preparation_version,
+        );
         state.ba_policy_version = self
             .creation_intent
             .as_ref()
@@ -177,6 +185,11 @@ impl ProjectManager {
             }
         });
         state.inputs = Some(crate::pipeline::inputs::InputCheckpoint::new(inputs));
+        if let Some(checkpoint) = &mut state.inputs {
+            checkpoint.camera_grouping_policy_version = state.camera_grouping_policy_version;
+            checkpoint.ordinary_image_preparation_version =
+                state.ordinary_image_preparation_version;
+        }
         self.write_state(&paths.state, &state).await?;
         if self.register_in_catalog && self.creation_intent.is_none() {
             catalog::register_project(id, &paths.project).await?;
@@ -278,6 +291,8 @@ impl ProjectManager {
             }
         }
         let mut state = PipelineStateFile::created_for(quality, input_type);
+        state.camera_grouping_policy_version = intent.camera_grouping_policy_version;
+        state.ordinary_image_preparation_version = intent.ordinary_image_preparation_version;
         state.creation = Some(crate::project::creation::ProjectCreationState {
             intent: intent.clone(),
             ready: false,
@@ -618,6 +633,14 @@ impl ProjectManager {
         atomic_write_json(&metadata_path, &metadata).await?;
         let state = project.join("state.json");
         let mut pipeline_state = PipelineStateFile::created_for(quality, input_type);
+        pipeline_state.camera_grouping_policy_version = self.creation_intent.as_ref().map_or(
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION),
+            |intent| intent.camera_grouping_policy_version,
+        );
+        pipeline_state.ordinary_image_preparation_version = self.creation_intent.as_ref().map_or(
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION),
+            |intent| intent.ordinary_image_preparation_version,
+        );
         pipeline_state.ba_policy_version = self
             .creation_intent
             .as_ref()
@@ -971,6 +994,12 @@ mod tests {
     use super::*;
     fn reserved(root: &Path) -> crate::project::creation::ProjectCreationIntent {
         crate::project::creation::ProjectCreationIntent {
+            ordinary_image_preparation_version: Some(
+                crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION,
+            ),
+            camera_grouping_policy_version: Some(
+                crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION,
+            ),
             ba_policy_version: Some(crate::pipeline::ba_policy::VERSION),
             brush_execution_options: Some(Default::default()),
             intent_id: Uuid::new_v4(),
@@ -1082,6 +1111,100 @@ mod tests {
             state.ba_policy_version,
             Some(crate::pipeline::ba_policy::VERSION)
         );
+        assert_eq!(state.camera_grouping_policy_version, Some(1));
+        assert_eq!(state.ordinary_image_preparation_version, Some(1));
+        assert_eq!(
+            state
+                .inputs
+                .as_ref()
+                .unwrap()
+                .ordinary_image_preparation_version,
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .inputs
+                .as_ref()
+                .unwrap()
+                .camera_grouping_policy_version,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_creation_keeps_the_reserved_camera_policy_in_state_and_inputs() {
+        for (version, preparation_version) in [
+            (None, None),
+            (None, Some(1)),
+            (Some(1), None),
+            (Some(1), Some(1)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut intent = reserved(root.path());
+            intent.camera_grouping_policy_version = version;
+            intent.ordinary_image_preparation_version = preparation_version;
+            let manager = ProjectManager::for_diagnostics(root.path().into())
+                .with_creation_intent(Some(intent.clone()));
+            let paths = ProjectPaths::existing(intent.project_id, intent.project_path.clone());
+            manager
+                .begin_creation(&paths, Quality::Fast, ProjectInputType::Images)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .read_state(&paths.state)
+                    .await
+                    .unwrap()
+                    .camera_grouping_policy_version,
+                version
+            );
+            let (paths, _) = manager
+                .create_collection(
+                    Quality::Fast,
+                    crate::pipeline::inputs::GenerationInputs::Materials { items: vec![] },
+                )
+                .await
+                .unwrap();
+            let state = manager.read_state(&paths.state).await.unwrap();
+            assert_eq!(state.camera_grouping_policy_version, version);
+            assert_eq!(
+                state.ordinary_image_preparation_version,
+                preparation_version
+            );
+            assert_eq!(
+                state
+                    .inputs
+                    .as_ref()
+                    .unwrap()
+                    .ordinary_image_preparation_version,
+                preparation_version
+            );
+            assert_eq!(
+                state
+                    .creation
+                    .as_ref()
+                    .unwrap()
+                    .intent
+                    .ordinary_image_preparation_version,
+                preparation_version
+            );
+            assert_eq!(
+                state
+                    .inputs
+                    .as_ref()
+                    .unwrap()
+                    .camera_grouping_policy_version,
+                version
+            );
+            assert_eq!(
+                state
+                    .creation
+                    .unwrap()
+                    .intent
+                    .camera_grouping_policy_version,
+                version
+            );
+        }
     }
 
     #[tokio::test]
