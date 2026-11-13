@@ -32,7 +32,7 @@ The shared SfM implementation restores the 0.7.1 native single-input matchers an
 
 策略版本3中，仅手动抽帧改为总量最多1.2倍：首次实际抽取`N`帧、源视频可用`T`帧时，最多新增`min(N / 5 向下取整, T − N)`帧。100%不新增。当时的默认档位仍使用9／12／15 FPS候选预算。初始注册率低于80%、存在有效初始模型时，按未注册区间优先级从源帧范围按需选取，不再受旧候选池密度限制；不提前枚举或抽取全部源帧。只尝试一轮，保存预算及选择，续跑不重复扩大。
 
-候选范围与允许新增量分开记录，不代表全部抽取。策略版本5起，用户手动修改某段视频的设置后，该段沿用20%规则，按首次实际帧数冻结，不跨段挪用；未修改的默认配置仍走正常Bridge路径。界面显示的保留比例仅描述首次计划，不包含可能发生的Bridge补帧。整个多素材任务至多一轮联合Bridge，恢复不增加预算；统一补拍仅为新增视频来源执行同一Bridge，不修改旧画面或转移预算。视频保存真实PTS索引并复用，不按平均FPS伪造时间。GUI、CLI和MCP的新任务默认使用版本7，抽帧规则与版本6相同；显式旧全局FPS继续按兼容目标帧率解释。旧任务中断续跑保持保存策略。1.2倍仅表示帧数预算，不保证耗时或成功率。[旧单素材验证](MANUAL_BRIDGE_V3.md)及[新输入说明](MULTI_INPUTS.md)。
+候选范围与允许新增量分开记录，不代表全部抽取。策略版本5起，用户手动修改某段视频的设置后，该段沿用20%规则，按首次实际帧数冻结，不跨段挪用；未修改的默认配置仍走正常Bridge路径。界面显示的保留比例仅描述首次计划，不包含可能发生的Bridge补帧。整个多素材任务至多一轮联合Bridge，恢复不增加预算；统一补拍仅为新增视频来源执行同一Bridge，不修改旧画面或转移预算。视频保存真实PTS索引并复用，不按平均FPS伪造时间。GUI、CLI和MCP的新任务默认使用版本7，抽帧规则与版本6相同；显式旧全局FPS继续按兼容目标帧率解释。旧任务中断续跑保持保存策略。1.2倍仅表示帧数预算，不保证耗时或成功率。[旧单素材验证](MANUAL_BRIDGE_V3.md)及新输入说明。
 
 精细档不按显存分档：普通30000步，阈值0.0015、选择比例0.15、截止24000；全景45000步，阈值0.001、比例0.30、截止38000；Refine均为200步。策略版本2的普通素材采用[有效像素预算](FINE_SPLAT_BUDGET.md)：`round(0.5 × sqrt(2462476 × 0.063362106 × X_eff / meanTrackLength))`；仅统计已注册训练图片，扣除 Alpha 为零的像素，半透明像素仍计入。全景继续使用最终有效球面 COLMAP 稀疏点数×40，不乘六，不保留原1000万硬上限。旧 PLY 初始化超过预算时仅提高至初始化点数，不丢点。上限不是增密目标；数量溢出和引擎数值范围仍校验。旧版本任务续跑保持原快照及原预算。
 
@@ -52,7 +52,7 @@ The shared SfM implementation restores the 0.7.1 native single-input matchers an
 
 New tasks freeze an optional, independent BA scope version. Compatible ordinary/reshoot/Bridge mapping uses local Ceres and global Caspar only after data-size, GPU, camera and constraint checks. ERP and GPS position priors retain Ceres without dropping observations or priors. Older tasks retain their scope; caches and publication recovery are not invalidated by the added field. Alpha hints now belong to each input and report channel presence only, not transparent pixels or mask creation.
 
-本轮自动／原生验证及未完成项目见[验证记录](BA_POLICY_AND_SOURCE_UI_VALIDATION.md)。
+本轮自动／原生验证及未完成项目见验证记录。
 
 ## 自动重试与兼容
 
@@ -73,7 +73,7 @@ Previous optimization behavior is standard, independently of Automatic retry. Po
 
 Policy v3 changes only manual sampling: for `N` initially selected frames from `T` source frames, add at most `min(floor(N/5), T-N)`. The initial indices remain unchanged. Default sampling retains the 9/12/15 FPS candidate pools. Below 80% initial registration with a valid initial model, one bridge attempt searches unregistered intervals lazily across source indices, independently of the old pool. It does not extract all candidates, and resume cannot renew the frozen budget. Panorama bridges reuse the bounded real PTS index already probed during generation, including VFR and nonzero start times. Candidate availability is not the extraction budget or the number of training views.
 
-New admission uses v7 with the same frame rules as v6; continuing failed, cancelled or interrupted work preserves its saved version and snapshot. A manually changed rate freezes at most 20% extra frames for that clip, with one joint Bridge attempt and no cross-clip transfer. The retention percentage shown before generation describes the initial plan only. Unmodified defaults retain the normal Bridge path. The 1.2× ceiling controls frame counts, not time or success. Legacy global FPS/ratio fields keep their prior semantics. See [unified input boundaries and validation](MULTI_INPUTS.md); the previous [v3 native record](MANUAL_BRIDGE_V3.md) remains historical.
+New admission uses v7 with the same frame rules as v6; continuing failed, cancelled or interrupted work preserves its saved version and snapshot. A manually changed rate freezes at most 20% extra frames for that clip, with one joint Bridge attempt and no cross-clip transfer. The retention percentage shown before generation describes the initial plan only. Unmodified defaults retain the normal Bridge path. The 1.2× ceiling controls frame counts, not time or success. Legacy global FPS/ratio fields keep their prior semantics. See the unified input boundaries and validation; the previous [v3 native record](MANUAL_BRIDGE_V3.md) remains historical.
 
 Detailed uses source-resolution training, including native ERP and width/4 cubemap faces at 92°. SfM feature limits and the 512 MiB image decode guard remain. Policy version 2 uses the [effective-pixel budget](FINE_SPLAT_BUDGET.md) for ordinary media: `round(0.5 × sqrt(2462476 × 0.063362106 × X_eff / meanTrackLength))`. Only registered training views contribute; zero-alpha pixels are excluded, while positive semi-transparent pixels count. Panoramas retain 40× the final valid spherical sparse point count, without VRAM tiers or the old 10M cap. A larger trusted PLY initialization raises the effective ceiling without discarding points. Saved older runs retain their original policy. This is a ceiling, not a promised final count.
 
@@ -91,7 +91,7 @@ Explicit continuation turns off the local automatic queue and runs only that tas
 
 2026-11-10 普通快速／均衡公式预算（策略版本7）：Rust731项、前端741项、诊断协议7项通过，构建、格式检查、差异空白检查与全目标Clippy（`-D warnings`）通过。Rust另有36项资源／人工测试默认忽略，3项已知Windows符号链接权限夹具未执行；既有第三方构建警告保留。覆盖系数、实际Brush尺寸、Alpha、旧快照身份、初始化保护、恢复及抽帧／增密／全景参数不变。未重新训练或评测PSNR，不将预算计算视为实际点数、画质或显存验收。Fast/Balanced v7 passed automated regression and build checks; no new training or PSNR claim is made. See [budget verification](FINE_SPLAT_BUDGET.md#验证--verification).
 
-2026-11-09 统一继续入口前端回归：失败、取消、中断的项目行与共享详情使用同一操作；不依赖详情读取成功才显示入口；无项目记录可由后台验证原请求后继续；运行标识、历史继承配置及中英文按钮已覆盖。命令、结果及未验收项见[统一继续验证记录](UNIFIED_CONTINUATION_VALIDATION.md)，不以界面自动测试代替完整训练、硬件OOM或原生桌面恢复验收。
+2026-11-09 统一继续入口前端回归：失败、取消、中断的项目行与共享详情使用同一操作；不依赖详情读取成功才显示入口；无项目记录可由后台验证原请求后继续；运行标识、历史继承配置及中英文按钮已覆盖。命令、结果及未验收项见统一继续验证记录，不以界面自动测试代替完整训练、硬件OOM或原生桌面恢复验收。
 
 2026-10-28 手动补帧版本3验证见[独立记录](MANUAL_BRIDGE_V3.md)。下方版本1／2记录保留为历史，不代表重新执行完整训练。
 

@@ -120,7 +120,7 @@ GUI、MCP、CLI 均暂停新的 COLMAP 文件／文件夹导入和直接训练�
 
 New COLMAP direct-training imports are temporarily unavailable in every entry point. Preflight and task creation return `UNSUPPORTED_INPUT` with reason `colmap_disabled`; other unsupported input formats use `unsupported_input`. No task or engine is started. The capability is no longer advertised. Existing idempotent requests can still return their original task, and existing-task continuation retains its saved configuration. Do not work around the restriction by presenting a COLMAP directory as an image folder.
 
-“已完成→导入”仍支持高斯模型，但新导入不再关联附带的 COLMAP，也不因此开放补拍。已保存的 COLMAP 类型、历史关联和既有补拍能力继续兼容；正常生成内部的 COLMAP、旧任务状态中的导入重建标记及共享执行器不变。详见[输入边界与验收](MULTI_INPUTS.md)及[CLI说明](CLI.md)。
+“已完成→导入”仍支持高斯模型，但新导入不再关联附带的 COLMAP，也不因此开放补拍。已保存的 COLMAP 类型、历史关联和既有补拍能力继续兼容；正常生成内部的 COLMAP、旧任务状态中的导入重建标记及共享执行器不变。详见输入边界与验收及 CLI 说明。
 
 GPS is a non-blocking summary (`pending`, `checked`, `unavailable`; nullable `detected`). No coordinates, geographic origin or per-image GPS manifest are returned. Status exposes actual projection/matching, bounded sampling/backfill summaries, initial/final Brush settings, controlled retries, actual reshoot path and GPS adoption/fallback status. Each run returns its last eight Brush executions in order, with a truncation flag; device/VRAM/driver remain null unless supported by that execution's evidence. Raw device identifiers and raw config/log blobs are not returned in these summaries.
 
@@ -235,7 +235,7 @@ The official rmcp client integration test starts the real token-free HTTP transp
 
 ## 本轮验证 / Current verification — 2026-11-10
 
-前端全量80个文件、798项测试及7项诊断协议测试、前端构建、完整 Rust 测试（755库＋1 CLI）、格式及全目标 Clippy `-D warnings` 通过。36项 Rust 测试忽略，3项因 Windows 符号链接权限限制（1314）过滤。MCP 回归覆盖公开 Schema 隐藏 COLMAP 模式、工具暂停说明及旧原始请求解析后明确拒绝。Edge 的24组中英文／缩放／视口弹窗检查通过，含键盘和焦点恢复；bicycle只读准入与底层模型检查、范围及记录见[统一输入验证](MULTI_INPUTS.md)。原生桌面文件选择／拖放和 macOS／Linux 实机交互尚未验收，不以历史直接训练测试证明新导入可用。
+前端全量80个文件、798项测试及7项诊断协议测试、前端构建、完整 Rust 测试（755库＋1 CLI）、格式及全目标 Clippy `-D warnings` 通过。36项 Rust 测试忽略，3项因 Windows 符号链接权限限制（1314）过滤。MCP 回归覆盖公开 Schema 隐藏 COLMAP 模式、工具暂停说明及旧原始请求解析后明确拒绝。Edge 的24组中英文／缩放／视口弹窗检查通过，含键盘和焦点恢复；bicycle只读准入与底层模型检查、范围及记录见统一输入验证。原生桌面文件选择／拖放和 macOS／Linux 实机交互尚未验收，不以历史直接训练测试证明新导入可用。
 
 Frontend tests, diagnostic-protocol tests, the production build, the full Rust suite (755 library plus one CLI test), formatting, all-target Clippy with `-D warnings`, and the 24-case Edge dialog matrix passed. Three Windows symlink-permission tests were filtered. MCP tests verify hidden public COLMAP schemas, tool notices, and explicit rejection of compatible legacy raw requests. Read-only bicycle admission/model checks are recorded in the unified-input notes. Native desktop picker/drop interaction and macOS/Linux device checks remain unverified. Historical direct-training tests do not advertise a currently available new-import path.
 
