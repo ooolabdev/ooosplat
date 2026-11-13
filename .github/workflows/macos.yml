@@ -2,14 +2,64 @@ name: macOS 15+ Apple Silicon Alpha
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "public/**"
+      - "assets/app-icon*.svg"
+      - "config/**"
+      - "db/**"
+      - "engines/**"
+      - "html-viewer/**"
+      - "scripts/**"
+      - "server/**"
+      - "licenses/**"
+      - "package.json"
+      - "package-lock.json"
+      - "index.html"
+      - "tsconfig*.json"
+      - "vite.config.*"
+      - "vitest.config.*"
+      - "rust-toolchain.toml"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/workflows/**"
   pull_request:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "public/**"
+      - "assets/app-icon*.svg"
+      - "config/**"
+      - "db/**"
+      - "engines/**"
+      - "html-viewer/**"
+      - "scripts/**"
+      - "server/**"
+      - "licenses/**"
+      - "package.json"
+      - "package-lock.json"
+      - "index.html"
+      - "tsconfig*.json"
+      - "vite.config.*"
+      - "vitest.config.*"
+      - "rust-toolchain.toml"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-alpha-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,9 +88,11 @@ jobs:
 
       - name: Set up Rust
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
           rustup component add rustfmt clippy
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+          cargo clippy --version
 
       - name: Install frontend dependencies
         run: npm ci
@@ -105,11 +157,13 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Build unsigned app and DMG
+        if: github.event_name != 'pull_request'
         env:
           APPLE_SIGNING_IDENTITY: "-"
         run: npm run tauri -- build --bundles app,dmg
 
       - name: Verify packaged engine resources
+        if: github.event_name != 'pull_request'
         run: |
           app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
           dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
@@ -131,6 +185,7 @@ jobs:
           hdiutil verify "$dmg"
 
       - name: Package downloadable files
+        if: github.event_name != 'pull_request'
         run: |
           app="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
           dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
@@ -143,6 +198,7 @@ jobs:
           (cd dist-artifacts && shasum -a 256 "$app_archive" "$dmg_name" > SHA256SUMS.txt)
 
       - name: Upload unsigned macOS Alpha
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: OOOSplat-${{ steps.package.outputs.version }}-arm64-macos

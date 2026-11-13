@@ -313,22 +313,61 @@ impl PreparationContext {
 }
 
 fn redirected(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return true;
-        }
+        metadata.file_type().is_symlink()
+            || windows_file_attributes_redirected(metadata.file_attributes())
     }
-    false
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_attributes_redirected(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_files_and_directories_are_not_redirected() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("plain-file");
+        std::fs::write(&file, b"plain").unwrap();
+
+        assert!(!redirected(&std::fs::symlink_metadata(&file).unwrap()));
+        assert!(!redirected(
+            &std::fs::symlink_metadata(root.path()).unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_symlinks_are_redirected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(redirected(&std::fs::symlink_metadata(link).unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attributes_are_redirected() {
+        assert!(!windows_file_attributes_redirected(0));
+        assert!(windows_file_attributes_redirected(0x400));
+        assert!(windows_file_attributes_redirected(0x400 | 0x10));
+    }
 
     #[tokio::test]
     async fn all_os_codes_and_atomic_substep_survive_without_a_writable_log() {

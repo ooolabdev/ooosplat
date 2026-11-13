@@ -1,0 +1,58 @@
+name: Rust latest stable compatibility
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-latest-stable-canary
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential curl ffmpeg file libvulkan1 mesa-vulkan-drivers \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+
+      - name: Prepare generated Tauri resources
+        run: |
+          npm ci
+          npm run build:html-viewer
+
+      - name: Set up latest stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup component add --toolchain stable rustfmt clippy
+          rustc +stable --version
+          cargo +stable --version
+          cargo +stable clippy --version
+
+      - name: Rust formatting
+        run: cargo +stable fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust tests
+        run: cargo +stable test --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust clippy
+        run: cargo +stable clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

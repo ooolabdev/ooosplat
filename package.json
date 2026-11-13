@@ -24,6 +24,7 @@
     "verify:engines": "node scripts/engine-command.mjs verify",
     "verify:bundle-resources": "node scripts/verify-bundle-resources.mjs",
     "verify:colmap-lock": "node scripts/verify-colmap-lock.mjs",
+    "verify:docs": "node scripts/verify-docs.mjs",
     "test:engine-scripts": "node --test scripts/colmap-runtime.test.mjs scripts/colmap-development.test.mjs scripts/cuda-toolkit.test.mjs scripts/collect-linux-runtime.test.mjs scripts/colmap-macos-notices.test.mjs scripts/brush-runtime.test.mjs scripts/ffmpeg-release-policy.test.mjs",
     "build:engines:windows": "powershell -ExecutionPolicy Bypass -File scripts/build-colmap-windows.ps1",
     "build:engines:linux": "bash scripts/build-colmap-linux.sh",
