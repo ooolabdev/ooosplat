@@ -54,6 +54,9 @@ export async function checkGaussianVideoCapability(orientation: VideoOrientation
     return { supported: false, reason: translate(locale, "video.noWebCodecs") };
   }
   try {
+    // WebKitGTK can register its WebCodecs encoder before initializing
+    // GStreamer, aborting the web process. Initialize the media backend first.
+    document.createElement("video").canPlayType('video/mp4; codecs="avc1.42001f"');
     const supported = await canEncodeVideo("avc", {
       bitrate: GAUSSIAN_VIDEO_BITRATE,
       ...gaussianVideoDimensions(orientation),

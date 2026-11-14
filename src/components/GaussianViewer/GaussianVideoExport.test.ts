@@ -92,6 +92,7 @@ beforeEach(() => {
   mediabunny.canEncodeVideo.mockReset();
   Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
   Object.defineProperty(globalThis, "VideoEncoder", { configurable: true, value: class VideoEncoder {} });
+  vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
 });
 
 afterEach(() => {
@@ -141,6 +142,26 @@ describe("GaussianVideoExport", () => {
       supported: false,
       reason: "当前系统没有可用的 AVC / H.264 编码器。",
     });
+  });
+
+  it("initializes the media backend before probing WebCodecs even without MP4 playback support", async () => {
+    let mediaInitialized = false;
+    const canPlayType = vi.mocked(HTMLMediaElement.prototype.canPlayType);
+    canPlayType.mockImplementation(() => {
+      mediaInitialized = true;
+      return "";
+    });
+    mediabunny.canEncodeVideo.mockImplementation(async () => {
+      if (!mediaInitialized) throw new Error("WebKitGTK media backend was not initialized");
+      return false;
+    });
+
+    await expect(checkGaussianVideoCapability()).resolves.toEqual({
+      supported: false,
+      reason: "当前系统没有可用的 AVC / H.264 编码器。",
+    });
+    expect(canPlayType).toHaveBeenCalledWith('video/mp4; codecs="avc1.42001f"');
+    expect(mediabunny.canEncodeVideo).toHaveBeenCalledOnce();
   });
 
   it("encodes exactly 690 deterministic frames and finalizes MP4", async () => {
