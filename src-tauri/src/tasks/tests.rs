@@ -4458,3 +4458,103 @@ fn real_activity_journal_count_redaction_read_only_regression() {
     }
     panic!("no existing mis-redacted application count found in the bounded recent activity tails");
 }
+
+/// A committed project's final.ply deleted outside the app used to make
+/// `load_locked` fail, so the whole task list stayed unloadable until the file
+/// was restored. Only the affected task may report the missing artifact.
+#[tokio::test]
+async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_loadable() {
+    use crate::pipeline::publication::{self, PublicationIdentity, PublicationPhase};
+
+    let (root, service, task) = fixture().await;
+    let other = service
+        .create(
+            None,
+            task.input_path.clone(),
+            Quality::Balanced,
+            root.path().join("projects"),
+            false,
+            "gui",
+            Some("request-2".into()),
+            Some(serde_json::json!({"quality":"balanced"})),
+        )
+        .await
+        .unwrap();
+    assert_ne!(other.task_id, task.task_id);
+
+    // A finished generation: committed publication, project.json, task record.
+    let project = root.path().join("projects").join("committed");
+    let candidate = project.join("work/brush/final.ply.tmp");
+    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    std::fs::write(
+        &candidate,
+        "ply\nformat binary_little_endian 1.0\nelement vertex 5\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float opacity\nproperty float scale_0\nproperty float rot_0\nend_header\n",
+    )
+    .unwrap();
+    let final_ply = project.join("final.ply");
+    let transaction = project
+        .join("work")
+        .join(publication::TRANSACTION_FILE_NAME);
+    let published = publication::publish_candidate(
+        &project,
+        &transaction,
+        &candidate,
+        &final_ply,
+        Default::default(),
+        PublicationIdentity {
+            attempt_id: "brush-0".into(),
+            ..Default::default()
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(published.transaction.phase, PublicationPhase::Committed);
+    {
+        let mut records = service.records();
+        let saved = records.tasks.get_mut(&task.task_id).unwrap();
+        saved.project_id = Some(Uuid::new_v4());
+        saved.project_path = Some(project.clone());
+        saved.status = TaskStatus::Completed;
+    }
+    persist_bound_project_metadata(&service, task.task_id).await;
+    service.persist().await.unwrap();
+
+    // Control: with final.ply intact, a restart loads and reconciles everything.
+    let healthy = TaskService::at(root.path().join("registry"));
+    let tasks = healthy.all().await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    let completed = healthy.get(task.task_id).await.unwrap();
+    assert_eq!(completed.status, TaskStatus::Completed);
+    assert_eq!(
+        publication::load_transaction(&project, &transaction)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        PublicationPhase::Reconciled
+    );
+    drop(healthy);
+
+    // Someone deletes the published model outside the app, then the app restarts.
+    let model = std::fs::read(&final_ply).unwrap();
+    std::fs::remove_file(&final_ply).unwrap();
+    let restarted = TaskService::at(root.path().join("registry"));
+    assert_eq!(restarted.all().await.unwrap().len(), 2);
+    let unavailable = restarted.get(task.task_id).await.unwrap();
+    assert_eq!(unavailable.status, TaskStatus::Interrupted);
+    assert!(unavailable.result.is_none());
+    assert_eq!(unavailable.error.unwrap().code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(
+        restarted.get(other.task_id).await.unwrap().status,
+        TaskStatus::Created
+    );
+    drop(restarted);
+
+    // Restoring the file and restarting brings the committed result back.
+    std::fs::write(&final_ply, model).unwrap();
+    let recovered = TaskService::at(root.path().join("registry"));
+    let task = recovered.get(task.task_id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert!(task.error.is_none());
+}
