@@ -702,6 +702,21 @@ impl ProjectManager {
         }
         Ok(())
     }
+    /// Training preparation uses the same atomic-write substeps without
+    /// labelling a training failure as retry admission.
+    pub(crate) async fn write_state_for_training(
+        &self,
+        path: &Path,
+        state: &PipelineStateFile,
+    ) -> Result<()> {
+        self.write_state_for_preparation(path, state)
+            .await
+            .map_err(|error| {
+                error.with_io_diagnostic(
+                    "training_preparation_operation=save_training_state\npath_role=project_state",
+                )
+            })
+    }
     pub async fn read_state(&self, path: &Path) -> Result<PipelineStateFile> {
         Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)
     }

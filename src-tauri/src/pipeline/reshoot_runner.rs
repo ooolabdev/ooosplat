@@ -139,6 +139,9 @@ pub(super) async fn validate_ply(
     })
     .await
     .map_err(|e| invalid(&format!("Gaussian validation worker: {e}")))?
+    .map_err(|error| error.with_io_diagnostic(
+        "training_preparation_operation=validate_gaussian\npath_role=training_gaussian\nio_substep=read_and_validate"
+    ))
 }
 
 pub(super) struct SourceAssets {

@@ -286,12 +286,25 @@ pub async fn train(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_directory).await?;
+    if manager.child_token().is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
+    tokio::fs::create_dir_all(output_directory).await.map_err(SplatError::from)
+        .map_err(|error| error.with_io_diagnostic(
+            "training_preparation_operation=prepare_brush_output\npath_role=brush_output\nio_substep=create_directory"
+        ))?;
     let candidate = output_directory.join("final.ply.tmp");
     let alternate = output_directory.join("final.ply.tmp.ply");
     for partial in [&candidate, &alternate] {
-        if partial.exists() {
-            tokio::fs::remove_file(partial).await?;
+        match tokio::fs::symlink_metadata(partial).await {
+            Ok(_) => tokio::fs::remove_file(partial).await.map_err(SplatError::from)
+                .map_err(|error| error.with_io_diagnostic(
+                    "training_preparation_operation=prepare_brush_output\npath_role=brush_candidate\nio_substep=remove_incomplete_candidate"
+                ))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(SplatError::Io(error).with_io_diagnostic(
+                "training_preparation_operation=prepare_brush_output\npath_role=brush_candidate\nio_substep=inspect_incomplete_candidate"
+            )),
         }
     }
     let environment = options.gpu_launch_policy.environment();
@@ -336,9 +349,17 @@ pub async fn train(
         );
     }
     let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let evidence = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::failure::EngineFailureEvidence::default(),
+    ));
+    let live_evidence = evidence.clone();
     let counts = last_splat_count.clone();
     let observer: ProcessObserver = std::sync::Arc::new(move |update| {
         if let crate::process::ProcessUpdate::Line { line, .. } = &update {
+            live_evidence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe(line);
             if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
                 *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
             }
@@ -358,9 +379,17 @@ pub async fn train(
             },
             &environment,
         )
-        .await?;
+        .await.map_err(|error| error.with_io_diagnostic(
+            "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
+        ))?;
     resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
         if let SplatError::EngineProcess(failure) = &mut error {
+            **failure = crate::failure::EngineProcessFailure::from_output_with_evidence(
+                crate::pipeline::PipelineEngine::Brush,
+                "train",
+                &output,
+                &evidence.lock().unwrap_or_else(|p| p.into_inner()),
+            );
             failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
         }
         error
@@ -381,21 +410,25 @@ fn resolve_train_output(
             ),
         )));
     }
-    let candidate = if candidate.is_file() {
-        candidate
-    } else {
-        if alternate.is_file() {
-            alternate
-        } else {
-            candidate
+    let is_file = |path: &Path| -> Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SplatError::Io(error).with_io_diagnostic(
+                "training_preparation_operation=validate_brush_output\npath_role=brush_candidate\nio_substep=read_metadata"
+            )),
         }
     };
-    if !candidate.is_file() {
+    let candidate = if is_file(&candidate)? {
+        candidate
+    } else if is_file(&alternate)? {
+        alternate
+    } else {
         return Err(SplatError::Process(format!(
             "Brush 未生成预期文件：{}",
             candidate.display()
         )));
-    }
+    };
     Ok(candidate)
 }
 
@@ -409,6 +442,74 @@ mod tests {
         },
         presets::{resolve_brush_training_preset, Quality},
     };
+
+    #[tokio::test]
+    async fn training_output_preparation_failure_retains_io_context_without_starting_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("not-a-directory");
+        std::fs::write(&output, b"existing file").unwrap();
+        let policy =
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Cpu, 0, None));
+        let result = train(
+            &root.path().join("missing-brush.exe"),
+            root.path(),
+            &output,
+            BrushTrainingOptions {
+                init_sh_degree: None,
+                alpha_mode: None,
+                warm: None,
+                preset: resolve_brush_training_preset(Quality::Fast, false, None, 128, 0).preset,
+                panorama: false,
+                log_path: root.path().join("brush.log"),
+                gpu_launch_policy: &policy,
+            },
+            &ProcessManager::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(result.io_error().is_some());
+        assert!(result.io_error().unwrap().raw_os_error().is_some());
+        assert!(result
+            .to_string()
+            .contains("training_preparation_operation=prepare_brush_output"));
+        assert!(result.to_string().contains("io_substep=create_directory"));
+        assert!(!result.is_brush_oom());
+        assert!(!root.path().join("brush.log").exists());
+        assert_eq!(std::fs::read(output).unwrap(), b"existing file");
+    }
+
+    #[tokio::test]
+    async fn cancelled_training_does_not_delete_candidate_or_replace_cancel_with_preparation_error()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("final.ply.tmp");
+        std::fs::write(&candidate, b"existing candidate").unwrap();
+        let policy =
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Cpu, 0, None));
+        let manager = ProcessManager::new();
+        manager.cancel();
+        let result = train(
+            &root.path().join("missing-brush.exe"),
+            root.path(),
+            root.path(),
+            BrushTrainingOptions {
+                init_sh_degree: None,
+                alpha_mode: None,
+                warm: None,
+                preset: resolve_brush_training_preset(Quality::Fast, false, None, 128, 0).preset,
+                panorama: false,
+                log_path: root.path().join("brush.log"),
+                gpu_launch_policy: &policy,
+            },
+            &manager,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert_eq!(std::fs::read(candidate).unwrap(), b"existing candidate");
+        assert!(!root.path().join("brush.log").exists());
+    }
 
     #[test]
     fn native_camera_capability_rejects_unknown_and_changed_runtime() {

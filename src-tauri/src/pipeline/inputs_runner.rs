@@ -1771,7 +1771,9 @@ impl PipelineRunner {
                         None,
                     );
                     self.record_collection_artifacts(paths, &mut state).await?;
-                    manager.write_state(&paths.state, &state).await?;
+                    manager
+                        .write_state_for_training(&paths.state, &state)
+                        .await?;
                     training_dataset = Some(dataset);
                 }
                 GenerationAction::Train => {
@@ -1871,14 +1873,19 @@ impl PipelineRunner {
                         )
                     })
                     .await
-                    .map_err(|e| SplatError::Process(e.to_string()))??;
+                    .map_err(|e| SplatError::Process(e.to_string()))?
+                    .map_err(|error| error.with_io_diagnostic(
+                        "training_preparation_operation=transform_initialization\npath_role=training_initialization\nio_substep=read_transform_and_write"
+                    ))?;
                             } else {
                                 super::reshoot_runner::copy_reshoot_file(
                                     &model,
                                     &init,
                                     &self.process_manager.child_token(),
                                 )
-                                .await?;
+                                .await.map_err(|error| error.with_io_diagnostic(
+                                    "training_preparation_operation=copy_initialization\npath_role=training_initialization\nio_substep=copy"
+                                ))?;
                             }
                             let (copy, copy_sh, copy_hash) = super::reshoot_runner::validate_ply(
                                 &init,
@@ -1900,14 +1907,20 @@ impl PipelineRunner {
                         }
                         if warm_seed.is_none() {
                             let init = dataset.path.join("init.ply");
-                            if init.exists() {
+                            if tokio::fs::try_exists(&init).await.map_err(SplatError::from)
+                                .map_err(|error| error.with_io_diagnostic(
+                                    "training_preparation_operation=archive_initialization\npath_role=training_initialization\nio_substep=inspect"
+                                ))? {
                                 tokio::fs::rename(
                                     &init,
                                     dataset
                                         .path
                                         .join(format!("init.warm-{}.ply", uuid::Uuid::new_v4())),
                                 )
-                                .await?;
+                                .await.map_err(SplatError::from)
+                                    .map_err(|error| error.with_io_diagnostic(
+                                        "training_preparation_operation=archive_initialization\npath_role=training_initialization\nio_substep=rename"
+                                    ))?;
                             }
                         }
                         self.events.training_substage("trainingValidation");
@@ -1999,7 +2012,9 @@ impl PipelineRunner {
                             None,
                             None,
                         );
-                        manager.write_state(&paths.state, &state).await?;
+                        manager
+                            .write_state_for_training(&paths.state, &state)
+                            .await?;
                         let mut attempt = paths.clone();
                         let training_attempt = state
                             .reshoot
@@ -2076,7 +2091,7 @@ impl PipelineRunner {
                                 .await
                                 .map(|_| path);
                                 let invalid = validation.as_ref().err().is_some_and(|e| {
-                                    !matches!(e, SplatError::Io(_) | SplatError::Cancelled)
+                                    e.io_error().is_none() && !matches!(e, SplatError::Cancelled)
                                 });
                                 (validation, invalid)
                             }
@@ -2090,7 +2105,9 @@ impl PipelineRunner {
                             Ok(path) => {
                                 state.brush_complete = true;
                                 self.record_collection_artifacts(paths, &mut state).await?;
-                                manager.write_state(&paths.state, &state).await?;
+                                manager
+                                    .write_state_for_training(&paths.state, &state)
+                                    .await?;
                                 break path;
                             }
                             Err(error) => {
@@ -2113,7 +2130,9 @@ impl PipelineRunner {
                                 state.brush_training.resolved = None;
                                 state.brush_training.dataset_identity = None;
                                 state.validated_output = None;
-                                manager.write_state(&paths.state, &state).await?;
+                                manager
+                                    .write_state_for_training(&paths.state, &state)
+                                    .await?;
                                 self.mark_automatic_retry();
                                 self.events.stage(
                                     PipelineStage::TrainingSplats,
@@ -2123,7 +2142,9 @@ impl PipelineRunner {
                             }
                         }
                     };
-                    let ply = inspect_gaussian_ply(&candidate)?;
+                    let ply = inspect_gaussian_ply(&candidate).map_err(|error| error.with_io_diagnostic(
+                        "training_preparation_operation=validate_brush_output\npath_role=brush_candidate\nio_substep=read_and_validate"
+                    ))?;
                     state.validated_output = Some(ProjectOutput {
                         final_ply: paths.project.join("final.ply"),
                         file_size: ply.file_size,
@@ -2133,7 +2154,9 @@ impl PipelineRunner {
                         registered_ratio: report.registered_ratio,
                         points_3d: report.points_3d,
                     });
-                    manager.write_state(&paths.state, &state).await?;
+                    manager
+                        .write_state_for_training(&paths.state, &state)
+                        .await?;
                 }
                 GenerationAction::Publish => {
                     let candidate = completed_candidate.expect("validated completed candidate");
@@ -2196,6 +2219,17 @@ impl PipelineRunner {
     ) -> Result<PathBuf> {
         use crate::reconstruction::gps;
         if c.imported_reconstruction {
+            return Ok(visual.into());
+        }
+        // Recovering the same run's disposable SQLite cache does not grant a
+        // previously abandoned GPS attempt or require reopening source images.
+        if state.gps.as_ref().is_some_and(|checkpoint| {
+            checkpoint.database_recovery_visual_only && checkpoint.status == "fallback"
+        }) {
+            if self.process_manager.child_token().is_cancelled() {
+                return Err(SplatError::Cancelled);
+            }
+            self.gps_log(gps::FALLBACK_MESSAGE, true);
             return Ok(visual.into());
         }
         let local = paths.work.join("gps/manifest.json");
@@ -2408,52 +2442,7 @@ impl PipelineRunner {
         }
         tokio::fs::create_dir_all(&paths.colmap).await?;
         tokio::fs::create_dir_all(&paths.brush).await?;
-        if state.inputs.as_ref().is_some_and(execution_plan_is_reshoot) {
-            // `colmap` also held derived base copies. Recreate them from the
-            // verified local snapshot, never from the now-optional old project.
-            let snapshot_root = paths.work.join("reshoot-snapshot-v3");
-            let expected = state
-                .reshoot
-                .as_ref()
-                .and_then(|reshoot| reshoot.snapshot_v3_identity.clone());
-            let snapshot = snapshot_root.clone();
-            let model = paths.colmap.join("base-model");
-            crate::presets::spawn_pipeline_blocking(move || -> Result<()> {
-                let manifest = crate::pipeline::reshoot_snapshot::verify_snapshot(&snapshot)?;
-                if expected
-                    .as_ref()
-                    .is_some_and(|identity| identity != &manifest.content_identity)
-                {
-                    return Err(SplatError::Process(
-                        "Reshoot source snapshot identity changed".into(),
-                    ));
-                }
-                read_model(&snapshot.join("colmap/sparse"))?.write(&model)
-            })
-            .await
-            .map_err(|error| SplatError::Process(error.to_string()))??;
-            super::reshoot_runner::copy_reshoot_file(
-                &snapshot_root.join("colmap/database.db"),
-                &paths.colmap.join("base-database.db"),
-                &self.process_manager.child_token(),
-            )
-            .await?;
-            let paths = paths.clone();
-            let mut restored = state.clone();
-            let cancel = self.process_manager.child_token();
-            restored =
-                crate::presets::spawn_pipeline_blocking(move || -> Result<PipelineStateFile> {
-                    crate::pipeline::artifacts::rebind_restored_focal_base(
-                        &paths,
-                        &mut restored,
-                        &cancel,
-                    )?;
-                    Ok(restored)
-                })
-                .await
-                .map_err(|error| SplatError::Process(error.to_string()))??;
-            *state = restored;
-        }
+        self.restore_collection_database_base(paths, state).await?;
         let checkpoint = state.inputs.as_mut().ok_or_else(|| {
             SplatError::Process("Missing prepared inputs for focal policy".into())
         })?;
@@ -2499,14 +2488,16 @@ impl PipelineRunner {
         self.events
             .stage(PipelineStage::ExtractingFeatures, 0., "正在提取画面信息");
         let db = paths.colmap.join("database.db");
-        if db.exists() {
-            tokio::fs::rename(
-                &db,
-                paths
-                    .colmap
-                    .join(format!("incomplete-{}.db", uuid::Uuid::new_v4())),
-            )
-            .await?;
+        if tokio::fs::try_exists(&db).await? {
+            // Never rename only the main file while a same-name WAL/journal
+            // survives. Persist a whole-cache barrier, including interrupted
+            // partial feature extraction, before creating a new database.
+            state.inputs = Some(c.clone());
+            self.begin_database_rebuild(manager, paths, state, "incomplete_feature_database")
+                .await?;
+            *c = state.inputs.clone().ok_or_else(|| {
+                SplatError::Process("Missing prepared inputs after database archive".into())
+            })?;
         }
         if execution_plan_is_reshoot(c) {
             tokio::fs::copy(paths.colmap.join("base-database.db"), &db).await?;
@@ -3246,7 +3237,7 @@ fn collection_gps_base_model(
     execution_plan_is_incremental(checkpoint).then(|| paths.colmap.join("base-model"))
 }
 
-fn execution_plan_is_reshoot(checkpoint: &InputCheckpoint) -> bool {
+pub(super) fn execution_plan_is_reshoot(checkpoint: &InputCheckpoint) -> bool {
     checkpoint.execution_plan.as_ref().is_some_and(|plan| {
         plan.matching == crate::pipeline::execution_plan::MatchPlan::ReshootCrossSource
     })
@@ -3356,27 +3347,8 @@ fn collection_coordinates_match(base: &Path, updated: &Path) -> Result<bool> {
 }
 
 fn best_model(root: &Path, count: u64) -> Result<(PathBuf, ReconstructionReport)> {
-    let mut candidates = vec![root.to_path_buf()];
-    let mut children = std::fs::read_dir(root)?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    children.sort();
-    candidates.extend(children);
-    let mut best = None;
-    for path in candidates {
-        if path.join("cameras.bin").is_file() {
-            let report = ReconstructionValidator::validate_with_input_images(count, &path)?;
-            if best
-                .as_ref()
-                .is_none_or(|(_, r): &(PathBuf, ReconstructionReport)| {
-                    report.registered_images > r.registered_images
-                })
-            {
-                best = Some((path, report));
-            }
-        }
-    }
-    best.ok_or_else(|| SplatError::Process("稀疏重建没有可用的注册图像或三维点".into()))
+    colmap::select_reconstruction_model(root, count)?
+        .ok_or_else(|| SplatError::Process("稀疏重建没有可用的注册图像或三维点".into()))
 }
 fn source_requires_feature_masks(source: &SourceCheckpoint) -> bool {
     // Old frame checkpoints can default an absent Alpha field to false. A

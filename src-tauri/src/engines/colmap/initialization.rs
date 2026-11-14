@@ -42,6 +42,9 @@ pub(super) struct ModelAssessment {
     pub registered_images: u64,
     pub points_3d: u64,
     pub valid_intrinsics: bool,
+    /// Local bounded facts from this model, not inferred from native bad-pair
+    /// messages. No image names, source paths or coordinates are recorded.
+    pub invalid_camera_parameters: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +369,63 @@ fn valid_camera(camera: &ColmapCamera) -> bool {
             .all(|extra| extra.abs() <= 1.)
 }
 
+fn invalid_camera_parameters(camera: &ColmapCamera) -> Vec<String> {
+    if valid_camera(camera) {
+        return Vec::new();
+    }
+    let (focal_indices, principal_indices, extra_start): (&[usize], [usize; 2], usize) =
+        match camera.model_id {
+            0 => (&[0], [1, 2], 3),
+            1 => (&[0, 1], [2, 3], 4),
+            2 | 3 => (&[0], [1, 2], 3),
+            4 | 6 => (&[0, 1], [2, 3], 4),
+            _ => return Vec::new(),
+        };
+    let prefix = format!("camera_id={} model_id={}", camera.id, camera.model_id);
+    let mut details = Vec::new();
+    if camera.width == 0 || camera.height == 0 {
+        details.push(format!(
+            "{prefix} field=dimensions value={}x{} required=positive",
+            camera.width, camera.height
+        ));
+    }
+    if camera.params.len() < extra_start {
+        details.push(format!(
+            "{prefix} field=parameter_count value={} required_at_least={extra_start}",
+            camera.params.len()
+        ));
+    }
+    let max_dimension = camera.width.max(camera.height) as f64;
+    for (index, value) in camera.params.iter().enumerate() {
+        let constraint = if !value.is_finite() {
+            Some("required=finite".to_owned())
+        } else if focal_indices.contains(&index) && !(0.1..=10.).contains(&(value / max_dimension))
+        {
+            Some(format!(
+                "normalized_value={} allowed_normalized_range=[0.1,10]",
+                value / max_dimension
+            ))
+        } else if index == principal_indices[0] && !(0. ..=camera.width as f64).contains(value) {
+            Some(format!("allowed_range=[0,{}]", camera.width))
+        } else if index == principal_indices[1] && !(0. ..=camera.height as f64).contains(value) {
+            Some(format!("allowed_range=[0,{}]", camera.height))
+        } else if index >= extra_start && value.abs() > 1. {
+            Some("allowed_range=[-1,1]".to_owned())
+        } else {
+            None
+        };
+        if let Some(constraint) = constraint {
+            details.push(format!(
+                "{prefix} parameter_index={index} value={value} {constraint}"
+            ));
+        }
+        if details.len() >= 8 {
+            break;
+        }
+    }
+    details
+}
+
 fn read_count(path: &Path) -> Result<u64> {
     let mut value = [0; 8];
     File::open(path)?.read_exact(&mut value)?;
@@ -374,8 +434,14 @@ fn read_count(path: &Path) -> Result<u64> {
 
 fn assess_model(model: &Path, cancel: &CancellationToken) -> Result<Option<ModelAssessment>> {
     check_cancel(cancel)?;
-    if !model.join("cameras.bin").is_file() {
-        return Ok(None);
+    let camera_path = model.join("cameras.bin");
+    match std::fs::symlink_metadata(&camera_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(SplatError::InvalidPath(camera_path));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     }
     let cameras = read_cameras(model)?;
     check_cancel(cancel)?;
@@ -402,6 +468,7 @@ fn assess_model(model: &Path, cancel: &CancellationToken) -> Result<Option<Model
             registered_images: image_count,
             points_3d,
             valid_intrinsics: true,
+            invalid_camera_parameters: Vec::new(),
         }));
     }
     let registered = read_registered_images(model)?;
@@ -426,6 +493,12 @@ fn assess_model(model: &Path, cancel: &CancellationToken) -> Result<Option<Model
             .iter()
             .filter(|camera| used_cameras.contains(&camera.id))
             .all(valid_camera),
+        invalid_camera_parameters: cameras
+            .iter()
+            .filter(|camera| used_cameras.contains(&camera.id))
+            .flat_map(invalid_camera_parameters)
+            .take(8)
+            .collect(),
     }))
 }
 
@@ -1028,6 +1101,39 @@ mod tests {
         assert!(!valid_camera(&camera));
         camera.params.clear();
         assert!(!valid_camera(&camera));
+    }
+
+    #[test]
+    fn invalid_intrinsics_diagnostic_reports_measured_parameter_and_original_bound() {
+        let mut camera = ColmapCamera {
+            id: 42,
+            model_id: 2,
+            model: "SIMPLE_RADIAL".into(),
+            width: 2560,
+            height: 3840,
+            params: vec![27380., 1280., 1920., 1.93],
+        };
+        let details = invalid_camera_parameters(&camera);
+        assert_eq!(
+            details,
+            ["camera_id=42 model_id=2 parameter_index=3 value=1.93 allowed_range=[-1,1]"]
+        );
+        camera.params[3] = 0.;
+        camera.params[0] = 38401.;
+        let details = invalid_camera_parameters(&camera).join("\n");
+        assert!(details.contains("parameter_index=0 value=38401"));
+        assert!(details.contains("allowed_normalized_range=[0.1,10]"));
+        camera.params[0] = 38400.;
+        assert!(invalid_camera_parameters(&camera).is_empty());
+        let root = tempfile::tempdir().unwrap();
+        model(&root.path().join("0"), 3, 1.93);
+        let assessment = assess_output(root.path(), &CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(assessment.invalid_camera_parameters.len(), 1);
+        assert!(assessment.invalid_camera_parameters[0].contains("parameter_index=3 value=1.93"));
+        assert!(!assessment.invalid_camera_parameters[0]
+            .contains(root.path().to_string_lossy().as_ref()));
     }
 
     #[test]

@@ -35,6 +35,8 @@ mod feature_progress_tests;
 mod input_dataset;
 #[path = "inputs_runner.rs"]
 mod inputs_runner;
+#[path = "legacy_bridge_recovery.rs"]
+mod legacy_bridge_recovery;
 #[path = "legacy_work_order.rs"]
 mod legacy_work_order;
 #[cfg(test)]
@@ -49,6 +51,8 @@ mod repeated_reshoot_validation;
 mod reshoot_runner;
 #[path = "retry_archive.rs"]
 mod retry_archive;
+#[path = "working_database.rs"]
+mod working_database;
 
 use crate::{
     engines::{
@@ -120,6 +124,11 @@ pub struct PreparedFrames {
     pub has_alpha: bool,
     pub working_width: u32,
     pub working_height: u32,
+}
+
+enum LegacyBridgeAttempt {
+    Accepted(PathBuf, ReconstructionReport),
+    GeometryRejected(SplatError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,7 +714,11 @@ impl PipelineRunner {
         if result.is_ok() {
             activity.finish();
         }
-        result
+        result.map_err(|error| {
+            error.with_io_diagnostic(
+                "artifact_operation=validate_and_capture\npath_role=work_artifacts",
+            )
+        })
     }
 
     pub fn with_inputs(mut self, inputs: Option<super::inputs::GenerationInputs>) -> Self {
@@ -2648,6 +2661,9 @@ impl PipelineRunner {
         if state.retry_cache_pending.is_empty() {
             return Ok(());
         }
+        if state.database_recovery_pending.is_some() {
+            self.validate_database_rebuild_base(paths, state).await?;
+        }
         self.retry_preparation_step(
             paths,
             RetryPreparationOperation::WriteRetryReuseBarrier,
@@ -3239,6 +3255,51 @@ impl PipelineRunner {
                 "项目档位与检查点不一致，无法安全继续".into(),
             ));
         }
+        if let Some(candidate) = crate::pipeline::artifacts::recover_collection_candidate(
+            &paths,
+            &state,
+            &self.process_manager.child_token(),
+        )
+        .await?
+        {
+            let output = state.validated_output.clone().ok_or_else(|| {
+                SplatError::Process(legacy_work_order::UNRESTORABLE_RECIPE.into())
+            })?;
+            let warning = state
+                .inputs
+                .as_ref()
+                .and_then(crate::pipeline::inputs::source_adoption_warning);
+            return self
+                .publish_work_order(
+                    &project_manager,
+                    &paths,
+                    metadata,
+                    &mut state,
+                    &candidate,
+                    output,
+                    "continued-training".into(),
+                    warning,
+                )
+                .await;
+        }
+        if state.inputs.is_none()
+            && legacy_bridge_recovery::recover_pending(
+                &paths,
+                &mut state,
+                &self.process_manager.child_token(),
+            )
+            .await?
+        {
+            self.retry_preparation_step(
+                &paths,
+                RetryPreparationOperation::WriteRetryReuseBarrier,
+                "project_state",
+                Some("colmap"),
+                project_manager.write_state_for_preparation(&paths.state, &state),
+            )
+            .await?;
+            legacy_bridge_recovery::acknowledge_rollback(&paths).await?;
+        }
         self.prepare_continuation(&project_manager, &paths, &mut state)
             .await?;
         if self
@@ -3254,11 +3315,9 @@ impl PipelineRunner {
             self.reconcile_collection_bridge(&project_manager, &paths, &mut state)
                 .await?;
         }
-        if state.inputs.is_some()
-            && !(state.brush_complete
-                && state.validated_output.is_some()
-                && state.brush_training.dataset_identity.is_some())
-        {
+        self.recover_work_order_database(&project_manager, &paths, &mut state)
+            .await?;
+        if state.inputs.is_some() {
             self.apply_collection_focal_preflight(&project_manager, &paths, &mut state)
                 .await?;
         }
@@ -3314,6 +3373,8 @@ impl PipelineRunner {
             .await?;
         }
         self.prepare_continuation(&project_manager, &paths, &mut state)
+            .await?;
+        self.finish_database_rebuild(&project_manager, &paths, &mut state)
             .await?;
         if state.brush_complete {
             if let Some(candidate) = work_order_candidate(&paths, &state) {
@@ -5004,7 +5065,10 @@ impl PipelineRunner {
             }
         })
         .await
-        .map_err(|e| SplatError::Process(e.to_string()))??;
+        .map_err(|e| SplatError::Process(e.to_string()))?
+        .map_err(|error| error.with_io_diagnostic(
+            "training_preparation_operation=calculate_splat_budget\npath_role=training_images_and_model\nio_substep=read_and_validate"
+        ))?;
         self.events.send(
             PipelineStage::TrainingSplats, Some(PipelineEngine::System), EventKind::Log,
             EventLevel::Info, None, false,
@@ -5046,7 +5110,9 @@ impl PipelineRunner {
                 resolved.preset.max_splats =
                     Some(resolved.preset.max_splats.map_or(cap, |old| old.min(cap)));
                 state.brush_training.resolved = Some(resolved);
-                project_manager.write_state(&paths.state, state).await?;
+                project_manager
+                    .write_state_for_training(&paths.state, state)
+                    .await?;
             }
         }
         self.prepare_brush_observation(state);
@@ -5104,9 +5170,20 @@ impl PipelineRunner {
             Some(first_observer),
         )
         .await;
+        if matches!(&first, Err(SplatError::Cancelled)) {
+            return first;
+        }
         if state.brush_training.oom_retry_used && first_started.load(Ordering::Relaxed) {
             state.brush_training.oom_retry_started = true;
-            project_manager.write_state(&paths.state, state).await?;
+            if let Err(write_error) = project_manager
+                .write_state_for_training(&paths.state, state)
+                .await
+            {
+                return Err(match first {
+                    Err(engine_error) => write_error.with_previous_attempt(engine_error),
+                    Ok(_) => write_error,
+                });
+            }
             self.mark_automatic_retry();
         }
 
@@ -5161,7 +5238,12 @@ impl PipelineRunner {
                     _ => None,
                 };
                 state.brush_training.resolved = Some(downgraded);
-                project_manager.write_state(&paths.state, state).await?;
+                if let Err(write_error) = project_manager
+                    .write_state_for_training(&paths.state, state)
+                    .await
+                {
+                    return Err(write_error.with_previous_attempt(error));
+                }
                 self.events.send(
                     PipelineStage::TrainingSplats,
                     Some(PipelineEngine::Brush),
@@ -5205,9 +5287,21 @@ impl PipelineRunner {
                     Some(retry_observer),
                 )
                 .await;
+                if matches!(&retried, Err(SplatError::Cancelled)) {
+                    return retried;
+                }
                 if retry_started.load(Ordering::Relaxed) {
                     state.brush_training.oom_retry_started = true;
-                    project_manager.write_state(&paths.state, state).await?;
+                    if let Err(write_error) = project_manager
+                        .write_state_for_training(&paths.state, state)
+                        .await
+                    {
+                        let write_error = write_error.with_previous_attempt(error);
+                        return Err(match retried {
+                            Err(retry_error) => write_error.with_previous_attempt(retry_error),
+                            Ok(_) => write_error,
+                        });
+                    }
                     self.mark_automatic_retry();
                 }
                 retried.map_err(|retry_error| retry_error.with_previous_attempt(error))
@@ -5303,16 +5397,17 @@ impl PipelineRunner {
             BridgeBackfillStatus::Completed => {
                 if let Some(relative) = state.bridge_backfill.selected_model.as_deref() {
                     let model = paths.colmap.join(relative);
-                    if let Ok(report) = ReconstructionValidator::validate_with_input_images(
-                        prepared.extracted_frames,
-                        &model,
-                    ) {
+                    if let Some((model, report)) =
+                        colmap::select_reconstruction_model(&model, prepared.extracted_frames)?
+                    {
                         return Ok((model, report));
                     }
                 }
-                state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
-                project_manager.write_state(&paths.state, state).await?;
-                return Ok((initial_model, initial_report));
+                // A missing completed output is not evidence that the original
+                // database/frames are still the pre-Bridge set.
+                return Err(SplatError::Process(
+                    legacy_work_order::UNRESTORABLE_RECIPE.into(),
+                ));
             }
             BridgeBackfillStatus::NotEvaluated | BridgeBackfillStatus::Running => {}
         }
@@ -5337,28 +5432,7 @@ impl PipelineRunner {
         let bridge_plan = if state.bridge_backfill.status == BridgeBackfillStatus::Running {
             state.bridge_backfill.plan.clone().unwrap_or_default()
         } else {
-            let registered = match read_registered_source_indices(&initial_model) {
-                Ok(indices) => indices,
-                Err(error) => {
-                    state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
-                    project_manager.write_state(&paths.state, state).await?;
-                    self.events.send(
-                        PipelineStage::ValidatingReconstruction,
-                        Some(PipelineEngine::System),
-                        EventKind::Log,
-                        EventLevel::Warning,
-                        Some(1.0),
-                        false,
-                        format!(
-                            "Bridge Backfill 无法读取初始注册时间线，继续使用初始模型：{error}"
-                        ),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Ok((initial_model, initial_report));
-                }
-            };
+            let registered = read_registered_source_indices(&initial_model)?;
             let frame_plan = prepared.plan.clone();
             let registered_images = initial_report.registered_images;
             let cancellation = self.process_manager.child_token();
@@ -5397,8 +5471,6 @@ impl PipelineRunner {
                 );
                 return Ok((initial_model, initial_report));
             }
-            state.bridge_backfill.status = BridgeBackfillStatus::Running;
-            project_manager.write_state(&paths.state, state).await?;
             plan
         };
 
@@ -5414,22 +5486,23 @@ impl PipelineRunner {
         .await
         .map_err(|e| SplatError::Process(e.to_string()))??;
         if additional.len() != bridge_plan.selected_frame_indices.len() {
-            state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
-            project_manager.write_state(&paths.state, state).await?;
-            self.events.send(
-                PipelineStage::ValidatingReconstruction,
-                Some(PipelineEngine::System),
-                EventKind::Log,
-                EventLevel::Warning,
-                Some(1.0),
-                false,
-                "Bridge Backfill 检查点与候选池不一致，继续使用初始模型",
-                None,
-                None,
-                None,
-            );
-            return Ok((initial_model, initial_report));
+            return Err(SplatError::Process(
+                legacy_work_order::UNRESTORABLE_RECIPE.into(),
+            ));
         }
+
+        legacy_bridge_recovery::prepare(
+            paths,
+            state,
+            prepared,
+            &bridge_plan,
+            &initial_model,
+            &initial_report,
+            &self.process_manager.child_token(),
+        )
+        .await?;
+        state.bridge_backfill.status = BridgeBackfillStatus::Running;
+        project_manager.write_state(&paths.state, state).await?;
 
         if let Some(first) = bridge_plan.selection_trace.first() {
             self.events.send(
@@ -5492,7 +5565,7 @@ impl PipelineRunner {
             )
             .await;
         match attempt {
-            Ok((model, report)) => {
+            Ok(LegacyBridgeAttempt::Accepted(model, report)) => {
                 let bridge_duration_ms = bridge_started.elapsed().as_millis() as u64;
                 state.bridge_backfill.status = BridgeBackfillStatus::Completed;
                 state.bridge_backfill.selected_model = Some(relative_model_path(paths, &model));
@@ -5523,42 +5596,44 @@ impl PipelineRunner {
                 );
                 Ok((model, report))
             }
-            Err(error) => {
+            Ok(LegacyBridgeAttempt::GeometryRejected(error)) => {
                 let bridge_duration_ms = bridge_started.elapsed().as_millis() as u64;
-                remove_bridge_outputs(
-                    &paths.frames,
-                    &paths.colmap_frames,
-                    &paths.masks,
-                    &additional,
-                    prepared.has_alpha,
-                )
-                .await;
-                let added = additional
-                    .iter()
-                    .map(|frame| frame.source_frame_index)
-                    .collect::<HashSet<_>>();
-                prepared
-                    .plan
-                    .selected_frames
-                    .retain(|frame| !added.contains(&frame.source_frame_index));
-                prepared.extracted_frames = bridge_plan.initial_input_images;
-                prepared.mask_count = if prepared.has_alpha {
-                    bridge_plan.initial_input_images
-                } else {
-                    0
-                };
-                prepared.plan.estimated_frames = bridge_plan.initial_input_images;
-                if let Some(video) = prepared.video.as_ref() {
-                    prepared.plan.retention_ratio =
-                        bridge_plan.initial_input_images as f64 / video.total_frames.max(1) as f64;
-                    prepared.plan.sampling_fps =
-                        bridge_plan.initial_input_images as f64 / video.duration.max(0.001);
+                let seed = initial_model.clone();
+                let count = bridge_plan.initial_input_images;
+                let (_, verified) = crate::presets::spawn_pipeline_blocking(move || {
+                    colmap::select_reconstruction_model(&seed, count)
+                })
+                .await
+                .map_err(|error| SplatError::Process(error.to_string()))??
+                .ok_or_else(|| {
+                    SplatError::Process(legacy_work_order::UNRESTORABLE_RECIPE.into())
+                })?;
+                if verified.registered_images != initial_report.registered_images
+                    || verified.points_3d != initial_report.points_3d
+                {
+                    return Err(SplatError::Process(
+                        legacy_work_order::UNRESTORABLE_RECIPE.into(),
+                    ));
                 }
-                update_frame_checkpoint(state, prepared);
-                state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
-                state.bridge_backfill.selected_model = state.bridge_backfill.initial_model.clone();
-                state.bridge_backfill.duration_ms = Some(bridge_duration_ms);
-                project_manager.write_state(&paths.state, state).await?;
+                let rollback = async {
+                    if self.process_manager.child_token().is_cancelled() {
+                        return Err(SplatError::Cancelled);
+                    }
+                    legacy_bridge_recovery::mark_rollback(paths, bridge_duration_ms).await?;
+                    legacy_bridge_recovery::recover_pending(
+                        paths,
+                        state,
+                        &self.process_manager.child_token(),
+                    )
+                    .await?;
+                    legacy_bridge_recovery::restore_prepared(paths, prepared)?;
+                    project_manager.write_state(&paths.state, state).await?;
+                    legacy_bridge_recovery::acknowledge_rollback(paths).await
+                }
+                .await;
+                if let Err(restore_error) = rollback {
+                    return Err(restore_error.with_previous_attempt(error));
+                }
                 self.events.send(
                     PipelineStage::ValidatingReconstruction,
                     Some(PipelineEngine::System),
@@ -5570,12 +5645,13 @@ impl PipelineRunner {
                         "Bridge Backfill 失败并回退可用初始模型（耗时 {}）：{error}",
                         format_duration(bridge_duration_ms)
                     ),
-                    Some(initial_report.registered_images),
-                    Some(initial_report.input_images),
+                    Some(verified.registered_images),
+                    Some(verified.input_images),
                     Some("images"),
                 );
-                Ok((initial_model, initial_report))
+                Ok((initial_model, verified))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -5595,7 +5671,7 @@ impl PipelineRunner {
         initial_model: &Path,
         initial_report: &ReconstructionReport,
         additional: &[PlannedFrame],
-    ) -> Result<(PathBuf, ReconstructionReport)> {
+    ) -> Result<LegacyBridgeAttempt> {
         self.authorize_external_path(&metadata.source_path)?;
         self.events.stage(
             PipelineStage::ValidatingReconstruction,
@@ -5754,7 +5830,7 @@ impl PipelineRunner {
         let input_model = initial_model
             .strip_prefix(&paths.colmap)
             .unwrap_or(initial_model);
-        colmap::map_from_existing(
+        let mapped = colmap::map_from_existing(
             &self.engines.colmap,
             database,
             colmap_images,
@@ -5772,16 +5848,35 @@ impl PipelineRunner {
             )),
             gpu_index,
         )
-        .await?;
-        let (model, report) =
-            best_sparse_model_with_input_count(&bridge_sparse, prepared.extracted_frames).await?;
+        .await;
+        if let Err(error) = mapped {
+            return if colmap::is_recoverable_mapper_geometry_failure(&error) {
+                Ok(LegacyBridgeAttempt::GeometryRejected(error))
+            } else {
+                Err(error)
+            };
+        }
+        let sparse = bridge_sparse.clone();
+        let count = prepared.extracted_frames;
+        let candidate = crate::presets::spawn_pipeline_blocking(move || {
+            colmap::select_reconstruction_model(&sparse, count)
+        })
+        .await
+        .map_err(|error| SplatError::Process(error.to_string()))??;
+        let Some((model, report)) = candidate else {
+            return Ok(LegacyBridgeAttempt::GeometryRejected(SplatError::Process(
+                "COLMAP did not produce a usable sparse model".into(),
+            )));
+        };
         if report.registered_images < initial_report.registered_images {
-            return Err(SplatError::Process(format!(
-                "Bridge model registered fewer images than the initial model ({} < {})",
-                report.registered_images, initial_report.registered_images
+            return Ok(LegacyBridgeAttempt::GeometryRejected(SplatError::Process(
+                format!(
+                    "Bridge model registered fewer images than the initial model ({} < {})",
+                    report.registered_images, initial_report.registered_images
+                ),
             )));
         }
-        Ok((model, report))
+        Ok(LegacyBridgeAttempt::Accepted(model, report))
     }
 
     fn process_observer(
@@ -7881,7 +7976,11 @@ fn work_order_candidate(paths: &ProjectPaths, state: &PipelineStateFile) -> Opti
 
 async fn read_training_dataset_identity(dataset: &Path) -> Result<String> {
     let value: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(dataset.join("inputs-dataset.json")).await?)?;
+        serde_json::from_slice(&tokio::fs::read(dataset.join("inputs-dataset.json")).await
+            .map_err(SplatError::from)
+            .map_err(|error| error.with_io_diagnostic(
+                "training_preparation_operation=read_dataset_identity\npath_role=training_dataset_manifest"
+            ))?)?;
     value
         .get(0)
         .and_then(serde_json::Value::as_str)
@@ -8255,53 +8354,28 @@ fn best_sparse_model_blocking(
     frames: &Path,
     sparse: &Path,
 ) -> Result<(PathBuf, ReconstructionReport)> {
-    // COLMAP normally writes numbered children such as `sparse/0`, while
-    // continuation from `--input_path` may write directly to the requested
-    // directory. Accept both layouts and keep the model with most registered
-    // images.
-    let mut best = ReconstructionValidator::validate(frames, sparse)
-        .ok()
-        .map(|report| (sparse.to_path_buf(), report));
-    for entry in std::fs::read_dir(sparse)? {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if let Ok(report) = ReconstructionValidator::validate(frames, &path) {
-            if best
-                .as_ref()
-                .is_none_or(|(_, current)| report.registered_images > current.registered_images)
-            {
-                best = Some((path, report));
-            }
+    let mut input_images = 0;
+    for entry in std::fs::read_dir(frames)? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("jpg")
+                || extension.eq_ignore_ascii_case("jpeg")
+                || extension.eq_ignore_ascii_case("png")
+        }) && entry.file_type()?.is_file()
+        {
+            input_images += 1;
         }
     }
-    best.ok_or_else(|| SplatError::Process("COLMAP 未生成完整的稀疏模型".into()))
+    colmap::select_reconstruction_model(sparse, input_images)?
+        .ok_or_else(|| SplatError::Process("COLMAP 未生成完整的稀疏模型".into()))
 }
 
 fn best_sparse_model_with_input_count_blocking(
     sparse: &Path,
     input_images: u64,
 ) -> Result<(PathBuf, ReconstructionReport)> {
-    let mut best = ReconstructionValidator::validate_with_input_images(input_images, sparse)
-        .ok()
-        .map(|report| (sparse.to_path_buf(), report));
-    for entry in std::fs::read_dir(sparse)? {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if let Ok(report) = ReconstructionValidator::validate_with_input_images(input_images, &path)
-        {
-            if best
-                .as_ref()
-                .is_none_or(|(_, current)| report.registered_images > current.registered_images)
-            {
-                best = Some((path, report));
-            }
-        }
-    }
-    best.ok_or_else(|| SplatError::Process("COLMAP did not produce a usable sparse model".into()))
+    colmap::select_reconstruction_model(sparse, input_images)?
+        .ok_or_else(|| SplatError::Process("COLMAP did not produce a usable sparse model".into()))
 }
 
 fn relative_model_path(paths: &ProjectPaths, model: &Path) -> String {
@@ -8404,22 +8478,30 @@ fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
     }
 }
 
+#[cfg(test)]
 async fn remove_bridge_outputs(
     frames: &Path,
     colmap_frames: &Path,
     masks: &Path,
     additional: &[PlannedFrame],
     has_alpha: bool,
-) {
+) -> Result<()> {
     let extension = if has_alpha { "png" } else { "jpg" };
     for frame in additional {
         let name = format!("frame_{:010}.{extension}", frame.source_frame_index);
-        let _ = tokio::fs::remove_file(frames.join(&name)).await;
-        let _ = tokio::fs::remove_file(colmap_frames.join(&name)).await;
+        let mut files = vec![frames.join(&name), colmap_frames.join(&name)];
         if has_alpha {
-            let _ = tokio::fs::remove_file(masks.join(format!("{name}.png"))).await;
+            files.push(masks.join(format!("{name}.png")));
+        }
+        for path in files {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
+    Ok(())
 }
 
 pub fn default_engine_paths(engine_root: Option<PathBuf>) -> EnginePaths {
@@ -9015,7 +9097,9 @@ mod tests {
                 assert_eq!(&std::fs::read(file).unwrap(), bytes);
             }
             let count = output.frame_count;
-            remove_bridge_outputs(&frames, &colmap, &masks, &added, alpha).await;
+            remove_bridge_outputs(&frames, &colmap, &masks, &added, alpha)
+                .await
+                .unwrap();
             assert_eq!(
                 validate_extraction(&frames, &colmap, &masks, alpha)
                     .await
@@ -10218,16 +10302,41 @@ mod tests {
     }
 
     fn write_validator_model(root: &Path, registered: u64, points: u64) {
-        std::fs::create_dir_all(root).unwrap();
-        for (name, count) in [
-            ("cameras.bin", 1_u64),
-            ("images.bin", registered),
-            ("points3D.bin", points),
-        ] {
-            let mut bytes = count.to_le_bytes().to_vec();
-            bytes.extend_from_slice(&[0_u8; 8]);
-            std::fs::write(root.join(name), bytes).unwrap();
+        use crate::reconstruction::direct_input::{Model, ModelImage, Point};
+        use crate::video::panorama::PosedImage;
+        Model {
+            cameras: vec![ColmapCamera {
+                id: 1,
+                model_id: 2,
+                model: "SIMPLE_RADIAL".into(),
+                width: 100,
+                height: 100,
+                params: vec![100., 50., 50., 0.],
+            }],
+            images: (1..=registered)
+                .map(|id| ModelImage {
+                    pose: PosedImage {
+                        id: id as u32,
+                        camera_id: 1,
+                        name: format!("frame_{id:010}.jpg"),
+                        qvec: [1., 0., 0., 0.],
+                        tvec: [id as f64, 0., 0.],
+                    },
+                    observations: vec![],
+                })
+                .collect(),
+            points: (1..=points)
+                .map(|id| Point {
+                    id,
+                    xyz: [0., 0., 1.],
+                    rgb: [128; 3],
+                    error: 0.,
+                    track: vec![],
+                })
+                .collect(),
         }
+        .write(root)
+        .unwrap();
     }
 
     #[test]

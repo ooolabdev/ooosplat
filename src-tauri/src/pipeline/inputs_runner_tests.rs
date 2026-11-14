@@ -1,5 +1,65 @@
 use super::*;
 
+#[tokio::test]
+async fn database_recovery_keeps_abandoned_gps_visual_only_without_reopening_source() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+    let manager = ProjectManager::for_diagnostics(root.path().into());
+    let runner = PipelineRunner::new(
+        EnginePaths::from_root(root.path().join("missing-engines")),
+        |_| {},
+    )
+    .with_input_boundary(Some(root.path().join("authorized")));
+    let metadata = ProjectMetadata {
+        project_path: paths.project.clone(),
+        ..Default::default()
+    };
+    let mut state = PipelineStateFile::created(Quality::Balanced);
+    state.gps = Some(crate::reconstruction::gps::Checkpoint {
+        status: "fallback".into(),
+        fingerprint: "previous-observations".into(),
+        input_identity: Some("previous-visual-model".into()),
+        database_recovery_visual_only: true,
+        ..crate::reconstruction::gps::Checkpoint::pending()
+    });
+    let mut checkpoint = InputCheckpoint::new(GenerationInputs::Materials { items: vec![] });
+    let mut source = preparation_source("photos", &["source.png"], None);
+    source.originals = vec![root.path().join("outside-authorization/missing.png")];
+    checkpoint.sources.push(source);
+    let visual = paths.colmap.join("new-visual");
+    // No manifest, no source image, no engine, and even no readable model:
+    // the frozen decision must return before GPS reads or launches anything.
+    let before = serde_json::to_value(&state).unwrap();
+    let result = runner
+        .collection_gps(
+            &manager,
+            &paths,
+            &metadata,
+            &mut state,
+            &mut checkpoint,
+            &visual,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, visual);
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    assert!(!paths.project.exists());
+    runner.process_manager.cancel();
+    assert!(matches!(
+        runner
+            .collection_gps(
+                &manager,
+                &paths,
+                &metadata,
+                &mut state,
+                &mut checkpoint,
+                &visual
+            )
+            .await,
+        Err(SplatError::Cancelled)
+    ));
+}
+
 #[test]
 fn collection_feature_limits_match_071_for_ordinary_and_erp_inputs() {
     for (quality, ordinary, panorama, features) in [

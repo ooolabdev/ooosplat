@@ -22,6 +22,7 @@ pub(crate) enum RetryPreparationOperation {
     CreateRetryArchive,
     ArchiveRetryCache,
     WriteRetryArchiveProgress,
+    RecoverWorkingDatabase,
 }
 
 impl RetryPreparationOperation {
@@ -33,6 +34,7 @@ impl RetryPreparationOperation {
             Self::CreateRetryArchive => "create_retry_archive",
             Self::ArchiveRetryCache => "archive_retry_cache",
             Self::WriteRetryArchiveProgress => "write_retry_archive_progress",
+            Self::RecoverWorkingDatabase => "recover_working_database",
         }
     }
 }
@@ -275,6 +277,14 @@ impl PreparationContext {
             let mut record = self.record.lock().unwrap_or_else(|p| p.into_inner());
             record.registered_log.get_or_insert((path, offset));
         }
+    }
+
+    pub(crate) async fn record_database_recovery(&self, outcome: &str, reason: &str) {
+        self.append_line(format!(
+            "{} preparation_id={} operation=recover_working_database path_role=colmap_database outcome={} reason={}\n",
+            chrono::Utc::now().to_rfc3339(), self.preparation_id,
+            label(outcome), label(reason),
+        )).await;
     }
 
     async fn append_disk(&self, line: &str) -> Option<(PathBuf, u64)> {

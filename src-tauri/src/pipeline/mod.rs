@@ -21,6 +21,7 @@ pub(crate) mod retry_preparation;
 pub mod runner;
 pub mod runtime;
 pub mod splat_budget;
+pub(crate) mod sqlite_recovery;
 pub mod state;
 pub mod work_order;
 

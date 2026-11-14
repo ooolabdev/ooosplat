@@ -10,6 +10,14 @@ use crate::{
 
 mod initialization;
 #[cfg(test)]
+mod mapper_native_smoke;
+mod mapper_outcome;
+pub(crate) use mapper_outcome::{
+    is_recoverable_mapper_geometry_failure, select_reconstruction_model,
+};
+#[cfg(test)]
+mod initialization_recovery_tests;
+#[cfg(test)]
 mod initialization_runtime_tests;
 mod vocabulary;
 
@@ -193,23 +201,44 @@ pub(crate) async fn run_colmap(
         .first()
         .map(|arg| arg.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Collect evidence before the process capture/display limits. This wrapper
+    // is invocation-local, so an appended log or a previous seed cannot decide
+    // whether the current failure is safe to treat as a geometric rejection.
+    let evidence = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::failure::EngineFailureEvidence::default(),
+    ));
+    let observed_evidence = evidence.clone();
+    let combined_observer: ProcessObserver = std::sync::Arc::new(move |update| {
+        if let crate::process::ProcessUpdate::Line { line, .. } = &update {
+            observed_evidence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe(line);
+        }
+        if let Some(observer) = &observer {
+            observer(update);
+        }
+    });
     let output = manager
         .run(ProcessSpec {
             executable: executable.to_path_buf(),
             args,
             working_directory: Some(working_directory.to_path_buf()),
             log_path: Some(log_path),
-            observer,
+            observer: Some(combined_observer),
         })
         .await?;
     if output.success {
         Ok(())
     } else {
         Err(SplatError::EngineProcess(Box::new(
-            crate::failure::EngineProcessFailure::from_output(
+            crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Colmap,
                 &operation,
                 &output,
+                &evidence
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
             ),
         )))
     }
@@ -227,7 +256,7 @@ async fn run_mapper_with_ceres_fallback(
     observer: Option<ProcessObserver>,
     selection: &super::colmap_ba::BaSelection,
 ) -> Result<()> {
-    let used_caspar = Box::pin(run_mapper_with_ceres_fallback_once(
+    let attempt = Box::pin(run_mapper_with_ceres_fallback_once(
         executable,
         caspar_args.clone(),
         ceres_args.clone(),
@@ -238,7 +267,9 @@ async fn run_mapper_with_ceres_fallback(
         observer.clone(),
         selection,
     ))
-    .await?;
+    .await;
+    attempt.result?;
+    let used_caspar = attempt.used_caspar;
     let (actual_args, actual_selection) = if selection.gpu_index.is_some() && !used_caspar {
         let mut args = ceres_args.clone();
         super::colmap_ba::append_explicit_ceres_options(&mut args);
@@ -266,6 +297,11 @@ async fn run_mapper_with_ceres_fallback(
 /// BA compatibility fallback for exactly one geometric initialization attempt.
 /// The return value freezes the backend actually used, so a later seed search
 /// cannot accidentally re-enable a Caspar backend already disabled in session.
+struct MapperAttemptOutcome {
+    used_caspar: bool,
+    result: Result<()>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_mapper_with_ceres_fallback_once(
     executable: &Path,
@@ -277,8 +313,13 @@ async fn run_mapper_with_ceres_fallback_once(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     selection: &super::colmap_ba::BaSelection,
-) -> Result<bool> {
-    guard_mapper_output(output, working_directory, &ceres_args)?;
+) -> MapperAttemptOutcome {
+    if let Err(error) = guard_mapper_output(output, working_directory, &ceres_args) {
+        return MapperAttemptOutcome {
+            used_caspar: selection.gpu_index.is_some(),
+            result: Err(error),
+        };
+    }
     let result = run_colmap(
         executable,
         caspar_args,
@@ -289,12 +330,25 @@ async fn run_mapper_with_ceres_fallback_once(
     )
     .await;
     let Some(index) = selection.gpu_index else {
-        return result.map(|()| false);
+        return MapperAttemptOutcome {
+            used_caspar: false,
+            result,
+        };
     };
     let caspar_error = match result {
-        Ok(()) => return Ok(true),
+        Ok(()) => {
+            return MapperAttemptOutcome {
+                used_caspar: true,
+                result: Ok(()),
+            }
+        }
         Err(error) if should_retry_mapper_with_ceres(selection, &error) => error,
-        Err(error) => return Err(error),
+        Err(error) => {
+            return MapperAttemptOutcome {
+                used_caspar: true,
+                result: Err(error),
+            }
+        }
     };
 
     super::colmap_ba::disable_after_runtime_failure(
@@ -316,13 +370,25 @@ async fn run_mapper_with_ceres_fallback_once(
         caspar_error
     );
     if let Err(error) = guard_mapper_output(output, working_directory, &ceres_args) {
-        return Err(error.with_previous_attempt(caspar_error));
+        return MapperAttemptOutcome {
+            used_caspar: false,
+            result: Err(mapper_outcome::with_previous_mapper_attempt(
+                error,
+                caspar_error,
+            )),
+        };
     }
     if let Err(error) = reset_mapper_output(output).await {
-        return Err(error.with_previous_attempt(caspar_error));
+        return MapperAttemptOutcome {
+            used_caspar: false,
+            result: Err(mapper_outcome::with_previous_mapper_attempt(
+                error,
+                caspar_error,
+            )),
+        };
     }
     super::colmap_ba::append_explicit_ceres_options(&mut ceres_args);
-    match run_colmap(
+    let result = match run_colmap(
         executable,
         ceres_args,
         working_directory,
@@ -338,11 +404,18 @@ async fn run_mapper_with_ceres_fallback_once(
                 "[OOOSplat] Ceres fallback completed successfully; Caspar is disabled for this engine/GPU for the remainder of the application process.\n",
             )
             .await;
-            Ok(false)
+            Ok(())
         }
         // Cancellation/start/IO failures retain their own type; an earlier
         // Caspar failure must not override the final attempt's outcome.
-        Err(error) => Err(error.with_previous_attempt(caspar_error)),
+        Err(error) => Err(mapper_outcome::with_previous_mapper_attempt(
+            error,
+            caspar_error,
+        )),
+    };
+    MapperAttemptOutcome {
+        used_caspar: false,
+        result,
     }
 }
 
@@ -411,18 +484,26 @@ async fn recover_mapper_initialization(
     append_explanation(
         &log_path,
         &format!(
-            "[OOOSplat] Invalid cold Mapper intrinsics with {}/{} registered images; checking at most {} deterministic first-image initializations. Original images, masks, matches and geometric thresholds are unchanged.\n",
-            best.registered_images, seeds.input_images, seeds.seeds.len()
+            "[OOOSplat] Invalid cold Mapper intrinsics with {}/{} registered images; checking at most {} deterministic first-image initializations. Original images, masks, matches and geometric thresholds are unchanged.\n[OOOSplat] initialization_rejection=invalid_intrinsics\n{}\n",
+            best.registered_images, seeds.input_images, seeds.seeds.len(), best.invalid_camera_parameters.join("\n")
         ),
     )
     .await;
+    let mut rejected_attempts = Vec::new();
+    let mut last_attempt_was_geometry_failure = false;
     for (index, seed) in seeds.seeds.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(SplatError::Cancelled);
         }
-        let attempt = initialization::create_attempt_output(&output)?;
-        let args = initialization::recovery_args(&actual_args, &attempt, seed)?;
-        let ceres = initialization::recovery_args(&ceres_args, &attempt, seed)?;
+        let preparation = (|| {
+            let attempt = initialization::create_attempt_output(&output)?;
+            let args = initialization::recovery_args(&actual_args, &attempt, seed)?;
+            let ceres = initialization::recovery_args(&ceres_args, &attempt, seed)?;
+            Ok((attempt, args, ceres))
+        })();
+        let (attempt, args, ceres) = preparation.map_err(|error| {
+            mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts.clone())
+        })?;
         append_explanation(
             &log_path,
             &format!(
@@ -431,7 +512,7 @@ async fn recover_mapper_initialization(
             ),
         )
         .await;
-        let used_caspar = Box::pin(run_mapper_with_ceres_fallback_once(
+        let execution = Box::pin(run_mapper_with_ceres_fallback_once(
             executable,
             args,
             ceres,
@@ -442,24 +523,57 @@ async fn recover_mapper_initialization(
             observer.clone(),
             &selection,
         ))
-        .await?;
-        if selection.gpu_index.is_some() && !used_caspar {
+        .await;
+        // A failed Ceres fallback still disables Caspar for later seeds.
+        // Backend state is not conditional on a usable reconstruction.
+        if selection.gpu_index.is_some() && !execution.used_caspar {
             actual_args = ceres_args.clone();
             super::colmap_ba::append_explicit_ceres_options(&mut actual_args);
             selection = super::colmap_ba::ceres_selection(
                 "Ceres retained after Caspar compatibility fallback",
             );
         }
+        if let Err(error) = execution.result {
+            if is_recoverable_mapper_geometry_failure(&error) {
+                last_attempt_was_geometry_failure = true;
+                append_explanation(
+                    &log_path,
+                    &format!(
+                        "[OOOSplat] Initialization check {}/{} rejected geometrically; retaining the previous verified candidate and checking the remaining frozen seeds.\n{error}\n",
+                        index + 1,
+                        initialization::MAX_RECOVERY_SEEDS,
+                    ),
+                )
+                .await;
+                if let SplatError::EngineProcess(failure) = error {
+                    rejected_attempts.push(*failure);
+                }
+                continue;
+            }
+            return Err(mapper_outcome::with_previous_geometry_attempts(
+                error,
+                rejected_attempts,
+            ));
+        }
+        last_attempt_was_geometry_failure = false;
         let checked_attempt = attempt.clone();
         let check_cancel = cancel.clone();
         let candidate = crate::presets::spawn_pipeline_blocking(move || {
             initialization::assess_recovery_output(&checked_attempt, &check_cancel)
         })
         .await
+        .map_err(|error| SplatError::Process(format!("Mapper output inspection failed: {error}")))
+        .and_then(|result| result)
         .map_err(|error| {
-            SplatError::Process(format!("Mapper output inspection failed: {error}"))
-        })??;
+            mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts.clone())
+        })?;
         if let Some(candidate) = candidate {
+            if !candidate.valid_intrinsics {
+                append_explanation(&log_path, &format!(
+                    "[OOOSplat] Initialization check {}: initialization_rejection=invalid_intrinsics\n{}\n",
+                    index + 1, candidate.invalid_camera_parameters.join("\n"),
+                )).await;
+            }
             let checked_output = output.clone();
             let previous = best.clone();
             let check_cancel = cancel.clone();
@@ -472,9 +586,11 @@ async fn recover_mapper_initialization(
                 )
             })
             .await
+            .map_err(|error| SplatError::Process(format!("Mapper model admission failed: {error}")))
+            .and_then(|result| result)
             .map_err(|error| {
-                SplatError::Process(format!("Mapper model admission failed: {error}"))
-            })??;
+                mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts.clone())
+            })?;
             if let Some(promoted) = promoted {
                 best = promoted;
                 append_explanation(
@@ -495,8 +611,20 @@ async fn recover_mapper_initialization(
         return Err(SplatError::Cancelled);
     }
     if !best.valid_intrinsics {
-        return Err(SplatError::Process(
-            "COLMAP initialization produced invalid camera parameters; bounded alternative initializations did not produce a better valid reconstruction".into(),
+        if let Some(last) = last_attempt_was_geometry_failure
+            .then(|| rejected_attempts.pop())
+            .flatten()
+        {
+            return Err(mapper_outcome::with_previous_geometry_attempts(
+                SplatError::EngineProcess(Box::new(last)),
+                rejected_attempts,
+            ));
+        }
+        return Err(mapper_outcome::with_previous_geometry_attempts(
+            SplatError::Process(
+                "COLMAP initialization produced invalid camera parameters; bounded alternative initializations did not produce a better valid reconstruction".into(),
+            ),
+            rejected_attempts,
         ));
     }
     Ok(())
@@ -2476,6 +2604,48 @@ mod tests {
             assert_eq!(std::fs::read(base.join("seed")).unwrap(), b"seed unchanged");
             assert!(!output.join("partial").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn failed_ceres_attempt_still_reports_caspar_disabled_to_next_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let (executable, prefix) = fallback_script(root.path(), 1);
+        let output = root.path().join("native");
+        std::fs::create_dir(&output).unwrap();
+        let mut caspar = prefix.clone();
+        caspar.extend([
+            "CASPAR".into(),
+            "--output_path".into(),
+            output.clone().into_os_string(),
+        ]);
+        let mut ceres = prefix;
+        ceres.extend([
+            "CERES".into(),
+            "--output_path".into(),
+            output.clone().into_os_string(),
+        ]);
+        let outcome = run_mapper_with_ceres_fallback_once(
+            &executable,
+            caspar,
+            ceres,
+            &output,
+            root.path(),
+            root.path().join("colmap.log"),
+            &ProcessManager::new(),
+            None,
+            &super::super::colmap_ba::BaSelection {
+                gpu_index: Some(0),
+                detail: String::new(),
+            },
+        )
+        .await;
+        assert!(!outcome.used_caspar);
+        let SplatError::EngineProcess(failure) = outcome.result.unwrap_err() else {
+            panic!("the final process failure must remain structured");
+        };
+        assert_eq!(failure.termination.exit_code, Some(1));
+        assert_eq!(failure.previous_attempts.len(), 1);
+        assert_eq!(failure.previous_attempts[0].termination.exit_code, Some(7));
     }
 
     #[tokio::test]

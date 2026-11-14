@@ -162,6 +162,11 @@ impl PipelineRunner {
             native_runtime,
         ))
         .await
+        .map_err(|error| {
+            error.with_io_diagnostic(
+            "training_preparation_operation=prepare_training_dataset\npath_role=training_dataset"
+        )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

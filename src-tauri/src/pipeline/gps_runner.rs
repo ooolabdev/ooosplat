@@ -184,7 +184,7 @@ fn gps_mapper_args(options: GpsMapperOptions<'_>) -> Vec<OsString> {
 }
 
 impl PipelineRunner {
-    fn gps_log(&self, message: impl Into<String>, warning: bool) {
+    pub(super) fn gps_log(&self, message: impl Into<String>, warning: bool) {
         self.events.send(
             PipelineStage::Reconstructing,
             Some(PipelineEngine::System),
@@ -222,6 +222,10 @@ impl PipelineRunner {
             return Ok(None);
         };
         if checkpoint.version != gps::POLICY_VERSION {
+            return Ok(None);
+        }
+        if checkpoint.database_recovery_visual_only && checkpoint.status == "fallback" {
+            self.gps_log(gps::FALLBACK_MESSAGE, true);
             return Ok(None);
         }
         let fingerprint = gps::fingerprint(&records)?;
@@ -945,6 +949,7 @@ mod tests {
         use crate::failure::{EngineProcessFailure, FailureClassification};
         use crate::process::ProcessTermination;
         let failure = |termination, kind, detail: &str| EngineProcessFailure {
+            mapper_geometry_failure: false,
             last_splat_count: None,
             engine: PipelineEngine::Colmap,
             operation: "mapper".into(),
@@ -1120,6 +1125,41 @@ mod tests {
                 .await,
             Err(SplatError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn database_rebuild_does_not_renew_the_same_runs_gps_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+        let manager = ProjectManager::for_diagnostics(root.path().into());
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        );
+        let mut state = PipelineStateFile::created(Quality::Balanced);
+        state.gps = Some(Checkpoint {
+            status: "fallback".into(),
+            database_recovery_visual_only: true,
+            input_identity: Some("old-model-identity".into()),
+            ..Checkpoint::pending()
+        });
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(runner
+            .apply_gps(
+                &manager,
+                &paths,
+                &mut state,
+                vec![],
+                None,
+                &paths.colmap.join("missing-new-model"),
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        assert!(!paths.project.exists());
     }
 
     #[tokio::test]
