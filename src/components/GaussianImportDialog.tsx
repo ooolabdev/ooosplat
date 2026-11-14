@@ -2,6 +2,7 @@ import { CircleAlert, FileBox, LoaderCircle, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { beginGaussianImport, cancelGaussianImport, completeGaussianImport, probeGaussianImport } from "../lib/backend";
 import { convertGaussianImport } from "../lib/gaussianImport";
+import { formatBinarySize } from "../lib/fileSize";
 import type { GaussianImportProbe, ProjectSummary } from "../types/pipeline";
 import { localizePipelineMessage, useI18n } from "../i18n";
 import { inputAdmissionReason, type InputAdmissionReason } from "../lib/inputAdmission";
@@ -15,11 +16,7 @@ interface Props {
 
 const formatBytes = (bytes: number, locale: string) => {
   if (!Number.isFinite(bytes) || bytes <= 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value)} ${units[unit]}`;
+  return formatBinarySize(bytes, locale);
 };
 
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
