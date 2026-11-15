@@ -219,7 +219,12 @@ pub async fn resolve(
             AccelerationReasonCode::NoNvidiaGpu
         },
         reason: if selected.colmap_compatible {
-            format!("Using selected GPU {}", selected.name)
+            format!(
+                "已启用 {}（驱动 {}，Compute Capability {}）",
+                selected.name,
+                selected.driver.as_deref().unwrap_or_default(),
+                selected.compute_capability.as_deref().unwrap_or_default(),
+            )
         } else {
             format!("{} is used for training; COLMAP uses CPU", selected.name)
         },
