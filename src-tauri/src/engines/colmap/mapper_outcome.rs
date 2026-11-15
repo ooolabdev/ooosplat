@@ -20,7 +20,8 @@ pub(crate) fn is_recoverable_mapper_geometry_failure(error: &SplatError) -> bool
     }
 }
 
-/// Select the same largest/stably ordered model as before, without interpreting
+/// Honor an identity-bound initialization recovery selection, when present.
+/// Otherwise select the same largest/stably ordered model as before, without interpreting
 /// a permission error, broken model or missing member as an empty result.
 /// `None` means no model was produced, or a complete empty model was read.
 pub(crate) fn select_reconstruction_model(
@@ -35,6 +36,12 @@ pub(crate) fn select_reconstruction_model(
     let root_meta = std::fs::symlink_metadata(root)?;
     if !root_meta.file_type().is_dir() {
         return Err(SplatError::InvalidPath(root.into()));
+    }
+    if let Some(selected) = super::initialization_selection::read(root)? {
+        let report = inspect_candidate(&selected, input_images)?.ok_or_else(|| {
+            SplatError::Process("Selected Mapper initialization model is empty".into())
+        })?;
+        return Ok(Some((selected, report)));
     }
     let mut children = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -304,5 +311,144 @@ mod tests {
         ] {
             assert!(!is_recoverable_mapper_geometry_failure(&error));
         }
+    }
+
+    async fn save_selection(root: &Path, selected: &Path) {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let assessment = super::super::initialization::assess_model(selected, &cancel)
+            .unwrap()
+            .unwrap();
+        super::super::initialization_selection::save(root, &assessment, &cancel)
+            .await
+            .unwrap();
+    }
+
+    fn selection_path(root: &Path) -> PathBuf {
+        root.join(super::super::initialization_selection::RECORD_NAME)
+    }
+
+    #[tokio::test]
+    async fn recovered_selection_keeps_smaller_valid_model_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid = root.path().join("0");
+        let selected = root.path().join("1");
+        model(&invalid, 18);
+        let mut bad = crate::reconstruction::direct_input::read_model(&invalid).unwrap();
+        bad.cameras[0].params[3] = 1.93;
+        bad.write(&invalid).unwrap();
+        model(&selected, 12);
+        // No record preserves the old policy; unrelated outputs do not gain
+        // initialization recovery's camera bounds merely by using a selector.
+        assert_eq!(
+            select_reconstruction_model(root.path(), 20)
+                .unwrap()
+                .unwrap()
+                .0,
+            invalid
+        );
+        let originals = std::fs::read(invalid.join("cameras.bin")).unwrap();
+        save_selection(root.path(), &selected).await;
+        for _ in 0..2 {
+            let (path, report) = select_reconstruction_model(root.path(), 20)
+                .unwrap()
+                .unwrap();
+            assert_eq!(path, selected);
+            assert_eq!(report.registered_images, 12);
+        }
+        assert_eq!(
+            std::fs::read(invalid.join("cameras.bin")).unwrap(),
+            originals
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_selection_rejects_changed_missing_or_malformed_evidence() {
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            let root = tempfile::tempdir().unwrap();
+            model(&root.path().join("0"), 18);
+            let selected = root.path().join("1");
+            model(&selected, 12);
+            save_selection(root.path(), &selected).await;
+            let path = selected.join(name);
+            let mut bytes = std::fs::read(&path).unwrap();
+            // Same-length edits must not be accepted based on size alone.
+            *bytes.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            assert!(select_reconstruction_model(root.path(), 20).is_err());
+            std::fs::remove_file(&path).unwrap();
+            assert!(select_reconstruction_model(root.path(), 20).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        model(&root.path().join("0"), 3);
+        std::fs::write(selection_path(root.path()), b"{").unwrap();
+        assert!(select_reconstruction_model(root.path(), 20).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_selection_rejects_unknown_version_or_escaping_path() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("1");
+        model(&selected, 12);
+        save_selection(root.path(), &selected).await;
+        let path = selection_path(root.path());
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for relative in ["../1", "1/..", "1\\..", "C:\\outside", "1:stream", ".", ""] {
+            let mut changed = original.clone();
+            changed["model"] = relative.into();
+            std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(select_reconstruction_model(root.path(), 20).is_err());
+        }
+        let mut changed = original;
+        changed["version"] = 99.into();
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(select_reconstruction_model(root.path(), 20).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_selection_write_failure_or_cancellation_cannot_report_success() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("1");
+        model(&selected, 12);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let assessment = super::super::initialization::assess_model(&selected, &cancel)
+            .unwrap()
+            .unwrap();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            super::super::initialization_selection::save(root.path(), &assessment, &cancelled)
+                .await,
+            Err(SplatError::Cancelled)
+        ));
+        assert!(!selection_path(root.path()).exists());
+        std::fs::create_dir(selection_path(root.path())).unwrap();
+        assert!(
+            super::super::initialization_selection::save(root.path(), &assessment, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(select_reconstruction_model(root.path(), 20).is_err());
+        assert!(selected.join("cameras.bin").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovered_selection_rejects_redirected_model_and_record() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("1");
+        model(&selected, 12);
+        save_selection(root.path(), &selected).await;
+        let moved = root.path().join("moved");
+        std::fs::rename(&selected, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &selected).unwrap();
+        assert!(select_reconstruction_model(root.path(), 20).is_err());
+        std::fs::remove_file(&selected).unwrap();
+        std::fs::rename(&moved, &selected).unwrap();
+        let record = selection_path(root.path());
+        let outside = root.path().join("moved-record.json");
+        std::fs::rename(&record, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &record).unwrap();
+        assert!(select_reconstruction_model(root.path(), 20).is_err());
     }
 }

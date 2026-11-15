@@ -60,7 +60,7 @@ pub type PipelineController = crate::tasks::TaskService;
 #[serde(rename_all = "camelCase")]
 pub struct PipelineCommandError {
     pub(crate) code: &'static str,
-    pub(crate) message: String,
+    pub(crate) message: Box<str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failed_stage: Option<PipelineStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +80,8 @@ pub struct PipelineCommandError {
     logs_directory: Option<Box<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_id: Option<Box<Uuid>>,
+    #[serde(skip)]
+    pub(crate) terminal_save_context: Option<Box<crate::pipeline::runner::TerminalSaveContext>>,
 }
 
 impl From<SplatError> for PipelineCommandError {
@@ -95,7 +97,7 @@ impl From<SplatError> for PipelineCommandError {
             } else {
                 "pipeline_failed"
             },
-            message: error.to_string(),
+            message: error.to_string().into_boxed_str(),
             failed_stage: None,
             engine: classification.engine,
             failure_kind: classification.kind,
@@ -107,13 +109,14 @@ impl From<SplatError> for PipelineCommandError {
             project_path: None,
             logs_directory: None,
             failure_id: None,
+            terminal_save_context: None,
         }
     }
 }
 
 impl PipelineCommandError {
     pub(crate) fn from_runner(error: &SplatError, runner: &PipelineRunner) -> Self {
-        let message = error.to_string();
+        let message = runner.failure_message(error).into_boxed_str();
         let cancelled = matches!(error, SplatError::Cancelled);
         let PipelineFailureContext {
             failed_stage,
@@ -142,6 +145,7 @@ impl PipelineCommandError {
             project_path: project_path.map(Box::new),
             logs_directory: logs_directory.map(Box::new),
             failure_id: None,
+            terminal_save_context: runner.terminal_save_context(error).map(Box::new),
         }
     }
 }
@@ -1668,7 +1672,7 @@ fn service_command_error(error: crate::tasks::ServiceError) -> PipelineCommandEr
             };
             return PipelineCommandError {
                 code,
-                message: saved.message,
+                message: saved.message.into_boxed_str(),
                 failed_stage: saved.failed_stage,
                 engine: saved.engine,
                 failure_kind,
@@ -1680,6 +1684,7 @@ fn service_command_error(error: crate::tasks::ServiceError) -> PipelineCommandEr
                 project_path: None,
                 logs_directory: None,
                 failure_id: saved.failure_id.map(Box::new),
+                terminal_save_context: None,
             };
         }
     }
@@ -1708,7 +1713,7 @@ async fn wait_task_result(
             } else {
                 "pipeline_failed"
             },
-            message: error.message,
+            message: error.message.into_boxed_str(),
             failed_stage: error.failed_stage,
             engine: error.engine,
             failure_kind: crate::failure::known_kind(error.classification.as_deref()),
@@ -1719,6 +1724,7 @@ async fn wait_task_result(
             project_path: task.project_path.map(Box::new),
             logs_directory: None,
             failure_id: error.failure_id.map(Box::new),
+            terminal_save_context: None,
         });
     }
     Err(PipelineCommandError::from(SplatError::Process(

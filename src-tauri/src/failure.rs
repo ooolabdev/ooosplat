@@ -46,9 +46,26 @@ pub struct EngineFailureEvidence {
     mapper_operational_error: bool,
     gpu_initialization_started: bool,
     gpu_initialization_completed: bool,
+    brush_final_iteration: Option<u64>,
+    brush_export_failure: Option<(u64, Option<i32>, String)>,
+    brush_any_export_failure: bool,
+    brush_numeric_divergence: Vec<String>,
 }
 
 impl EngineFailureEvidence {
+    /// The export contract belongs to this invocation, never to a previous
+    /// log file or a guessed last progress line.
+    pub fn brush_training(final_iteration: u64) -> Self {
+        Self {
+            brush_final_iteration: Some(final_iteration),
+            ..Self::default()
+        }
+    }
+
+    pub fn brush_final_export_failed(&self) -> bool {
+        self.brush_export_failure.is_some()
+    }
+
     pub fn observe(&mut self, line: &str) {
         fn keep(lines: &mut Vec<String>, line: &str, matched: bool) {
             if matched && lines.len() < 4 {
@@ -74,6 +91,22 @@ impl EngineFailureEvidence {
         self.mapper_operational_error |= mapper_operational_error(line);
         self.gpu_initialization_started |= lower.contains("gpu initialization started");
         self.gpu_initialization_completed |= lower.contains("gpu initialization completed");
+        keep(
+            &mut self.brush_numeric_divergence,
+            line,
+            brush_numeric_divergence(line),
+        );
+        self.brush_any_export_failure |= brush_export_failure_iteration(line).is_some();
+        if let Some(iteration) = brush_export_failure_iteration(line)
+            .filter(|iteration| Some(*iteration) == self.brush_final_iteration)
+            .filter(|_| self.brush_export_failure.is_none())
+        {
+            self.brush_export_failure = Some((
+                iteration,
+                reported_os_error(line),
+                line.chars().take(1_024).collect(),
+            ));
+        }
     }
 
     fn from_output(output: &ProcessOutput) -> Self {
@@ -83,6 +116,17 @@ impl EngineFailureEvidence {
         }
         evidence
     }
+}
+
+/// Internal execution evidence; not serialized into the project or wire schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushFailureReason {
+    FinalExport {
+        iteration: u64,
+        /// An error reported by Brush, not a fabricated application I/O error.
+        reported_os_error: Option<i32>,
+    },
+    NumericDivergence,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +140,7 @@ pub struct EngineProcessFailure {
     pub previous_attempts: Vec<EngineProcessFailure>,
     /// A narrow execution decision, not the heuristic mapper_source UI kind.
     pub mapper_geometry_failure: bool,
+    pub brush_failure_reason: Option<BrushFailureReason>,
 }
 
 impl EngineProcessFailure {
@@ -120,6 +165,10 @@ impl EngineProcessFailure {
             heuristic: false,
         };
         let (kind, lines): (Option<&'static str>, &[String]) = match engine {
+            // A known failed final export cannot be rescued by retraining.
+            // Keep its native termination and reported storage cause even if
+            // an earlier warning also happened to mention a GPU failure.
+            PipelineEngine::Brush if evidence.brush_final_export_failed() => (None, &[]),
             PipelineEngine::Brush if !evidence.oom.is_empty() => {
                 (Some("brush_out_of_memory"), &evidence.oom)
             }
@@ -157,7 +206,44 @@ impl EngineProcessFailure {
         classification.kind = kind;
         // Preserve bounded root evidence from BOTH current streams, including
         // early lines outside failure_detail(). No full output crosses IPC.
-        let root_lines = lines.join("\n");
+        let brush_failure_reason = if engine == PipelineEngine::Brush {
+            if let Some((iteration, reported_os_error, _)) = &evidence.brush_export_failure {
+                Some(BrushFailureReason::FinalExport {
+                    iteration: *iteration,
+                    reported_os_error: *reported_os_error,
+                })
+            } else if kind.is_none()
+                && !output.success
+                && !output.termination.abnormal()
+                && output.termination.exit_code.is_some_and(|code| code != 101)
+                && evidence.storage.is_empty()
+                && evidence.dataset.is_empty()
+                && !evidence.mapper_operational_error
+                && !evidence.brush_any_export_failure
+                && !evidence.brush_numeric_divergence.is_empty()
+            {
+                Some(BrushFailureReason::NumericDivergence)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut root_lines = lines.join("\n");
+        match brush_failure_reason {
+            Some(BrushFailureReason::FinalExport { .. }) => {
+                if let Some((_, _, line)) = &evidence.brush_export_failure {
+                    if !root_lines.is_empty() {
+                        root_lines.push('\n');
+                    }
+                    root_lines.push_str(line);
+                }
+            }
+            Some(BrushFailureReason::NumericDivergence) => {
+                root_lines = evidence.brush_numeric_divergence.join("\n");
+            }
+            None => {}
+        }
         let tail = output.failure_detail();
         let mut detail = if root_lines.is_empty() {
             tail
@@ -165,6 +251,15 @@ impl EngineProcessFailure {
             format!("{root_lines}\n--- current attempt tail ---\n{tail}")
         };
         if engine == PipelineEngine::Brush {
+            if let Some(BrushFailureReason::FinalExport {
+                iteration,
+                reported_os_error,
+            }) = brush_failure_reason
+            {
+                detail.push_str(&format!(
+                    "\nfailure_reason=brush_final_export_failed\nexport_iteration={iteration}\nreported_os_error={reported_os_error:?}"
+                ));
+            }
             if kind == Some("brush_gpu") && !evidence.unsupported_feature.is_empty() {
                 detail.push_str("\nfailure_reason=gpu_feature_unsupported");
             } else if kind == Some("brush_gpu")
@@ -196,6 +291,7 @@ impl EngineProcessFailure {
                 && !output.termination.abnormal()
                 && evidence.mapper_terminal
                 && !evidence.mapper_operational_error,
+            brush_failure_reason,
         }
     }
 
@@ -356,6 +452,57 @@ pub fn device_lost(text: &str) -> bool {
 fn gpu_feature_unsupported(text: &str) -> bool {
     text.to_ascii_lowercase()
         .contains("requested feature is not available on this device")
+}
+
+fn brush_numeric_divergence(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "non-finite training loss",
+        "training loss became nan",
+        "numerical divergence",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Match the bundled CLI's export event, not a generic `failed` warning.
+/// The caller additionally binds the parsed iteration to the planned final
+/// export. Earlier periodic exports do not establish a final-export failure.
+fn brush_export_failure_iteration(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let message = if text.starts_with('[') {
+        text.split_once("] ")?.1
+    } else {
+        text
+    };
+    let rest = message.strip_prefix("Export at iteration ")?;
+    let (iteration, rest) = rest.split_once(' ')?;
+    if iteration.is_empty() || !iteration.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let suffix = rest.strip_prefix("failed")?;
+    if !(suffix.is_empty() || suffix.starts_with(':')) {
+        return None;
+    }
+    let iteration = iteration.parse().ok()?;
+    // The nested train_stream error includes the destination. If present, it
+    // must be this invocation's configured candidate, not an evaluation file.
+    if suffix
+        .split_once(&format!(": iteration {iteration}, "))
+        .is_some_and(|(_, destination)| {
+            !destination.starts_with("final.ply.tmp:")
+                && !destination.starts_with("final.ply.tmp.ply:")
+        })
+    {
+        return None;
+    }
+    Some(iteration)
+}
+
+fn reported_os_error(text: &str) -> Option<i32> {
+    let (_, suffix) = text.split_once("(os error ")?;
+    let (code, _) = suffix.split_once(')')?;
+    code.parse().ok()
 }
 
 /// Parse the native glog header, not an arbitrary English word beginning with
@@ -573,6 +720,119 @@ mod tests {
                 Some("brush_out_of_memory")
             );
         }
+    }
+
+    #[test]
+    fn final_export_failure_survives_success_exit_and_truncated_tail() {
+        for os_error in [5, 112] {
+            let message = format!(
+                "[2026-11-14T06:47:13Z WARN  brush_cli] Export at iteration 8000 failed: Export failed after 1.296s: iteration 8000, final.ply.tmp: Failed to export ply \"[REDACTED]\": native storage error (os error {os_error})"
+            );
+            let mut evidence = EngineFailureEvidence::brush_training(8_000);
+            evidence.observe("Training progress: iteration=7995 total=8000");
+            evidence.observe(&message);
+            evidence.observe("Done training! Took FormattedDuration(4220s).");
+            let output = ProcessOutput {
+                success: true,
+                exit_code: Some(0),
+                termination: ProcessTermination {
+                    exit_code: Some(0),
+                    windows_status: Some("0x00000000".into()),
+                    ..Default::default()
+                },
+                stdout: "Done training!".into(),
+                stderr: "tail no longer contains export event".into(),
+            };
+            let failure = EngineProcessFailure::from_output_with_evidence(
+                PipelineEngine::Brush,
+                "train",
+                &output,
+                &evidence,
+            );
+            assert_eq!(failure.termination.exit_code, Some(0));
+            assert_eq!(
+                failure.brush_failure_reason,
+                Some(BrushFailureReason::FinalExport {
+                    iteration: 8_000,
+                    reported_os_error: Some(os_error),
+                })
+            );
+            assert!(failure.detail.contains(&format!("os error {os_error}")));
+            assert!(!crate::pipeline::reshoot::explicit_numeric_divergence(
+                &SplatError::EngineProcess(Box::new(failure))
+            ));
+            let fresh = EngineProcessFailure::from_output_with_evidence(
+                PipelineEngine::Brush,
+                "train",
+                &output,
+                &EngineFailureEvidence::brush_training(8_000),
+            );
+            assert_eq!(fresh.brush_failure_reason, None);
+        }
+    }
+
+    #[test]
+    fn export_evidence_is_bound_to_final_iteration_and_exact_event() {
+        let mut evidence = EngineFailureEvidence::brush_training(8_000);
+        for line in [
+            "Export at iteration 4000 failed: optional earlier output",
+            "warning: Export at iteration 8000 failed is a documented message",
+            "Export at iteration 8000 failedness is not an export event",
+            "Export at iteration 8000 completed",
+            "Export at iteration 8000 failed: Export failed after 1s: iteration 8000, evaluation.ply: optional output failed",
+            "Optional evaluation failed",
+            "Export at iteration -1 failed: invalid iteration",
+            "Export at iteration 8000x failed: invalid iteration",
+        ] {
+            evidence.observe(line);
+            assert!(!evidence.brush_final_export_failed(), "{line}");
+        }
+        evidence.observe("Export at iteration 8000 failed: native write error");
+        assert!(evidence.brush_final_export_failed());
+    }
+
+    #[test]
+    fn explicit_numeric_failure_is_collected_before_tail_truncation() {
+        let output = ProcessOutput {
+            success: false,
+            exit_code: Some(1),
+            termination: ProcessTermination {
+                exit_code: Some(1),
+                ..Default::default()
+            },
+            stdout: String::new(),
+            stderr: "late output only".into(),
+        };
+        for blocker in [
+            None,
+            Some("permission denied"),
+            Some("Export at iteration 8000 failed: (os error 112)"),
+        ] {
+            let mut evidence = EngineFailureEvidence::brush_training(8_000);
+            evidence.observe("Training loss became NaN");
+            if let Some(blocker) = blocker {
+                evidence.observe(blocker);
+            }
+            let failure = EngineProcessFailure::from_output_with_evidence(
+                PipelineEngine::Brush,
+                "train",
+                &output,
+                &evidence,
+            );
+            assert_eq!(
+                crate::pipeline::reshoot::explicit_numeric_divergence(&SplatError::EngineProcess(
+                    Box::new(failure)
+                )),
+                blocker.is_none(),
+            );
+        }
+        let fresh = EngineProcessFailure::from_output_with_evidence(
+            PipelineEngine::Brush,
+            "train",
+            &output,
+            &EngineFailureEvidence::brush_training(8_000),
+        );
+        assert_eq!(fresh.brush_failure_reason, None);
     }
 
     #[test]

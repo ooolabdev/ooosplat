@@ -1375,6 +1375,7 @@ impl TaskService {
                         executions,
                         current,
                         log,
+                        error.terminal_save_context.as_deref(),
                     )
                     .await,
             ));
@@ -1394,15 +1395,30 @@ impl TaskService {
             error.project_id = context.project_id.map(|id| id.to_string().into_boxed_str());
             error.failure_id = Some(Box::new(
                 self.diagnostics
-                    .capture_preparation(&error.message, context, paths)
+                    .capture_preparation(
+                        &error.message,
+                        context,
+                        paths,
+                        error.terminal_save_context.as_deref(),
+                    )
                     .await,
             ));
             let mut private_paths = paths.to_vec();
             private_paths.extend(context.project_root.iter().cloned());
-            error.message = context.redacted_message(
-                &error.message,
+            let mut message = context.redacted_message(
+                error
+                    .terminal_save_context
+                    .as_ref()
+                    .map_or(error.message.as_ref(), |terminal| {
+                        terminal.original_message()
+                    }),
                 &crate::diagnostics::redact::private_values(&private_paths),
             );
+            if let Some(terminal) = &error.terminal_save_context {
+                message.push('\n');
+                message.push_str(terminal.safe_details());
+            }
+            error.message = message.into_boxed_str();
         }
         error
     }
@@ -1442,7 +1458,7 @@ impl TaskService {
         ServiceError {
             code: code.into(),
             reason: None,
-            message: command.message,
+            message: command.message.into_string(),
             task_id,
             run_id,
             details: Some(serde_json::json!({
@@ -2495,7 +2511,7 @@ impl TaskService {
             if let Some(e) = error {
                 t.error = Some(TaskError {
                     code: e.code.into(),
-                    message: e.message,
+                    message: e.message.into_string(),
                     failed_stage: e.failed_stage,
                     engine: e.engine,
                     exit_code: e.termination.as_ref().and_then(|status| status.exit_code),

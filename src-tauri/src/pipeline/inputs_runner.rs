@@ -1790,6 +1790,16 @@ impl PipelineRunner {
                     let mut previous_training_failure: Option<SplatError> = None;
                     let candidate = loop {
                         let mut initial = report.points_3d;
+                        let mut initialization = crate::pipeline::brush_initialization::InitializationContract::SparsePoints;
+                        // Initialization isolation must never precede the durable
+                        // recipe/fallback state that tells a resumed run what to do.
+                        if !state.brush_complete {
+                            state.brush_training.dataset_identity =
+                                Some(read_training_dataset_identity(&dataset.path).await?);
+                            manager
+                                .write_state_for_training(&paths.state, &state)
+                                .await?;
+                        }
                         if !state.brush_complete {
                             if let Some(inputs) = state.inputs.as_mut() {
                                 inputs.init_sh_degree = None;
@@ -1831,6 +1841,7 @@ impl PipelineRunner {
                                 None,
                             );
                             let model = paths.work.join(relative_model);
+                            super::training_initialization::owned_path(&paths.project, &model)?;
                             let (info, sh, hash) = super::reshoot_runner::validate_ply(
                                 &model,
                                 &self.process_manager.child_token(),
@@ -1846,7 +1857,8 @@ impl PipelineRunner {
                             .into(),
                     ));
                             }
-                            let init = dataset.path.join("init.ply");
+                            let staged_init = super::training_initialization::staging_path(paths)?;
+                            let init = staged_init.path().to_owned();
                             let transform = state
                                 .gps
                                 .as_ref()
@@ -1900,28 +1912,30 @@ impl PipelineRunner {
                                     "Initialization snapshot changed".into(),
                                 ));
                             }
+                            initialization = super::training_initialization::install_staged(
+                                paths,
+                                &state,
+                                &dataset.path,
+                                &init,
+                                super::training_initialization::identity(&copy, copy_sh, copy_hash),
+                                expected_coordinate_frame.clone(),
+                                &self.process_manager.child_token(),
+                            )
+                            .await?;
                             initial = info.splat_count;
                             if let Some(inputs) = state.inputs.as_mut() {
                                 inputs.init_sh_degree = Some(sh);
                             }
                         }
-                        if warm_seed.is_none() {
-                            let init = dataset.path.join("init.ply");
-                            if tokio::fs::try_exists(&init).await.map_err(SplatError::from)
-                                .map_err(|error| error.with_io_diagnostic(
-                                    "training_preparation_operation=archive_initialization\npath_role=training_initialization\nio_substep=inspect"
-                                ))? {
-                                tokio::fs::rename(
-                                    &init,
-                                    dataset
-                                        .path
-                                        .join(format!("init.warm-{}.ply", uuid::Uuid::new_v4())),
-                                )
-                                .await.map_err(SplatError::from)
-                                    .map_err(|error| error.with_io_diagnostic(
-                                        "training_preparation_operation=archive_initialization\npath_role=training_initialization\nio_substep=rename"
-                                    ))?;
-                            }
+                        if warm_seed.is_none() && !state.brush_complete {
+                            super::training_initialization::prepare_saved(
+                                paths,
+                                &state,
+                                &dataset.path,
+                                &initialization,
+                                &self.process_manager.child_token(),
+                            )
+                            .await?;
                         }
                         self.events.training_substage("trainingValidation");
                         self.events.send(
@@ -2076,6 +2090,7 @@ impl PipelineRunner {
                                 metadata.quality,
                                 acceleration,
                                 &dataset.path,
+                                &initialization,
                                 initial,
                                 resolved,
                                 estimate,
@@ -2084,16 +2099,11 @@ impl PipelineRunner {
                         };
                         let (validation, invalid) = match outcome {
                             Ok(path) => {
-                                let validation = super::reshoot_runner::validate_ply(
-                                    &path,
-                                    &self.process_manager.child_token(),
+                                super::reshoot_runner::validate_training_candidate(
+                                    path,
+                                    self.process_manager.child_token(),
                                 )
                                 .await
-                                .map(|_| path);
-                                let invalid = validation.as_ref().err().is_some_and(|e| {
-                                    e.io_error().is_none() && !matches!(e, SplatError::Cancelled)
-                                });
-                                (validation, invalid)
                             }
                             Err(error) => {
                                 let invalid =
@@ -2128,11 +2138,30 @@ impl PipelineRunner {
                                 previous_training_failure = Some(error);
                                 state.brush_complete = false;
                                 state.brush_training.resolved = None;
-                                state.brush_training.dataset_identity = None;
+                                // The dataset is unchanged by a Warm -> Cold
+                                // switch; retain its identity for safe isolation.
                                 state.validated_output = None;
-                                manager
-                                    .write_state_for_training(&paths.state, &state)
-                                    .await?;
+                                if let Err(save_error) =
+                                    manager.write_state_for_training(&paths.state, &state).await
+                                {
+                                    // The failed durable barrier stops the Cold
+                                    // attempt; keep its original training cause
+                                    // as context, including typed PLY failures.
+                                    let previous = previous_training_failure
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_default();
+                                    return Err(SplatError::Diagnostic {
+                                        source: Box::new(save_error),
+                                        detail: format!(
+                                            "previous_attempt_context_only=true\n{}",
+                                            crate::diagnostics::redact::sanitize(
+                                                &previous.chars().take(2_048).collect::<String>(),
+                                                &[],
+                                            )
+                                        ),
+                                    });
+                                }
                                 self.mark_automatic_retry();
                                 self.events.stage(
                                     PipelineStage::TrainingSplats,

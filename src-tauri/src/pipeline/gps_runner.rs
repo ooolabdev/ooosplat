@@ -949,6 +949,7 @@ mod tests {
         use crate::failure::{EngineProcessFailure, FailureClassification};
         use crate::process::ProcessTermination;
         let failure = |termination, kind, detail: &str| EngineProcessFailure {
+            brush_failure_reason: None,
             mapper_geometry_failure: false,
             last_splat_count: None,
             engine: PipelineEngine::Colmap,

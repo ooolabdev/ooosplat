@@ -141,7 +141,9 @@ impl DiagnosticService {
         message: &str,
         context: &crate::pipeline::retry_preparation::PreparationDiagnosticContext,
         paths: &[PathBuf],
+        terminal: Option<&crate::pipeline::runner::TerminalSaveContext>,
     ) -> Uuid {
+        let message = terminal.map_or(message, |context| context.original_message());
         let mut private_paths = paths.to_vec();
         private_paths.extend(context.project_root.iter().cloned());
         let private = redact::private_values(&private_paths);
@@ -170,6 +172,7 @@ impl DiagnosticService {
             &[],
             None,
             true,
+            terminal,
         )
     }
 
@@ -196,7 +199,7 @@ impl DiagnosticService {
         current: Option<usize>,
     ) -> Uuid {
         self.capture_with_execution_log(
-            stage, engine, kind, message, project_id, paths, executions, current, None,
+            stage, engine, kind, message, project_id, paths, executions, current, None, None,
         )
         .await
     }
@@ -213,7 +216,9 @@ impl DiagnosticService {
         executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
         current: Option<usize>,
         log: Option<logs::FrozenLog>,
+        terminal: Option<&crate::pipeline::runner::TerminalSaveContext>,
     ) -> Uuid {
+        let message = terminal.map_or(message, |context| context.original_message());
         let mut private_paths = paths.to_vec();
         let mut private_names = Vec::new();
         if let Some(project_id) = project_id {
@@ -238,6 +243,7 @@ impl DiagnosticService {
             executions,
             current,
             false,
+            terminal,
         )
     }
 
@@ -254,6 +260,7 @@ impl DiagnosticService {
         executions: &[crate::pipeline::brush_execution::BrushExecutionSnapshot],
         current: Option<usize>,
         preparation_text_is_safe: bool,
+        terminal: Option<&crate::pipeline::runner::TerminalSaveContext>,
     ) -> Uuid {
         let id = Uuid::new_v4();
         let actual_device = current
@@ -269,16 +276,29 @@ impl DiagnosticService {
         };
         // The structured error starts with the final failure's root cause.
         // Keep its beginning, reserving separate space for the most recent attempts.
-        let mut detail_budget = if executions.is_empty() {
+        let detail_limit = if executions.is_empty() {
             16 * 1024
         } else {
             12 * 1024
         };
-        detail_budget = detail_budget.min(detail.len());
+        // Typed collector fields must survive both basename redaction (a user
+        // project can be named "state") and a long primary/previous-attempt
+        // message. They are already path-free, unlike arbitrary engine text.
+        let safe_terminal = terminal
+            .map(|context| redact::bounded(context.safe_details(), 2 * 1024))
+            .filter(|details| !details.is_empty());
+        let reserved = safe_terminal
+            .as_ref()
+            .map_or(0, |details| details.len() + 1);
+        let mut detail_budget = (detail_limit - reserved).min(detail.len());
         while !detail.is_char_boundary(detail_budget) {
             detail_budget -= 1;
         }
         detail.truncate(detail_budget);
+        if let Some(safe_terminal) = safe_terminal {
+            detail.push('\n');
+            detail.push_str(&safe_terminal);
+        }
         if !executions.is_empty() {
             let mut summaries = Vec::new();
             let mut bytes = 0;
@@ -564,6 +584,7 @@ mod tests {
                 &[],
                 None,
                 Some(logs::FrozenLog { text, truncated }),
+                None,
             )
             .await;
         std::fs::write(&path, "later unrelated output\n").unwrap();
@@ -652,7 +673,9 @@ mod tests {
             let snapshot = context.snapshot();
             let message = format!("{failure}\n{}", project.join("state.json").display());
             let service = DiagnosticService::default();
-            let id = service.capture_preparation(&message, &snapshot, &[]).await;
+            let id = service
+                .capture_preparation(&message, &snapshot, &[], None)
+                .await;
             let report = service.captured_report_for_test(id).unwrap();
             assert_eq!(report.stage, None);
             assert_eq!(report.engine, Some(PipelineEngine::System));
@@ -708,6 +731,7 @@ mod tests {
                 "COLMAP mapper source text must not change typed classification",
                 &current,
                 &[],
+                None,
             )
             .await;
         let report = service.captured_report_for_test(id).unwrap();
@@ -743,7 +767,7 @@ mod tests {
         snapshot.operation_log = snapshot.operation_log.repeat(500);
         let service = DiagnosticService::default();
         let id = service
-            .capture_preparation(&"long native context ".repeat(4000), &snapshot, &[])
+            .capture_preparation(&"long native context ".repeat(4000), &snapshot, &[], None)
             .await;
         let report = service.captured_report_for_test(id).unwrap();
         assert!(report.detail.contains("archive_retry_cache"));
@@ -785,7 +809,7 @@ mod tests {
             );
             let service = DiagnosticService::default();
             let id = service
-                .capture_preparation(&message, &snapshot, &private_paths)
+                .capture_preparation(&message, &snapshot, &private_paths, None)
                 .await;
             let report = service.captured_report_for_test(id).unwrap();
             assert!(report.detail.contains("\"operation\":\"read_retry_state\""));

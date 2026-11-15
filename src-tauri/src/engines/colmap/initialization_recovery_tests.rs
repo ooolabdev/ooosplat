@@ -122,8 +122,21 @@ mod unix {
     async fn run_case(mode: &str) -> (tempfile::TempDir, Result<()>) {
         let root = tempfile::tempdir().unwrap();
         let sparse = root.path().join("sparse");
-        model(&sparse.join("0"), 1, 1.93);
-        model(&root.path().join("candidate"), 2, 0.55);
+        let original_count = if matches!(mode, "smaller" | "equal") {
+            3
+        } else {
+            1
+        };
+        let candidate_count = match mode {
+            "equal" => 3,
+            "complete" => 4,
+            _ => 2,
+        };
+        model(&sparse.join("0"), original_count, 1.93);
+        model(&root.path().join("candidate"), candidate_count, 0.55);
+        if mode == "selection_write_failure" {
+            std::fs::create_dir(sparse.join(initialization_selection::RECORD_NAME)).unwrap();
+        }
         let db = root.path().join("database.db");
         database(&db);
         let images = root.path().join("images");
@@ -143,7 +156,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' "$seed" >> '{dir}/seeds'
-if [ "$seed" = 3 ]; then
+if [ "$seed" = 3 ] && [ '{mode}' != 'all_geometry' ]; then
   mkdir -p "$out/0"
   cp '{dir}/candidate/cameras.bin' '{dir}/candidate/images.bin' '{dir}/candidate/points3D.bin' "$out/0/"
   exit 0
@@ -190,6 +203,16 @@ exit 1
         let seeds = std::fs::read_to_string(root.path().join("seeds")).unwrap();
         assert_eq!(seeds.lines().collect::<Vec<_>>(), ["3", "1", "2"]);
         assert!(root.path().join("sparse/0/cameras.bin").is_file());
+        let (selected, report) = select_reconstruction_model(&root.path().join("sparse"), 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected, best.model);
+        assert_eq!(report.registered_images, 2);
+        assert!(root
+            .path()
+            .join("sparse")
+            .join(initialization_selection::RECORD_NAME)
+            .is_file());
     }
 
     #[tokio::test]
@@ -201,6 +224,50 @@ exit 1
             let seeds = std::fs::read_to_string(root.path().join("seeds")).unwrap();
             assert_eq!(seeds.lines().collect::<Vec<_>>(), ["3", "1"]);
             assert!(root.path().join("sparse/1/cameras.bin").is_file());
+            assert!(!root
+                .path()
+                .join("sparse")
+                .join(initialization_selection::RECORD_NAME)
+                .exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_smaller_equal_and_complete_recoveries_freeze_final_model_selection() {
+        for (mode, expected, calls) in [
+            ("smaller", 2, vec!["3", "1", "2"]),
+            ("equal", 3, vec!["3", "1", "2"]),
+            ("complete", 4, vec!["3"]),
+        ] {
+            let (root, result) = run_case(mode).await;
+            result.unwrap();
+            let output = root.path().join("sparse");
+            let (selected, report) = select_reconstruction_model(&output, 4).unwrap().unwrap();
+            assert_eq!(selected, output.join("1"));
+            assert_eq!(report.registered_images, expected);
+            assert!(output.join("0/cameras.bin").is_file());
+            let seeds = std::fs::read_to_string(root.path().join("seeds")).unwrap();
+            assert_eq!(seeds.lines().collect::<Vec<_>>(), calls);
+            // Reopening has no in-memory best pointer; it must still return
+            // the admitted model instead of the older illegal component.
+            assert_eq!(
+                select_reconstruction_model(&output, 4).unwrap().unwrap().0,
+                selected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_geometry_or_selection_persistence_never_completes_recovery() {
+        for mode in ["all_geometry", "selection_write_failure"] {
+            let (root, result) = run_case(mode).await;
+            assert!(result.is_err());
+            assert!(!root
+                .path()
+                .join("sparse")
+                .join(initialization_selection::RECORD_NAME)
+                .is_file());
+            assert!(root.path().join("sparse/0/cameras.bin").is_file());
         }
     }
 }

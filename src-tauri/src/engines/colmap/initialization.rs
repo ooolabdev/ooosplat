@@ -432,7 +432,10 @@ fn read_count(path: &Path) -> Result<u64> {
     Ok(u64::from_le_bytes(value))
 }
 
-fn assess_model(model: &Path, cancel: &CancellationToken) -> Result<Option<ModelAssessment>> {
+pub(super) fn assess_model(
+    model: &Path,
+    cancel: &CancellationToken,
+) -> Result<Option<ModelAssessment>> {
     check_cancel(cancel)?;
     let camera_path = model.join("cameras.bin");
     match std::fs::symlink_metadata(&camera_path) {
@@ -636,7 +639,9 @@ pub(super) fn promote_if_better(
     cancel: &CancellationToken,
 ) -> Result<Option<ModelAssessment>> {
     check_cancel(cancel)?;
-    if !candidate.valid_intrinsics || candidate.registered_images <= previous.registered_images {
+    if !candidate.valid_intrinsics
+        || (previous.valid_intrinsics && candidate.registered_images <= previous.registered_images)
+    {
         return Ok(None);
     }
     let parent = output
@@ -1034,10 +1039,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_smaller_candidates_never_replace_the_original() {
+    fn invalid_or_smaller_candidates_never_replace_a_valid_original() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("sparse");
-        model(&output.join("0"), 3, 1.93);
+        model(&output.join("0"), 3, 0.55);
         let cancel = CancellationToken::new();
         let before = assess_output(&output, &cancel).unwrap().unwrap();
         let attempt = create_attempt_output(&output).unwrap();
@@ -1052,6 +1057,28 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(output.join("0/cameras.bin").is_file());
+    }
+
+    #[test]
+    fn valid_smaller_or_equal_candidate_replaces_invalid_original() {
+        for count in [2, 3] {
+            let root = tempfile::tempdir().unwrap();
+            let output = root.path().join("sparse");
+            model(&output.join("0"), 3, 1.93);
+            let cancel = CancellationToken::new();
+            let before = assess_output(&output, &cancel).unwrap().unwrap();
+            let attempt = create_attempt_output(&output).unwrap();
+            model(&attempt.join("0"), count, 0.55);
+            let candidate = assess_output(&attempt, &cancel).unwrap().unwrap();
+            let promoted = promote_if_better(&output, &before, &candidate, &cancel)
+                .unwrap()
+                .unwrap();
+            assert!(promoted.valid_intrinsics);
+            assert_eq!(promoted.registered_images, u64::from(count));
+            assert_eq!(promoted.model, output.join("1"));
+            assert!(output.join("0/cameras.bin").is_file());
+            assert!(attempt.join("0/cameras.bin").is_file());
+        }
     }
 
     #[test]

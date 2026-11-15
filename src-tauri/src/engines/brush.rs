@@ -350,7 +350,7 @@ pub async fn train(
     }
     let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
     let evidence = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::failure::EngineFailureEvidence::default(),
+        crate::failure::EngineFailureEvidence::brush_training(options.preset.total_steps as u64),
     ));
     let live_evidence = evidence.clone();
     let counts = last_splat_count.clone();
@@ -382,13 +382,14 @@ pub async fn train(
         .await.map_err(|error| error.with_io_diagnostic(
             "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
         ))?;
-    resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
+    let evidence = evidence.lock().unwrap_or_else(|p| p.into_inner());
+    resolve_train_output(&output, candidate, alternate, &evidence).map_err(|mut error| {
         if let SplatError::EngineProcess(failure) = &mut error {
             **failure = crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Brush,
                 "train",
                 &output,
-                &evidence.lock().unwrap_or_else(|p| p.into_inner()),
+                &evidence,
             );
             failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
         }
@@ -400,13 +401,15 @@ fn resolve_train_output(
     output: &ProcessOutput,
     candidate: PathBuf,
     alternate: PathBuf,
+    evidence: &crate::failure::EngineFailureEvidence,
 ) -> Result<PathBuf> {
-    if !output.success {
+    if !output.success || evidence.brush_final_export_failed() {
         return Err(SplatError::EngineProcess(Box::new(
-            crate::failure::EngineProcessFailure::from_output(
+            crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Brush,
                 "train",
                 output,
+                evidence,
             ),
         )));
     }
@@ -695,14 +698,41 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
-            termination: crate::process::ProcessTermination::default(),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0),
+                ..Default::default()
+            },
             stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
             stderr: "Export at iteration 4 failed".into(),
         };
-        assert!(resolve_train_output(&output, candidate.clone(), alternate.clone()).is_err());
-        std::fs::write(&candidate, "candidate is validated as PLY by the pipeline").unwrap();
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
+        for contents in [None, Some(""), Some("nonempty but incomplete PLY")] {
+            if let Some(contents) = contents {
+                std::fs::write(&candidate, contents).unwrap();
+            }
+            assert!(matches!(
+                resolve_train_output(&output, candidate.clone(), alternate.clone(), &evidence),
+                Err(SplatError::EngineProcess(ref failure))
+                    if failure.termination.exit_code == Some(0)
+                    && matches!(failure.brush_failure_reason,
+                        Some(crate::failure::BrushFailureReason::FinalExport { iteration: 4, .. }))
+            ));
+        }
+        let successful = ProcessOutput {
+            stderr: "unrelated optional feature failed; continuing".into(),
+            ..output.clone()
+        };
         assert_eq!(
-            resolve_train_output(&output, candidate.clone(), alternate.clone()).unwrap(),
+            resolve_train_output(
+                &successful,
+                candidate.clone(),
+                alternate.clone(),
+                &crate::failure::EngineFailureEvidence::brush_training(4)
+            )
+            .unwrap(),
             candidate
         );
         let failed = ProcessOutput {
@@ -711,8 +741,10 @@ mod tests {
             stderr: "VK_ERROR_DEVICE_LOST".into(),
             ..output
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        evidence.observe(&failed.stderr);
         assert!(matches!(
-            resolve_train_output(&failed, candidate, alternate),
+            resolve_train_output(&failed, candidate, alternate, &evidence),
             Err(SplatError::EngineProcess(ref failure)) if failure.classification.kind == Some("brush_device_lost")
         ));
     }
@@ -842,11 +874,16 @@ mod tests {
             stdout: "Refine iter 41001, 3476124 splats.".into(),
             stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(45_000);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
         assert!(matches!(
             resolve_train_output(
                 &output,
                 PathBuf::from("absent.ply"),
-                PathBuf::from("absent.tmp.ply")
+                PathBuf::from("absent.tmp.ply"),
+                &evidence
             ),
             Err(ref error) if error.is_brush_oom()
         ));

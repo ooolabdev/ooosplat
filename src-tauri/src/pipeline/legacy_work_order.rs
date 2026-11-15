@@ -500,6 +500,12 @@ impl PipelineRunner {
         if !dataset.is_dir() {
             return Err(unrestorable());
         }
+        crate::pipeline::brush_initialization::check_dataset_boundary(&paths.project, &dataset)?;
+        super::training_initialization::owned_path(&paths.project, &dataset.join("init.ply"))?;
+        super::training_initialization::owned_path(
+            &paths.project,
+            &paths.work.join("legacy-training-init.ply"),
+        )?;
         let owned_dataset = dataset.clone();
         let owned_model = model.to_path_buf();
         let cancel = self.process_manager.child_token();
@@ -519,6 +525,8 @@ impl PipelineRunner {
         let warm = recipe
             .as_ref()
             .is_some_and(|r| r.actual.training == TrainingMode::Warm);
+        let mut initialization =
+            crate::pipeline::brush_initialization::InitializationContract::SparsePoints;
         let initial = if warm {
             let recipe = recipe.as_ref().unwrap();
             let init = dataset.join("init.ply");
@@ -544,6 +552,7 @@ impl PipelineRunner {
             let (info, sh, hash) =
                 super::reshoot_runner::validate_ply(&init, &self.process_manager.child_token())
                     .await?;
+            let init_identity = super::training_initialization::identity(&info, sh, hash.clone());
             if recipe
                 .warm_parameters
                 .is_some_and(|warm| warm.sh_degree != sh)
@@ -645,11 +654,16 @@ impl PipelineRunner {
                 }
                 state.brush_training.legacy_initialization_sha256 = Some(hash);
             }
+            initialization =
+                crate::pipeline::brush_initialization::InitializationContract::GaussianSnapshot {
+                    identity: init_identity,
+                    coordinate_frame_id: recipe
+                        .init_georeference
+                        .clone()
+                        .unwrap_or_else(|| "legacy-verified-training-frame".into()),
+                };
             info.splat_count
         } else {
-            if dataset.join("init.ply").exists() {
-                return Err(unrestorable());
-            }
             authority.points.len() as u64
         };
         if resolved
@@ -663,6 +677,14 @@ impl PipelineRunner {
         // Freeze the exact replay evidence before spawning Brush. No profile,
         // warm multiplier, coordinate transform or retry count is recalculated.
         manager.write_state(&paths.state, &state).await?;
+        super::training_initialization::prepare_saved(
+            paths,
+            &state,
+            &dataset,
+            &initialization,
+            &self.process_manager.child_token(),
+        )
+        .await?;
         let mut attempt = paths.clone();
         if let Some(recipe) = &recipe {
             attempt.brush = paths.brush.join(format!(
@@ -684,6 +706,7 @@ impl PipelineRunner {
                 metadata.quality,
                 acceleration,
                 &dataset,
+                &initialization,
                 initial,
                 resolved,
                 0,

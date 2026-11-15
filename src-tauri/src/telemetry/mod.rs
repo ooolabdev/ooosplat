@@ -469,6 +469,24 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::Cancelled => TelemetryErrorCode::Unknown,
         SplatError::BrushOutOfMemory(_) => TelemetryErrorCode::BrushOutOfMemory,
         SplatError::BrushDeviceLost(_) => TelemetryErrorCode::BrushDeviceLost,
+        SplatError::EngineProcess(failure)
+            if matches!(
+                failure.brush_failure_reason,
+                Some(crate::failure::BrushFailureReason::FinalExport { .. })
+            ) =>
+        {
+            match failure.brush_failure_reason {
+                Some(crate::failure::BrushFailureReason::FinalExport {
+                    reported_os_error: Some(112),
+                    ..
+                }) => TelemetryErrorCode::DiskSpaceLow,
+                Some(crate::failure::BrushFailureReason::FinalExport {
+                    reported_os_error: Some(_),
+                    ..
+                }) => TelemetryErrorCode::IoFailed,
+                _ => TelemetryErrorCode::BrushFailed,
+            }
+        }
         SplatError::EngineProcess(failure) => match failure.classification.kind {
             Some("brush_out_of_memory") => TelemetryErrorCode::BrushOutOfMemory,
             Some("brush_device_lost") => TelemetryErrorCode::BrushDeviceLost,
@@ -606,6 +624,41 @@ mod tests {
                 safe_error_code(&error, Some(TelemetryStage::TrainingSplats)),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn final_export_io_keeps_existing_codes_and_real_success_exit_status() {
+        for (code, expected) in [
+            (112, TelemetryErrorCode::DiskSpaceLow),
+            (5, TelemetryErrorCode::IoFailed),
+        ] {
+            let output = crate::process::ProcessOutput {
+                success: true,
+                exit_code: Some(0),
+                termination: crate::process::ProcessTermination {
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+            let mut failure = crate::failure::EngineProcessFailure::from_output(
+                PipelineEngine::Brush,
+                "train",
+                &output,
+            );
+            failure.brush_failure_reason = Some(crate::failure::BrushFailureReason::FinalExport {
+                iteration: 8000,
+                reported_os_error: Some(code),
+            });
+            assert_eq!(failure.termination.exit_code, Some(0));
+            let error = SplatError::EngineProcess(Box::new(failure));
+            assert_eq!(
+                safe_error_code(&error, Some(TelemetryStage::TrainingSplats)),
+                expected
+            );
+            assert!(!error.is_brush_oom());
         }
     }
 

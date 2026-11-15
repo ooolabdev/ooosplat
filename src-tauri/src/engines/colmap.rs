@@ -9,6 +9,7 @@ use crate::{
 };
 
 mod initialization;
+mod initialization_selection;
 #[cfg(test)]
 mod mapper_native_smoke;
 mod mapper_outcome;
@@ -604,7 +605,11 @@ async fn recover_mapper_initialization(
             }
         }
         if best.valid_intrinsics && best.registered_images >= seeds.input_images {
-            return Ok(());
+            return initialization_selection::save(&output, &best, &cancel)
+                .await
+                .map_err(|error| {
+                    mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts)
+                });
         }
     }
     if cancel.is_cancelled() {
@@ -627,7 +632,9 @@ async fn recover_mapper_initialization(
             rejected_attempts,
         ));
     }
-    Ok(())
+    initialization_selection::save(&output, &best, &cancel)
+        .await
+        .map_err(|error| mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts))
 }
 
 fn resolved_path(path: &Path, working_directory: &Path) -> Result<PathBuf> {

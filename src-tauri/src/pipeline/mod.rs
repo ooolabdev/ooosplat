@@ -2,6 +2,7 @@ pub mod access;
 pub mod artifacts;
 pub mod ba_policy;
 pub mod brush_execution;
+pub(crate) mod brush_initialization;
 pub mod effectiveness;
 pub mod estimate;
 pub mod event;

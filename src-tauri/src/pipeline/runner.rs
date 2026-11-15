@@ -45,12 +45,28 @@ mod mapper_progress_tests;
 #[path = "prepared_recovery.rs"]
 mod prepared_recovery;
 #[cfg(test)]
+#[path = "recovery_8016f801.rs"]
+mod recovery_8016f801;
+#[cfg(test)]
 #[path = "repeated_reshoot_validation.rs"]
 mod repeated_reshoot_validation;
 #[path = "reshoot_runner.rs"]
 mod reshoot_runner;
 #[path = "retry_archive.rs"]
 mod retry_archive;
+pub(crate) async fn rename_initialization_entry(
+    source: &Path,
+    destination: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    retry_archive::rename_entry(source, destination, cancel, |_| async {}).await?;
+    Ok(())
+}
+#[path = "terminal_persistence.rs"]
+mod terminal_persistence;
+pub(crate) use terminal_persistence::TerminalSaveContext;
+#[path = "training_initialization.rs"]
+mod training_initialization;
 #[path = "working_database.rs"]
 mod working_database;
 
@@ -663,6 +679,7 @@ pub struct PipelineRunner {
     diagnostic_logs: Arc<std::sync::Mutex<crate::diagnostics::logs::ExecutionLogs>>,
     active_project: Arc<std::sync::Mutex<Option<ActiveProjectContext>>>,
     preparation_context: std::sync::Mutex<Option<PreparationContext>>,
+    terminal_save_diagnostics: terminal_persistence::Diagnostics,
     current_acceleration: Arc<std::sync::Mutex<Option<crate::engines::ColmapAccelerationStatus>>>,
     automatic_retry_this_run: AtomicBool,
     elapsed_offset_ms: AtomicU64,
@@ -769,6 +786,7 @@ impl PipelineRunner {
             active_project: Arc::new(std::sync::Mutex::new(None)),
             diagnostic_logs: Default::default(),
             preparation_context: std::sync::Mutex::new(None),
+            terminal_save_diagnostics: Default::default(),
             current_acceleration: Arc::new(std::sync::Mutex::new(None)),
             automatic_retry_this_run: AtomicBool::new(false),
             elapsed_offset_ms: AtomicU64::new(0),
@@ -1413,6 +1431,9 @@ impl PipelineRunner {
     }
 
     pub fn with_execution_run_id(mut self, execution_run_id: Option<uuid::Uuid>) -> Self {
+        if self.execution_run_id != execution_run_id {
+            self.terminal_save_diagnostics.clear();
+        }
         self.execution_run_id = execution_run_id;
         self
     }
@@ -3492,15 +3513,8 @@ impl PipelineRunner {
             metadata.duration_ms =
                 Some(previous_duration.saturating_add(started.elapsed().as_millis() as u64));
             metadata.failure_message = Some(error.to_string());
-            let _ = project_manager
-                .write_metadata(&paths.metadata, metadata)
+            self.persist_terminal_records(&project_manager, &paths, metadata, cancelled)
                 .await;
-            // A failed read is not an empty work order. Never overwrite a
-            // damaged or temporarily inaccessible checkpoint with defaults.
-            if let Ok(state) = project_manager.read_state(&paths.state).await {
-                let state = mark_state_terminal(state, cancelled);
-                let _ = project_manager.write_state(&paths.state, &state).await;
-            }
         }
         result
     }
@@ -5090,6 +5104,7 @@ impl PipelineRunner {
         quality: Quality,
         acceleration: &crate::engines::ColmapAccelerationStatus,
         dataset: &Path,
+        initialization: &crate::pipeline::brush_initialization::InitializationContract,
         initial_sfm_points: u64,
         resolved: ResolvedBrushTrainingPreset,
         _estimated_duration_ms: u64,
@@ -5121,6 +5136,7 @@ impl PipelineRunner {
             .reshoot
             .as_ref()
             .and_then(|r| r.recipe.as_ref())
+            .filter(|r| r.actual.training == crate::pipeline::reshoot::TrainingMode::Warm)
             .and_then(|r| r.warm_parameters);
         let alpha_mode = state.brush_training.alpha_mode(
             state
@@ -5153,6 +5169,13 @@ impl PipelineRunner {
             Some(resolved.preset.total_steps as u64),
             ObserverMode::Brush,
         ));
+        training_initialization::verify_start(
+            paths,
+            dataset,
+            initialization,
+            &self.process_manager.child_token(),
+        )
+        .await?;
         let first = brush::train(
             &self.engines.brush,
             dataset,
@@ -5270,6 +5293,16 @@ impl PipelineRunner {
                     Some(downgraded.preset.total_steps as u64),
                     ObserverMode::Brush,
                 ));
+                if let Err(check_error) = training_initialization::verify_start(
+                    paths,
+                    dataset,
+                    initialization,
+                    &self.process_manager.child_token(),
+                )
+                .await
+                {
+                    return Err(check_error.with_previous_attempt(error));
+                }
                 let retried = brush::train(
                     &self.engines.brush,
                     dataset,
