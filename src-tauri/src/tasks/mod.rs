@@ -439,6 +439,13 @@ pub(crate) type TestExecutor = Arc<
         + Sync,
 >;
 type Emit = Arc<dyn Fn(TaskUpdate) + Send + Sync>;
+
+enum TaskPublicationReconcile {
+    None,
+    Reconciled(PathBuf, Uuid),
+    ArtifactUnavailable(crate::pipeline::publication::CommittedArtifactIssue),
+}
+
 #[derive(Clone)]
 pub struct TaskService {
     invocation_access: Option<crate::pipeline::access::InvocationAccess>,
@@ -673,18 +680,28 @@ impl TaskService {
         Ok(())
     }
 
-    async fn reconcile_task_publication(task: &mut TaskRecord) -> Result<Option<(PathBuf, Uuid)>> {
+    async fn reconcile_task_publication(task: &mut TaskRecord) -> Result<TaskPublicationReconcile> {
         let Some(project_root) = task.project_path.clone() else {
-            return Ok(None);
+            return Ok(TaskPublicationReconcile::None);
         };
         let transaction_path = project_root
             .join("work")
             .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
-        let Some(publication) =
-            crate::pipeline::publication::committed_publication(&project_root, &transaction_path)
-                .await?
-        else {
-            return Ok(None);
+        let publication = match crate::pipeline::publication::committed_publication_status(
+            &project_root,
+            &transaction_path,
+        )
+        .await?
+        {
+            crate::pipeline::publication::CommittedPublicationStatus::None => {
+                return Ok(TaskPublicationReconcile::None);
+            }
+            crate::pipeline::publication::CommittedPublicationStatus::Available(publication) => {
+                publication
+            }
+            crate::pipeline::publication::CommittedPublicationStatus::ArtifactUnavailable(
+                issue,
+            ) => return Ok(TaskPublicationReconcile::ArtifactUnavailable(issue)),
         };
         if publication.transaction.phase
             == crate::pipeline::publication::PublicationPhase::Reconciled
@@ -706,7 +723,7 @@ impl TaskService {
             // views durable and the task contains the full public result.
             // Avoid rewriting it and incrementing the revision on every app
             // startup.
-            return Ok(None);
+            return Ok(TaskPublicationReconcile::None);
         }
         let metadata_path = project_root.join("project.json");
         let mut metadata: crate::project::ProjectMetadata =
@@ -766,7 +783,10 @@ impl TaskService {
             run.error = None;
         }
         task.revision += 1;
-        Ok(Some((project_root, publication.transaction.transaction_id)))
+        Ok(TaskPublicationReconcile::Reconciled(
+            project_root,
+            publication.transaction.transaction_id,
+        ))
     }
 
     async fn load_locked(&self) -> Result<()> {
@@ -781,9 +801,24 @@ impl TaskService {
         };
         let mut reconciled_publications = Vec::new();
         for task in registry.tasks.values_mut() {
-            if let Some(publication) = Self::reconcile_task_publication(task).await? {
-                reconciled_publications.push(publication);
-                continue;
+            match Self::reconcile_task_publication(task).await? {
+                TaskPublicationReconcile::Reconciled(project_root, transaction_id) => {
+                    reconciled_publications.push((project_root, transaction_id));
+                    continue;
+                }
+                TaskPublicationReconcile::None => {}
+                TaskPublicationReconcile::ArtifactUnavailable(issue) => {
+                    // A missing or changed committed model belongs to this task.
+                    // Transaction, permission and state I/O errors still return
+                    // through the ordinary error chain instead of being hidden.
+                    tracing::warn!(task=%task.task_id, reason=%issue, "Committed publication artifact is unavailable");
+                    task.status = TaskStatus::Interrupted;
+                    task.result = None;
+                    task.revision += 1;
+                    task.updated_at = Utc::now();
+                    task.error = Some(artifact_unavailable(task, None));
+                    continue;
+                }
             }
             if task.status.active() {
                 task.status = TaskStatus::Interrupted;
@@ -2771,25 +2806,7 @@ impl TaskService {
                     task.result = None;
                     task.revision += 1;
                     task.updated_at = Utc::now();
-                    task.error = Some(TaskError {
-                        code: "ARTIFACT_UNAVAILABLE".into(),
-                        message: project.failure_message.clone().unwrap_or_else(|| {
-                            "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()
-                        }),
-                        failed_stage: None,
-                        engine: None,
-                        exit_code: None,
-                        classification: None,
-                        classification_is_heuristic: false,
-                        classification_version: None,
-                        termination: None,
-                        failure_id: None,
-                        log_sources: task
-                            .runs
-                            .last()
-                            .map(|run| run.logs.keys().cloned().collect())
-                            .unwrap_or_default(),
-                    });
+                    task.error = Some(artifact_unavailable(task, project.failure_message.clone()));
                     changes.push(task.clone());
                 }
             }
@@ -2837,6 +2854,27 @@ impl TaskService {
                 }
             }
         })
+    }
+}
+
+fn artifact_unavailable(task: &TaskRecord, message: Option<String>) -> TaskError {
+    TaskError {
+        code: "ARTIFACT_UNAVAILABLE".into(),
+        message: message
+            .unwrap_or_else(|| "项目产物当前不可访问，可以使用现有恢复入口检查并修复".into()),
+        failed_stage: None,
+        engine: None,
+        exit_code: None,
+        classification: None,
+        classification_is_heuristic: false,
+        classification_version: None,
+        termination: None,
+        failure_id: None,
+        log_sources: task
+            .runs
+            .last()
+            .map(|run| run.logs.keys().cloned().collect())
+            .unwrap_or_default(),
     }
 }
 
