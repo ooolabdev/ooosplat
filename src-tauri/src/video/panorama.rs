@@ -139,6 +139,7 @@ pub async fn detect(
     let result = manager
         .clone()
         .with_output_capture_limit(64 * 1024)
+        .with_complete_stdout_limit(crate::engines::ffprobe::MAX_PROBE_JSON_BYTES)
         .run(ProcessSpec {
             executable: ffprobe.into(),
             args: vec![

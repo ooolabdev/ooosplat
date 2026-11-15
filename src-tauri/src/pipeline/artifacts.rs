@@ -35,6 +35,7 @@ const MATCHING: &str = "matching";
 const RECONSTRUCTION: &str = "reconstruction";
 const TRAINING_DATASET: &str = "trainingDataset";
 const BRUSH_CANDIDATE: &str = "brushCandidate";
+const MATCHING_SEMANTIC_PREFIX: &str = "artifact-matches-v2:";
 
 /// Called only after the shared normalizer has verified the upstream chain and
 /// the durable archive barrier has completed. An invalid *derived* dataset may
@@ -518,6 +519,282 @@ fn database_in_use(message: &str) -> SplatError {
     SplatError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, message))
 }
 
+/// A PERSIST journal remains allocated after commit, with an invalidated zero
+/// header. Do not mistake this SQLite-owned, cold journal for pending writes.
+fn journal_is_cold(path: &Path, length: u64) -> Result<bool> {
+    if length == 0 {
+        return Ok(true);
+    }
+    if length < 8 {
+        return Ok(false);
+    }
+    let mut header = [0_u8; 8];
+    File::open(path)?.read_exact(&mut header)?;
+    Ok(header == [0; 8])
+}
+
+pub(super) fn validate_recovery_path(project: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(project).map_err(|_| {
+        SplatError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Unsafe COLMAP database recovery path",
+        ))
+    })?;
+    let mut current = project.to_path_buf();
+    for part in relative.components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err(SplatError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Unsafe COLMAP database recovery path",
+            )));
+        }
+        current.push(part);
+        let metadata = std::fs::symlink_metadata(&current)?;
+        let redirected = metadata.file_type().is_symlink();
+        #[cfg(windows)]
+        let redirected = {
+            use std::os::windows::fs::MetadataExt;
+            redirected || metadata.file_attributes() & 0x400 != 0
+        };
+        if redirected {
+            return Err(SplatError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Redirected COLMAP database recovery path",
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn reject_shared_recovery_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let shared = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)?.nlink() > 1
+    };
+    #[cfg(windows)]
+    let shared = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let file = File::open(path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        info.nNumberOfLinks > 1
+    };
+    #[cfg(not(any(unix, windows)))]
+    let shared = {
+        let _ = path;
+        // Unknown link semantics cannot prove a mutable file is privately owned.
+        true
+    };
+    if shared {
+        return Err(SplatError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "COLMAP database recovery requires a private file, not a hard-linked source snapshot",
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkingDatabaseRecovery {
+    NotNeeded,
+    Reusable,
+    RebuildRequired { reason: &'static str },
+}
+
+/// Only the current task's mutable database is eligible for recovery. The
+/// caller must first resolve publication/candidate fast paths and own the run
+/// lock. RebuildRequired is a request for a durable archive barrier, not
+/// permission to remove individual sidecars or restart against a stale model.
+pub(super) fn recover_working_database(
+    paths: &ProjectPaths,
+    state: &PipelineStateFile,
+    cancel: &CancellationToken,
+) -> Result<WorkingDatabaseRecovery> {
+    check_cancel(cancel)?;
+    if state
+        .inputs
+        .as_ref()
+        .is_some_and(|value| value.imported_reconstruction)
+    {
+        return Ok(WorkingDatabaseRecovery::NotNeeded);
+    }
+    let path = paths.colmap.join("database.db");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkingDatabaseRecovery::NotNeeded)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_recovery_path(&paths.project, &path)?;
+    let root = std::fs::canonicalize(&paths.project)?;
+    if !metadata.file_type().is_file() || !std::fs::canonicalize(&path)?.starts_with(&root) {
+        return Err(SplatError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Unsafe COLMAP database recovery path",
+        )));
+    }
+    let mut pending = false;
+    let mut existing_sidecars = Vec::new();
+    for suffix in ["-wal", "-journal", "-shm"] {
+        let mut sidecar_name = path.as_os_str().to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar = PathBuf::from(sidecar_name);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(value) => {
+                validate_recovery_path(&paths.project, &sidecar)?;
+                if !value.file_type().is_file()
+                    || !std::fs::canonicalize(&sidecar)?.starts_with(&root)
+                {
+                    return Err(SplatError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Unsafe COLMAP database sidecar recovery path",
+                    )));
+                }
+                // A cold PERSIST journal is legal, but its connection may
+                // still own a live write transaction. Let SQLite prove the
+                // exclusive lock instead of equating a zero header with idle.
+                pending |= matches!(suffix, "-wal" | "-journal") && value.len() > 0;
+                existing_sidecars.push(sidecar);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !pending {
+        return Ok(WorkingDatabaseRecovery::NotNeeded);
+    }
+    reject_shared_recovery_file(&path)?;
+    for sidecar in existing_sidecars {
+        reject_shared_recovery_file(&sidecar)?;
+    }
+    // Historical tasks have no semantic manifest. An unchanged main-file hash
+    // may continue through their existing strict validator; changed bytes
+    // cannot be used to manufacture evidence for an old reconstructed model.
+    let before = describe_file_cancellable(&paths.project, &path, true, cancel)?;
+    let recovered = (|| {
+        let connection = super::sqlite_recovery::settle(&path, cancel)?;
+        let summary = read_database_summary(&connection, cancel)?;
+        // Bind the semantic read to bytes while SQLite still owns the lock.
+        // This plain read deliberately does not open Windows change-evidence
+        // handles. A writer after close must not pair a stale summary with new
+        // bytes in the manifest below.
+        let locked_sha256 = hash_file_cancellable(&path, cancel)?;
+        // Close SQLite before filesystem change-evidence handles (Windows).
+        connection
+            .close()
+            .map_err(|(_, error)| database_error(error))?;
+        database_stamps(&path, cancel)?;
+        let file = describe_file_cancellable(&paths.project, &path, true, cancel)?;
+        ensure_recovered_file_identity(&locked_sha256, &file)?;
+        Ok::<_, SplatError>((summary, file))
+    })();
+    let (summary, file) = match recovered {
+        Ok(value) => value,
+        Err(error) if invalid_artifact_error(&error) => {
+            return Ok(WorkingDatabaseRecovery::RebuildRequired {
+                reason: "sqlite_recovery_invalid",
+            })
+        }
+        Err(error) => return Err(error),
+    };
+    if state.features_complete {
+        if let Some(saved) = state.artifact_manifests.entries.get(FEATURES) {
+            if saved.semantic_identity.as_ref() != Some(&summary.feature_identity) {
+                return Ok(WorkingDatabaseRecovery::RebuildRequired {
+                    reason: "sqlite_recovery_features_changed",
+                });
+            }
+        }
+    }
+    let matching_complete = state.matching_complete
+        || state
+            .reshoot
+            .as_ref()
+            .is_some_and(|value| value.incremental_matching_complete);
+    if matching_complete {
+        if let Some(saved) = state.artifact_manifests.entries.get(MATCHING) {
+            let current = database_manifest_for_file(
+                file,
+                &saved.attempt_id,
+                &saved.upstream_identity,
+                &summary.matching_identity,
+                summary.match_count,
+            )?;
+            if !matching_manifest_match(saved, &current) {
+                return Ok(WorkingDatabaseRecovery::RebuildRequired {
+                    reason: "sqlite_recovery_matching_changed",
+                });
+            }
+        } else if !same_file_content(&before, &file) {
+            return Ok(WorkingDatabaseRecovery::RebuildRequired {
+                reason: "sqlite_recovery_legacy_identity_unproven",
+            });
+        }
+    }
+    Ok(WorkingDatabaseRecovery::Reusable)
+}
+
+fn ensure_recovered_file_identity(locked_sha256: &str, file: &ArtifactFile) -> Result<()> {
+    if file.sha256.as_deref() != Some(locked_sha256) {
+        return Err(database_in_use(
+            "COLMAP database changed after SQLite recovery",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve prepared pixels, recipes, source snapshots and every rescue ledger.
+/// Database/model-derived outputs must move together before any extractor runs.
+pub(super) fn invalidate_database_for_rebuild(state: &mut PipelineStateFile) {
+    state.features_complete = false;
+    state.matching_complete = false;
+    state.reconstruction_complete = false;
+    state.brush_complete = false;
+    state.validated_output = None;
+    state.stage = PipelineStage::ExtractingFeatures;
+    if let Some(gps) = state.gps.as_mut() {
+        gps.database_recovery_visual_only |= gps.status == "fallback";
+    }
+    if let Some(checkpoint) = state.inputs.as_mut() {
+        checkpoint.reference_image = None;
+        checkpoint.unused.clear();
+        checkpoint.source_adoption.clear();
+    }
+    if let Some(reshoot) = state.reshoot.as_mut() {
+        reshoot.supplemental_features_complete = false;
+        reshoot.incremental_matching_complete = false;
+        reshoot.incremental_reconstruction_complete = false;
+    }
+    state
+        .artifact_manifests
+        .entries
+        .retain(|stage, _| stage == PREPARED);
+    if state.database_recovery_pending.is_none() {
+        state.database_recovery_pending = Some("database_cache_untrusted".into());
+    }
+    for name in [
+        "brush",
+        "colmap",
+        "joint-bridge",
+        "panorama-training",
+        "undistorted-training",
+        "ordinary-training-model",
+        "sphere-training-model",
+        "sphere-training-images",
+    ] {
+        if !state.retry_cache_pending.iter().any(|entry| entry == name) {
+            state.retry_cache_pending.push(name.into());
+        }
+    }
+}
+
 fn database_stamps(path: &Path, cancel: &CancellationToken) -> Result<Vec<FileStamp>> {
     check_cancel(cancel)?;
     let mut roots = vec![path.to_path_buf()];
@@ -526,7 +803,12 @@ fn database_stamps(path: &Path, cancel: &CancellationToken) -> Result<Vec<FileSt
         sidecar.push(suffix);
         let sidecar = PathBuf::from(sidecar);
         match std::fs::symlink_metadata(&sidecar) {
-            Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > 0 => {
+            Ok(metadata)
+                if !metadata.file_type().is_file()
+                    || (metadata.len() > 0
+                        && !(suffix == "-journal"
+                            && journal_is_cold(&sidecar, metadata.len())?)) =>
+            {
                 // Immutable SQLite would ignore pending sidecar writes. This is
                 // an operational busy condition, not proof of a corrupt cache.
                 return Err(database_in_use(
@@ -548,13 +830,21 @@ fn database_stamps(path: &Path, cancel: &CancellationToken) -> Result<Vec<FileSt
         result => result?,
     };
     // file_stamps also observes a sidecar that appeared after the first check.
-    if stamps
-        .iter()
-        .any(|stamp| stamp.path != path && (stamp.directory || stamp.length > 0))
-    {
-        return Err(database_in_use(
-            "COLMAP database has pending sidecar writes",
-        ));
+    for stamp in &stamps {
+        if stamp.path != path
+            && (stamp.directory
+                || (stamp.length > 0
+                    && !(stamp
+                        .path
+                        .as_os_str()
+                        .to_string_lossy()
+                        .ends_with("-journal")
+                        && journal_is_cold(&stamp.path, stamp.length)?)))
+        {
+            return Err(database_in_use(
+                "COLMAP database has pending sidecar writes",
+            ));
+        }
     }
     Ok(stamps)
 }
@@ -784,6 +1074,75 @@ pub async fn normalize_collection_cancellable(
     Ok(changed)
 }
 
+/// Prove a publication candidate before touching disposable working databases.
+/// Completion flags alone are not sufficient: a missing/corrupt candidate must
+/// still allow normal database recovery and artifact normalization to run.
+pub(super) async fn recover_collection_candidate(
+    paths: &ProjectPaths,
+    state: &PipelineStateFile,
+    cancel: &CancellationToken,
+) -> Result<Option<PathBuf>> {
+    let paths = paths.clone();
+    let saved = Box::new(state.clone());
+    let cancel = cancel.clone();
+    crate::presets::spawn_pipeline_blocking(move || {
+        verified_collection_candidate(&paths, &saved, &cancel)
+    })
+    .await
+    .map_err(|error| SplatError::Process(error.to_string()))?
+}
+
+fn verified_collection_candidate(
+    paths: &ProjectPaths,
+    state: &PipelineStateFile,
+    cancel: &CancellationToken,
+) -> Result<Option<PathBuf>> {
+    check_cancel(cancel)?;
+    let Some(checkpoint) = state.inputs.as_ref() else {
+        return Ok(None);
+    };
+    validate_collection_camera_policy(state, checkpoint)?;
+    let previous = &state.artifact_manifests;
+    if previous.version != ARTIFACT_MANIFEST_VERSION
+        || !state.brush_complete
+        || !state.retry_cache_pending.is_empty()
+        || state.database_recovery_pending.is_some()
+        || checkpoint.temporary_png_focal_pending_records.is_some()
+        || state.brush_training.dataset_identity.is_none()
+    {
+        return Ok(None);
+    }
+    if let (Some(output), Some(saved), Some(dataset)) = (
+        state.validated_output.as_ref(),
+        previous.entries.get(BRUSH_CANDIDATE),
+        previous.entries.get(TRAINING_DATASET),
+    ) {
+        if saved.semantic_identity.is_some() && saved.upstream_identity == dataset.artifact_identity
+        {
+            let current = usable_validation(
+                capture_candidate_cancellable(
+                    paths,
+                    state,
+                    &saved.attempt_id,
+                    &saved.upstream_identity,
+                    cancel,
+                )
+                .map(Some),
+                cancel,
+            )?;
+            if let Some(current) = current.filter(|current| {
+                candidate_manifest_match(saved, current)
+                    && current.expected_count == output.splat_count
+                    && current.files.len() == 1
+                    && current.files[0].file_size == output.file_size
+            }) {
+                return Ok(Some(paths.project.join(&current.files[0].relative_path)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn normalize_collection_inner(
     paths: &ProjectPaths,
     state: &mut PipelineStateFile,
@@ -804,41 +1163,8 @@ fn normalize_collection_inner(
     // A fully validated immutable candidate is sufficient for publication.
     // Its saved source/config/recipe identity and dataset key must match, but
     // regenerable upstream images/databases no longer need to be on disk.
-    if usable_previous
-        && state.brush_complete
-        && state.retry_cache_pending.is_empty()
-        && checkpoint.temporary_png_focal_pending_records.is_none()
-        && state.brush_training.dataset_identity.is_some()
-    {
-        if let (Some(output), Some(saved), Some(dataset)) = (
-            state.validated_output.as_ref(),
-            previous.entries.get(BRUSH_CANDIDATE),
-            previous.entries.get(TRAINING_DATASET),
-        ) {
-            if saved.semantic_identity.is_some()
-                && saved.upstream_identity == dataset.artifact_identity
-            {
-                let current = usable_validation(
-                    capture_candidate_cancellable(
-                        paths,
-                        state,
-                        &attempt,
-                        &saved.upstream_identity,
-                        cancel,
-                    )
-                    .map(Some),
-                    cancel,
-                )?;
-                if current.as_ref().is_some_and(|current| {
-                    candidate_manifest_match(saved, current)
-                        && current.expected_count == output.splat_count
-                        && current.files.len() == 1
-                        && current.files[0].file_size == output.file_size
-                }) {
-                    return Ok(false);
-                }
-            }
-        }
+    if verified_collection_candidate(paths, state, cancel)?.is_some() {
+        return Ok(false);
     }
     let upstream = source_identity(state, &checkpoint)?;
     let mut retained = ArtifactManifestSet {
@@ -896,6 +1222,8 @@ fn normalize_collection_inner(
         .entries
         .get(PREPARED)
         .map(|manifest| manifest.artifact_identity.as_str());
+    let features_expected = state.features_complete;
+    let matching_expected = state.matching_complete;
     let current_feature = usable_validation(
         match (
             state.features_complete,
@@ -960,13 +1288,26 @@ fn normalize_collection_inner(
             previous
                 .entries
                 .get(MATCHING)
-                .is_some_and(|saved| exact_manifest_match(saved, current))
+                .is_some_and(|saved| matching_manifest_match(saved, current))
         });
     state.matching_complete &= matching;
     if matching {
         retained
             .entries
             .insert(MATCHING.into(), previous.entries[MATCHING].clone());
+    }
+
+    if prepared
+        && !checkpoint.imported_reconstruction
+        && ((features_expected && !features)
+            || (matching_expected && !matching)
+            || (database.is_none() && paths.colmap.join("database.db").try_exists()?))
+    {
+        // Do not let collection_features rename just database.db while leaving
+        // its old WAL behind, or let a matcher reuse rejected verified pairs.
+        state.inputs = Some(checkpoint);
+        invalidate_database_for_rebuild(state);
+        return Ok(true);
     }
 
     let reconstruction_upstream = if checkpoint.imported_reconstruction {
@@ -1312,18 +1653,9 @@ fn legacy_v2_combined_database(
                 return Err(untrusted_artifact());
             }
             let path = paths.colmap.join("database.db");
-            // immutable=1 cannot account for uncheckpointed external writers.
-            for suffix in ["-wal", "-journal"] {
-                let sidecar = path.with_file_name(format!("database.db{suffix}"));
-                match std::fs::symlink_metadata(sidecar) {
-                    Ok(metadata) if !metadata.is_file() || metadata.len() != 0 => {
-                        return Err(untrusted_artifact());
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
+            // The shared validator rejects pending writers while allowing a
+            // native SQLite recovery's cold PERSIST journal. A busy database
+            // must not be misclassified as a corrupt legacy source snapshot.
             let summary = validate_database(&path)?;
             let database_names = summary.images.keys().collect::<BTreeSet<_>>();
             if !source_names.is_subset(&database_names)
@@ -1938,7 +2270,11 @@ pub async fn recover_saved_legacy_candidate(
     state: &PipelineStateFile,
     cancel: &CancellationToken,
 ) -> Result<Option<PathBuf>> {
-    if !state.brush_complete || state.brush_training.legacy_dataset_identity.is_none() {
+    if !state.brush_complete
+        || state.brush_training.legacy_dataset_identity.is_none()
+        || !state.retry_cache_pending.is_empty()
+        || state.database_recovery_pending.is_some()
+    {
         return Ok(None);
     }
     let saved = state
@@ -1968,7 +2304,17 @@ pub async fn recover_saved_legacy_candidate(
             .validated_output
             .as_ref()
             .ok_or_else(untrusted_artifact)?;
-        let info = inspect_gaussian_ply(&path)?;
+        let recipe = candidate_recipe_identity(&snapshot)?;
+        if saved.semantic_identity.as_ref() != Some(&recipe)
+            || snapshot.brush_training.legacy_dataset_identity.as_ref()
+                != Some(&saved.upstream_identity)
+        {
+            // Conflicting historical configuration is not a disposable file.
+            return Err(untrusted_artifact());
+        }
+        let Some(info) = usable_validation(inspect_gaussian_ply(&path).map(Some), &token)? else {
+            return Ok(None);
+        };
         let current = make_manifest(
             &saved.attempt_id,
             snapshot
@@ -1977,7 +2323,7 @@ pub async fn recover_saved_legacy_candidate(
                 .as_deref()
                 .ok_or_else(untrusted_artifact)?,
             info.splat_count,
-            Some(candidate_recipe_identity(&snapshot)?),
+            Some(recipe),
             vec![describe_file_cancellable(
                 &paths.project,
                 &path,
@@ -1989,7 +2335,10 @@ pub async fn recover_saved_legacy_candidate(
             || output.splat_count != info.splat_count
             || output.file_size != info.file_size
         {
-            return Err(untrusted_artifact());
+            // Missing/modified output must not skip database recovery based
+            // only on old completion flags. Normalization decides which of
+            // the remaining, independently verified artifacts can be reused.
+            return Ok(None);
         }
         Ok(Some(path))
     })
@@ -2013,8 +2362,8 @@ fn candidate_manifest_match(saved: &ArtifactManifest, current: &ArtifactManifest
     .is_ok_and(|legacy| exact_manifest_match(saved, &legacy))
 }
 
-#[derive(Debug, Clone)]
-struct DatabaseSummary {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DatabaseSummary {
     images: BTreeMap<String, (i64, i64)>,
     feature_identity: String,
     matching_identity: String,
@@ -2036,133 +2385,285 @@ fn validate_database_cancellable(
     // owned by this validation operation (or a genuinely active external writer).
     let summary = {
         let connection = open_immutable_database(path)?;
-        let integrity: String = connection
-            .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
-            .map_err(database_error)?;
-        if integrity != "ok" {
-            return Err(untrusted_artifact());
-        }
-        check_cancel(cancel)?;
-        let cameras = scalar_set(
-            &connection,
-            "SELECT camera_id FROM cameras ORDER BY camera_id",
-        )?;
-        if cameras.is_empty() {
-            return Err(untrusted_artifact());
-        }
-        let mut images = BTreeMap::new();
-        let mut image_ids = BTreeSet::new();
-        let mut statement = connection
-            .prepare("SELECT image_id,name,camera_id FROM images ORDER BY image_id")
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(database_error)?;
-        for row in rows {
-            check_cancel(cancel)?;
-            let (id, name, camera) = row.map_err(database_error)?;
-            if id <= 0
-                || name.is_empty()
-                || !cameras.contains(&camera)
-                || !image_ids.insert(id)
-                || images.insert(name, (id, camera)).is_some()
-            {
-                return Err(untrusted_artifact());
-            }
-        }
-        if images.is_empty() {
-            return Err(untrusted_artifact());
-        }
-
-        let keypoints = matrix_rows(&connection, "keypoints", 4, cancel, |cols| {
-            matches!(cols, 2 | 4 | 6)
-        })?;
-        let descriptors = matrix_rows(&connection, "descriptors", 1, cancel, |cols| cols == 128)?;
-        if keypoints.len() != images.len()
-            || descriptors.len() != images.len()
-            || keypoints.keys().any(|id| !image_ids.contains(id))
-            || descriptors.keys().any(|id| !image_ids.contains(id))
-            || keypoints.iter().any(|(id, row)| {
-                descriptors
-                    .get(id)
-                    .is_none_or(|descriptor| descriptor.rows != row.rows)
-            })
-        {
-            return Err(untrusted_artifact());
-        }
-
-        let mut feature_hash = Sha256::new();
-        hash_label(&mut feature_hash, "artifact-features-v1");
-        for (name, (id, camera)) in &images {
-            check_cancel(cancel)?;
-            hash_i64(&mut feature_hash, *id);
-            hash_i64(&mut feature_hash, *camera);
-            hash_label(&mut feature_hash, name);
-            hash_matrix(&mut feature_hash, &keypoints[id]);
-            hash_matrix(&mut feature_hash, &descriptors[id]);
-        }
-        let feature_identity = format!("{:x}", feature_hash.finalize());
-
-        const MAX_IMAGE_ID: i64 = 2_147_483_647;
-        let mut matches_hash = Sha256::new();
-        hash_label(&mut matches_hash, "artifact-matches-v1");
-        hash_label(&mut matches_hash, &feature_identity);
-        let mut match_count = 0_u64;
-        let mut statement = connection
-            .prepare("SELECT pair_id,rows,cols,data FROM matches ORDER BY pair_id")
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                ))
-            })
-            .map_err(database_error)?;
-        for row in rows {
-            check_cancel(cancel)?;
-            let (pair, row_count, cols, data) = row.map_err(database_error)?;
-            let first = pair / MAX_IMAGE_ID;
-            let second = pair % MAX_IMAGE_ID;
-            let bytes = data.unwrap_or_default();
-            if pair <= 0
-                || first <= 0
-                || second <= 0
-                || first == second
-                || !image_ids.contains(&first)
-                || !image_ids.contains(&second)
-                || row_count < 0
-                || cols != 2
-                || matrix_byte_len(row_count, cols, 4) != Some(bytes.len())
-            {
-                return Err(untrusted_artifact());
-            }
-            match_count = match_count.saturating_add(row_count as u64);
-            hash_i64(&mut matches_hash, pair);
-            hash_i64(&mut matches_hash, row_count);
-            hash_i64(&mut matches_hash, cols);
-            matches_hash.update(&bytes);
-        }
-        DatabaseSummary {
-            images,
-            feature_identity,
-            matching_identity: format!("{:x}", matches_hash.finalize()),
-            match_count,
-        }
+        read_database_summary(&connection, cancel)?
     };
     check_cancel(cancel)?;
     if database_stamps(path, cancel)? != initial_stamp {
         return Err(database_in_use("COLMAP database changed during validation"));
     }
     Ok(summary)
+}
+
+/// Shared by immutable cache validation and the locked mutable-db recovery.
+/// The caller owns connection lifetime and must not expose immutable source
+/// snapshots to a writable SQLite connection.
+pub(super) fn read_database_summary(
+    connection: &Connection,
+    cancel: &CancellationToken,
+) -> Result<DatabaseSummary> {
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+        .map_err(database_error)?;
+    if integrity != "ok" {
+        return Err(untrusted_artifact());
+    }
+    check_cancel(cancel)?;
+    let cameras = scalar_set(
+        connection,
+        "SELECT camera_id FROM cameras ORDER BY camera_id",
+    )?;
+    if cameras.is_empty() {
+        return Err(untrusted_artifact());
+    }
+    let mut images = BTreeMap::new();
+    let mut image_ids = BTreeSet::new();
+    let mut statement = connection
+        .prepare("SELECT image_id,name,camera_id FROM images ORDER BY image_id")
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(database_error)?;
+    for row in rows {
+        check_cancel(cancel)?;
+        let (id, name, camera) = row.map_err(database_error)?;
+        if id <= 0
+            || name.is_empty()
+            || !cameras.contains(&camera)
+            || !image_ids.insert(id)
+            || images.insert(name, (id, camera)).is_some()
+        {
+            return Err(untrusted_artifact());
+        }
+    }
+    if images.is_empty() {
+        return Err(untrusted_artifact());
+    }
+
+    let keypoints = matrix_rows(connection, "keypoints", 4, cancel, |cols| {
+        matches!(cols, 2 | 4 | 6)
+    })?;
+    let descriptors = matrix_rows(connection, "descriptors", 1, cancel, |cols| cols == 128)?;
+    if keypoints.len() != images.len()
+        || descriptors.len() != images.len()
+        || keypoints.keys().any(|id| !image_ids.contains(id))
+        || descriptors.keys().any(|id| !image_ids.contains(id))
+        || keypoints.iter().any(|(id, row)| {
+            descriptors
+                .get(id)
+                .is_none_or(|descriptor| descriptor.rows != row.rows)
+        })
+    {
+        return Err(untrusted_artifact());
+    }
+
+    let mut feature_hash = Sha256::new();
+    hash_label(&mut feature_hash, "artifact-features-v1");
+    for (name, (id, camera)) in &images {
+        check_cancel(cancel)?;
+        hash_i64(&mut feature_hash, *id);
+        hash_i64(&mut feature_hash, *camera);
+        hash_label(&mut feature_hash, name);
+        hash_matrix(&mut feature_hash, &keypoints[id]);
+        hash_matrix(&mut feature_hash, &descriptors[id]);
+    }
+    let feature_identity = format!("{:x}", feature_hash.finalize());
+
+    const MAX_IMAGE_ID: i64 = 2_147_483_647;
+    let mut matches_hash = Sha256::new();
+    hash_label(&mut matches_hash, "artifact-matches-v1");
+    hash_label(&mut matches_hash, &feature_identity);
+    let mut match_count = 0_u64;
+    let mut statement = connection
+        .prepare("SELECT pair_id,rows,cols,data FROM matches ORDER BY pair_id")
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .map_err(database_error)?;
+    for row in rows {
+        check_cancel(cancel)?;
+        let (pair, row_count, cols, data) = row.map_err(database_error)?;
+        let first = pair / MAX_IMAGE_ID;
+        let second = pair % MAX_IMAGE_ID;
+        let bytes = data.unwrap_or_default();
+        if pair <= 0
+            || first <= 0
+            || second <= 0
+            || first == second
+            || !image_ids.contains(&first)
+            || !image_ids.contains(&second)
+            || row_count < 0
+            || cols != 2
+            || matrix_byte_len(row_count, cols, 4) != Some(bytes.len())
+        {
+            return Err(untrusted_artifact());
+        }
+        match_count = match_count.saturating_add(row_count as u64);
+        hash_i64(&mut matches_hash, pair);
+        hash_i64(&mut matches_hash, row_count);
+        hash_i64(&mut matches_hash, cols);
+        matches_hash.update(&bytes);
+    }
+    let raw_matching_identity = format!("{:x}", matches_hash.finalize());
+    let matching_identity =
+        complete_matching_identity(connection, &raw_matching_identity, &keypoints, cancel)?;
+    Ok(DatabaseSummary {
+        images,
+        feature_identity,
+        matching_identity,
+        match_count,
+    })
+}
+
+/// v1 covered only raw matches. Mapper also consumes verified geometry, camera
+/// calibration, rigs/frames and position priors. Hash every column of those
+/// tables (including schema/presence) in deterministic row order, so a WAL
+/// checkpoint may change file layout without concealing changed SfM inputs.
+fn complete_matching_identity(
+    connection: &Connection,
+    raw_matching_identity: &str,
+    keypoints: &BTreeMap<i64, MatrixRow>,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash_label(&mut hash, MATCHING_SEMANTIC_PREFIX);
+    hash_label(&mut hash, raw_matching_identity);
+    for table in [
+        "cameras",
+        "images",
+        "rigs",
+        "rig_sensors",
+        "frames",
+        "frame_data",
+        "pose_priors",
+        "two_view_geometries",
+    ] {
+        check_cancel(cancel)?;
+        hash_label(&mut hash, table);
+        let mut schema = connection
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .map_err(database_error)?;
+        let columns = schema
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(database_error)?;
+        if columns.is_empty() {
+            hash_label(&mut hash, "absent");
+            continue;
+        }
+        hash_label(&mut hash, &serde_json::to_string(&columns)?);
+        let mut keys = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.4 > 0)
+            .map(|(index, column)| (column.4, index + 1))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let ordering = if keys.is_empty() {
+            (1..=columns.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            keys.into_iter()
+                .map(|(_, index)| index.to_string())
+                .collect()
+        }
+        .join(",");
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY {ordering}"))
+            .map_err(database_error)?;
+        let mut rows = statement.query([]).map_err(database_error)?;
+        while let Some(row) = rows.next().map_err(database_error)? {
+            check_cancel(cancel)?;
+            hash_label(&mut hash, "row");
+            if table == "two_view_geometries" {
+                validate_geometry_row(row, keypoints)?;
+            }
+            for index in 0..columns.len() {
+                use rusqlite::types::ValueRef;
+                match row.get_ref(index).map_err(database_error)? {
+                    ValueRef::Null => hash.update([0]),
+                    ValueRef::Integer(value) => {
+                        hash.update([1]);
+                        hash_i64(&mut hash, value);
+                    }
+                    ValueRef::Real(value) if value.is_finite() => {
+                        hash.update([2]);
+                        hash.update(value.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Real(_) => return Err(untrusted_artifact()),
+                    ValueRef::Text(value) => {
+                        hash.update([3]);
+                        hash.update((value.len() as u64).to_le_bytes());
+                        hash.update(value);
+                    }
+                    ValueRef::Blob(value) => {
+                        hash.update([4]);
+                        hash.update((value.len() as u64).to_le_bytes());
+                        hash.update(value);
+                    }
+                }
+            }
+        }
+    }
+    Ok(format!("{MATCHING_SEMANTIC_PREFIX}{:x}", hash.finalize()))
+}
+
+fn validate_geometry_row(
+    row: &rusqlite::Row<'_>,
+    keypoints: &BTreeMap<i64, MatrixRow>,
+) -> Result<()> {
+    const MAX_IMAGE_ID: i64 = 2_147_483_647;
+    let pair = row.get::<_, i64>("pair_id").map_err(database_error)?;
+    let count = row.get::<_, i64>("rows").map_err(database_error)?;
+    let cols = row.get::<_, i64>("cols").map_err(database_error)?;
+    let data = row
+        .get::<_, Option<Vec<u8>>>("data")
+        .map_err(database_error)?
+        .unwrap_or_default();
+    let first = pair / MAX_IMAGE_ID;
+    let second = pair % MAX_IMAGE_ID;
+    let (Some(first_points), Some(second_points)) = (keypoints.get(&first), keypoints.get(&second))
+    else {
+        return Err(untrusted_artifact());
+    };
+    if pair <= 0
+        || first >= second
+        || count < 0
+        || (cols != 2 && !(count == 0 && cols == 0))
+        || matrix_byte_len(count, cols, 4) != Some(data.len())
+    {
+        return Err(untrusted_artifact());
+    }
+    for pair in data.as_chunks::<8>().0 {
+        let left = u32::from_le_bytes(pair[..4].try_into().expect("four bytes"));
+        let right = u32::from_le_bytes(pair[4..].try_into().expect("four bytes"));
+        if i64::from(left) >= first_points.rows || i64::from(right) >= second_points.rows {
+            return Err(untrusted_artifact());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2327,6 +2828,36 @@ fn semantic_manifest_match(saved: &ArtifactManifest, current: &ArtifactManifest)
         && saved.files.iter().zip(&current.files).all(|(left, right)| {
             left.relative_path == right.relative_path && left.file_type == right.file_type
         })
+}
+
+fn same_file_content(saved: &ArtifactFile, current: &ArtifactFile) -> bool {
+    saved.relative_path == current.relative_path
+        && saved.file_type == current.file_type
+        && saved.file_size == current.file_size
+        && saved.sha256.is_some()
+        && saved.sha256 == current.sha256
+}
+
+fn matching_manifest_match(saved: &ArtifactManifest, current: &ArtifactManifest) -> bool {
+    if saved
+        .semantic_identity
+        .as_deref()
+        .is_some_and(|value| value.starts_with(MATCHING_SEMANTIC_PREFIX))
+    {
+        return semantic_manifest_match(saved, current);
+    }
+    // Old raw-match-only summaries do not certify camera/verified geometry.
+    // Preserve unchanged content (including mtime-only recovery) but never
+    // replace this evidence with a newly measured semantic baseline.
+    saved.upstream_identity == current.upstream_identity
+        && saved.expected_count == current.expected_count
+        && !saved.files.is_empty()
+        && saved.files.len() == current.files.len()
+        && saved
+            .files
+            .iter()
+            .zip(&current.files)
+            .all(|(old, new)| same_file_content(old, new))
 }
 
 fn describe_file_cancellable(
@@ -2920,7 +3451,8 @@ mod tests {
         assert!(
             recover_saved_legacy_candidate(&fixture.paths, &fixture.state, &token)
                 .await
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         fixture.state.brush_complete = false;
         assert!(
@@ -3475,14 +4007,16 @@ mod tests {
             b"uncheckpointed",
         )
         .unwrap();
-        normalize_reshoot_v2(&fixture.paths, &mut fixture.state).unwrap();
-        assert!(
-            !fixture
-                .state
-                .reshoot
-                .as_ref()
-                .unwrap()
-                .source_snapshot_complete
+        let saved_state = serde_json::to_value(&fixture.state).unwrap();
+        let error = normalize_reshoot_v2(&fixture.paths, &mut fixture.state).unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.state).unwrap(),
+            saved_state,
+            "pending writes require recovery, not a corrupt-cache downgrade"
         );
         assert_eq!(std::fs::read(&candidate).unwrap(), before);
     }
@@ -3782,6 +4316,242 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fixture.state.artifact_manifests, before);
+    }
+
+    #[tokio::test]
+    async fn cold_persist_journal_does_not_invalidate_saved_sfm() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_complete = false;
+        std::fs::write(
+            fixture.paths.colmap.join("database.db-journal"),
+            [0_u8; 1024],
+        )
+        .unwrap();
+        assert_eq!(
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap(),
+            WorkingDatabaseRecovery::Reusable
+        );
+        normalize_collection(&fixture.paths, &mut fixture.state, None)
+            .await
+            .unwrap();
+        assert!(fixture.state.matching_complete && fixture.state.reconstruction_complete);
+        assert!(fixture.state.retry_cache_pending.is_empty());
+    }
+
+    #[test]
+    fn cold_persist_journal_with_an_active_writer_is_busy_not_reusable() {
+        let fixture = fixture(false);
+        let database = fixture.paths.colmap.join("database.db");
+        let writer = Connection::open(database).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=PERSIST; PRAGMA user_version=3; BEGIN IMMEDIATE")
+            .unwrap();
+        let journal = fixture.paths.colmap.join("database.db-journal");
+        let length = std::fs::metadata(&journal).unwrap().len();
+        assert!(length > 0 && journal_is_cold(&journal, length).unwrap());
+        let error =
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!writer.is_autocommit());
+        assert!(fixture.state.features_complete && fixture.state.matching_complete);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_wal_recovery_preserves_complete_semantic_cache_identity() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_complete = false;
+        let before = fixture.state.artifact_manifests.clone();
+        super::super::sqlite_recovery::tests::crash_fixture(
+            &fixture.paths.colmap.join("database.db"),
+            "layout",
+        );
+        assert_eq!(
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap(),
+            WorkingDatabaseRecovery::Reusable
+        );
+        normalize_collection(&fixture.paths, &mut fixture.state, None)
+            .await
+            .unwrap();
+        assert!(
+            fixture.state.features_complete
+                && fixture.state.matching_complete
+                && fixture.state.reconstruction_complete
+        );
+        assert_eq!(
+            fixture.state.artifact_manifests.entries[MATCHING],
+            before.entries[MATCHING]
+        );
+        assert_eq!(
+            fixture.state.artifact_manifests.entries[RECONSTRUCTION],
+            before.entries[RECONSTRUCTION]
+        );
+        assert!(fixture.state.retry_cache_pending.is_empty());
+    }
+
+    #[test]
+    fn old_matching_summary_cannot_rebase_over_changed_database_bytes() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_complete = false;
+        fixture
+            .state
+            .artifact_manifests
+            .entries
+            .get_mut(MATCHING)
+            .unwrap()
+            .semantic_identity = Some("old-raw-matches-digest".into());
+        super::super::sqlite_recovery::tests::crash_fixture(
+            &fixture.paths.colmap.join("database.db"),
+            "layout",
+        );
+        assert_eq!(
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap(),
+            WorkingDatabaseRecovery::RebuildRequired {
+                reason: "sqlite_recovery_matching_changed"
+            }
+        );
+        // The preflight only reports; no cache or completion bit is mutated.
+        assert!(
+            fixture.state.matching_complete && fixture.paths.colmap.join("authoritative").exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn old_matching_summary_accepts_unchanged_content_without_promoting_new_evidence() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_complete = false;
+        fixture
+            .state
+            .artifact_manifests
+            .entries
+            .get_mut(MATCHING)
+            .unwrap()
+            .semantic_identity = Some("old-raw-matches-digest".into());
+        let saved = fixture.state.artifact_manifests.entries[MATCHING].clone();
+        normalize_collection(&fixture.paths, &mut fixture.state, None)
+            .await
+            .unwrap();
+        assert!(fixture.state.matching_complete && fixture.state.reconstruction_complete);
+        assert_eq!(fixture.state.artifact_manifests.entries[MATCHING], saved);
+    }
+
+    #[tokio::test]
+    async fn camera_or_verified_geometry_changes_require_whole_database_archive() {
+        for change in ["UPDATE cameras SET params=X'000000000000F03F'", "ALTER TABLE two_view_geometries ADD COLUMN config INTEGER DEFAULT 2", "CREATE TABLE pose_priors(id INTEGER PRIMARY KEY,position BLOB); INSERT INTO pose_priors VALUES(1,X'00')"] {
+            let mut fixture = fixture(false);
+            fixture.state.brush_complete = false;
+            fixture.state.inputs.as_mut().unwrap().bridge_used = true;
+            fixture.state.inputs.as_mut().unwrap().expanded_matching = true;
+            let db = Connection::open(fixture.paths.colmap.join("database.db")).unwrap();
+            db.execute_batch(change).unwrap();
+            drop(db);
+            normalize_collection(&fixture.paths, &mut fixture.state, None).await.unwrap();
+            assert!(!fixture.state.features_complete && !fixture.state.matching_complete && !fixture.state.reconstruction_complete, "{change}");
+            assert!(fixture.state.inputs.as_ref().unwrap().prepared);
+            assert!(fixture.state.inputs.as_ref().unwrap().bridge_used && fixture.state.inputs.as_ref().unwrap().expanded_matching);
+            assert!(fixture.state.database_recovery_pending.is_some());
+            assert!(fixture.state.retry_cache_pending.iter().any(|entry| entry == "colmap"));
+            assert!(fixture.paths.colmap.join("database.db").exists());
+            assert!(fixture.paths.frames.join("normal.png").exists());
+        }
+    }
+
+    #[test]
+    fn semantic_geometry_hash_covers_verified_pairs_and_rejects_bad_feature_indices() {
+        let fixture = fixture(false);
+        let db = Connection::open(fixture.paths.colmap.join("database.db")).unwrap();
+        db.execute_batch("INSERT INTO images VALUES(2,'second.png',1); INSERT INTO keypoints SELECT 2,rows,cols,data FROM keypoints WHERE image_id=1; INSERT INTO descriptors SELECT 2,rows,cols,data FROM descriptors WHERE image_id=1; ALTER TABLE two_view_geometries ADD COLUMN config INTEGER; ALTER TABLE two_view_geometries ADD COLUMN qvec BLOB; INSERT INTO two_view_geometries VALUES(2147483649,1,2,X'0000000000000000',2,X'000000000000F03F');").unwrap();
+        let first = read_database_summary(&db, &CancellationToken::new()).unwrap();
+        db.execute_batch("UPDATE two_view_geometries SET config=3")
+            .unwrap();
+        let second = read_database_summary(&db, &CancellationToken::new()).unwrap();
+        assert_eq!(first.feature_identity, second.feature_identity);
+        assert_ne!(first.matching_identity, second.matching_identity);
+        db.execute_batch("UPDATE two_view_geometries SET qvec=X'0000000000000040'")
+            .unwrap();
+        let third = read_database_summary(&db, &CancellationToken::new()).unwrap();
+        assert_ne!(second.matching_identity, third.matching_identity);
+        db.execute_batch("UPDATE two_view_geometries SET data=X'0100000000000000'")
+            .unwrap();
+        assert!(read_database_summary(&db, &CancellationToken::new()).is_err());
+    }
+
+    #[test]
+    fn recovery_reports_corruption_but_does_not_move_or_replace_database_family() {
+        let fixture = fixture(false);
+        let database = fixture.paths.colmap.join("database.db");
+        let wal = fixture.paths.colmap.join("database.db-wal");
+        std::fs::write(&database, b"invalid sqlite database").unwrap();
+        std::fs::write(&wal, b"unrecoverable WAL").unwrap();
+        assert_eq!(
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap(),
+            WorkingDatabaseRecovery::RebuildRequired {
+                reason: "sqlite_recovery_invalid"
+            }
+        );
+        assert!(database.exists());
+        assert!(fixture.state.features_complete);
+    }
+
+    #[test]
+    fn legacy_clean_database_is_not_forced_into_new_manifest_policy() {
+        let mut fixture = fixture(false);
+        fixture.state.inputs = None;
+        fixture.state.artifact_manifests = ArtifactManifestSet::default();
+        assert_eq!(
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap(),
+            WorkingDatabaseRecovery::NotNeeded
+        );
+    }
+
+    #[test]
+    fn recovery_never_writes_a_database_hard_linked_to_source_snapshot() {
+        let fixture = fixture(false);
+        let database = fixture.paths.colmap.join("database.db");
+        let source = fixture.paths.work.join("immutable-source.db");
+        std::fs::hard_link(&database, &source).unwrap();
+        let before = std::fs::read(&source).unwrap();
+        std::fs::write(fixture.paths.colmap.join("database.db-wal"), b"pending WAL").unwrap();
+        let error =
+            recover_working_database(&fixture.paths, &fixture.state, &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert_eq!(
+            std::fs::read(fixture.paths.colmap.join("database.db-wal")).unwrap(),
+            b"pending WAL"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_file_changed_after_releasing_the_sqlite_lock() {
+        let fixture = fixture(false);
+        let path = fixture.paths.colmap.join("database.db");
+        let cancel = CancellationToken::new();
+        let locked = hash_file_cancellable(&path, &cancel).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=123").unwrap();
+        drop(db);
+        let changed =
+            describe_file_cancellable(&fixture.paths.project, &path, true, &cancel).unwrap();
+        let error = ensure_recovered_file_identity(&locked, &changed).unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!invalid_artifact_error(&error));
     }
 
     #[tokio::test]
@@ -4321,6 +5091,47 @@ mod tests {
         assert!(
             !fixture.state.brush_complete,
             "a byte-identical candidate must still bind to its source recipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_fast_path_proves_candidate_without_opening_pending_database() {
+        let mut fixture = fixture(false);
+        fixture.state.brush_training.dataset_identity = Some("frozen-dataset".into());
+        let info = inspect_gaussian_ply(&fixture.candidate).unwrap();
+        fixture.state.validated_output = Some(crate::project::ProjectOutput {
+            final_ply: fixture.paths.project.join("final.ply"),
+            file_size: info.file_size,
+            splat_count: info.splat_count,
+            input_images: 1,
+            registered_images: 1,
+            registered_ratio: 1.,
+            points_3d: 0,
+        });
+        record_collection_artifacts(&fixture.paths, &mut fixture.state, None).unwrap();
+        let database = fixture.paths.colmap.join("database.db");
+        let wal = fixture.paths.colmap.join("database.db-wal");
+        std::fs::write(&database, b"unavailable disposable database").unwrap();
+        std::fs::write(&wal, b"pending disposable writes").unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            recover_collection_candidate(&fixture.paths, &fixture.state, &cancel)
+                .await
+                .unwrap(),
+            Some(fixture.candidate.clone()),
+        );
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            b"unavailable disposable database"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"pending disposable writes");
+        std::fs::remove_file(&fixture.candidate).unwrap();
+        assert!(
+            recover_collection_candidate(&fixture.paths, &fixture.state, &cancel)
+                .await
+                .unwrap()
+                .is_none(),
+            "stale completion flags must not skip database recovery"
         );
     }
 

@@ -16,9 +16,9 @@
 
 Generation, reshoots, direct COLMAP training and continuation share one artifact-driven processing flow backed by the existing `state.json`, not a new Ticket file. Failed, cancelled and interrupted tasks all use Continue generation. Each explicit continuation creates a `continue` run record but preserves the saved policy, actual route/recipe, OOM-lowered cap, Bridge results and consumed fallback allowances. Historical `resume`/`retry` records are unchanged. Consumed allowances do not renew, and app restart does not start work automatically. Incomplete Brush training restarts from its recorded initialization, not optimizer state; validated candidates/committed outputs recover publication without training again.
 
-本轮自动化与尚未完成的原生验收见[统一继续验证记录](UNIFIED_CONTINUATION_VALIDATION.md)。以下2026-10-30及更早章节保留当时的接口、配方和实测上下文；当前默认参数及授权以[生成策略说明](GENERATION_POLICY.md)为准，不能将历史“自动优化”、1000万上限或微调倍率解释为新任务行为。
+本轮自动化与尚未完成的原生验收见统一继续验证记录。以下2026-10-30及更早章节保留当时的接口、配方和实测上下文；当前默认参数及授权以[生成策略说明](GENERATION_POLICY.md)为准，不能将历史“自动优化”、1000万上限或微调倍率解释为新任务行为。
 
-2026-10-30 更新：新建补拍可使用有序多素材列表，混合普通／完整ERP视频、图片文件夹和散图集；每个普通来源分别确认拍摄设置，每个超过100张的图片集分别确认顺序。版本4视频共用目标FPS，训练使用正常完整配方，含ERP训练面时使用全景配方。旧任务续跑不改写快照。下方原始单素材、旧配方与原生测试记录保留为历史；当前边界及未完成验收见[统一输入说明](MULTI_INPUTS.md)。
+2026-10-30 更新：新建补拍可使用有序多素材列表，混合普通／完整ERP视频、图片文件夹和散图集；每个普通来源分别确认拍摄设置，每个超过100张的图片集分别确认顺序。版本4视频共用目标FPS，训练使用正常完整配方，含ERP训练面时使用全景配方。旧任务续跑不改写快照。下方原始单素材、旧配方与原生测试记录保留为历史；当前边界及未完成验收见统一输入说明。
 
 New reshoots accept ordered mixed sources, with camera-relation and image-order answers bound to each applicable source. Policy v4 uses shared FPS and normal full training recipes, preserving saved older resumes. Historical notes below are not acceptance evidence for mixed-device/project end-to-end runs.
 

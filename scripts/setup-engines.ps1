@@ -95,7 +95,7 @@ foreach ($engine in $manifest.engines) {
   $temporary = Join-Path $workspace ('.tmp\engine-setup-' + [guid]::NewGuid().ToString('N'))
   try {
     New-Item -ItemType Directory -Path $temporary -Force | Out-Null
-    Expand-Archive -LiteralPath $archivePath -DestinationPath $temporary -Force
+    & (Join-Path $PSScriptRoot 'expand-engine-archive.ps1') -ArchivePath $archivePath -DestinationPath $temporary
     $anchors = @(Get-ChildItem -LiteralPath $temporary -Recurse -File | Where-Object { $_.Name -eq $install.anchorFile })
     if ($anchors.Count -ne 1) {
       throw "Expected one '$($install.anchorFile)' in $($install.archiveName), found $($anchors.Count)."

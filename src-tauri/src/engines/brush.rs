@@ -286,12 +286,25 @@ pub async fn train(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
 ) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_directory).await?;
+    if manager.child_token().is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
+    tokio::fs::create_dir_all(output_directory).await.map_err(SplatError::from)
+        .map_err(|error| error.with_io_diagnostic(
+            "training_preparation_operation=prepare_brush_output\npath_role=brush_output\nio_substep=create_directory"
+        ))?;
     let candidate = output_directory.join("final.ply.tmp");
     let alternate = output_directory.join("final.ply.tmp.ply");
     for partial in [&candidate, &alternate] {
-        if partial.exists() {
-            tokio::fs::remove_file(partial).await?;
+        match tokio::fs::symlink_metadata(partial).await {
+            Ok(_) => tokio::fs::remove_file(partial).await.map_err(SplatError::from)
+                .map_err(|error| error.with_io_diagnostic(
+                    "training_preparation_operation=prepare_brush_output\npath_role=brush_candidate\nio_substep=remove_incomplete_candidate"
+                ))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(SplatError::Io(error).with_io_diagnostic(
+                "training_preparation_operation=prepare_brush_output\npath_role=brush_candidate\nio_substep=inspect_incomplete_candidate"
+            )),
         }
     }
     let environment = options.gpu_launch_policy.environment();
@@ -336,9 +349,17 @@ pub async fn train(
         );
     }
     let last_splat_count = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let evidence = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::failure::EngineFailureEvidence::brush_training(options.preset.total_steps as u64),
+    ));
+    let live_evidence = evidence.clone();
     let counts = last_splat_count.clone();
     let observer: ProcessObserver = std::sync::Arc::new(move |update| {
         if let crate::process::ProcessUpdate::Line { line, .. } = &update {
+            live_evidence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe(line);
             if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
                 *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
             }
@@ -358,9 +379,18 @@ pub async fn train(
             },
             &environment,
         )
-        .await?;
-    resolve_train_output(&output, candidate, alternate).map_err(|mut error| {
+        .await.map_err(|error| error.with_io_diagnostic(
+            "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
+        ))?;
+    let evidence = evidence.lock().unwrap_or_else(|p| p.into_inner());
+    resolve_train_output(&output, candidate, alternate, &evidence).map_err(|mut error| {
         if let SplatError::EngineProcess(failure) = &mut error {
+            **failure = crate::failure::EngineProcessFailure::from_output_with_evidence(
+                crate::pipeline::PipelineEngine::Brush,
+                "train",
+                &output,
+                &evidence,
+            );
             failure.last_splat_count = *last_splat_count.lock().unwrap_or_else(|p| p.into_inner());
         }
         error
@@ -371,31 +401,37 @@ fn resolve_train_output(
     output: &ProcessOutput,
     candidate: PathBuf,
     alternate: PathBuf,
+    evidence: &crate::failure::EngineFailureEvidence,
 ) -> Result<PathBuf> {
-    if !output.success {
+    if !output.success || evidence.brush_final_export_failed() {
         return Err(SplatError::EngineProcess(Box::new(
-            crate::failure::EngineProcessFailure::from_output(
+            crate::failure::EngineProcessFailure::from_output_with_evidence(
                 crate::pipeline::PipelineEngine::Brush,
                 "train",
                 output,
+                evidence,
             ),
         )));
     }
-    let candidate = if candidate.is_file() {
-        candidate
-    } else {
-        if alternate.is_file() {
-            alternate
-        } else {
-            candidate
+    let is_file = |path: &Path| -> Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SplatError::Io(error).with_io_diagnostic(
+                "training_preparation_operation=validate_brush_output\npath_role=brush_candidate\nio_substep=read_metadata"
+            )),
         }
     };
-    if !candidate.is_file() {
+    let candidate = if is_file(&candidate)? {
+        candidate
+    } else if is_file(&alternate)? {
+        alternate
+    } else {
         return Err(SplatError::Process(format!(
             "Brush 未生成预期文件：{}",
             candidate.display()
         )));
-    }
+    };
     Ok(candidate)
 }
 
@@ -409,6 +445,74 @@ mod tests {
         },
         presets::{resolve_brush_training_preset, Quality},
     };
+
+    #[tokio::test]
+    async fn training_output_preparation_failure_retains_io_context_without_starting_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("not-a-directory");
+        std::fs::write(&output, b"existing file").unwrap();
+        let policy =
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Cpu, 0, None));
+        let result = train(
+            &root.path().join("missing-brush.exe"),
+            root.path(),
+            &output,
+            BrushTrainingOptions {
+                init_sh_degree: None,
+                alpha_mode: None,
+                warm: None,
+                preset: resolve_brush_training_preset(Quality::Fast, false, None, 128, 0).preset,
+                panorama: false,
+                log_path: root.path().join("brush.log"),
+                gpu_launch_policy: &policy,
+            },
+            &ProcessManager::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(result.io_error().is_some());
+        assert!(result.io_error().unwrap().raw_os_error().is_some());
+        assert!(result
+            .to_string()
+            .contains("training_preparation_operation=prepare_brush_output"));
+        assert!(result.to_string().contains("io_substep=create_directory"));
+        assert!(!result.is_brush_oom());
+        assert!(!root.path().join("brush.log").exists());
+        assert_eq!(std::fs::read(output).unwrap(), b"existing file");
+    }
+
+    #[tokio::test]
+    async fn cancelled_training_does_not_delete_candidate_or_replace_cancel_with_preparation_error()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("final.ply.tmp");
+        std::fs::write(&candidate, b"existing candidate").unwrap();
+        let policy =
+            BrushGpuLaunchPolicy::resolve(false, &acceleration(ColmapBackend::Cpu, 0, None));
+        let manager = ProcessManager::new();
+        manager.cancel();
+        let result = train(
+            &root.path().join("missing-brush.exe"),
+            root.path(),
+            root.path(),
+            BrushTrainingOptions {
+                init_sh_degree: None,
+                alpha_mode: None,
+                warm: None,
+                preset: resolve_brush_training_preset(Quality::Fast, false, None, 128, 0).preset,
+                panorama: false,
+                log_path: root.path().join("brush.log"),
+                gpu_launch_policy: &policy,
+            },
+            &manager,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert_eq!(std::fs::read(candidate).unwrap(), b"existing candidate");
+        assert!(!root.path().join("brush.log").exists());
+    }
 
     #[test]
     fn native_camera_capability_rejects_unknown_and_changed_runtime() {
@@ -594,14 +698,41 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
-            termination: crate::process::ProcessTermination::default(),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0),
+                ..Default::default()
+            },
             stdout: "Training progress: iteration=4 total=4\nDone training!".into(),
             stderr: "Export at iteration 4 failed".into(),
         };
-        assert!(resolve_train_output(&output, candidate.clone(), alternate.clone()).is_err());
-        std::fs::write(&candidate, "candidate is validated as PLY by the pipeline").unwrap();
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
+        for contents in [None, Some(""), Some("nonempty but incomplete PLY")] {
+            if let Some(contents) = contents {
+                std::fs::write(&candidate, contents).unwrap();
+            }
+            assert!(matches!(
+                resolve_train_output(&output, candidate.clone(), alternate.clone(), &evidence),
+                Err(SplatError::EngineProcess(ref failure))
+                    if failure.termination.exit_code == Some(0)
+                    && matches!(failure.brush_failure_reason,
+                        Some(crate::failure::BrushFailureReason::FinalExport { iteration: 4, .. }))
+            ));
+        }
+        let successful = ProcessOutput {
+            stderr: "unrelated optional feature failed; continuing".into(),
+            ..output.clone()
+        };
         assert_eq!(
-            resolve_train_output(&output, candidate.clone(), alternate.clone()).unwrap(),
+            resolve_train_output(
+                &successful,
+                candidate.clone(),
+                alternate.clone(),
+                &crate::failure::EngineFailureEvidence::brush_training(4)
+            )
+            .unwrap(),
             candidate
         );
         let failed = ProcessOutput {
@@ -610,8 +741,10 @@ mod tests {
             stderr: "VK_ERROR_DEVICE_LOST".into(),
             ..output
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(4);
+        evidence.observe(&failed.stderr);
         assert!(matches!(
-            resolve_train_output(&failed, candidate, alternate),
+            resolve_train_output(&failed, candidate, alternate, &evidence),
             Err(SplatError::EngineProcess(ref failure)) if failure.classification.kind == Some("brush_device_lost")
         ));
     }
@@ -741,11 +874,16 @@ mod tests {
             stdout: "Refine iter 41001, 3476124 splats.".into(),
             stderr: "wgpu error: Out of Memory\nFailed to read counts: An error happened during execution\nThe bytes were never written\nskipped ProjectForwardKernel\nMemory location was never initialized".into(),
         };
+        let mut evidence = crate::failure::EngineFailureEvidence::brush_training(45_000);
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            evidence.observe(line);
+        }
         assert!(matches!(
             resolve_train_output(
                 &output,
                 PathBuf::from("absent.ply"),
-                PathBuf::from("absent.tmp.ply")
+                PathBuf::from("absent.tmp.ply"),
+                &evidence
             ),
             Err(ref error) if error.is_brush_oom()
         ));

@@ -439,6 +439,13 @@ pub(crate) type TestExecutor = Arc<
         + Sync,
 >;
 type Emit = Arc<dyn Fn(TaskUpdate) + Send + Sync>;
+
+enum TaskPublicationReconcile {
+    None,
+    Reconciled(PathBuf, Uuid),
+    ArtifactUnavailable(crate::pipeline::publication::CommittedArtifactIssue),
+}
+
 #[derive(Clone)]
 pub struct TaskService {
     invocation_access: Option<crate::pipeline::access::InvocationAccess>,
@@ -673,18 +680,28 @@ impl TaskService {
         Ok(())
     }
 
-    async fn reconcile_task_publication(task: &mut TaskRecord) -> Result<Option<(PathBuf, Uuid)>> {
+    async fn reconcile_task_publication(task: &mut TaskRecord) -> Result<TaskPublicationReconcile> {
         let Some(project_root) = task.project_path.clone() else {
-            return Ok(None);
+            return Ok(TaskPublicationReconcile::None);
         };
         let transaction_path = project_root
             .join("work")
             .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
-        let Some(publication) =
-            crate::pipeline::publication::committed_publication(&project_root, &transaction_path)
-                .await?
-        else {
-            return Ok(None);
+        let publication = match crate::pipeline::publication::committed_publication_status(
+            &project_root,
+            &transaction_path,
+        )
+        .await?
+        {
+            crate::pipeline::publication::CommittedPublicationStatus::None => {
+                return Ok(TaskPublicationReconcile::None);
+            }
+            crate::pipeline::publication::CommittedPublicationStatus::Available(publication) => {
+                publication
+            }
+            crate::pipeline::publication::CommittedPublicationStatus::ArtifactUnavailable(
+                issue,
+            ) => return Ok(TaskPublicationReconcile::ArtifactUnavailable(issue)),
         };
         if publication.transaction.phase
             == crate::pipeline::publication::PublicationPhase::Reconciled
@@ -706,7 +723,7 @@ impl TaskService {
             // views durable and the task contains the full public result.
             // Avoid rewriting it and incrementing the revision on every app
             // startup.
-            return Ok(None);
+            return Ok(TaskPublicationReconcile::None);
         }
         let metadata_path = project_root.join("project.json");
         let mut metadata: crate::project::ProjectMetadata =
@@ -766,7 +783,10 @@ impl TaskService {
             run.error = None;
         }
         task.revision += 1;
-        Ok(Some((project_root, publication.transaction.transaction_id)))
+        Ok(TaskPublicationReconcile::Reconciled(
+            project_root,
+            publication.transaction.transaction_id,
+        ))
     }
 
     async fn load_locked(&self) -> Result<()> {
@@ -781,24 +801,23 @@ impl TaskService {
         };
         let mut reconciled_publications = Vec::new();
         for task in registry.tasks.values_mut() {
-            match Self::reconcile_task_publication(task).await {
-                Ok(Some(publication)) => {
-                    reconciled_publications.push(publication);
+            match Self::reconcile_task_publication(task).await? {
+                TaskPublicationReconcile::Reconciled(project_root, transaction_id) => {
+                    reconciled_publications.push((project_root, transaction_id));
                     continue;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    // One project's unreadable or changed final.ply must not
-                    // make every other task unloadable. Report only this task.
-                    tracing::warn!(code=%error.code, task=%task.task_id, "Could not verify committed publication");
-                    if task.status == TaskStatus::Completed {
-                        task.status = TaskStatus::Interrupted;
-                        task.result = None;
-                        task.revision += 1;
-                        task.updated_at = Utc::now();
-                        task.error = Some(artifact_unavailable(task, None));
-                        continue;
-                    }
+                TaskPublicationReconcile::None => {}
+                TaskPublicationReconcile::ArtifactUnavailable(issue) => {
+                    // A missing or changed committed model belongs to this task.
+                    // Transaction, permission and state I/O errors still return
+                    // through the ordinary error chain instead of being hidden.
+                    tracing::warn!(task=%task.task_id, reason=%issue, "Committed publication artifact is unavailable");
+                    task.status = TaskStatus::Interrupted;
+                    task.result = None;
+                    task.revision += 1;
+                    task.updated_at = Utc::now();
+                    task.error = Some(artifact_unavailable(task, None));
+                    continue;
                 }
             }
             if task.status.active() {
@@ -1391,6 +1410,7 @@ impl TaskService {
                         executions,
                         current,
                         log,
+                        error.terminal_save_context.as_deref(),
                     )
                     .await,
             ));
@@ -1410,15 +1430,30 @@ impl TaskService {
             error.project_id = context.project_id.map(|id| id.to_string().into_boxed_str());
             error.failure_id = Some(Box::new(
                 self.diagnostics
-                    .capture_preparation(&error.message, context, paths)
+                    .capture_preparation(
+                        &error.message,
+                        context,
+                        paths,
+                        error.terminal_save_context.as_deref(),
+                    )
                     .await,
             ));
             let mut private_paths = paths.to_vec();
             private_paths.extend(context.project_root.iter().cloned());
-            error.message = context.redacted_message(
-                &error.message,
+            let mut message = context.redacted_message(
+                error
+                    .terminal_save_context
+                    .as_ref()
+                    .map_or(error.message.as_ref(), |terminal| {
+                        terminal.original_message()
+                    }),
                 &crate::diagnostics::redact::private_values(&private_paths),
             );
+            if let Some(terminal) = &error.terminal_save_context {
+                message.push('\n');
+                message.push_str(terminal.safe_details());
+            }
+            error.message = message.into_boxed_str();
         }
         error
     }
@@ -1458,7 +1493,7 @@ impl TaskService {
         ServiceError {
             code: code.into(),
             reason: None,
-            message: command.message,
+            message: command.message.into_string(),
             task_id,
             run_id,
             details: Some(serde_json::json!({
@@ -2511,7 +2546,7 @@ impl TaskService {
             if let Some(e) = error {
                 t.error = Some(TaskError {
                     code: e.code.into(),
-                    message: e.message,
+                    message: e.message.into_string(),
                     failed_stage: e.failed_stage,
                     engine: e.engine,
                     exit_code: e.termination.as_ref().and_then(|status| status.exit_code),

@@ -4459,11 +4459,18 @@ fn real_activity_journal_count_redaction_read_only_regression() {
     panic!("no existing mis-redacted application count found in the bounded recent activity tails");
 }
 
-/// A committed project's final.ply deleted outside the app used to make
-/// `load_locked` fail, so the whole task list stayed unloadable until the file
-/// was restored. Only the affected task may report the missing artifact.
-#[tokio::test]
-async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_loadable() {
+struct CommittedTaskFixture {
+    root: tempfile::TempDir,
+    service: TaskService,
+    task: TaskRecord,
+    other: TaskRecord,
+    project: PathBuf,
+    final_ply: PathBuf,
+    transaction: PathBuf,
+    model: Vec<u8>,
+}
+
+async fn committed_task_fixture() -> CommittedTaskFixture {
     use crate::pipeline::publication::{self, PublicationIdentity, PublicationPhase};
 
     let (root, service, task) = fixture().await;
@@ -4520,14 +4527,35 @@ async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_load
     persist_bound_project_metadata(&service, task.task_id).await;
     service.persist().await.unwrap();
 
+    CommittedTaskFixture {
+        root,
+        service,
+        task,
+        other,
+        project,
+        final_ply,
+        transaction,
+        model: std::fs::read(&published.output.final_ply).unwrap(),
+    }
+}
+
+/// A committed project's final.ply deleted outside the app used to make
+/// `load_locked` fail, so the whole task list stayed unloadable until the file
+/// was restored. Only the affected task may report the missing artifact.
+#[tokio::test]
+async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_loadable() {
+    use crate::pipeline::publication::{self, PublicationPhase};
+
+    let fixture = committed_task_fixture().await;
+
     // Control: with final.ply intact, a restart loads and reconciles everything.
-    let healthy = TaskService::at(root.path().join("registry"));
+    let healthy = TaskService::at(fixture.root.path().join("registry"));
     let tasks = healthy.all().await.unwrap();
     assert_eq!(tasks.len(), 2);
-    let completed = healthy.get(task.task_id).await.unwrap();
+    let completed = healthy.get(fixture.task.task_id).await.unwrap();
     assert_eq!(completed.status, TaskStatus::Completed);
     assert_eq!(
-        publication::load_transaction(&project, &transaction)
+        publication::load_transaction(&fixture.project, &fixture.transaction)
             .await
             .unwrap()
             .unwrap()
@@ -4537,24 +4565,94 @@ async fn missing_committed_final_ply_marks_only_its_task_and_keeps_the_list_load
     drop(healthy);
 
     // Someone deletes the published model outside the app, then the app restarts.
-    let model = std::fs::read(&final_ply).unwrap();
-    std::fs::remove_file(&final_ply).unwrap();
-    let restarted = TaskService::at(root.path().join("registry"));
+    std::fs::remove_file(&fixture.final_ply).unwrap();
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
     assert_eq!(restarted.all().await.unwrap().len(), 2);
-    let unavailable = restarted.get(task.task_id).await.unwrap();
+    let unavailable = restarted.get(fixture.task.task_id).await.unwrap();
     assert_eq!(unavailable.status, TaskStatus::Interrupted);
     assert!(unavailable.result.is_none());
     assert_eq!(unavailable.error.unwrap().code, "ARTIFACT_UNAVAILABLE");
     assert_eq!(
-        restarted.get(other.task_id).await.unwrap().status,
+        restarted.get(fixture.other.task_id).await.unwrap().status,
         TaskStatus::Created
     );
     drop(restarted);
 
     // Restoring the file and restarting brings the committed result back.
-    std::fs::write(&final_ply, model).unwrap();
-    let recovered = TaskService::at(root.path().join("registry"));
-    let task = recovered.get(task.task_id).await.unwrap();
+    std::fs::write(&fixture.final_ply, &fixture.model).unwrap();
+    let recovered = TaskService::at(fixture.root.path().join("registry"));
+    let task = recovered.get(fixture.task.task_id).await.unwrap();
     assert_eq!(task.status, TaskStatus::Completed);
     assert!(task.error.is_none());
+}
+
+#[tokio::test]
+async fn invalid_or_mismatched_committed_final_ply_only_interrupts_its_task() {
+    for invalid_ply in [true, false] {
+        let fixture = committed_task_fixture().await;
+        if invalid_ply {
+            std::fs::write(&fixture.final_ply, b"not a ply").unwrap();
+        } else {
+            let mut changed = fixture.model.clone();
+            changed.push(b'\n');
+            std::fs::write(&fixture.final_ply, changed).unwrap();
+        }
+
+        let restarted = TaskService::at(fixture.root.path().join("registry"));
+        assert_eq!(restarted.all().await.unwrap().len(), 2);
+        let unavailable = restarted.get(fixture.task.task_id).await.unwrap();
+        assert_eq!(unavailable.status, TaskStatus::Interrupted);
+        assert!(unavailable.result.is_none());
+        assert_eq!(unavailable.error.unwrap().code, "ARTIFACT_UNAVAILABLE");
+        assert_eq!(
+            restarted.get(fixture.other.task_id).await.unwrap().status,
+            TaskStatus::Created
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_publication_transaction_is_not_reported_as_an_unavailable_artifact() {
+    let fixture = committed_task_fixture().await;
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(&fixture.transaction, b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_ne!(error.code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
+}
+
+#[tokio::test]
+async fn invalid_project_state_is_not_reported_as_an_unavailable_artifact() {
+    let fixture = committed_task_fixture().await;
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(fixture.project.join("project.json"), b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_eq!(error.code, "INVALID_DATA");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
+}
+
+#[tokio::test]
+async fn reconciliation_errors_for_non_completed_tasks_are_not_silently_ignored() {
+    let fixture = committed_task_fixture().await;
+    {
+        let mut records = fixture.service.records();
+        let task = records.tasks.get_mut(&fixture.task.task_id).unwrap();
+        task.status = TaskStatus::Failed;
+        task.result = None;
+    }
+    fixture.service.persist().await.unwrap();
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    std::fs::write(&fixture.transaction, b"{").unwrap();
+
+    let restarted = TaskService::at(fixture.root.path().join("registry"));
+    let error = restarted.all().await.unwrap_err();
+    assert_ne!(error.code, "ARTIFACT_UNAVAILABLE");
+    assert_eq!(std::fs::read(registry_path).unwrap(), registry_before);
 }

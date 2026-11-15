@@ -487,6 +487,10 @@ pub struct PipelineStateFile {
     pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retry_cache_pending: Vec<String>,
+    /// Durable prohibition on reusing a database being recovered/rebuilt.
+    /// Kept until the archive and any local reshoot base restoration finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_recovery_pending: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_transparency: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +601,7 @@ impl PipelineStateFile {
             // Older projects were always perspective. Never reinterpret their caches.
             generation_policy: None,
             retry_cache_pending: vec![],
+            database_recovery_pending: None,
             actual_transparency: None,
             gps: None,
             creation: None,

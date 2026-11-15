@@ -30,6 +30,10 @@ pub struct Checkpoint {
     pub manifest_identity: Option<String>,
     #[serde(default)]
     pub reference_valid: bool,
+    /// Database cache recovery must not grant a GPS attempt already abandoned
+    /// by this run. Local continuation state only; not part of input identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub database_recovery_visual_only: bool,
 }
 impl Checkpoint {
     pub fn pending() -> Self {
@@ -473,6 +477,7 @@ mod tests {
             input_identity: Some("synthetic-input".into()),
             output_identity: Some("synthetic-output".into()),
             reference_valid: true,
+            database_recovery_visual_only: false,
             transform: Some(Similarity {
                 rotation: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
                 scale: 1.2345678901234567,

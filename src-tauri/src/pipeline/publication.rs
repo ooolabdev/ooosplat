@@ -78,6 +78,47 @@ pub struct PublicationOutcome {
     pub output: ProjectOutput,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommittedArtifactIssue {
+    Missing,
+    Invalid(String),
+    Mismatch(String),
+}
+
+impl std::fmt::Display for CommittedArtifactIssue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("published final.ply is missing"),
+            Self::Invalid(detail) => write!(formatter, "published final.ply is invalid: {detail}"),
+            Self::Mismatch(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl CommittedArtifactIssue {
+    fn into_error(self) -> SplatError {
+        match self {
+            Self::Missing => SplatError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Published final.ply is missing",
+            )),
+            Self::Invalid(detail) | Self::Mismatch(detail) => SplatError::Process(detail),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CommittedPublicationStatus {
+    None,
+    Available(Box<PublicationOutcome>),
+    ArtifactUnavailable(CommittedArtifactIssue),
+}
+
+enum OutputVerification<T> {
+    Verified(T),
+    Unavailable(CommittedArtifactIssue),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileDisposition {
     ViewsRequired,
@@ -170,8 +211,19 @@ pub async fn committed_publication(
     project_root: &Path,
     transaction_path: &Path,
 ) -> Result<Option<PublicationOutcome>> {
+    match committed_publication_status(project_root, transaction_path).await? {
+        CommittedPublicationStatus::None => Ok(None),
+        CommittedPublicationStatus::Available(publication) => Ok(Some(*publication)),
+        CommittedPublicationStatus::ArtifactUnavailable(issue) => Err(issue.into_error()),
+    }
+}
+
+pub(crate) async fn committed_publication_status(
+    project_root: &Path,
+    transaction_path: &Path,
+) -> Result<CommittedPublicationStatus> {
     let Some(transaction) = load_transaction(project_root, transaction_path).await? else {
-        return Ok(None);
+        return Ok(CommittedPublicationStatus::None);
     };
     if !matches!(
         transaction.phase,
@@ -179,10 +231,16 @@ pub async fn committed_publication(
             | PublicationPhase::ProjectViewsReconciled
             | PublicationPhase::Reconciled
     ) {
-        return Ok(None);
+        return Ok(CommittedPublicationStatus::None);
     }
-    verify_installed_output(project_root, &transaction).await?;
-    Ok(Some(outcome(project_root, transaction)?))
+    match verify_committed_output(project_root, &transaction).await? {
+        OutputVerification::Verified(()) => Ok(CommittedPublicationStatus::Available(Box::new(
+            outcome(project_root, transaction)?,
+        ))),
+        OutputVerification::Unavailable(issue) => {
+            Ok(CommittedPublicationStatus::ArtifactUnavailable(issue))
+        }
+    }
 }
 
 /// Replays an interrupted publication. A committed result never needs Brush
@@ -402,19 +460,94 @@ async fn verify_installed_output(
     project_root: &Path,
     transaction: &PublicationTransaction,
 ) -> Result<()> {
+    match verify_committed_output(project_root, transaction).await? {
+        OutputVerification::Verified(()) => Ok(()),
+        OutputVerification::Unavailable(issue) => Err(issue.into_error()),
+    }
+}
+
+async fn verify_committed_output(
+    project_root: &Path,
+    transaction: &PublicationTransaction,
+) -> Result<OutputVerification<()>> {
     validate_transaction(transaction)?;
     let destination = resolve_project_path(project_root, &transaction.destination_relative_path)?;
     let expected_hash = transaction.output_sha256.as_deref().ok_or_else(|| {
         SplatError::Process("Committed publication is missing its output fingerprint".into())
     })?;
-    verify_output_against_candidate(
-        &destination,
-        expected_hash,
-        transaction.output.file_size,
-        transaction.output.splat_count,
-    )
-    .await?;
-    Ok(())
+    let info = match inspect_committed_ply(&destination).await? {
+        OutputVerification::Verified(info) => info,
+        OutputVerification::Unavailable(issue) => {
+            return Ok(OutputVerification::Unavailable(issue));
+        }
+    };
+    if info.file_size != transaction.output.file_size
+        || info.splat_count != transaction.output.splat_count
+    {
+        return Ok(OutputVerification::Unavailable(
+            CommittedArtifactIssue::Mismatch(
+                "Published final.ply does not match its committed result summary".into(),
+            ),
+        ));
+    }
+    let actual_hash = match hash_committed_output(&destination).await? {
+        OutputVerification::Verified(hash) => hash,
+        OutputVerification::Unavailable(issue) => {
+            return Ok(OutputVerification::Unavailable(issue));
+        }
+    };
+    if actual_hash != expected_hash {
+        return Ok(OutputVerification::Unavailable(
+            CommittedArtifactIssue::Mismatch(
+                "Published final.ply does not belong to this publication attempt".into(),
+            ),
+        ));
+    }
+    Ok(OutputVerification::Verified(()))
+}
+
+async fn inspect_committed_ply(
+    path: &Path,
+) -> Result<OutputVerification<crate::reconstruction::ply::PlyInfo>> {
+    let path = path.to_path_buf();
+    let inspected = crate::presets::spawn_pipeline_blocking(move || inspect_gaussian_ply(&path))
+        .await
+        .map_err(|error| SplatError::Process(format!("PLY validation task failed: {error}")))?;
+    match inspected {
+        Ok(info) => Ok(OutputVerification::Verified(info)),
+        Err(SplatError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(
+            OutputVerification::Unavailable(CommittedArtifactIssue::Missing),
+        ),
+        Err(SplatError::Process(detail)) => Ok(OutputVerification::Unavailable(
+            CommittedArtifactIssue::Invalid(detail),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+async fn hash_committed_output(path: &Path) -> Result<OutputVerification<String>> {
+    let mut input = match tokio::fs::File::open(path).await {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OutputVerification::Unavailable(
+                CommittedArtifactIssue::Missing,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(OutputVerification::Verified(format!(
+        "{:x}",
+        hasher.finalize()
+    )))
 }
 
 async fn verify_output_against_candidate(

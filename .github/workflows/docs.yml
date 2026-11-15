@@ -1,0 +1,62 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "README*.md"
+      - "ROADMAP*.md"
+      - "CONTRIBUTING.md"
+      - "TRADEMARK_POLICY.md"
+      - "GENERATED_OUTPUTS.md"
+      - "docs/**"
+      - "assets/readme-logo.svg"
+      - "assets/screenshots/**"
+      - "LICENSE"
+      - "NOTICE"
+      - "package.json"
+      - "scripts/verify-docs.mjs"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "README*.md"
+      - "ROADMAP*.md"
+      - "CONTRIBUTING.md"
+      - "TRADEMARK_POLICY.md"
+      - "GENERATED_OUTPUTS.md"
+      - "docs/**"
+      - "assets/readme-logo.svg"
+      - "assets/screenshots/**"
+      - "LICENSE"
+      - "NOTICE"
+      - "package.json"
+      - "scripts/verify-docs.mjs"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Verify documentation
+        run: npm run verify:docs

@@ -702,6 +702,21 @@ impl ProjectManager {
         }
         Ok(())
     }
+    /// Training preparation uses the same atomic-write substeps without
+    /// labelling a training failure as retry admission.
+    pub(crate) async fn write_state_for_training(
+        &self,
+        path: &Path,
+        state: &PipelineStateFile,
+    ) -> Result<()> {
+        self.write_state_for_preparation(path, state)
+            .await
+            .map_err(|error| {
+                error.with_io_diagnostic(
+                    "training_preparation_operation=save_training_state\npath_role=project_state",
+                )
+            })
+    }
     pub async fn read_state(&self, path: &Path) -> Result<PipelineStateFile> {
         Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)
     }
@@ -836,25 +851,70 @@ async fn atomic_write_json_with_context<T: serde::Serialize>(
         .unwrap_or("data.json");
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)?;
-    let result = async {
-        let mut file = context
-            .io("create_state_temp", tokio::fs::File::create(&temporary))
-            .await?;
-        use tokio::io::AsyncWriteExt;
-        context
-            .io("write_state_temp", file.write_all(&bytes))
-            .await?;
-        context.io("sync_state_temp", file.sync_all()).await?;
-        drop(file);
-        atomic_replace_with_context(&temporary, path, context)
-    }
-    .await;
+    atomic_write_json_to_temporary(path, &temporary, &bytes, context).await
+}
+
+async fn atomic_write_json_to_temporary(
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    context: &AtomicWriteContext,
+) -> Result<()> {
+    // Do not truncate, or subsequently clean up, a file we did not create.
+    let file = context
+        .io(
+            "create_state_temp",
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temporary),
+        )
+        .await?;
+    let result = write_and_install_json_file(file, path, temporary, bytes, context).await;
     if result.is_err() {
         let _ = context
-            .io("cleanup_state_temp", tokio::fs::remove_file(&temporary))
+            .io("cleanup_state_temp", tokio::fs::remove_file(temporary))
             .await;
     }
     result
+}
+
+async fn write_and_install_json_file(
+    mut file: tokio::fs::File,
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    context: &AtomicWriteContext,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    context
+        .io("write_state_temp", file.write_all(bytes))
+        .await?;
+    // Tokio may acknowledge a buffered write before its blocking filesystem
+    // operation finishes. sync_all waits for that operation but can retain its
+    // error for a later write/flush; dropping the handle then loses the error.
+    // Flush FIRST so a disk-full/partial write can never install an empty JSON.
+    context.io("flush_state_temp", file.flush()).await?;
+    context.io("sync_state_temp", file.sync_all()).await?;
+    let metadata = context.io("verify_state_temp", file.metadata()).await?;
+    if metadata.len() != bytes.len() as u64 {
+        return Err(context.error(
+            "verify_state_temp",
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSON temporary file length does not match serialized data",
+            ),
+        ));
+    }
+    drop(file);
+    atomic_replace_with_context(temporary, path, context, ReplacementMode::Json)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacementMode {
+    Json,
+    // Preserve the existing large-file publication compatibility policy.
+    AllowCopyFallback,
 }
 
 pub(crate) async fn atomic_replace_file(source: &Path, destination: &Path) -> Result<()> {
@@ -866,7 +926,12 @@ pub(crate) async fn atomic_replace_file(source: &Path, destination: &Path) -> Re
 }
 
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    atomic_replace_with_context(source, destination, &AtomicWriteContext::default())
+    atomic_replace_with_context(
+        source,
+        destination,
+        &AtomicWriteContext::default(),
+        ReplacementMode::AllowCopyFallback,
+    )
 }
 
 #[cfg(windows)]
@@ -874,6 +939,7 @@ fn atomic_replace_with_context(
     source: &Path,
     destination: &Path,
     context: &AtomicWriteContext,
+    mode: ReplacementMode,
 ) -> Result<()> {
     use std::{iter, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -901,8 +967,28 @@ fn atomic_replace_with_context(
     if result != 0 {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::CrossesDevices {
+    replacement_failed(
+        source,
+        destination,
+        context,
+        mode,
+        std::io::Error::last_os_error(),
+    )
+}
+
+#[cfg(windows)]
+fn replacement_failed(
+    source: &Path,
+    destination: &Path,
+    context: &AtomicWriteContext,
+    mode: ReplacementMode,
+    error: std::io::Error,
+) -> Result<()> {
+    // A copy overwrites/truncates destination before it can fail. JSON must
+    // retain the previous checkpoint instead of trying that compatibility path.
+    if mode == ReplacementMode::AllowCopyFallback
+        && error.kind() == std::io::ErrorKind::CrossesDevices
+    {
         copy_replace_for_encrypted_directory_with_context(source, destination, context)
     } else {
         Err(context.error("replace_state", error))
@@ -984,6 +1070,7 @@ fn atomic_replace_with_context(
     source: &Path,
     destination: &Path,
     context: &AtomicWriteContext,
+    _mode: ReplacementMode,
 ) -> Result<()> {
     context.before("replace_state")?;
     std::fs::rename(source, destination).map_err(|error| context.error("replace_state", error))
@@ -1284,11 +1371,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_save_flushes_real_tokio_background_write_errors_before_sync_or_replace() {
+        use std::io::Write;
+
+        // A read-only OS handle makes the actual Tokio blocking write fail
+        // without filling a disk. Exercise both empty and partially written
+        // staging files through the same writer/flush/install path as saves.
+        for prefix in [b"".as_slice(), b"{\"partial\":".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let temporary = directory.path().join("state.tmp");
+            let original = br#"{"preserved":true}"#;
+            std::fs::write(&path, original).unwrap();
+            std::fs::write(&temporary, prefix).unwrap();
+            let mut read_only = std::fs::File::open(&temporary).unwrap();
+            let underlying_error = read_only.write_all(b"not writable").unwrap_err();
+            let context = AtomicWriteContext {
+                preparation: true,
+                // If flush does not surface the real error first, this error
+                // wins instead, or the temporary file is incorrectly installed.
+                failures: vec![("sync_state_temp", 112)],
+            };
+            let error = write_and_install_json_file(
+                tokio::fs::File::from_std(read_only),
+                &path,
+                &temporary,
+                br#"{"replacement":true}"#,
+                &context,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("io_substep=flush_state_temp"));
+            assert_eq!(error.io_error().unwrap().kind(), underlying_error.kind());
+            assert_eq!(
+                error.io_error().unwrap().raw_os_error(),
+                underlying_error.raw_os_error()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&temporary).unwrap(), prefix);
+        }
+    }
+
+    #[tokio::test]
+    async fn json_save_rejects_mismatched_temporary_length_before_replacing_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("project.json");
+        let temporary = directory.path().join("project.tmp");
+        let original = br#"{"preserved":true}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(
+            &temporary,
+            b"this unexpected staging data is longer than the new JSON",
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .unwrap();
+        let error = write_and_install_json_file(
+            tokio::fs::File::from_std(file),
+            &path,
+            &temporary,
+            br#"{"value":2}"#,
+            &AtomicWriteContext::preparation(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(error.to_string().contains("io_substep=verify_state_temp"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(temporary.is_file());
+    }
+
+    #[tokio::test]
+    async fn json_save_never_truncates_or_cleans_up_an_existing_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let temporary = directory.path().join("already-owned.tmp");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::write(&temporary, b"other writer").unwrap();
+        let error = atomic_write_json_to_temporary(
+            &path,
+            &temporary,
+            br#"{"replacement":true}"#,
+            &AtomicWriteContext::preparation(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(error.to_string().contains("io_substep=create_state_temp"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"other writer");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_replacement_refuses_cross_device_copy_without_touching_any_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.tmp");
+        let destination = directory.path().join("state.json");
+        let backup = directory.path().join("state.json.bak");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"original").unwrap();
+        std::fs::write(&backup, b"existing backup").unwrap();
+        let os_error = std::io::Error::from_raw_os_error(17); // ERROR_NOT_SAME_DEVICE
+        assert_eq!(os_error.kind(), std::io::ErrorKind::CrossesDevices);
+        let error = replacement_failed(
+            &source,
+            &destination,
+            &AtomicWriteContext::preparation(),
+            ReplacementMode::Json,
+            os_error,
+        )
+        .unwrap_err();
+        assert_eq!(error.io_error().unwrap().raw_os_error(), Some(17));
+        assert!(error.to_string().contains("io_substep=replace_state"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"new");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"existing backup");
+    }
+
+    #[tokio::test]
     async fn preparation_atomic_write_preserves_os_error_for_each_substep() {
         for step in [
             "create_state_temp",
             "write_state_temp",
+            "flush_state_temp",
             "sync_state_temp",
+            "verify_state_temp",
             "replace_state",
         ] {
             for code in [5, 32, 33, 112] {
@@ -1359,7 +1575,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let context = AtomicWriteContext {
             preparation: true,
-            failures: vec![("write_state_temp", 112), ("cleanup_state_temp", 5)],
+            failures: vec![("flush_state_temp", 112), ("cleanup_state_temp", 5)],
         };
         let error = atomic_write_json_with_context(
             &path,
@@ -1372,7 +1588,7 @@ mod tests {
             error.io_error().and_then(std::io::Error::raw_os_error),
             Some(112)
         );
-        assert!(error.to_string().contains("io_substep=write_state_temp"));
+        assert!(error.to_string().contains("io_substep=flush_state_temp"));
         assert!(!error.to_string().contains("io_substep=cleanup_state_temp"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         // The failed best-effort cleanup is confined to this temporary fixture.
@@ -1397,6 +1613,15 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("io_substep=create_state_temp"));
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        let blocked = temporary.path().join("directory-not-a-state-file");
+        std::fs::create_dir(&blocked).unwrap();
+        let error = manager
+            .write_state_for_preparation(&blocked, &state)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("io_substep=replace_state"));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(blocked.is_dir());
         let path = temporary.path().join("state.json");
         manager
             .write_state_for_preparation(&path, &state)

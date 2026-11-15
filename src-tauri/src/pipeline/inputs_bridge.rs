@@ -9,7 +9,71 @@ struct Publication {
     model: PathBuf,
     additions: Vec<String>,
 }
+
+enum JointBridgeAttempt {
+    Accepted(PathBuf, ReconstructionReport),
+    /// Only explicit mapper geometry evidence or an otherwise complete,
+    /// readable candidate that regressed can enter this branch.
+    Rejected(SplatError),
+}
+
+async fn bridge_candidate(
+    root: PathBuf,
+    count: u64,
+) -> Result<Option<(PathBuf, ReconstructionReport)>> {
+    crate::presets::spawn_pipeline_blocking(move || {
+        colmap::select_reconstruction_model(&root, count)
+    })
+    .await
+    .map_err(|error| SplatError::Process(error.to_string()))?
+}
+
+async fn copy_bridge_database(
+    paths: &ProjectPaths,
+    source: PathBuf,
+    target: PathBuf,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let root = paths.project.clone();
+    let cancel = cancel.clone();
+    crate::presets::spawn_pipeline_blocking(move || {
+        crate::pipeline::sqlite_recovery::copy_owned_database(&root, &source, &target, &cancel)
+    })
+    .await
+    .map_err(|error| SplatError::Process(error.to_string()))?
+    .map_err(|error| {
+        error.with_io_diagnostic(
+            "bridge_operation=copy_database_snapshot\npath_role=colmap_database",
+        )
+    })
+}
+
 impl PipelineRunner {
+    async fn archive_unpublished_bridge_attempt(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+    ) -> Result<()> {
+        if !tokio::fs::try_exists(paths.work.join("joint-bridge")).await? {
+            return Ok(());
+        }
+        if tokio::fs::try_exists(paths.work.join("joint-bridge/publication.json")).await? {
+            return Err(SplatError::Process(
+                "Pending Bridge publication must be reconciled first".into(),
+            ));
+        }
+        // A stopped attempt may own WAL/journal files. Move its whole namespace
+        // behind the existing durable barrier, never overwrite just its main DB.
+        if !state
+            .retry_cache_pending
+            .iter()
+            .any(|entry| entry == "joint-bridge")
+        {
+            state.retry_cache_pending.push("joint-bridge".into());
+        }
+        self.prepare_continuation(manager, paths, state).await
+    }
     /// Finish a durable Bridge publication before artifact normalization sees
     /// half-installed RGB/Mask/database files as a changed prepared dataset.
     /// Replaying an already copied file is safe; no engine is started here.
@@ -230,6 +294,15 @@ impl PipelineRunner {
             }
         }
         // The attempt owns its database and image namespace. An unsuccessful bridge never mutates initial caches.
+        let identity_model = authority.clone();
+        let initial_identity = crate::presets::spawn_pipeline_blocking(move || {
+            super::super::gps_runner::model_identity(&identity_model)
+        })
+        .await
+        .map_err(|error| SplatError::Process(error.to_string()))??;
+        let initial_transparency = state.actual_transparency;
+        self.archive_unpublished_bridge_attempt(manager, paths, state)
+            .await?;
         let attempt = paths.work.join("joint-bridge");
         tokio::fs::create_dir_all(&attempt).await?;
         let mut p = paths.clone();
@@ -240,9 +313,11 @@ impl PipelineRunner {
         for dir in [&p.colmap, &p.frames, &p.colmap_frames, &p.masks] {
             tokio::fs::create_dir_all(dir).await?;
         }
-        tokio::fs::copy(
+        copy_bridge_database(
+            paths,
             paths.colmap.join("database.db"),
             p.colmap.join("database.db"),
+            &self.process_manager.child_token(),
         )
         .await?;
         let mut updated = c.clone();
@@ -469,16 +544,31 @@ impl PipelineRunner {
                 accel.gpu_index(),
             )
             .await?;
-            let transparent = self
+            let transparent = match self
                 .collection_mapper(&p, &updated, state, Some(&authority), accel)
-                .await?;
+                .await
+            {
+                Ok(transparent) => transparent,
+                Err(error) if colmap::is_recoverable_mapper_geometry_failure(&error) => {
+                    return Ok(JointBridgeAttempt::Rejected(error));
+                }
+                Err(error) => return Err(error),
+            };
             state.actual_transparency = Some(transparent);
             let count = updated.sources.iter().map(|s| s.names.len() as u64).sum();
-            let (candidate, report) = best_model(&sparse_attempt(&p, state), count)?;
+            let Some((candidate, report)) =
+                bridge_candidate(sparse_attempt(&p, state), count).await?
+            else {
+                return Ok(JointBridgeAttempt::Rejected(SplatError::Process(
+                    "Bridge produced no usable sparse model".into(),
+                )));
+            };
             if report.registered_images < initial.images.len() as u64 {
-                return Err(SplatError::Process("Bridge registration regressed".into()));
+                return Ok(JointBridgeAttempt::Rejected(SplatError::Process(
+                    "Bridge registration regressed".into(),
+                )));
             }
-            Ok((candidate, report))
+            Ok(JointBridgeAttempt::Accepted(candidate, report))
         }
         .await;
         if let Some(metrics) = c.telemetry.as_mut().and_then(|saved| saved.bridge.as_mut()) {
@@ -491,7 +581,7 @@ impl PipelineRunner {
             );
         }
         match result {
-            Ok((candidate, report)) => {
+            Ok(JointBridgeAttempt::Accepted(candidate, report)) => {
                 updated.telemetry = c.telemetry.clone();
                 if let Some(metrics) = updated
                     .telemetry
@@ -521,8 +611,8 @@ impl PipelineRunner {
                 *c = pending.checkpoint;
                 state.bridge_backfill.status = BridgeBackfillStatus::Completed;
             }
-            Err(error) if !matches!(&error,SplatError::Process(message) if message=="Bridge registration regressed"||message=="稀疏重建没有可用的注册图像或三维点") =>
-            {
+            Err(error) => {
+                state.actual_transparency = initial_transparency;
                 self.restore_collection_metrics(c, state.preset, state.generation_policy);
                 state.inputs = Some(c.clone());
                 if let Err(save_error) = manager.write_state(&paths.state, state).await {
@@ -530,25 +620,18 @@ impl PipelineRunner {
                 }
                 return Err(error);
             }
-            Err(error) => {
-                state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
-                if let Some(metrics) = c.telemetry.as_mut().and_then(|saved| saved.bridge.as_mut())
-                {
-                    metrics.status = PlannerBridgeStatus::FailedRolledBack;
-                    metrics.adopted = false;
-                }
-                self.events.send(
-                    PipelineStage::ValidatingReconstruction,
-                    Some(PipelineEngine::System),
-                    EventKind::Log,
-                    EventLevel::Warning,
-                    None,
-                    true,
-                    format!("Bridge Backfill 未采用，继续使用初始模型：{error}"),
-                    None,
-                    None,
-                    None,
-                );
+            Ok(JointBridgeAttempt::Rejected(error)) => {
+                state.actual_transparency = initial_transparency;
+                return self
+                    .finish_joint_geometry_rollback(
+                        manager,
+                        paths,
+                        state,
+                        c,
+                        &initial_identity,
+                        &error,
+                    )
+                    .await;
             }
         }
         state.inputs = Some(c.clone());
@@ -558,6 +641,66 @@ impl PipelineRunner {
         }
         self.record_collection_artifacts(paths, state).await?;
         manager.write_state(&paths.state, state).await?;
+        Ok(())
+    }
+
+    async fn finish_joint_geometry_rollback(
+        &self,
+        manager: &ProjectManager,
+        paths: &ProjectPaths,
+        state: &mut PipelineStateFile,
+        checkpoint: &mut InputCheckpoint,
+        initial_identity: &str,
+        error: &SplatError,
+    ) -> Result<()> {
+        if self.process_manager.child_token().is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        let authority = paths.colmap.join("authoritative");
+        let count = checkpoint
+            .sources
+            .iter()
+            .map(|source| source.names.len() as u64)
+            .sum();
+        if bridge_candidate(authority.clone(), count).await?.is_none()
+            || super::super::gps_runner::model_identity(&authority)? != initial_identity
+        {
+            return Err(SplatError::Process(
+                "Bridge initial model changed during the attempt".into(),
+            ));
+        }
+        if self.process_manager.child_token().is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
+        if let Some(metrics) = checkpoint
+            .telemetry
+            .as_mut()
+            .and_then(|saved| saved.bridge.as_mut())
+        {
+            metrics.status = PlannerBridgeStatus::FailedRolledBack;
+            metrics.adopted = false;
+        }
+        state.inputs = Some(checkpoint.clone());
+        self.restore_collection_metrics(checkpoint, state.preset, state.generation_policy);
+        if let Some(frames) = state.frames.as_mut() {
+            frames.extracted_frames = Some(count);
+        }
+        self.record_collection_artifacts(paths, state).await?;
+        manager.write_state(&paths.state, state).await?;
+        // The durable terminal checkpoint precedes any success-like notice.
+        self.events.send(
+            PipelineStage::ValidatingReconstruction,
+            Some(PipelineEngine::System),
+            EventKind::Log,
+            EventLevel::Warning,
+            None,
+            true,
+            format!("Bridge Backfill 未采用，继续使用初始模型：{error}"),
+            None,
+            None,
+            None,
+        );
         Ok(())
     }
 }
@@ -853,9 +996,10 @@ async fn publish(
         }
     }
     read_model(&candidate)?.write(&paths.colmap.join("authoritative"))?;
-    super::super::reshoot_runner::copy_reshoot_file(
-        &attempt.join("colmap/database.db"),
-        &paths.colmap.join("database.db"),
+    copy_bridge_database(
+        paths,
+        attempt.join("colmap/database.db"),
+        paths.colmap.join("database.db"),
         cancel,
     )
     .await?;
@@ -877,6 +1021,161 @@ async fn link_copy(source: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopped_joint_attempt_archives_its_database_family_only_after_a_saved_barrier() {
+        for block_state_write in [true, false] {
+            let (root, paths, mut state, _) = recovery_fixture();
+            let manager = ProjectManager::for_diagnostics(root.path().to_owned());
+            let attempt = paths.work.join("joint-bridge");
+            for suffix in ["-wal", "-journal", "-shm"] {
+                std::fs::write(attempt.join(format!("colmap/database.db{suffix}")), suffix)
+                    .unwrap();
+            }
+            let original = std::fs::read(paths.colmap.join("database.db")).unwrap();
+            let frozen = serde_json::to_value(state.inputs.as_ref().unwrap()).unwrap();
+            if block_state_write {
+                std::fs::create_dir(&paths.state).unwrap();
+            }
+            let runner = PipelineRunner::new(
+                EnginePaths::from_root(root.path().join("missing-engines")),
+                |_| {},
+            );
+            let result = runner
+                .archive_unpublished_bridge_attempt(&manager, &paths, &mut state)
+                .await;
+            if block_state_write {
+                assert!(result.unwrap_err().io_error().is_some());
+                assert!(attempt.join("colmap/database.db-wal").is_file());
+                assert!(!paths.work.join("cache-archive").exists());
+            } else {
+                result.unwrap();
+                assert!(!attempt.exists());
+                let archive = std::fs::read_dir(paths.work.join("cache-archive"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .join("joint-bridge/colmap");
+                for suffix in ["", "-wal", "-journal", "-shm"] {
+                    assert!(archive.join(format!("database.db{suffix}")).is_file());
+                }
+                let saved = manager.read_state(&paths.state).await.unwrap();
+                assert!(saved.retry_cache_pending.is_empty());
+                assert_eq!(
+                    serde_json::to_value(saved.inputs.as_ref().unwrap()).unwrap(),
+                    frozen
+                );
+            }
+            assert_eq!(
+                std::fs::read(paths.colmap.join("database.db")).unwrap(),
+                original
+            );
+            assert_eq!(
+                serde_json::to_value(state.inputs.as_ref().unwrap()).unwrap(),
+                frozen
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn geometry_rollback_is_durable_preserves_counts_and_never_regrants_budget() {
+        let (root, paths, mut state, _) = recovery_fixture();
+        let manager = ProjectManager::for_diagnostics(root.path().to_owned());
+        let mut checkpoint = state.inputs.clone().unwrap();
+        checkpoint.bridge_used = true;
+        checkpoint.telemetry = Some(crate::pipeline::effectiveness::CollectionTelemetry {
+            bridge: Some(PlannerBridgeMetrics {
+                status: PlannerBridgeStatus::Running,
+                added_frames: 1,
+                requested_frames: 1,
+                available_budget: 1,
+                duration_ms: Some(321),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let original_db = std::fs::read(paths.colmap.join("database.db")).unwrap();
+        let identity =
+            super::super::super::gps_runner::model_identity(&paths.colmap.join("authoritative"))
+                .unwrap();
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            |_| {},
+        );
+        runner
+            .finish_joint_geometry_rollback(
+                &manager,
+                &paths,
+                &mut state,
+                &mut checkpoint,
+                &identity,
+                &SplatError::Process("explicit geometry rejection".into()),
+            )
+            .await
+            .unwrap();
+        let saved = manager.read_state(&paths.state).await.unwrap();
+        assert_eq!(
+            saved.bridge_backfill.status,
+            BridgeBackfillStatus::FailedRolledBack
+        );
+        let stored = saved.inputs.unwrap();
+        assert!(stored.bridge_used);
+        assert_eq!(stored.sources[0].bridge_frames.len(), 1);
+        let metrics = stored.telemetry.unwrap().bridge.unwrap();
+        assert_eq!(metrics.status, PlannerBridgeStatus::FailedRolledBack);
+        assert_eq!(
+            (
+                metrics.added_frames,
+                metrics.available_budget,
+                metrics.duration_ms
+            ),
+            (1, 1, Some(321))
+        );
+        assert!(!metrics.adopted);
+        assert_eq!(
+            original_db,
+            std::fs::read(paths.colmap.join("database.db")).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn geometry_rollback_cannot_report_success_before_state_is_saved() {
+        let (root, paths, mut state, _) = recovery_fixture();
+        let manager = ProjectManager::for_diagnostics(root.path().to_owned());
+        let mut checkpoint = state.inputs.clone().unwrap();
+        let identity =
+            super::super::super::gps_runner::model_identity(&paths.colmap.join("authoritative"))
+                .unwrap();
+        std::fs::create_dir(&paths.state).unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let runner = PipelineRunner::new(
+            EnginePaths::from_root(root.path().join("missing-engines")),
+            move |event| {
+                observed.lock().unwrap().push(event);
+            },
+        );
+        let error = runner
+            .finish_joint_geometry_rollback(
+                &manager,
+                &paths,
+                &mut state,
+                &mut checkpoint,
+                &identity,
+                &SplatError::Process("explicit geometry rejection".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.io_error().is_some());
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.message.contains("继续使用初始模型")));
+        assert!(paths.colmap.join("database.db").is_file());
+    }
 
     fn source_plan(input: u64, registered: u64, available_budget: u64) -> BridgeBackfillPlan {
         BridgeBackfillPlan {
@@ -1464,7 +1763,10 @@ mod tests {
                 std::fs::copy(fixture.images.join(name), attempt.join(dir).join(name)).unwrap();
             }
         }
-        std::fs::write(attempt.join("colmap/database.db"), b"owned database").unwrap();
+        write_recovery_database(
+            &attempt.join("colmap/database.db"),
+            &read_model(&candidate).unwrap(),
+        );
         let original =
             crate::video::panorama::fingerprint(&fixture.images.join("normal.png")).unwrap();
         let pending = Publication {
@@ -1506,10 +1808,15 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(
-            std::fs::read(moved.colmap.join("database.db")).unwrap(),
-            b"owned database"
-        );
+        let db = rusqlite::Connection::open(moved.colmap.join("database.db")).unwrap();
+        let names = db
+            .prepare("SELECT name FROM images ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(names, ["normal.png", "second.png"]);
         assert_eq!(
             crate::video::panorama::fingerprint(&fixture.images.join("normal.png")).unwrap(),
             original

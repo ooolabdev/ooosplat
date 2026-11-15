@@ -173,16 +173,8 @@ pub fn explicit_numeric_divergence(error: &crate::error::SplatError) -> bool {
         return false;
     };
     failure.engine == crate::pipeline::PipelineEngine::Brush
-        && failure.classification.kind.is_none()
-        && !failure.termination.abnormal()
-        && failure.termination.exit_code != Some(101)
-        && [
-            "non-finite training loss",
-            "training loss became nan",
-            "numerical divergence",
-        ]
-        .iter()
-        .any(|marker| failure.detail.to_ascii_lowercase().contains(marker))
+        && failure.brush_failure_reason
+            == Some(crate::failure::BrushFailureReason::NumericDivergence)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +315,17 @@ mod tests {
             ("GPU out of memory\nnon-finite training loss", 1, false),
             ("DeviceLost\nnon-finite training loss", 1, false),
             ("BufferTooBig\nnon-finite training loss", 1, false),
+            ("permission denied\nnon-finite training loss", 1, false),
+            (
+                "non-finite training loss\n磁盘空间不足。 (os error 112)",
+                1,
+                false,
+            ),
+            (
+                "non-finite training loss\nExport at iteration 8000 failed: native write failure",
+                1,
+                false,
+            ),
             ("non-finite training loss", -1073740940, false),
         ] {
             let output = ProcessOutput {

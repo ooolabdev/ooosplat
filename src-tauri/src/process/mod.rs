@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -12,7 +12,7 @@ use std::{
 use tokio::{
     fs,
     fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
 };
@@ -330,16 +330,35 @@ impl ProcessOutput {
 #[derive(Clone, Default)]
 pub struct ProcessManager {
     output_capture_limit: Option<usize>,
+    complete_stdout_limit: Option<usize>,
     lifecycle: Option<ProcessObserver>,
     cancellation: CancellationToken,
+    active_runs: Arc<AtomicUsize>,
+}
+
+struct ActiveRunGuard(Arc<AtomicUsize>);
+
+impl ActiveRunGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
             output_capture_limit: None,
+            complete_stdout_limit: None,
             cancellation: CancellationToken::new(),
             lifecycle: None,
+            active_runs: Arc::default(),
         }
     }
 
@@ -355,12 +374,26 @@ impl ProcessManager {
         self
     }
 
+    /// Structured stdout is a complete document, not a diagnostic tail. Keep
+    /// its prefix up to this bound and drain any excess without accumulating
+    /// it; a successful process with excess output is returned as an error.
+    /// Stderr retains the ordinary diagnostic capture policy. Structured
+    /// stdout is not emitted as line-oriented progress through the observer.
+    pub(crate) fn with_complete_stdout_limit(mut self, limit: usize) -> Self {
+        self.complete_stdout_limit = Some(limit);
+        self
+    }
+
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
 
     pub fn child_token(&self) -> CancellationToken {
         self.cancellation.child_token()
+    }
+
+    pub(crate) fn has_active_processes(&self) -> bool {
+        self.active_runs.load(Ordering::Acquire) != 0
     }
 
     pub async fn run(&self, spec: ProcessSpec) -> Result<ProcessOutput> {
@@ -378,6 +411,9 @@ impl ProcessManager {
         if self.cancellation.is_cancelled() {
             return Err(SplatError::Cancelled);
         }
+        // Declared before child/job guards: it is released only after their
+        // cleanup, including cancellation and an early launch failure.
+        let _active = ActiveRunGuard::new(&self.active_runs);
         if !spec.executable.is_file() {
             return Err(SplatError::EngineMissing(
                 spec.executable.display().to_string(),
@@ -483,13 +519,29 @@ impl ProcessManager {
         } else {
             None
         };
-        let stdout_task = tokio::spawn(pump_stream(
-            child.stdout.take().expect("stdout is piped"),
-            ProcessStream::Stdout,
-            spec.observer.clone(),
-            log_file.clone(),
-            self.output_capture_limit,
-        ));
+        let stdout_reader = child.stdout.take().expect("stdout is piped");
+        let stdout_observer = spec.observer.clone();
+        let stdout_log = log_file.clone();
+        let stdout_tail_limit = self.output_capture_limit;
+        let complete_stdout_limit = self.complete_stdout_limit;
+        let stdout_task = tokio::spawn(async move {
+            if let Some(limit) = complete_stdout_limit {
+                pump_complete_stdout(stdout_reader, stdout_log, limit).await
+            } else {
+                let bytes = pump_stream(
+                    stdout_reader,
+                    ProcessStream::Stdout,
+                    stdout_observer,
+                    stdout_log,
+                    stdout_tail_limit,
+                )
+                .await?;
+                Ok(CapturedStdout {
+                    total_bytes: bytes.len() as u64,
+                    bytes,
+                })
+            }
+        });
         let stderr_task = tokio::spawn(pump_stream(
             child.stderr.take().expect("stderr is piped"),
             ProcessStream::Stderr,
@@ -595,7 +647,7 @@ impl ProcessManager {
             success: status.success(),
             exit_code: status.code(),
             termination: ProcessTermination::from_status(status),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         };
 
@@ -634,8 +686,51 @@ impl ProcessManager {
             });
         }
 
+        // Preserve a real process failure (and cancellation above), rather
+        // than replacing it with a secondary metadata-size error. Complete
+        // the normal process/log lifecycle before rejecting partial stdout.
+        if let Some(limit) = self
+            .complete_stdout_limit
+            .filter(|&limit| output.success && stdout.total_bytes > limit as u64)
+        {
+            return Err(SplatError::Process(format!(
+                "Structured stdout capture limit exceeded: stdout_bytes={}; limit_bytes={limit}; stdout_truncated=true; {}",
+                stdout.total_bytes, output.termination
+            )));
+        }
+
         Ok(output)
     }
+}
+
+struct CapturedStdout {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+}
+
+/// Fixed-size reads also bound memory for metadata emitted as one enormous
+/// line. Keep draining after overflow so the child cannot block on a full pipe.
+async fn pump_complete_stdout<R: AsyncRead + Unpin>(
+    mut reader: R,
+    log: Option<Arc<Mutex<tokio::fs::File>>>,
+    limit: usize,
+) -> std::io::Result<CapturedStdout> {
+    let mut bytes = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let retained = read.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&chunk[..retained]);
+        if let Some(file) = &log {
+            file.lock().await.write_all(&chunk[..read]).await?;
+        }
+    }
+    Ok(CapturedStdout { bytes, total_bytes })
 }
 
 async fn pump_stream<R: AsyncRead + Unpin>(
@@ -675,6 +770,153 @@ async fn pump_stream<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn complete_stdout_preserves_document_bytes_and_limit_boundary() {
+        let document = format!("{{\"metadata\":\"{}\"}}", "相机".repeat(20_000)).into_bytes();
+        assert!(document.len() > 64 * 1024);
+        for limit in [document.len(), document.len() + 1] {
+            let captured = pump_complete_stdout(document.as_slice(), None, limit)
+                .await
+                .unwrap();
+            assert_eq!(captured.total_bytes, document.len() as u64);
+            assert_eq!(captured.bytes, document);
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_stdout_overflow_drains_a_large_single_line_with_bounded_capture() {
+        let input = vec![b'1'; 1024 * 1024];
+        for limit in [0, 1, 64 * 1024] {
+            let captured = pump_complete_stdout(input.as_slice(), None, limit)
+                .await
+                .unwrap();
+            assert_eq!(captured.total_bytes, input.len() as u64);
+            assert_eq!(captured.bytes.len(), limit);
+            assert_eq!(captured.bytes, input[..limit]);
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    fn structured_output_command(exit_code: i32, wait: bool) -> (PathBuf, Vec<OsString>) {
+        #[cfg(windows)]
+        {
+            (
+                system_executable("WindowsPowerShell/v1.0/powershell.exe"),
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "[Console]::Out.Write('0123456789'); [Console]::Error.WriteLine('diagnostic-tail'); {} exit {exit_code}",
+                        if wait { "Start-Sleep -Seconds 30;" } else { "" },
+                    ).into(),
+                ],
+            )
+        }
+        #[cfg(unix)]
+        {
+            (
+                PathBuf::from("/bin/sh"),
+                vec![
+                    "-c".into(),
+                    format!(
+                        "printf '0123456789'; printf 'diagnostic-tail\\n' >&2; {} exit {exit_code}",
+                        if wait { "sleep 30;" } else { "" },
+                    )
+                    .into(),
+                ],
+            )
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn complete_stdout_does_not_change_stderr_tail_or_real_exit_failure() {
+        for (limit, exit_code) in [(10, 0), (9, 0), (9, 7)] {
+            let (executable, args) = structured_output_command(exit_code, false);
+            let manager = ProcessManager::new()
+                .with_output_capture_limit(6)
+                .with_complete_stdout_limit(limit);
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                manager.run(ProcessSpec {
+                    executable,
+                    args,
+                    working_directory: None,
+                    log_path: None,
+                    observer: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(!manager.has_active_processes());
+            if exit_code == 0 && limit == 9 {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("stdout_bytes=10"), "{error}");
+                assert!(error.contains("limit_bytes=9"), "{error}");
+                assert!(error.contains("stdout_truncated=true"), "{error}");
+                assert!(error.contains("exit_code: Some(0)"), "{error}");
+                assert!(!error.contains("0123456789"));
+            } else {
+                let output = result.unwrap();
+                assert_eq!(output.exit_code, Some(exit_code));
+                assert_eq!(output.success, exit_code == 0);
+                assert_eq!(output.stdout, &"0123456789"[..limit]);
+                assert!(output.stderr.ends_with("tail\n") || output.stderr.ends_with("tail\r\n"));
+                assert!(output.stderr.len() <= 6);
+            }
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn complete_stdout_overflow_does_not_override_cancellation() {
+        let (executable, args) = structured_output_command(0, true);
+        let manager = ProcessManager::new()
+            .with_output_capture_limit(16)
+            .with_complete_stdout_limit(1);
+        let cancel = manager.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.run(ProcessSpec {
+                executable,
+                args,
+                working_directory: None,
+                log_path: None,
+                observer: Some(Arc::new(move |update| {
+                    if let ProcessUpdate::Line {
+                        stream: ProcessStream::Stderr,
+                        line,
+                    } = update
+                    {
+                        if line == "diagnostic-tail" {
+                            cancel.cancel();
+                        }
+                    }
+                })),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert!(!manager.has_active_processes());
+    }
+
+    #[test]
+    fn activity_is_shared_by_clones_and_released_on_guard_drop() {
+        let manager = ProcessManager::new();
+        let observer = manager.clone();
+        assert!(!observer.has_active_processes());
+        {
+            let _first = ActiveRunGuard::new(&manager.active_runs);
+            let second = ActiveRunGuard::new(&manager.active_runs);
+            assert!(observer.has_active_processes());
+            drop(second);
+            assert!(observer.has_active_processes());
+        }
+        assert!(!observer.has_active_processes());
+    }
     use tokio::io::AsyncWriteExt;
 
     #[cfg(any(windows, unix))]
@@ -873,6 +1115,56 @@ mod tests {
         .await;
         assert_eq!(output.unwrap(), b"frame=2\n");
         assert_eq!(lines.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_capture_preserves_engine_failure_evidence() {
+        use crate::failure::{EngineFailureEvidence, EngineProcessFailure};
+        use crate::pipeline::PipelineEngine;
+        let evidence = Arc::new(std::sync::Mutex::new(EngineFailureEvidence::default()));
+        let seen = evidence.clone();
+        let observer: ProcessObserver = Arc::new(move |update| {
+            if let ProcessUpdate::Line { line, .. } = update {
+                seen.lock().unwrap().observe(&line);
+            }
+        });
+        let stdout = pump_stream(
+            &b"GPU initialization started\nwgpu error: Out of Memory\ntruncated output tail\n"[..],
+            ProcessStream::Stdout,
+            Some(observer.clone()),
+            None,
+            Some(8),
+        )
+        .await
+        .unwrap();
+        let stderr = pump_stream(
+            &b"failed to load dataset: early eof\n"[..],
+            ProcessStream::Stderr,
+            Some(observer),
+            None,
+            Some(8),
+        )
+        .await
+        .unwrap();
+        let output = ProcessOutput {
+            success: false,
+            exit_code: Some(101),
+            termination: ProcessTermination {
+                exit_code: Some(101),
+                ..Default::default()
+            },
+            stdout: String::from_utf8(stdout).unwrap(),
+            stderr: String::from_utf8(stderr).unwrap(),
+        };
+        assert!(!output.stdout.contains("Out of Memory"));
+        let failure = EngineProcessFailure::from_output_with_evidence(
+            PipelineEngine::Brush,
+            "train",
+            &output,
+            &evidence.lock().unwrap(),
+        );
+        assert_eq!(failure.classification.kind, Some("brush_out_of_memory"));
+        assert!(failure.detail.contains("wgpu error: Out of Memory"));
     }
 
     #[test]

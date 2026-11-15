@@ -2,6 +2,7 @@ pub mod access;
 pub mod artifacts;
 pub mod ba_policy;
 pub mod brush_execution;
+pub(crate) mod brush_initialization;
 pub mod effectiveness;
 pub mod estimate;
 pub mod event;
@@ -21,6 +22,7 @@ pub(crate) mod retry_preparation;
 pub mod runner;
 pub mod runtime;
 pub mod splat_budget;
+pub(crate) mod sqlite_recovery;
 pub mod state;
 pub mod work_order;
 

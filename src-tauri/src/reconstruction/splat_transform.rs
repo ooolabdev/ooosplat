@@ -20,17 +20,70 @@ use crate::{
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const ROWS_PER_CHUNK: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidGaussianKind {
+    ZeroPoints,
+    NonFiniteAttributes,
+    InvalidRotation,
+}
+
+/// Only a fully read, structurally complete output may establish an algorithm
+/// failure. Missing/truncated files, unsupported formats and I/O are not one.
+#[derive(Debug)]
+pub(crate) enum TrainingPlyValidationError {
+    Operational(SplatError),
+    InvalidGaussian(InvalidGaussianKind),
+}
+
+impl TrainingPlyValidationError {
+    pub(crate) fn is_algorithm_failure(&self) -> bool {
+        matches!(self, Self::InvalidGaussian(_))
+    }
+
+    pub(crate) fn into_error(self) -> SplatError {
+        match self {
+            Self::Operational(error) => error,
+            Self::InvalidGaussian(kind) => unsupported(match kind {
+                InvalidGaussianKind::ZeroPoints => "Gaussian output contains zero points",
+                InvalidGaussianKind::NonFiniteAttributes => "Non-finite Gaussian attributes",
+                InvalidGaussianKind::InvalidRotation => "Invalid Gaussian rotation",
+            }),
+        }
+    }
+}
+
+impl From<SplatError> for TrainingPlyValidationError {
+    fn from(error: SplatError) -> Self {
+        Self::Operational(error)
+    }
+}
+
+impl From<std::io::Error> for TrainingPlyValidationError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Operational(SplatError::Io(error))
+    }
+}
+
 /// Full bounded read, used for reshoot initialization and publication validation.
 /// Unlike header inspection this rejects truncated/non-finite Gaussian payloads.
 pub fn validate_training_ply(
     path: &Path,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(PlyInfo, u32, String)> {
-    use sha2::{Digest, Sha256};
+    validate_training_ply_classified(path, cancel).map_err(TrainingPlyValidationError::into_error)
+}
+
+pub(crate) fn validate_training_ply_classified(
+    path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> std::result::Result<(PlyInfo, u32, String), TrainingPlyValidationError> {
+    if cancel.is_cancelled() {
+        return Err(SplatError::Cancelled.into());
+    }
     let file = File::open(path)?;
     let info = file.metadata()?;
     let mut reader = BufReader::new(file);
-    let layout = parse_layout(&mut reader)?;
+    let layout = parse_layout_with_empty(&mut reader, true)?;
     let expected = (layout.header.len() as u64)
         .checked_add(
             layout
@@ -40,17 +93,28 @@ pub fn validate_training_ply(
         )
         .ok_or_else(|| unsupported("PLY size overflow"))?;
     if info.len() != expected {
-        return Err(unsupported("PLY data length mismatch"));
+        return Err(unsupported("PLY data length mismatch").into());
     }
+    validate_training_payload(&mut reader, layout, info.len(), cancel)
+}
+
+fn validate_training_payload(
+    reader: &mut impl Read,
+    layout: PlyLayout,
+    file_size: u64,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> std::result::Result<(PlyInfo, u32, String), TrainingPlyValidationError> {
+    use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(&layout.header);
     let mut row = vec![0; layout.stride];
+    let mut invalid = (layout.count == 0).then_some(InvalidGaussianKind::ZeroPoints);
     let rotation_offsets: Vec<_> = (0..4)
         .map(|i| layout.offsets[&format!("rot_{i}")])
         .collect();
     for _ in 0..layout.count {
         if cancel.is_cancelled() {
-            return Err(SplatError::Cancelled);
+            return Err(SplatError::Cancelled.into());
         }
         reader.read_exact(&mut row)?;
         if row
@@ -59,16 +123,27 @@ pub fn validate_training_ply(
             .iter()
             .any(|b| !f32::from_le_bytes(*b).is_finite())
         {
-            return Err(unsupported("Non-finite Gaussian attributes"));
+            invalid = Some(InvalidGaussianKind::NonFiniteAttributes);
         }
         let norm: f64 = rotation_offsets
             .iter()
             .map(|offset| read_float(&row, *offset).powi(2))
             .sum();
-        if norm < 1e-20 {
-            return Err(unsupported("Invalid Gaussian rotation"));
+        if norm < 1e-20 && invalid.is_none() {
+            invalid = Some(InvalidGaussianKind::InvalidRotation);
         }
         hash.update(&row);
+    }
+    if cancel.is_cancelled() {
+        return Err(SplatError::Cancelled.into());
+    }
+    // A read failure/truncation after an earlier NaN must still stop without
+    // consuming an algorithm fallback. Also reject files that grew mid-read.
+    if reader.read(&mut [0_u8; 1])? != 0 {
+        return Err(unsupported("PLY data length mismatch").into());
+    }
+    if let Some(kind) = invalid {
+        return Err(TrainingPlyValidationError::InvalidGaussian(kind));
     }
     let sh = match layout.rest_count {
         0 => 0,
@@ -78,7 +153,7 @@ pub fn validate_training_ply(
     };
     Ok((
         PlyInfo {
-            file_size: info.len(),
+            file_size,
             splat_count: layout.count,
         },
         sh,
@@ -255,13 +330,16 @@ fn unsupported(detail: impl Into<String>) -> SplatError {
     ))
 }
 
-fn parse_layout(reader: &mut BufReader<File>) -> Result<PlyLayout> {
+fn parse_layout(reader: &mut impl BufRead) -> Result<PlyLayout> {
+    parse_layout_with_empty(reader, false)
+}
+
+fn parse_layout_with_empty(reader: &mut impl BufRead, allow_empty: bool) -> Result<PlyLayout> {
     let mut header = Vec::new();
     let mut line = Vec::new();
     let mut format_ok = false;
     let mut vertex_seen = false;
     let mut in_vertex = false;
-    let mut data_element_seen = false;
     let mut count = 0_u64;
     let mut stride = 0_usize;
     let mut offsets = HashMap::new();
@@ -291,14 +369,17 @@ fn parse_layout(reader: &mut BufReader<File>) -> Result<PlyLayout> {
                 .ok_or_else(|| unsupported("element 数量无效"))?;
             in_vertex = name == "vertex";
             if in_vertex {
-                if data_element_seen {
-                    return Err(unsupported("vertex 必须是第一个数据元素"));
+                if vertex_seen {
+                    return Err(unsupported("vertex 包含重复声明"));
                 }
                 vertex_seen = true;
                 count = element_count;
-            }
-            if element_count > 0 {
-                data_element_seen = true;
+            } else if element_count > 0 {
+                // Gaussian validation only reads vertex payloads. In
+                // particular, a zero-vertex file with an absent face payload
+                // is structurally incomplete, not a complete zero-point
+                // training result that may authorize an algorithm fallback.
+                return Err(unsupported("仅支持 vertex 数据元素"));
             }
         } else if trimmed.starts_with("property ") && in_vertex {
             let parts = trimmed.split_whitespace().collect::<Vec<_>>();
@@ -315,7 +396,7 @@ fn parse_layout(reader: &mut BufReader<File>) -> Result<PlyLayout> {
         }
     }
 
-    if !format_ok || !vertex_seen || count == 0 || stride == 0 {
+    if !format_ok || !vertex_seen || (!allow_empty && count == 0) || stride == 0 {
         return Err(unsupported("格式、vertex 数量或属性布局无效"));
     }
     for name in [
@@ -922,6 +1003,138 @@ mod tests {
             validate_training_ply(&path, &token),
             Err(SplatError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn classified_validation_only_allows_complete_invalid_gaussians_to_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.ply");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let missing = validate_training_ply_classified(&path, &cancel).unwrap_err();
+        assert!(!missing.is_algorithm_failure());
+        assert_eq!(
+            missing.into_error().io_error().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for bytes in [
+            b"".as_slice(),
+            b"ply\n",
+            b"not a PLY",
+            b"ply\nformat binary_little_endian 1.0\nelement vertex 0\nend_header\n",
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(!validate_training_ply_classified(&path, &cancel)
+                .unwrap_err()
+                .is_algorithm_failure());
+        }
+        write_fixture_rows(&path, &[]);
+        assert!(matches!(
+            validate_training_ply_classified(&path, &cancel),
+            Err(TrainingPlyValidationError::InvalidGaussian(
+                InvalidGaussianKind::ZeroPoints
+            ))
+        ));
+        write_fixture_rows(&path, &[[f32::NAN, 0., 0.], [0., 1., 0.]]);
+        assert!(matches!(
+            validate_training_ply_classified(&path, &cancel),
+            Err(TrainingPlyValidationError::InvalidGaussian(
+                InvalidGaussianKind::NonFiniteAttributes
+            ))
+        ));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(!validate_training_ply_classified(&path, &cancel)
+            .unwrap_err()
+            .is_algorithm_failure());
+        write_fixture(&path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let layout = parse_layout(&mut std::io::Cursor::new(&bytes)).unwrap();
+        for index in 0..4 {
+            let offset = layout.header.len() + layout.offsets[&format!("rot_{index}")];
+            bytes[offset..offset + 4].copy_from_slice(&0_f32.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            validate_training_ply_classified(&path, &cancel),
+            Err(TrainingPlyValidationError::InvalidGaussian(
+                InvalidGaussianKind::InvalidRotation
+            ))
+        ));
+        cancel.cancel();
+        assert!(matches!(
+            validate_training_ply_classified(&path, &cancel),
+            Err(TrainingPlyValidationError::Operational(
+                SplatError::Cancelled
+            ))
+        ));
+    }
+
+    #[test]
+    fn malformed_zero_point_headers_are_not_algorithm_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.ply");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        write_fixture_rows(&path, &[]);
+        let header = std::fs::read_to_string(&path).unwrap();
+        for declaration in [
+            "element vertex 0\n",
+            "element vertex 1\n",
+            "element face 1\nproperty list uchar int vertex_indices\n",
+        ] {
+            std::fs::write(
+                &path,
+                header.replace("end_header\n", &format!("{declaration}end_header\n")),
+            )
+            .unwrap();
+            assert!(matches!(
+                validate_training_ply_classified(&path, &cancel),
+                Err(TrainingPlyValidationError::Operational(_))
+            ));
+        }
+        // An empty auxiliary element carries no payload and remains valid.
+        std::fs::write(
+            &path,
+            header.replace("end_header\n", "element face 0\nend_header\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_training_ply_classified(&path, &cancel),
+            Err(TrainingPlyValidationError::InvalidGaussian(
+                InvalidGaussianKind::ZeroPoints
+            ))
+        ));
+    }
+
+    #[test]
+    fn reading_after_nonfinite_attributes_preserves_later_io_failure() {
+        struct FailsAfterRow(std::io::Cursor<Vec<u8>>);
+        impl Read for FailsAfterRow {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.position() as usize == self.0.get_ref().len() {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+                self.0.read(bytes)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.ply");
+        write_fixture_rows(&path, &[[f32::NAN, 0., 0.], [0., 1., 0.]]);
+        let bytes = std::fs::read(&path).unwrap();
+        let layout = parse_layout(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let first_row = bytes[layout.header.len()..layout.header.len() + layout.stride].to_vec();
+        let mut reader = FailsAfterRow(std::io::Cursor::new(first_row));
+        let error = validate_training_payload(
+            &mut reader,
+            layout,
+            bytes.len() as u64,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(!error.is_algorithm_failure());
+        assert_eq!(
+            error.into_error().io_error().unwrap().raw_os_error(),
+            Some(5)
+        );
     }
 
     #[test]

@@ -80,11 +80,24 @@ impl SplatError {
                 current.previous_attempts.push(*previous);
                 Self::EngineProcess(current)
             }
+            (current, Self::EngineProcess(previous)) if current.io_error().is_some() => {
+                // Keep the real I/O error as the source. Earlier engine output
+                // is context only and must not reclassify a disk/permission
+                // failure as a GPU or geometric failure.
+                let summary = crate::diagnostics::redact::sanitize(
+                    &previous.to_string().chars().take(2_048).collect::<String>(),
+                    &[],
+                );
+                current.with_io_diagnostic(format!("previous_attempt_context_only=true\n{summary}"))
+            }
             (current, _) => current,
         }
     }
 
     pub fn is_brush_oom(&self) -> bool {
+        if let Self::Diagnostic { source, .. } = self {
+            return source.is_brush_oom();
+        }
         matches!(self, Self::BrushOutOfMemory(_))
             || matches!(self, Self::EngineProcess(failure)
                 if failure.classification.kind == Some("brush_out_of_memory"))
@@ -150,5 +163,43 @@ mod tests {
     fn io_diagnostic_does_not_reclassify_non_io_errors() {
         let error = SplatError::Process("original".into()).with_io_diagnostic("ignored");
         assert!(matches!(error, SplatError::Process(message) if message == "original"));
+    }
+
+    #[test]
+    fn previous_engine_failure_does_not_replace_last_io_reason() {
+        use crate::pipeline::{PipelineEngine, PipelineStage};
+        use crate::process::{ProcessOutput, ProcessTermination};
+        let previous = crate::failure::EngineProcessFailure::from_output(
+            PipelineEngine::Colmap,
+            "mapper",
+            &ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                termination: ProcessTermination {
+                    exit_code: Some(1),
+                    ..Default::default()
+                },
+                stdout: String::new(),
+                stderr: "Failed to create any sparse model".into(),
+            },
+        );
+        let error = SplatError::Io(std::io::Error::from_raw_os_error(5))
+            .with_io_diagnostic("training_preparation_operation=write_state")
+            .with_previous_attempt(SplatError::EngineProcess(Box::new(previous)));
+        assert_eq!(
+            error.io_error().and_then(std::io::Error::raw_os_error),
+            Some(5)
+        );
+        assert!(error
+            .to_string()
+            .contains("previous_attempt_context_only=true"));
+        assert!(error
+            .to_string()
+            .contains("training_preparation_operation=write_state"));
+        assert_eq!(
+            crate::failure::classify(Some(PipelineStage::Reconstructing), &error).kind,
+            Some("mapper_storage")
+        );
+        assert!(!error.is_brush_oom());
     }
 }

@@ -21,19 +21,17 @@
 
 OOOSplat is a local desktop application that turns ordinary or panorama videos and image sequences into 3D Gaussian Splatting projects. Choose source media, a project directory, and a quality preset, then generate, preview, edit, and export the result.
 
-Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service. The React interface calls the local Rust backend directly. Normal generation and preview do not require a separate HTTP server.
+Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and Brush with the application. Linux support remains limited to an Ubuntu 24.04 LTS x86_64 Alpha. Every generation stage runs on the user's own CPU and GPU; input media, project data, models, and logs do not need to be uploaded to a cloud reconstruction or training service.
 
-See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work. Current directions include Brush depth and crash diagnostics, imported COLMAP reconstruction without rerunning SfM, resumable training, floater cleanup, AMD acceleration, a dark theme, automatic matting, and experimental depth-assisted Mesh generation.
+See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
 > 0.8.0 unifies multi-input, reshoot, and continuation workflows; improves generation logs, error diagnostics, and cross-platform builds; and refines panoramas, GPS, exports, and preview navigation.
-
-The features below describe the current `main` source tree. Source updates are not necessarily released features; consult each release's notes for installer contents.
 
 ## Why OOOSplat
 
 - **One-click Gaussian generation**: Select an input video or image-sequence folder, project directory, and quality preset. OOOSplat then runs image preparation, COLMAP camera reconstruction, Brush training, and `final.ply` publishing without manual engine setup or command-line orchestration.
-- **Cross-platform compatibility**: Supports Windows, macOS, and Linux, bringing local Gaussian Splat generation to all three major desktop platforms. See the compatibility section below for specific OS and processor requirements.
-- **Security and privacy protection**: Source media, extracted frames, camera reconstruction data, Gaussian models, and logs stay in the user-selected local project directory by default. The core generation workflow runs on the user's machine, so original videos, images, and models do not need to be uploaded to third-party reconstruction or training platforms. This reduces exposure risks during network transfer, cloud retention, and unauthorized access.
+- **Easy to get started**: No knowledge of specialist Gaussian Splatting settings is required. OOOSplat automatically configures suitable frame sampling, reconstruction, and training parameters based on the device capabilities, input type, and resolution; follow the interface to select the inputs, project directory, and quality preset to start generation.
+- **Cross-platform support**: Supports Windows, with Apple Silicon macOS Alpha and Ubuntu 24.04 x86_64 Alpha builds. See the compatibility section below for specific OS and processor requirements.
 - **Fully local compute**: Reconstruction and training run on the user's own machine without remote compute services. COLMAP automatically uses a compatible local NVIDIA GPU when available and falls back to CPU otherwise, keeping both processing and data under the user's control.
 
 ## Demo Video
@@ -63,17 +61,8 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **Multi-task workspace**: Keep and reorder drafts, then automatically run subsequent tasks, one generation at a time. Failed, cancelled and interrupted work uses Continue generation, reusing valid results and preserving its recipe, actual route and consumed allowances. Explicit continuation turns off the automatic queue and runs only that task.
 - **Reshoots**: Answer the model-condition question and each ordinary source's camera-setting question. Supports multiple sources, mixed sizes and ordinary/full-ERP combinations. A frozen source snapshot feeds the shared generation workflow, with normal full training recipes in an independent derived project.
 - **Preview and editing**: Supports WebGPU/WebGL2, translation axes, rotation rings, cropping, deletion, inversion, undo, and redo. Static views stop redrawing; interactions run at up to 60 FPS. Use WASD mouse-look at 0.1×–5.0× speed (W/S along the view direction, A/D horizontally) or return to the first training view.
-- **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, bundled SOG, portrait or landscape MP4, and standalone offline HTML. Out-of-range SPZ coordinates can be adjusted on the export copy after confirmation.
+- **Multiple export formats**: Export standard PLY, compressed PLY, SPZ v4, single-file SOG, portrait or landscape MP4, and standalone offline HTML. Out-of-range SPZ coordinates can be adjusted on the export copy after confirmation.
 - **Local processing**: COLMAP reconstruction and Brush training run on the user's computer, using GPU acceleration when available.
-- **Cross-platform and bilingual**: Supports Windows, Apple Silicon macOS, and Ubuntu, with Simplified Chinese and English interfaces.
-
-Each image set needs at least two images and one projection type. Ordinary sets may mix dimensions; ERP sets must remain same-sized and full monoscopic panoramas. A 2:1 ratio alone does not confirm ERP. Dual-fisheye, stereo, VR180, cropped panoramas and private originals are unsupported. Unconnected inputs are not forcibly merged. Panorama caches have no fixed 20 GiB cap; the 512 MiB per-image decode guard remains.
-
-New COLMAP file/folder imports are temporarily unavailable in the GUI, MCP, and CLI. The desktop app shows a dialog for unsupported inputs. Existing-task continuation, reshoots with previously verified COLMAP data, and normal reconstruction remain available. Importing a validated COLMAP reconstruction and skipping SfM is tracked on the roadmap.
-
-Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated memory, but actual RAM, disk space, and format constraints still apply. Removing these gates does not guarantee large-model exports will succeed. See [export notes and verification](docs/model-export-verification.md).
-
-Continuation does not restore optimizer state: unfinished training restarts from its saved initialization, while a valid candidate only needs publication recovery. Old tasks require verifiable parameters and initialization data. Preview and export remain available during training, but compete for GPU and system memory; resources are not isolated.
 
 ### Gaussian Editing Shortcuts
 
@@ -99,12 +88,6 @@ Videos or image sets
   └─ Validate the PLY and atomically publish final.ply
 ```
 
-A normal generation task continues to Brush when COLMAP produces valid cameras, registered images and 3D points. Registration below 80% produces a quality warning rather than stopping the task solely for low coverage. An ordinary cold reconstruction with both low registration and invalid intrinsics checks at most three deterministic starting images under the original geometric thresholds; it stops rather than training an invalid solution if no better valid model is found. Valid existing reconstructions remain reusable. A reshoot also requires at least one new image to connect to the original scene. Zero new registrations fail; partial success can continue, with separate low-registration warnings for the new inputs overall and each source.
-
-Image preflight reads headers without decoding every pixel. Alpha channels do not necessarily contain transparent pixels. New projects save per-source mappings and prepared images while keeping originals read-only; derived images, COLMAP data and training outputs stay in the new project. Mixed reconstruction, cross-device quality and platform hardware require separate acceptance testing; small pipeline tests do not establish that all these cases work.
-
-Exact frame extraction uses passthrough output and validates source-frame mappings against the plan; missing frames or mismatched mappings still stop generation safely. Read, write or archive failures while preparing continuation retain their operation context and original OS error codes for diagnosis, rather than being reported as reconstruction or training failures.
-
 ## System Requirements
 
 - Windows 11, x64.
@@ -114,8 +97,6 @@ Exact frame extraction uses passthrough output and validates source-frame mappin
 - COLMAP CUDA acceleration requires an NVIDIA GPU, Windows driver 580.00 or newer, and Compute Capability 7.5 or higher. OOOSplat automatically uses CPU when these requirements are not met; no manual configuration is required.
 - Enough disk space for source-media copies, input images, COLMAP data, Brush intermediate files, and the final PLY. Long videos, large image sequences, and higher quality presets can require substantial space.
 - The installer uses a per-machine installation and may require administrator privileges.
-
-The COLMAP build bundled on Windows supports both CPU and CUDA GPU execution. OOOSplat automatically selects the available backend before each task. Brush uses its own available graphics backend; its GPU detection and runtime are independent of COLMAP.
 
 ### macOS 15+ Alpha (Apple Silicon only)
 
@@ -171,18 +152,6 @@ Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) t
 9. Switch to Animation, choose Portrait or Landscape, and use Export → Export video for a 30 FPS, 23-second MP4 at 1080×1920 or 1920×1080 respectively. Both Adjust and Animation can export offline HTML. Exports use the current edits, can be cancelled, and provide access to the output folder on completion.
 10. To add detail, choose Reshoot on a completed project. Select the new media and type, optionally adjust quality/Automatic retry, then answer the model-condition question. Ordinary inputs also ask whether capture settings are the same; there is no separate plan confirmation. Enabling Automatic retry allows a slower fallback if needed. New and old views must overlap and show the same scene.
 
-Usage notes:
-
-- Source information is kept inside the input box. An Alpha-channel hint belongs to the selected input; it does not prove transparent pixels or generated masks.
-- Drag the divider between the panels to resize them; double-click it to restore the default ratio.
-- Use the percentage button in the lower-right corner to reduce, reset, or increase the interface scale.
-- Drafts are saved locally and their media is rechecked after restart. Running-task parameters cannot be changed, but other drafts remain editable. A second task cannot run concurrently.
-- Drag new tasks to reorder them. Auto-run next task is off by default and never skips an unready task. Image-order questions pause startup; cancelling disables the queue.
-- New reshoots inherit source quality and default Automatic retry to enabled, editable before launch. Sources can differ in resolution, aspect ratio, device and lens, and can mix ordinary/full-ERP inputs; each ERP image set must remain same-sized internally. Original media cannot be submitted again. Missing trusted image/reconstruction snapshots prevent launch. Once frozen, the derived project reads its own snapshot rather than the source project, leaving source files and edits unchanged.
-- Reusing the original model initializes from the unedited generated PLY and trains on old and new views with the normal full recipe, without shortened steps or reduced learning rates. Original intrinsics are reused only after confirmation and compatible single-camera dimensions/orientation checks. This is not an optimizer resume or a guarantee that only new regions change; deletion/crop edits are not inherited. Existing tasks keep their saved settings. See the [reshoot validation notes](docs/RESHOOT_V2.md).
-- Task pages keep the latest 500 log entries; complete engine logs remain in the project's `logs/` directory. The training runtime monitor is hidden by default and can be enabled under Settings → Interface.
-- Delete moves the complete project, including source copies and intermediate files, to the Recycle Bin. OOOSplat does not fall back to permanent deletion if that operation fails.
-
 ## Quality Presets
 
 Sequential video and confirmed ordered-image matching use preset loop detection by default; valid loops are not guaranteed. Reshoots match old/new views separately, with window 10 and the preset loop policy among new ordered views. Backfill is independent of Automatic retry.
@@ -218,7 +187,7 @@ Each generation creates a separate directory under the projects root:
   edit.ply              Exported edits; safely replaced on later PLY exports (optional)
   edit.compressed.ply   Compressed PLY export (optional)
   edit.spz              SPZ v4 export (optional)
-  edit.sog              Bundled SOG export (optional)
+  edit.sog              Single-file SOG export (optional)
   preview.mp4           First optional animation-preview video export
   preview-2.mp4         Later video exports are automatically numbered
   preview-landscape.mp4 Landscape video (later exports are automatically numbered)
@@ -494,7 +463,7 @@ The preview Export menu supports models, portrait/landscape video, and single-fi
 | Standard PLY | Full precision, usually largest; archiving and continued editing |
 | Compressed PLY | Smaller, lossy; requires a compatible viewer |
 | SPZ v4 | Very small, lossy; sharing |
-| Bundled SOG | Typically higher compression, lossy; web presentation |
+| Single-file SOG | Typically higher compression, lossy; web presentation |
 
 SOG and SPZ are typically smaller; actual size varies and compression can affect detail. Processing starts only after selecting a format, without an intermediate PLY. The original `final.ply` stays unchanged, and failure or cancellation preserves existing exports. Compression is no longer blocked by an estimated-memory threshold, but large models can still fail if memory runs out. If SPZ coordinates exceed its range, explicit confirmation is required to center and, if needed, uniformly shrink only the export copy. Position, dimensions, and units may change; export still stops if safe encoding is impossible. See the [export notes and verification record](docs/model-export-verification.md).
 

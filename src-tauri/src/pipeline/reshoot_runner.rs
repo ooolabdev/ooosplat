@@ -139,6 +139,35 @@ pub(super) async fn validate_ply(
     })
     .await
     .map_err(|e| invalid(&format!("Gaussian validation worker: {e}")))?
+    .map_err(|error| error.with_io_diagnostic(
+        "training_preparation_operation=validate_gaussian\npath_role=training_gaussian\nio_substep=read_and_validate"
+    ))
+}
+
+/// A failed read/parse is not evidence that the training algorithm diverged.
+/// Only the typed, fully-read Gaussian validation may authorize that fallback.
+pub(super) async fn validate_training_candidate(
+    path: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (Result<PathBuf>, bool) {
+    let checked = path.clone();
+    match crate::presets::spawn_pipeline_blocking(move || {
+        crate::reconstruction::splat_transform::validate_training_ply_classified(&checked, &cancel)
+    })
+    .await
+    {
+        Ok(Ok(_)) => (Ok(path), false),
+        Ok(Err(error)) => {
+            let invalid = error.is_algorithm_failure();
+            (Err(error.into_error().with_io_diagnostic(
+                "training_preparation_operation=validate_gaussian\npath_role=brush_candidate\nio_substep=read_and_validate"
+            )), invalid)
+        }
+        Err(error) => (
+            Err(invalid(&format!("Gaussian validation worker: {error}"))),
+            false,
+        ),
+    }
 }
 
 pub(super) struct SourceAssets {
@@ -2261,6 +2290,126 @@ pub(super) fn sync_refined_cameras(database: &Path, model: &Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_candidate_validation_only_authorizes_one_complete_invalid_warm_fallback() {
+        fn ply(rows: &[[f32; 14]]) -> Vec<u8> {
+            let mut bytes = format!(
+                "ply\nformat binary_little_endian 1.0\nelement vertex {}\n",
+                rows.len()
+            )
+            .into_bytes();
+            for name in [
+                "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+                "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+            ] {
+                bytes.extend_from_slice(format!("property float {name}\n").as_bytes());
+            }
+            bytes.extend_from_slice(b"end_header\n");
+            for row in rows {
+                for value in row {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
+        fn recipe(training: TrainingMode, authorized: bool) -> ReshootRecipe {
+            let plan = ReshootPlan {
+                reconstruction: ReconstructionMode::Incremental,
+                training,
+            };
+            ReshootRecipe {
+                version: RECIPE_VERSION,
+                normal_parameters_version: Some(1),
+                camera_assignment: None,
+                options: ReshootOptions {
+                    condition: ModelCondition::Good,
+                    camera_relation: None,
+                    allow_fallback: authorized,
+                    source_identity: "source".into(),
+                    input_identity: "input".into(),
+                    projection: VideoProjection::Perspective,
+                    image_matching_strategy: Default::default(),
+                },
+                initial: plan,
+                actual: plan,
+                batch_id: "candidate-validation".into(),
+                reconstruction_fallbacks: 0,
+                training_fallbacks: 0,
+                expanded_matching: false,
+                source_names: vec![],
+                new_names: vec![],
+                warm_parameters: None,
+                init_sha256: None,
+                init_georeference: None,
+                stored_input_identity: None,
+                panorama_frames: vec![],
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let valid_row = [
+            0_f32, 0., 1., 0.1, 0.1, 0.1, 0., -3., -3., -3., 1., 0., 0., 0.,
+        ];
+        let valid = ply(&[valid_row]);
+        let mut truncated = valid.clone();
+        truncated.pop();
+        let mut nan_row = valid_row;
+        nan_row[0] = f32::NAN;
+        let mut invalid_rotation = valid_row;
+        invalid_rotation[10] = 0.;
+        for (name, bytes, algorithm_failure) in [
+            ("missing", None, false),
+            ("empty", Some(vec![]), false),
+            ("truncated", Some(truncated), false),
+            ("zero-points", Some(ply(&[])), true),
+            ("non-finite", Some(ply(&[nan_row])), true),
+            ("invalid-rotation", Some(ply(&[invalid_rotation])), true),
+        ] {
+            let path = root.path().join(format!("{name}.ply"));
+            if let Some(bytes) = &bytes {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let (result, invalid) = validate_training_candidate(
+                path.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            assert!(result.is_err(), "{name}");
+            assert_eq!(invalid, algorithm_failure, "{name}");
+            if let Some(bytes) = &bytes {
+                assert_eq!(&std::fs::read(&path).unwrap(), bytes, "{name}");
+            }
+            for (mode, authorized) in [
+                (TrainingMode::Warm, true),
+                (TrainingMode::Warm, false),
+                (TrainingMode::Cold, true),
+            ] {
+                let mut recipe = recipe(mode, authorized);
+                // This is the shared executor's gate: validation evidence is
+                // required before consulting the saved authorization/counter.
+                let used = invalid && recipe.fallback(AlgorithmFailure::InvalidWarmResult);
+                let expected = algorithm_failure && mode == TrainingMode::Warm && authorized;
+                assert_eq!(used, expected, "{name}: {mode:?}/{authorized}");
+                assert_eq!(recipe.training_fallbacks, u8::from(expected));
+                assert_eq!(recipe.reconstruction_fallbacks, 0);
+                assert!(!(invalid && recipe.fallback(AlgorithmFailure::InvalidWarmResult)));
+                assert_eq!(recipe.training_fallbacks, u8::from(expected));
+                assert_eq!(recipe.initial.training, mode);
+            }
+        }
+        let path = root.path().join("valid.ply");
+        std::fs::write(&path, valid).unwrap();
+        let (result, invalid) =
+            validate_training_candidate(path.clone(), tokio_util::sync::CancellationToken::new())
+                .await;
+        assert_eq!(result.unwrap(), path);
+        assert!(!invalid);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (result, invalid) = validate_training_candidate(path, cancel).await;
+        assert!(matches!(result, Err(SplatError::Cancelled)));
+        assert!(!invalid);
+    }
 
     #[tokio::test]
     async fn retained_v2_training_does_not_reopen_a_missing_original_project() {
