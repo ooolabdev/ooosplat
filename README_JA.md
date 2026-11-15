@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><img src="https://img.shields.io/badge/release-v0.8.0-blue?style=flat" alt="Release: v0.8.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><img src="https://img.shields.io/badge/release-v0.8.1-blue?style=flat" alt="Release: v0.8.1"></a>
   <a href="#システム要件"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><strong>ダウンロード</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><strong>ダウンロード</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ Windows と Apple Silicon 向けの macOS Alpha では、FFmpeg、FFprobe、COLM
 
 予定している作業については [OOOSplat のロードマップ](ROADMAP_EN.md)を参照してください。
 
-> 0.8.0 では、複数素材、再撮影、続行生成の処理フローを統合し、生成ログ、エラー診断、クロスプラットフォームのビルドを改善しました。さらに、パノラマ、GPS、書き出し、プレビュー操作も改良しています。
+> 0.8.1 では、生成と続行生成の信頼性を高め、複数 GPU の選択と、同じピクセル寸法を持つ横向き／縦向き写真の混在入力に対応しました。COLMAP、Brush、FFprobe、およびクロスプラットフォーム診断も改善しています。
 
 ## OOOSplat を選ぶ理由
 
@@ -50,7 +50,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## 主な機能
 
-- **統一された素材入力**：複数の MP4/MOV の動画、画像フォルダー、JPG/JPEG/PNG の画像セットを、選択またはドラッグ＆ドロップで追加できます。1 つの入力欄で素材ごとに検出、種類の確認、削除を行い、つながりのある 1 つのシーンを再構成します。
+- **統一された素材入力**：複数の MP4/MOV の動画、画像フォルダー、JPG/JPEG/PNG の画像セットを、選択またはドラッグ＆ドロップで追加できます。1 つの入力欄で素材ごとに検出、種類の確認、削除を行い、つながりのある 1 つのシーンを再構成します。通常画像セットでは、ピクセル寸法が一致する横向き／縦向き画像を混在でき、向きごとに独立したカメラグループを使用します。
 - **パノラマ素材**：つなぎ合わせ済みの単眼の、完全な 360°×180°、2:1 の ERP の MP4 と画像フォルダーに対応します。素材の種類は自動で判別され、判別しきれない入力はその場で選択を求めます。
 - **画像の順序の確認**：100 枚を超える画像セットごとに、入力欄の中で撮影順を確認します。順序のあるセットにはシーケンシャルマッチングを使い、順序のないセットと 100 枚以下のセットには総当たりのマッチングを使います。
 - **画像の GPS**：埋め込まれた位置のメタデータを検出し、検証済みの Windows x64 の経路でマッチングと再構成を補助します。信頼できる観測があれば、推定した北の向きとメートル単位の推定スケールが得られます。そうでなければ元のワークフローを使います。[範囲と検証](docs/IMAGE_GPS.md)
@@ -129,10 +129,10 @@ sudo apt install -y \
 
 グラフィックアダプターに合った動作する Vulkan のドライバーをインストールしてください。たとえば、NVIDIA のプロプライエタリなドライバーや、AMD/Intel 向けの Mesa です。同梱の COLMAP は、互換性のある NVIDIA のデバイスでは CUDA/Caspar を、それ以外では CPU/Ceres を使います。Brush はグラフィックスバックエンドを独自に選びます。CPU のみのソフトウェアの Vulkan は、まだエンドツーエンドで検証していません。
 
-main ブランチの GitHub Actions の実行から `OOOSplat-0.8.0-x64-linux` の Artifact をダウンロードしたら、次のコマンドでインストールします：
+main ブランチの GitHub Actions の実行から `OOOSplat-0.8.1-x64-linux` の Artifact をダウンロードしたら、次のコマンドでインストールします：
 
 ```bash
-sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.8.1-x64-linux.deb
 ```
 
 `.deb` が Ubuntu のパッケージマネージャーでインストールするのは FFmpeg/FFprobe だけで、固定したバージョンの COLMAP と Brush のランタイムは同梱されています。
@@ -141,7 +141,7 @@ sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
 
 サンプル素材：生成のワークフローをテストしたり試したりするには、[Quark Drive からダウンロード](https://pan.quark.cn/s/1dde892a1324)してください。
 
-1. Windows では `OOOSplat-0.8.0-x64-windows.exe` を実行します。Apple Silicon の Mac では `OOOSplat-0.8.0-arm64-macos.dmg` を開き、OOOSplat を「アプリケーション」にドラッグします。Ubuntu 24.04 では `sudo apt install ./OOOSplat-0.8.0-x64-linux.deb` を実行します。
+1. Windows では `OOOSplat-0.8.1-x64-windows.exe` を実行します。Apple Silicon の Mac では `OOOSplat-0.8.1-arm64-macos.dmg` を開き、OOOSplat を「アプリケーション」にドラッグします。Ubuntu 24.04 では `sudo apt install ./OOOSplat-0.8.1-x64-linux.deb` を実行します。
 2. OOOSplat を起動し、上部バーにある同梱エンジンの状態が正常であることを確認します。右上の `EN / 中文` を使うと、インターフェースの言語をすぐに切り替えられます。
 3. 「Task List → New Tasks」で下書きを選ぶか、Add を選び、Add files、Add folders、またはドラッグ＆ドロップで素材を追加します。素材ごとの判別が終わるのを待ち、種類がはっきりしない場合は、その素材の入力欄で通常かパノラマかの処理を選びます。
 4. プロジェクトのルートを選びます。OOOSplat は最後に使った場所を記憶します。
@@ -228,7 +228,7 @@ OOOSplat は、安定性と段階ごとの所要時間を把握するため、�
 | フィールド | 説明 |
 | --- | --- |
 | インストール ID | 初回起動時に生成されるランダムな UUID。ハードウェアのシリアル番号、MAC アドレス、デバイスのフィンガープリントは読み取りません |
-| アプリのバージョン、OS、CPU のアーキテクチャ | たとえば `0.8.0` / `windows` / `x86_64` |
+| アプリのバージョン、OS、CPU のアーキテクチャ | たとえば `0.8.1` / `windows` / `x86_64` |
 | イベント名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` は 1 日に最大 1 回送られ、アプリのバージョンが変わった日にはもう 1 回送られます |
 | 品質プリセットと入力の種類 | `balanced` / `video` のような列挙値。画像シーケンスの入力では `images` を報告します |
 | 段階ごとと全体の所要時間 | ミリ秒 |
@@ -360,7 +360,7 @@ npm run package:windows
 NSIS のインストーラーは次の場所に書き出されます：
 
 ```text
-dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.8.1-x64-windows.exe
 ```
 
 最初のビルドの前に `npm run setup:engines` を実行してください。Tauri の `beforeBuildCommand` はエンジンのチェックとフロントエンドの本番ビルドを自動で実行しますが、パッケージングの間に暗黙にネットワークにアクセスすることはありません。

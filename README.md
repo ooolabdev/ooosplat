@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><img src="https://img.shields.io/badge/release-v0.8.0-blue?style=flat" alt="Release: v0.8.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><img src="https://img.shields.io/badge/release-v0.8.1-blue?style=flat" alt="Release: v0.8.1"></a>
   <a href="#系统要求"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><strong>下载</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ Windows 和 Apple Silicon macOS Alpha 均随应用提供 FFmpeg、FFprobe、COLM
 
 查看 [OOOSplat Roadmap](ROADMAP.md) 了解后续规划。
 
-> 0.8.0 统一多素材输入与补拍／继续生成链路，完善生成日志、错误诊断与跨平台构建，并改进全景、GPS、导出和预览漫游。
+> 0.8.1 提升生成与继续生成的可靠性，支持多显卡选择及同规格横竖拍图片混合输入，并改进 COLMAP、Brush、FFprobe 与跨平台运行诊断。
 
 ## 核心优势
 
@@ -50,7 +50,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## 主要功能
 
-- **统一素材输入**：选择或拖入多段 MP4、MOV、多个图片文件夹或 JPG、JPEG、PNG 散图集，在同一输入框内逐项检测、确认类型和删除，联合重建同一场景。
+- **统一素材输入**：选择或拖入多段 MP4、MOV、多个图片文件夹或 JPG、JPEG、PNG 散图集，在同一输入框内逐项检测、确认类型和删除，联合重建同一场景；同一普通图片集可混合像素规格一致的横拍与竖拍图片，并按方向使用独立相机组。
 - **全景素材**：支持已拼接、单目、完整 360°×180° 的 2:1 ERP MP4 和图片文件夹；自动检测类型，无法确定时在素材框中选择。
 - **图片顺序确认**：每个图片集超过100张时，在素材框内分别选择拍摄顺序；已排序使用顺序匹配，未排序或100张及以下使用穷举匹配。
 - **图片 GPS**：识别内嵌定位信息，在通过校验的 Windows x64 路径中辅助匹配与重建，可靠时提供北向与米制尺度；信息不足自动沿用原流程。[范围及验证](docs/IMAGE_GPS.md)
@@ -129,10 +129,10 @@ sudo apt install -y \
 
 请为显卡安装可用的 Vulkan 驱动（例如 NVIDIA 专有驱动，或 AMD/Intel 的 Mesa 驱动）。内置 COLMAP 在兼容 NVIDIA 设备上使用 CUDA/Caspar，否则使用 CPU/Ceres；Brush 独立选择图形后端。完全 CPU-only 的软件 Vulkan 后端尚未完成端到端验证。
 
-从 main 分支 GitHub Actions 下载 `OOOSplat-0.8.0-x64-linux` Artifact 后，可执行：
+从 main 分支 GitHub Actions 下载 `OOOSplat-0.8.1-x64-linux` Artifact 后，可执行：
 
 ```bash
-sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.8.1-x64-linux.deb
 ```
 
 `.deb` 仅通过 Ubuntu 包管理器安装 FFmpeg/FFprobe；锁定的 COLMAP 和 Brush 已包含在安装包中。
@@ -141,7 +141,7 @@ sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
 
 测试素材：[夸克网盘下载](https://pan.quark.cn/s/1dde892a1324)，可用于测试或体验生成流程。
 
-1. Windows 运行 `OOOSplat-0.8.0-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.8.0-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.8.0-x64-linux.deb`。
+1. Windows 运行 `OOOSplat-0.8.1-x64-windows.exe`；Apple Silicon Mac 打开 `OOOSplat-0.8.1-arm64-macos.dmg` 并将 OOOSplat 拖入“应用程序”；Ubuntu 24.04 使用 `sudo apt install ./OOOSplat-0.8.1-x64-linux.deb`。
 2. 启动 OOOSplat，确认顶栏中的内置引擎状态正常；可使用右上角的 `EN / 中文` 按钮即时切换界面语言。
 3. 在右侧“任务列表 → 新任务”中选择草稿或点击“新增”，通过“添加文件”“添加文件夹”或拖放加入素材。等待逐项检测完成；无法确定时，在对应素材内选择普通或全景类型。
 4. 选择项目根目录；程序会记住上次使用的位置。
@@ -230,7 +230,7 @@ OOOSplat 默认开启匿名使用统计，用于了解稳定性和各阶段耗�
 | 字段 | 说明 |
 | --- | --- |
 | 安装 ID | 首次启动生成的随机 UUID，不读取硬件序列号、MAC 地址或设备指纹 |
-| 应用版本、操作系统、CPU 架构 | 例如 `0.8.0` / `windows` / `x86_64` |
+| 应用版本、操作系统、CPU 架构 | 例如 `0.8.1` / `windows` / `x86_64` |
 | 事件名 | `daily_active`、`generation_started`、`generation_completed`、`generation_failed`、`pipeline_stage_completed`、`planner_evaluation`。`daily_active` 每天最多一次，应用升级后当天会再报一次 |
 | 质量档位与输入类型 | 枚举值，例如 `balanced` / `video`；图片序列输入报 `images` |
 | 阶段耗时与总耗时 | 毫秒 |
@@ -362,7 +362,7 @@ npm run package:windows
 NSIS 安装包输出到：
 
 ```text
-dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.8.1-x64-windows.exe
 ```
 
 首次构建前必须运行 `npm run setup:engines`。`beforeBuildCommand` 会自动执行引擎校验和前端生产构建，但不会在打包过程中隐式访问网络。

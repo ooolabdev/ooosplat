@@ -4,7 +4,7 @@
 
 This roadmap describes OOOSplat's product direction and implementation priorities. P0–P3 indicate relative priority; they are not release numbers and do not guarantee delivery dates.
 
-Current `main` version identifier: **0.8.0**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
+Current `main` version identifier: **0.8.1**. This page tracks source implementation; items marked “main” are not necessarily included in installers carrying the same version. Consult the corresponding release notes for shipped features.
 
 ## Product Principles
 
@@ -51,6 +51,7 @@ Current `main` version identifier: **0.8.0**. This page tracks source implementa
 
 | Status | Item | Delivery | GitHub Issue / PR |
 | --- | --- | --- | --- |
+| Implemented · 0.8.1 | Generation recovery, hardware selection, and image-set compatibility | Improves SQLite work-cache recovery, Mapper initialization-candidate protection, training-output validation, and publication recovery boundaries; lets multi-GPU systems select a concrete adapter; and accepts matching landscape/portrait pixel dimensions in one ordinary image set by separating camera groups by orientation. | [#82](https://github.com/ooolabdev/ooosplat/issues/82) / [#83](https://github.com/ooolabdev/ooosplat/issues/83) / [#88](https://github.com/ooolabdev/ooosplat/pull/88) / [#91](https://github.com/ooolabdev/ooosplat/issues/91) |
 | Completed | Ubuntu 24.04 Alpha | Provides an x86_64 `.deb` desktop package and CLI using system FFmpeg/FFprobe and bundled pinned COLMAP/Brush runtimes. COLMAP uses CUDA or CPU as supported. | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
 | Completed | Apple Silicon macOS Alpha | Provides an application-bundled FFmpeg, FFprobe, CPU COLMAP, and Brush workflow for macOS 15+ arm64. | [#4](https://github.com/ooolabdev/ooosplat/issues/4) / [PR #8](https://github.com/ooolabdev/ooosplat/pull/8) |
 | Completed | Embedded Gaussian preview and animation export | Supports `.ply` loading, camera navigation, whole-model transforms, animation preview, and Gaussian and portrait-video export. | [#3](https://github.com/ooolabdev/ooosplat/issues/3) |

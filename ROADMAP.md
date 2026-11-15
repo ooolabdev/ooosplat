@@ -4,7 +4,7 @@
 
 本路线图用于说明 OOOSplat 的产品方向和实施优先级。P0–P3 表示相对优先顺序，不代表版本号，也不承诺具体发布日期。
 
-当前 `main` 版本标识：**0.8.0**。本页按源码实现更新；标注“main”的功能不代表已包含在同版本安装包中，发布范围以对应 Release 说明为准。
+当前 `main` 版本标识：**0.8.1**。本页按源码实现更新；标注“main”的功能不代表已包含在同版本安装包中，发布范围以对应 Release 说明为准。
 
 ## 产品原则
 
@@ -51,6 +51,7 @@
 
 | 状态 | 事项 | 交付 | GitHub Issue / PR |
 | --- | --- | --- | --- |
+| 已实现 · 0.8.1 | 生成恢复、硬件选择与图片集兼容 | 完善 SQLite 工作缓存恢复、Mapper 初始化候选保护、训练输出及发布恢复边界；多显卡设备可选择具体 GPU；同一普通图片集可混合像素规格一致的横拍与竖拍图片，并按方向拆分相机组。 | [#82](https://github.com/ooolabdev/ooosplat/issues/82) / [#83](https://github.com/ooolabdev/ooosplat/issues/83) / [#88](https://github.com/ooolabdev/ooosplat/pull/88) / [#91](https://github.com/ooolabdev/ooosplat/issues/91) |
 | 已完成 | Ubuntu 24.04 Alpha | 为 x86_64 提供 `.deb` 桌面安装包和 CLI，使用系统 FFmpeg/FFprobe，以及随包交付的固定版本 COLMAP 和 Brush；COLMAP 按条件使用 CUDA 或 CPU。 | [#5](https://github.com/ooolabdev/ooosplat/issues/5) / [PR #10](https://github.com/ooolabdev/ooosplat/pull/10) |
 | 已完成 | Apple Silicon macOS Alpha | 为 macOS 15+ arm64 提供随应用交付的 FFmpeg、FFprobe、CPU COLMAP 和 Brush 工作流。 | [#4](https://github.com/ooolabdev/ooosplat/issues/4) / [PR #8](https://github.com/ooolabdev/ooosplat/pull/8) |
 | 已完成 | 内嵌高斯泼溅预览与动画导出 | 支持 `.ply` 加载、相机浏览、整体 Transform、动画预览，以及 Gaussian 和竖屏视频导出。 | [#3](https://github.com/ooolabdev/ooosplat/issues/3) |

@@ -6,12 +6,12 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><img src="https://img.shields.io/badge/release-v0.8.0-blue?style=flat" alt="Release: v0.8.0"></a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><img src="https://img.shields.io/badge/release-v0.8.1-blue?style=flat" alt="Release: v0.8.1"></a>
   <a href="#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat" alt="Platforms: Windows, Linux, macOS"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.0"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
+  <a href="https://github.com/ooolabdev/ooosplat/releases/tag/0.8.1"><strong>Download</strong></a> | <a href="README.md">中文</a> | <a href="README_EN.md">English</a> | <a href="README_JA.md">日本語</a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ Windows and the Apple Silicon macOS Alpha provide FFmpeg, FFprobe, COLMAP, and B
 
 See the [OOOSplat Roadmap](ROADMAP_EN.md) for planned work.
 
-> 0.8.0 unifies multi-input, reshoot, and continuation workflows; improves generation logs, error diagnostics, and cross-platform builds; and refines panoramas, GPS, exports, and preview navigation.
+> 0.8.1 improves generation and continuation reliability, adds multi-GPU selection and mixed landscape/portrait photo sets with matching pixel dimensions, and strengthens COLMAP, Brush, FFprobe, and cross-platform diagnostics.
 
 ## Why OOOSplat
 
@@ -50,7 +50,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 
 ## Key Features
 
-- **Unified inputs**: Select or drop multiple MP4/MOV videos, image folders, or loose JPG/JPEG/PNG image sets. Inspect, confirm types, and remove sources in one input box, then reconstruct one connected scene.
+- **Unified inputs**: Select or drop multiple MP4/MOV videos, image folders, or loose JPG/JPEG/PNG image sets. Inspect, confirm types, and remove sources in one input box, then reconstruct one connected scene. One ordinary image set may mix landscape and portrait images with matching pixel dimensions; each orientation uses its own camera group.
 - **Panorama media**: Supports stitched, monoscopic, full 360°×180°, 2:1 ERP MP4 and image folders. Media types are detected automatically; ambiguous inputs require an inline choice.
 - **Image-order confirmation**: Choose capture order inside the input box for each image set above 100 images. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
 - **Image GPS**: Detect embedded location metadata and assist matching and reconstruction on the validated Windows x64 path. Reliable observations provide estimated north orientation and metric scale; otherwise the original workflow is used. [Scope and validation](docs/IMAGE_GPS.md)
@@ -129,10 +129,10 @@ sudo apt install -y \
 
 Install a working Vulkan driver for the graphics adapter, such as the proprietary NVIDIA driver or Mesa for AMD/Intel. Bundled COLMAP uses CUDA/Caspar on compatible NVIDIA devices and CPU/Ceres otherwise; Brush selects its graphics backend independently. Fully CPU-only software Vulkan has not yet been validated end to end.
 
-After downloading the `OOOSplat-0.8.0-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
+After downloading the `OOOSplat-0.8.1-x64-linux` Artifact from the main-branch GitHub Actions run, install it with:
 
 ```bash
-sudo apt install ./OOOSplat-0.8.0-x64-linux.deb
+sudo apt install ./OOOSplat-0.8.1-x64-linux.deb
 ```
 
 The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned COLMAP and Brush runtimes are included.
@@ -141,7 +141,7 @@ The `.deb` installs only FFmpeg/FFprobe through Ubuntu's package manager; pinned
 
 Sample media: [Download from Quark Drive](https://pan.quark.cn/s/1dde892a1324) to test or try the generation workflow.
 
-1. On Windows, run `OOOSplat-0.8.0-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.8.0-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.8.0-x64-linux.deb`.
+1. On Windows, run `OOOSplat-0.8.1-x64-windows.exe`. On an Apple Silicon Mac, open `OOOSplat-0.8.1-arm64-macos.dmg` and drag OOOSplat into Applications. On Ubuntu 24.04, run `sudo apt install ./OOOSplat-0.8.1-x64-linux.deb`.
 2. Start OOOSplat and confirm that the bundled engine status in the top bar is healthy. Use the `EN / 中文` action in the upper-right corner to switch the interface language instantly.
 3. Select a draft under “Task List → New Tasks,” or choose Add, then use Add files, Add folders, or drag and drop. Wait for each source's detection; choose ordinary or panorama processing inside that source if the type is uncertain.
 4. Choose the projects root; OOOSplat remembers the last location.
@@ -228,7 +228,7 @@ What is sent:
 | Field | Description |
 | --- | --- |
 | Install ID | A random UUID generated on first launch. No hardware serial, MAC address, or device fingerprint is read |
-| App version, OS, CPU architecture | For example `0.8.0` / `windows` / `x86_64` |
+| App version, OS, CPU architecture | For example `0.8.1` / `windows` / `x86_64` |
 | Event name | `daily_active`, `generation_started`, `generation_completed`, `generation_failed`, `pipeline_stage_completed`, `planner_evaluation`. `daily_active` is sent at most once a day, and once more on the day the app version changes |
 | Quality preset and input type | Enumerated values such as `balanced` / `video`; an image-sequence input reports `images` |
 | Stage and total durations | Milliseconds |
@@ -360,7 +360,7 @@ npm run package:windows
 The NSIS installer is written to:
 
 ```text
-dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
+dist-artifacts\OOOSplat-0.8.1-x64-windows.exe
 ```
 
 Run `npm run setup:engines` before the first build. Tauri's `beforeBuildCommand` automatically runs the engine checks and frontend production build, but it does not access the network implicitly during packaging.
