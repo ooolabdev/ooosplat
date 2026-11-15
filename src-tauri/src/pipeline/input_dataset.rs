@@ -1,6 +1,6 @@
 //! Reuse supported native training views; derive ERP/compatibility views only.
 use super::*;
-use crate::reconstruction::direct_input::{read_model, Model};
+use crate::reconstruction::direct_input::{read_model, read_undistorted_training_model, Model};
 use crate::video::panorama;
 
 #[derive(Serialize, Deserialize)]
@@ -13,7 +13,7 @@ pub(super) struct Dataset {
     pub derivation_version: u32,
 }
 
-const DATASET_DERIVATION_VERSION: u32 = 2;
+const DATASET_DERIVATION_VERSION: u32 = 3;
 
 #[cfg(test)]
 fn registered_pixel_identity(
@@ -413,7 +413,7 @@ impl PipelineRunner {
                 } else {
                     output.join("sparse/0")
                 };
-                let converted = read_model(&model)?;
+                let (converted, _) = read_undistorted_training_model(&model)?;
                 for (index, image) in converted.images.iter().enumerate() {
                     if self.process_manager.child_token().is_cancelled() {
                         return Err(SplatError::Cancelled);

@@ -195,6 +195,33 @@ fn parse<T: std::str::FromStr>(s: &str) -> Result<T> {
     s.parse().map_err(|_| invalid())
 }
 pub fn read_model(path: &Path) -> Result<Model> {
+    read_model_with_observation_policy(path, ObservationPolicy::Strict).map(|(model, _)| model)
+}
+
+/// Reads an application-owned `image_undistorter` result. COLMAP may retain
+/// out-of-bounds, unlinked observations as NaN; Brush never consumes those
+/// coordinates, but their vector slots must remain stable for point2D indices.
+pub(crate) fn read_undistorted_training_model(path: &Path) -> Result<(Model, u64)> {
+    let result = read_model_with_observation_policy(path, ObservationPolicy::UndistortedTraining)?;
+    if result.1 > 0 {
+        tracing::warn!(
+            normalized_unlinked_observations = result.1,
+            "Normalized unlinked non-finite observations in COLMAP undistorter output"
+        );
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Copy)]
+enum ObservationPolicy {
+    Strict,
+    UndistortedTraining,
+}
+
+fn read_model_with_observation_policy(
+    path: &Path,
+    policy: ObservationPolicy,
+) -> Result<(Model, u64)> {
     // The lower-level binary/text readers choose a representation using
     // `is_file()`. Probe every candidate first so a permission error cannot be
     // mistaken for a missing binary model and silently fall back to text.
@@ -235,11 +262,49 @@ pub fn read_model(path: &Path) -> Result<Model> {
     if text.iter().any(|b| *b) && !text.iter().all(|b| *b) {
         return Err(invalid());
     }
-    let model = read_model_format(path, binary[0])?;
-    if binary[0] && text[0] && !same_model(&model, &read_model_format(path, false)?) {
-        return Err(invalid());
+    let mut model = read_model_format(path, binary[0])?;
+    let normalized = normalize_observations(&mut model, policy)?;
+    if binary[0] && text[0] {
+        let mut text_model = read_model_format(path, false)?;
+        normalize_observations(&mut text_model, policy)?;
+        if !same_model(&model, &text_model) {
+            return Err(invalid());
+        }
     }
-    Ok(model)
+    model.validate()?;
+    Ok((model, normalized))
+}
+
+fn normalize_observations(model: &mut Model, policy: ObservationPolicy) -> Result<u64> {
+    if matches!(policy, ObservationPolicy::Strict) {
+        return Ok(0);
+    }
+    let mut normalized = 0_u64;
+    for image in &mut model.images {
+        for (index, observation) in image.observations.iter_mut().enumerate() {
+            if observation.x.is_finite() && observation.y.is_finite() {
+                continue;
+            }
+            if observation.point.is_some() {
+                tracing::warn!(
+                    image_id = image.pose.id,
+                    observation_index = index,
+                    "Linked COLMAP undistorter observation is non-finite"
+                );
+                return Err(SplatError::Diagnostic {
+                    source: Box::new(invalid()),
+                    detail: format!(
+                        "training_preparation_operation=validate_undistorted_training_model\nimage_id={}\nobservation_index={}\nlinked_to_point=true\nreason=non_finite_observation",
+                        image.pose.id, index
+                    ),
+                });
+            }
+            observation.x = 0.;
+            observation.y = 0.;
+            normalized = normalized.saturating_add(1);
+        }
+    }
+    Ok(normalized)
 }
 fn same_model(a: &Model, b: &Model) -> bool {
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * (1. + a.abs().max(b.abs()));
@@ -473,13 +538,11 @@ fn read_model_format(path: &Path, use_binary: bool) -> Result<Model> {
             });
         }
     }
-    let model = Model {
+    Ok(Model {
         cameras,
         images,
         points,
-    };
-    model.validate()?;
-    Ok(model)
+    })
 }
 impl Model {
     pub fn validate(&self) -> Result<()> {
@@ -1554,6 +1617,113 @@ pub(crate) mod tests {
                 std::fs::read(input.model.join(name)).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn undistorter_binary_model_normalizes_only_unlinked_non_finite_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let input = fixture(root.path(), false);
+        let mut model = read_model(&input.model).unwrap();
+        model.images[0].observations.insert(
+            0,
+            Observation {
+                x: f64::NAN,
+                y: f64::NAN,
+                point: None,
+            },
+        );
+        model.points[0].track[0].1 = 1;
+        model.write(&input.model).unwrap();
+
+        assert!(read_model(&input.model).is_err());
+        let (converted, normalized) = read_undistorted_training_model(&input.model).unwrap();
+        assert_eq!(normalized, 1);
+        assert_eq!(converted.images[0].observations.len(), 2);
+        assert_eq!(converted.images[0].observations[0].x, 0.);
+        assert_eq!(converted.images[0].observations[0].y, 0.);
+        assert_eq!(converted.points[0].track[0], (42, 1));
+        assert_eq!(converted.images[0].observations[1].point, Some(100));
+        converted.validate().unwrap();
+    }
+
+    #[test]
+    fn undistorter_text_model_normalizes_without_shifting_tracks() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::write(dir.join("cameras.txt"), "7 PINHOLE 64 48 50 50 32 24\n").unwrap();
+        std::fs::write(
+            dir.join("images.txt"),
+            "42 1 0 0 0 0 0 0 7 normal.png\nNaN NaN -1 32 24 100\n5 1 0 0 0 0 0 0 7 second.png\n32 24 100\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("points3D.txt"),
+            "100 0 0 5 128 128 128 0 42 1 5 0\n",
+        )
+        .unwrap();
+
+        assert!(read_model(dir).is_err());
+        let (converted, normalized) = read_undistorted_training_model(dir).unwrap();
+        assert_eq!(normalized, 1);
+        assert_eq!(converted.points[0].track, vec![(42, 1), (5, 0)]);
+        assert_eq!(converted.images[0].observations[0].point, None);
+        assert_eq!(converted.images[0].observations[1].point, Some(100));
+        converted.validate().unwrap();
+    }
+
+    #[test]
+    fn undistorter_normalizes_complete_binary_and_text_representations_before_comparison() {
+        let root = tempfile::tempdir().unwrap();
+        let input = fixture(root.path(), false);
+        let mut model = read_model(&input.model).unwrap();
+        model.images[0].observations.insert(
+            0,
+            Observation {
+                x: f64::NAN,
+                y: f64::NAN,
+                point: None,
+            },
+        );
+        model.points[0].track[0].1 = 1;
+        model.write(&input.model).unwrap();
+        std::fs::write(
+            input.model.join("cameras.txt"),
+            "7 PINHOLE 64 48 50 50 32 24\n",
+        )
+        .unwrap();
+        std::fs::write(
+            input.model.join("images.txt"),
+            "42 1 0 0 0 0 0 0 7 normal.png\nNaN NaN -1 32 24 100\n5 1 0 0 0 0 0 0 7 second.png\n32 24 100\n",
+        )
+        .unwrap();
+        std::fs::write(
+            input.model.join("points3D.txt"),
+            "100 0 0 5 128 128 128 0 42 1 5 0\n",
+        )
+        .unwrap();
+
+        assert!(read_model(&input.model).is_err());
+        let (converted, normalized) = read_undistorted_training_model(&input.model).unwrap();
+        assert_eq!(normalized, 1);
+        assert_eq!(converted.points[0].track, vec![(42, 1), (5, 0)]);
+    }
+
+    #[test]
+    fn undistorter_model_rejects_linked_non_finite_observation_with_context() {
+        let root = tempfile::tempdir().unwrap();
+        let input = fixture(root.path(), false);
+        let mut model = read_model(&input.model).unwrap();
+        model.images[0].observations[0].x = f64::NAN;
+        model.write(&input.model).unwrap();
+
+        let error = read_undistorted_training_model(&input.model).err().unwrap();
+        let detail = error.to_string();
+        assert!(detail.contains("validate_undistorted_training_model"));
+        assert!(detail.contains("image_id=42"));
+        assert!(detail.contains("observation_index=0"));
+        assert!(detail.contains("linked_to_point=true"));
+        assert!(!detail.contains(&root.path().to_string_lossy().to_string()));
+        assert!(read_model(&input.model).is_err());
     }
     #[test]
     fn imported_validation_rejects_missing_dimensions_tracks_poses_and_unsupported_camera() {

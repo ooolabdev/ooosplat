@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::Deserialize;
+
 use crate::{
     engines::ColmapAccelerationStatus,
     error::{Result, SplatError},
@@ -17,7 +19,10 @@ const BRUSH_GPU_LOG_FILTER: &str =
 /// Its COLMAP reader and renderer both apply these distortion models. A matching
 /// name/version string is not sufficient: custom runtimes retain conversion.
 pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
-    if !matches!(model_id, 0 | 1 | 2 | 3 | 4 | 6) {
+    let Some(capability) = native_colmap_capability() else {
+        return false;
+    };
+    if !capability.native_colmap_model_ids.contains(&model_id) {
         return false;
     }
     type Identity = (PathBuf, u64, std::time::SystemTime);
@@ -45,25 +50,71 @@ pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
             return *verified;
         }
     }
-    let verified = verified_native_binary(&path);
+    let verified = verified_native_binary(&path, &capability.runtime_binary_sha256);
     *cache = Some((identity, verified));
     verified
 }
 
-fn verified_native_binary(path: &Path) -> bool {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeColmapCapability {
+    runtime_binary_sha256: String,
+    native_colmap_model_ids: Vec<u32>,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.json");
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.linux.json");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM_ENGINE_MANIFEST: &str = include_str!("../../../engines/manifest.macos.json");
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+const PLATFORM_ENGINE_MANIFEST: &str = "{}";
+
+fn parse_native_colmap_capability(manifest: &str) -> Option<NativeColmapCapability> {
+    let manifest = serde_json::from_str::<serde_json::Value>(manifest).ok()?;
+    let brush =
+        manifest.get("brush").or_else(|| {
+            manifest.get("engines")?.as_array()?.iter().find(|engine| {
+                engine.get("name").and_then(serde_json::Value::as_str) == Some("Brush")
+            })
+        })?;
+    let capability = serde_json::from_value::<NativeColmapCapability>(brush.clone()).ok()?;
+    if capability.runtime_binary_sha256.len() != 64
+        || !capability
+            .runtime_binary_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || capability.native_colmap_model_ids.is_empty()
+    {
+        return None;
+    }
+    let mut models = capability.native_colmap_model_ids.clone();
+    models.sort_unstable();
+    models.dedup();
+    if models != capability.native_colmap_model_ids {
+        return None;
+    }
+    Some(capability)
+}
+
+fn native_colmap_capability() -> Option<&'static NativeColmapCapability> {
+    static CAPABILITY: std::sync::OnceLock<Option<NativeColmapCapability>> =
+        std::sync::OnceLock::new();
+    CAPABILITY
+        .get_or_init(|| parse_native_colmap_capability(PLATFORM_ENGINE_MANIFEST))
+        .as_ref()
+}
+
+fn verified_native_binary(path: &Path, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     // Do not automatically widen capability claims when runtime manifests are
     // updated. Review the exact reader/renderer before adding another digest.
-    let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "f65bba1c7fcbdbb13e9299897ecb885f90f30555bee9452a526e372eacf338df"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "ca819f94716c04add531e69e5f6812a2d1e9a8cefbc2803da000d905d4fccb0a"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "da613b4ed1c551f41e448d8ab0dc9caf0f80bfd9f6943542e1b02c93d19ca74a"
-    } else {
-        return false;
-    };
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -76,7 +127,7 @@ fn verified_native_binary(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
-    format!("{:x}", hash.finalize()) == expected
+    format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected)
 }
 pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--total-train-iters",
@@ -637,6 +688,42 @@ mod tests {
         assert!(!supports_native_colmap(&binary, 1));
         assert!(!supports_native_colmap(&binary, 17));
         assert!(!supports_native_colmap(&temp.path().join("missing"), 1));
+    }
+
+    #[test]
+    fn native_camera_capability_is_loaded_from_reviewed_platform_manifests() {
+        let cases = [
+            (
+                include_str!("../../../engines/manifest.json"),
+                "f65bba1c7fcbdbb13e9299897ecb885f90f30555bee9452a526e372eacf338df",
+            ),
+            (
+                include_str!("../../../engines/manifest.linux.json"),
+                "ca819f94716c04add531e69e5f6812a2d1e9a8cefbc2803da000d905d4fccb0a",
+            ),
+            (
+                include_str!("../../../engines/manifest.macos.json"),
+                "081678076dd31e7d211edf87f9d1619be4953fb6e1ad8a54afcd86f9cd543c82",
+            ),
+        ];
+        for (manifest, digest) in cases {
+            let capability = parse_native_colmap_capability(manifest).unwrap();
+            assert!(capability
+                .runtime_binary_sha256
+                .eq_ignore_ascii_case(digest));
+            assert_eq!(capability.native_colmap_model_ids, [0, 1, 2, 3, 4, 6]);
+        }
+    }
+
+    #[test]
+    fn native_binary_verification_uses_the_runtime_digest() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("brush_app");
+        std::fs::write(&binary, b"signed runtime bytes").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"signed runtime bytes"));
+        assert!(verified_native_binary(&binary, &expected));
+        assert!(!verified_native_binary(&binary, &"0".repeat(64)));
     }
 
     fn args_as_strings(args: Vec<OsString>) -> Vec<String> {

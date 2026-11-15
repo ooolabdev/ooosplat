@@ -28,6 +28,7 @@ function fixture(t, platform = "windows") {
   const entry = platform === "linux" ? manifest.brush : manifest.engines.find(engine => engine.name === "Brush");
   entry.archiveSha256 = sha256(archiveBytes);
   entry.binarySha256 = sha256(binary);
+  entry.runtimeBinarySha256 = sha256(binary);
   entry.buildInfoSha256 = sha256(contents["BUILDINFO.json"]);
   entry.licenseSha256 = sha256(contents.LICENSE);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest));
@@ -67,10 +68,16 @@ test("all three manifests pin the fork, architecture and published archive diges
     assert.equal(lock.commit, brushCommit);
     assert.equal(lock.releaseTag, brushTag);
     assert.match(lock.sourceBinary, /^brush-cli/);
+    assert.deepEqual(lock.nativeColmapModelIds, [0, 1, 2, 3, 4, 6]);
+    assert.match(lock.runtimeBinarySha256, /^[a-f0-9]{64}$/i);
   }
   assert.equal(hostPlatform("darwin", "arm64"), "macos");
   assert.throws(() => hostPlatform("darwin", "x64"), /no locked runtime/);
   assert.throws(() => hostPlatform("linux", "arm64"), /no locked runtime/);
+  const macos = brushLock("macos");
+  assert.equal(macos.binarySha256.toLowerCase(), "da613b4ed1c551f41e448d8ab0dc9caf0f80bfd9f6943542e1b02c93d19ca74a");
+  assert.equal(macos.runtimeBinarySha256.toLowerCase(), "081678076dd31e7d211edf87f9d1619be4953fb6e1ad8a54afcd86f9cd543c82");
+  assert.notEqual(macos.binarySha256.toLowerCase(), macos.runtimeBinarySha256.toLowerCase());
 });
 
 for (const platform of ["windows", "linux", "macos"]) {
@@ -96,6 +103,8 @@ for (const platform of ["windows", "linux", "macos"]) {
     const info = JSON.parse(fs.readFileSync(path.join(metadata, "INSTALL-INFO.json")));
     assert.equal(info.sourceBinary, f.lock.sourceBinary);
     assert.equal(info.installedBinary, f.lock.binary);
+    assert.equal(info.runtimeBinarySha256, f.lock.runtimeBinarySha256.toLowerCase());
+    assert.deepEqual(info.nativeColmapModelIds, [0, 1, 2, 3, 4, 6]);
     verifyBrushRuntime(f.runtime, f.lock, { run: f.run });
     if (platform === "macos") {
       assert.equal(fs.readFileSync(path.join(f.runtime, "bin", "ffmpeg"), "utf8"), "unchanged FFmpeg");

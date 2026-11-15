@@ -36,8 +36,14 @@ export function brushLock(platform, base = workspace) {
   if (lock.version !== "1.0.0" || lock.releaseTag !== brushTag || lock.commit !== brushCommit || lock.target !== details.target) {
     throw new Error(`Invalid pinned OOOBrush identity in ${details.manifest}`);
   }
-  for (const key of ["archiveSha256", "binarySha256", "buildInfoSha256", "licenseSha256"]) {
+  for (const key of ["archiveSha256", "binarySha256", "runtimeBinarySha256", "buildInfoSha256", "licenseSha256"]) {
     if (!/^[a-f0-9]{64}$/i.test(lock[key] ?? "")) throw new Error(`Missing Brush ${key} in ${details.manifest}`);
+  }
+  if (JSON.stringify(lock.nativeColmapModelIds) !== JSON.stringify([0, 1, 2, 3, 4, 6])) {
+    throw new Error(`Brush native COLMAP capabilities require review in ${details.manifest}`);
+  }
+  if (platform !== "macos" && lock.runtimeBinarySha256.toLowerCase() !== lock.binarySha256.toLowerCase()) {
+    throw new Error(`Untransformed Brush runtime hash differs from its source binary in ${details.manifest}`);
   }
   const expectedArchive = `OOOBrush-${details.target}.${platform === "windows" ? "zip" : "tar.gz"}`;
   if (lock.archiveName !== expectedArchive || lock.sourceUrl !== `https://github.com/ooolabdev/OOOBrush/releases/download/${brushTag}/${expectedArchive}`) {
@@ -90,7 +96,8 @@ export function verifyBrushCli(binary, lock, run = runCommand) {
 export function verifyBrushRuntime(root, lock, { run = runCommand, transformed = false } = {}) {
   const metadata = path.join(root, lock.metadata), binary = path.join(root, lock.binary);
   if (transformed && lock.host !== "darwin") throw new Error("Only a verified macOS mixed bundle may contain a re-signed Brush");
-  if (!transformed) assertHash(binary, lock.binarySha256, "Brush CLI");
+  assertHash(binary, transformed ? lock.runtimeBinarySha256 : lock.binarySha256,
+    transformed ? "Transformed Brush CLI" : "Brush CLI");
   if (lock.metadata === ".") {
     const allowed = [path.basename(lock.binary), ...metadataFiles, "README.md"];
     if (fs.readdirSync(root).some(file => !allowed.includes(file))) throw new Error("Unexpected Brush runtime files; viewer/development files must not be bundled");
@@ -102,7 +109,9 @@ export function verifyBrushRuntime(root, lock, { run = runCommand, transformed =
   }
   const installed = JSON.parse(fs.readFileSync(path.join(metadata, "INSTALL-INFO.json"), "utf8"));
   if (installed.commit !== brushCommit || installed.sourceArchiveSha256 !== lock.archiveSha256.toLowerCase()
-      || installed.target !== lock.target || installed.sourceBinary !== lock.sourceBinary || installed.installedBinary !== lock.binary) {
+      || installed.target !== lock.target || installed.sourceBinary !== lock.sourceBinary || installed.installedBinary !== lock.binary
+      || installed.runtimeBinarySha256 !== lock.runtimeBinarySha256.toLowerCase()
+      || JSON.stringify(installed.nativeColmapModelIds) !== JSON.stringify(lock.nativeColmapModelIds)) {
     throw new Error("Brush installation provenance mismatch");
   }
   verifyBrushCli(binary, lock, run);
@@ -232,6 +241,7 @@ export function prepareBrush(platform, { base = workspace, destination, cacheDir
     fs.writeFileSync(path.join(metadata, "INSTALL-INFO.json"), JSON.stringify({ schemaVersion: 1, name: "OOOBrush", releaseTag: brushTag,
       version: "1.0.0", commit: brushCommit, target: lock.target, sourceUrl: lock.sourceUrl, sourceArchiveSha256: lock.archiveSha256.toLowerCase(),
       sourceBinary: lock.sourceBinary, installedBinary: lock.binary, binarySha256: lock.binarySha256.toLowerCase(),
+      runtimeBinarySha256: lock.runtimeBinarySha256.toLowerCase(), nativeColmapModelIds: lock.nativeColmapModelIds,
       note: "Headless brush-cli installed under the compatible OOOSplat name; viewer excluded. GPU training acceptance is separate." }, null, 2) + "\n");
     if (lock.metadata === "." && fs.existsSync(path.join(runtime, "README.md"))) fs.copyFileSync(path.join(runtime, "README.md"), path.join(staged, "README.md"));
     verifyBrushRuntime(staged, lock, { run });
