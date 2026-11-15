@@ -6,6 +6,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LanguageProvider } from "../i18n";
 import { SettingsDialog } from "./SettingsDialog";
 
+vi.mock("../lib/backend", async importOriginal => ({
+  ...await importOriginal<typeof import("../lib/backend")>(),
+  getGpuSettings: vi.fn().mockResolvedValue({
+    settings: { defaultGpu: null, askOnMultipleGpus: true },
+    inventory: { recommendedDeviceId: "test-gpu", devices: [{
+      localDeviceId: "test-gpu", name: "Test GPU", vendor: "NVIDIA",
+      deviceKind: "discreteGpu", adapterIndex: 0, totalMemoryMb: 8192,
+      driver: "test", colmapCompatible: true, colmapGpuIndex: 0,
+      recommended: true, selectionConfidence: "uniqueModel", duplicateModel: false,
+    }] },
+  }),
+  setGpuSettings: vi.fn(),
+}));
+
 describe("SettingsDialog", () => {
   const mounted: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivElement }> = [];
   beforeEach(() => {
@@ -61,17 +75,19 @@ describe("SettingsDialog", () => {
     const tabs = container.querySelectorAll<HTMLButtonElement>('[role="tab"]');
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
     expect(tabs[1].getAttribute("aria-selected")).toBe("true");
-    expect(tabs[1].textContent).toContain("版本更新");
-    expect(container.querySelector('[role="tabpanel"]')?.textContent).toContain("检查更新");
     await act(async () => tabs[1].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
+    expect(tabs[2].textContent).toContain("版本更新");
+    expect(container.querySelector('[role="tabpanel"]')?.textContent).toContain("检查更新");
+    await act(async () => tabs[2].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    expect(tabs[3].getAttribute("aria-selected")).toBe("true");
     const privacyToggle = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
     await act(async () => privacyToggle.click());
     expect(onTelemetryChange).toHaveBeenCalledWith(false);
-    await act(async () => tabs[2].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
-    expect(document.activeElement).toBe(tabs[3]);
-    expect(tabs[3].getAttribute("aria-selected")).toBe("true");
-    await act(async () => tabs[3].dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true })));
+    await act(async () => tabs[3].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
+    expect(document.activeElement).toBe(tabs[4]);
+    expect(tabs[4].getAttribute("aria-selected")).toBe("true");
+    await act(async () => tabs[4].dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true })));
     expect(document.activeElement).toBe(tabs[0]);
     expect(tabs[0].getAttribute("aria-selected")).toBe("true");
   });

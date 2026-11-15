@@ -369,7 +369,7 @@ pub(super) async fn public_inspection(tools: &McpTools, inspection: Inspection) 
     Ok(
         json!({"preflight_id":inspection.id,"input_source_identity":inspection.identity,"input":input,
         "source":inspection.source.as_ref().map(|s|snake(serde_json::to_value(s).unwrap())),"generation_policy":snake(serde_json::to_value(inspection.policy)?),
-        "plan":plan,"plan_is_estimate":true,"max_splats":null,"questions":inspection.questions(),"gps":gps_summary(tools,&inspection)}),
+        "plan":plan,"plan_is_estimate":true,"max_splats":null,"questions":inspection.questions(),"gps":gps_summary(tools,&inspection),"gpu":gpu_inventory_public(tools).await?}),
     )
 }
 
@@ -446,6 +446,7 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
             "client_request_id already identifies different parameters",
         ));
     }
+    let gpu_selection = resolve_gpu_selection(tools, request.gpu_selection.clone(), None).await?;
     let inspection = inspect(
         tools,
         InspectRequest {
@@ -522,7 +523,7 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
     }
     let mut parameters = json!({"input_path":request.input_path,"quality":request.quality,"generationPolicy":policy,
         "videoProjection":projection,"videoSourceIdentity":inspection.identity,"imageMatchingStrategy":strategy,
-        "inputs":inputs,"mcp_intent":intent});
+        "inputs":inputs,"mcp_intent":intent,"gpuSelection":gpu_selection});
     if let Some(options) = options {
         parameters["reshootOptions"] = serde_json::to_value(options)?;
         parameters["source_project_id"] = json!(request.source_project_id);

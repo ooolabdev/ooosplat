@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianImportProbe, GaussianImportSelection, GaussianImportSession, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianImportProbe, GaussianImportSelection, GaussianImportSession, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, GpuSelection, HardwareSettings, HardwareSettingsView, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -35,8 +35,8 @@ export const classifyGenerationPaths=(paths:string[]):Promise<import('../types/i
 export const detectMaterialGps=(item:import('../types/inputs').MaterialInput,identity:string):Promise<boolean>=>invoke('detect_material_gps',{item,identity});
 export const inspectMaterialInputs=(inputs:import('../types/inputs').GenerationInputs,quality:Quality,generationPolicy:import('../types/pipeline').GenerationPolicy):Promise<import('../types/inputs').InputsInspection>=>invoke('inspect_material_inputs',{inputs,quality,generationPolicy});
 export const estimateMaterialInputs=(inputs:import('../types/inputs').GenerationInputs,quality:Quality,generationPolicy:import('../types/pipeline').GenerationPolicy):Promise<RuntimeEstimate|null>=>invoke('estimate_material_inputs',{inputs,quality,generationPolicy});
-export async function startInputsPipeline(inputs:import('../types/inputs').GenerationInputs,quality:Quality,projectsRoot:string,workspaceTaskId:string,generationPolicy:import('../types/pipeline').GenerationPolicy,sourceProjectId?:string|null,reshootOptions?:import('../types/pipeline').ReshootOptions):Promise<PipelineResult>{
-  const receipt=await invoke<StartReceipt>('start_gui_inputs',{inputs,quality,projectsRoot,workspaceTaskId,generationPolicy,sourceProjectId:sourceProjectId??null,reshootOptions:reshootOptions??null});
+export async function startInputsPipeline(inputs:import('../types/inputs').GenerationInputs,quality:Quality,projectsRoot:string,workspaceTaskId:string,generationPolicy:import('../types/pipeline').GenerationPolicy,sourceProjectId?:string|null,reshootOptions?:import('../types/pipeline').ReshootOptions,gpuSelection?:GpuSelection|null):Promise<PipelineResult>{
+  const receipt=await invoke<StartReceipt>('start_gui_inputs',{inputs,quality,projectsRoot,workspaceTaskId,generationPolicy,sourceProjectId:sourceProjectId??null,reshootOptions:reshootOptions??null,...(gpuSelection?{gpuSelection}:{})});
   return waitForSharedTask(receipt);
 }
 
@@ -85,6 +85,7 @@ export async function confirmSmallImageSequence(imageCount: number): Promise<boo
     translate(locale, "captureAdvice.title"),
     `• ${translate(locale, "captureAdvice.coverage")}`,
     `• ${translate(locale, "captureAdvice.overlap")}`,
+    `• ${translate(locale, "captureAdvice.multiInput")}`,
     `• ${translate(locale, "captureAdvice.consistency")}`,
     "",
     translate(locale, "captureAdvice.aiWarning"),
@@ -123,6 +124,8 @@ export async function getProjectTaskDetail(projectId: string): Promise<ProjectTa
 export async function getAppRuntimeStatus(): Promise<AppRuntimeStatus> { return invoke("get_app_runtime_status"); }
 export async function setProjectsRoot(projectsRoot: string): Promise<AppSettings> { return invoke("set_projects_root", { projectsRoot }); }
 export async function setPlannerEnabled(enabled: boolean): Promise<AppSettings> { return invoke("set_planner_enabled", { enabled }); }
+export async function getGpuSettings(refresh = false): Promise<HardwareSettingsView> { return invoke("get_gpu_settings", { refresh }); }
+export async function setGpuSettings(hardware: HardwareSettings): Promise<HardwareSettingsView> { return invoke("set_gpu_settings", { hardware }); }
 export async function classifyDroppedInput(path: string): Promise<{ inputType: InputType }> { return invoke("classify_dropped_input", { path }); }
 
 export type NativeInputDragEvent =
@@ -147,18 +150,18 @@ export async function onInputDragDrop(handler: (event: NativeInputDragEvent) => 
     });
   });
 }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy, generationPolicy?: import('../types/pipeline').GenerationPolicy): Promise<PipelineResult> {
-  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy, ...(generationPolicy ? { generationPolicy } : {}) });
-  const receipt = await startGuiTask(task.task_id);
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy, generationPolicy?: import('../types/pipeline').GenerationPolicy, gpuSelection?:GpuSelection|null): Promise<PipelineResult> {
+  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy, ...(generationPolicy ? { generationPolicy } : {}), ...(gpuSelection?{gpuSelection}:{}) });
+  const receipt = await startGuiTask(task.task_id, undefined, gpuSelection);
   return waitForSharedTask(receipt);
 }
-export async function resumePipeline(projectId: string, expectedRunId?: string): Promise<PipelineResult> {
-  const receipt = await invoke<StartReceipt>("resume_gui_task", { projectId, ...(expectedRunId ? { expectedRunId } : {}) });
+export async function resumePipeline(projectId: string, expectedRunId?: string, gpuSelection?:GpuSelection|null): Promise<PipelineResult> {
+  const receipt = await invoke<StartReceipt>("resume_gui_task", { projectId, ...(expectedRunId ? { expectedRunId } : {}), ...(gpuSelection?{gpuSelection}:{}) });
   return waitForSharedTask(receipt);
 }
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId, recipeVersion: 2 }); }
 export async function probeReshootInput(projectId: string, path: string, inputType: InputType, quality: Quality = "balanced", plannerEnabled = true, generationPolicy?: import('../types/pipeline').GenerationPolicy, videoAnalysis?: import('../types/pipeline').VideoAnalysis): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType, recipeVersion: 2, quality, plannerEnabled, generationPolicy, videoAnalysis }); }
-export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean; generationPolicy?: import('../types/pipeline').GenerationPolicy; reshootOptions?: import('../types/pipeline').ReshootOptions }): Promise<PipelineResult> {
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean; generationPolicy?: import('../types/pipeline').GenerationPolicy; reshootOptions?: import('../types/pipeline').ReshootOptions; gpuSelection?:GpuSelection|null }): Promise<PipelineResult> {
   const receipt = await invoke<StartReceipt>("start_gui_reshoot", { request });
   return waitForSharedTask(receipt);
 }
@@ -259,10 +262,10 @@ export async function exportPly(result: Pick<PipelineResult, 'finalPly'>): Promi
 
 export async function getSharedTasks(): Promise<SharedTask[]> { return inTauri() ? invoke("get_shared_tasks") : []; }
 export async function getSharedTask(taskId: string): Promise<SharedTask> { return invoke("get_shared_task", { taskId }); }
-export async function startGuiTask(taskId: string, retryFailedRunId?: string): Promise<StartReceipt> { return invoke("start_gui_task", { taskId, ...(retryFailedRunId ? {retryFailedRunId} : {}) }); }
+export async function startGuiTask(taskId: string, retryFailedRunId?: string, gpuSelection?:GpuSelection|null): Promise<StartReceipt> { return invoke("start_gui_task", { taskId, ...(retryFailedRunId ? {retryFailedRunId} : {}), ...(gpuSelection?{gpuSelection}:{}) }); }
 /** Continue an identified task even when it failed before project creation. */
-export async function continueTaskPipeline(taskId: string, expectedRunId: string): Promise<PipelineResult> {
-  const receipt = await startGuiTask(taskId, expectedRunId);
+export async function continueTaskPipeline(taskId: string, expectedRunId: string, gpuSelection?:GpuSelection|null): Promise<PipelineResult> {
+  const receipt = await startGuiTask(taskId, expectedRunId, gpuSelection);
   return waitForSharedTask(receipt);
 }
 export async function cancelSharedTask(taskId: string, runId: string): Promise<SharedTask> { return invoke("cancel_shared_task", { taskId, runId }); }

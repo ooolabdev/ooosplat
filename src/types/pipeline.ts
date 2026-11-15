@@ -228,7 +228,18 @@ export interface ProjectSummary {
   failureMessage: string | null;
 }
 
-export interface AppSettings { schemaVersion: number; projectsRoot: string; plannerEnabled: boolean; }
+export type GpuDeviceKind = "discreteGpu" | "integratedGpu";
+export type GpuSelectionConfidence = "pciIdentity" | "uniqueModel" | "ordered";
+export interface GpuSelection { localDeviceId: string; deviceKind: GpuDeviceKind; selectionConfidence: GpuSelectionConfidence; }
+export interface GpuDeviceOption {
+  localDeviceId: string; name: string; vendor: string; deviceKind: GpuDeviceKind; adapterIndex: number;
+  totalMemoryMb: number | null; driver: string | null; colmapCompatible: boolean; colmapGpuIndex: number | null;
+  recommended: boolean; selectionConfidence: GpuSelectionConfidence; duplicateModel: boolean;
+}
+export interface GpuInventory { devices: GpuDeviceOption[]; recommendedDeviceId: string | null; }
+export interface HardwareSettings { defaultGpu: GpuSelection | null; askOnMultipleGpus: boolean; }
+export interface HardwareSettingsView { settings: HardwareSettings; inventory: GpuInventory; }
+export interface AppSettings { schemaVersion: number; projectsRoot: string; plannerEnabled: boolean; hardware: HardwareSettings; }
 export interface ProjectOverview { projectsRoot: string; plannerEnabled: boolean; projects: ProjectSummary[]; }
 export interface AppRuntimeStatus {
   pipelineRunning: boolean;

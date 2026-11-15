@@ -3,6 +3,7 @@ import { nextOverallPercent, retainOperationProgress } from '../lib/progressStat
 import { mergeActivityEvents } from '../lib/taskActivity';
 export type TaskStatus = 'created' | 'starting' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export interface SharedTask {
+  gpu_selection?: import('./pipeline').GpuSelection | null;
   gps_assistance?: import('./inputs').GpsAssistanceSummary | null;
   imported_reconstruction?:boolean;
   generation_policy?: import('./pipeline').GenerationPolicy | null;

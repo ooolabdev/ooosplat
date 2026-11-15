@@ -1412,6 +1412,7 @@ fn notification_run(service: &TaskService, id: Uuid) -> Uuid {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     run
 }
@@ -3155,6 +3156,7 @@ async fn logs_are_bounded_incremental_and_detect_rewrite_and_wrong_execution() {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -3240,6 +3242,7 @@ async fn cursors_do_not_leak_redacted_text_and_reject_cross_task_access() {
         error: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,
@@ -3766,6 +3769,7 @@ async fn log_cursor_authentication_rotation_and_global_line_limit_are_enforced()
         last_exit_code: None,
         brush_executions: Vec::new(),
         current_brush_execution: None,
+        resolved_hardware: None,
     });
     let request = logs::LogRequest {
         task_id: task.task_id,

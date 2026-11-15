@@ -8,7 +8,7 @@ import { FrameSamplingControl } from '../components/FrameSamplingControl';
 import { FrameFpsControl } from '../components/FrameFpsControl';
 import { MaterialInputs } from '../components/MaterialInputs';
 import { sourcePath, type GenerationInputs, type ColmapInput } from '../types/inputs';
-import { selectMaterialPaths,selectColmapDatabase,selectColmapFolder,classifyGenerationPaths,inspectMaterialInputs,estimateMaterialInputs,startInputsPipeline,detectMaterialGps } from '../lib/backend';
+import { selectMaterialPaths,selectColmapDatabase,selectColmapFolder,classifyGenerationPaths,inspectMaterialInputs,estimateMaterialInputs,startInputsPipeline,detectMaterialGps,getGpuSettings,setGpuSettings } from '../lib/backend';
 import { EngineStatusPopover } from '../components/EngineStatusPopover';
 import { isProgressEvent, stagePercent } from '../lib/progressState';
 import { TaskProgress } from "../components/TaskProgress";
@@ -56,12 +56,13 @@ import { displayPath } from "../lib/displayPath";
 import { localizePipelineMessage, useI18n, type TranslationKey } from "../i18n";
 import { useAppStore } from "../stores/appStore";
 import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
-import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
+import type { EngineStatus, GpuInventory, GpuSelection, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 import { createGenerationDraft, createReshootDraft, draftDisplayName, draftGenerationPolicy, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
 import { displayStatusForDraft, draftIsRunnable, draftProjectionReady, firstQueueInputIssue, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
 import { loadUiPreferences, saveUiPreferences } from "./uiPreferences";
 import { GenerationPreflightDialog, type PreflightSession } from '../components/GenerationPreflightDialog';
+import { GpuSelectionDialog, type GpuSelectionResult } from '../components/GpuSelectionDialog';
 import { answerIsValid, collectPreflightQuestions,confirmedInputs, imageMatchingStrategy, preflightSnapshot, projectionIdentity, resolvedProjection, type PreflightAnswers, type PreflightQuestion } from './generationPreflight';
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
@@ -91,6 +92,7 @@ function CaptureAdviceHelp() {
       <ul>
         <li>{t("captureAdvice.coverage")}</li>
         <li>{t("captureAdvice.overlap")}</li>
+        <li>{t("captureAdvice.multiInput")}</li>
         <li>{t("captureAdvice.consistency")}</li>
       </ul>
       <small>{t("captureAdvice.aiWarning")}</small>
@@ -125,6 +127,11 @@ type FailureDialogState = {
   rawMessage: string;
   failureId: string | null;
   engine: string;
+};
+type GpuDialogSession = {
+  inventory: GpuInventory;
+  initialDeviceId: string | null;
+  resolve: (selection: GpuSelection | null) => void;
 };
 
 const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> => new Promise<T>((resolve, reject) => {
@@ -339,12 +346,17 @@ export function App() {
   const [autoRunNext, setAutoRunNext] = useState(false);
   const [preflight, setPreflight] = useState<PreflightSession | null>(null);
   const preflightRef = useRef<PreflightSession | null>(null);
+  const [gpuDialog, setGpuDialog] = useState<GpuDialogSession | null>(null);
+  const gpuDialogRef = useRef<GpuDialogSession | null>(null);
   const queueCheckingRef = useRef(false);
   const queueCompletionRef = useRef<Promise<void> | null>(null);
   const [queueChecking, setQueueChecking] = useState(false);
   const [queueInputNotice, setQueueInputNotice] = useState<string | null>(null);
   const queueIssueDraftIdRef = useRef<string | null>(null);
-  useEffect(() => () => { preflightRef.current?.resolve(null); preflightRef.current = null; }, []);
+  useEffect(() => () => {
+    preflightRef.current?.resolve(null); preflightRef.current = null;
+    gpuDialogRef.current?.resolve(null); gpuDialogRef.current = null;
+  }, []);
   const [inputDropActive, setInputDropActive] = useState(false);
   const [advancedSamplingOpen, setAdvancedSamplingOpen] = useState(false);
   const inputSelectionRevisions = useRef(new Map<string, number>());
@@ -372,7 +384,7 @@ export function App() {
   const gaussianImportSelectionRef = useRef(gaussianImportSelectionId);
   gaussianImportSelectionRef.current = gaussianImportSelectionId;
   const inputModalOpen = useRef(false);
-  inputModalOpen.current = Boolean(unsupportedInput || gaussianImportSelectionId || preflight || settingsOpen || failureDialog || showCancellationOverlay || (telemetryPreferences && !telemetryPreferences.consentDecided));
+  inputModalOpen.current = Boolean(unsupportedInput || gaussianImportSelectionId || preflight || gpuDialog || settingsOpen || failureDialog || showCancellationOverlay || (telemetryPreferences && !telemetryPreferences.consentDecided));
   const drafts = taskWorkspace.drafts;
   const selectedTask = taskWorkspace.selected;
   const selectedSharedTask = selectedTask.kind === "task" ? sharedTasks[selectedTask.id] : selectedTask.kind === "project" ? Object.values(sharedTasks).find(task => task.project_id === selectedTask.id && !task.project_deleted) : null;
@@ -599,6 +611,52 @@ export function App() {
       }
     }
     return answers;
+  }
+
+  const deviceSelection = (device: GpuInventory["devices"][number]): GpuSelection => ({
+    localDeviceId: device.localDeviceId,
+    deviceKind: device.deviceKind,
+    selectionConfidence: device.selectionConfidence,
+  });
+
+  async function chooseGenerationGpu(saved?: GpuSelection | null): Promise<GpuSelection | null> {
+    const view = await getGpuSettings(true);
+    const savedDevice = saved && view.inventory.devices.find(device => device.localDeviceId === saved.localDeviceId && device.deviceKind === saved.deviceKind);
+    if (savedDevice) return deviceSelection(savedDevice);
+    const savedDeviceUnavailable = Boolean(saved && !savedDevice);
+    if (view.inventory.devices.length === 0) throw new Error(t("common.unavailable"));
+    if (view.inventory.devices.length === 1) return deviceSelection(view.inventory.devices[0]);
+    const defaultDevice = view.settings.defaultGpu && view.inventory.devices.find(device => device.localDeviceId === view.settings.defaultGpu!.localDeviceId && device.deviceKind === view.settings.defaultGpu!.deviceKind);
+    if (!savedDeviceUnavailable && !view.settings.askOnMultipleGpus && defaultDevice) return deviceSelection(defaultDevice);
+    if (gpuDialogRef.current) return null;
+    return new Promise<GpuSelection | null>(resolve => {
+      const session: GpuDialogSession = {
+        inventory: view.inventory,
+        initialDeviceId: defaultDevice?.localDeviceId ?? view.inventory.recommendedDeviceId,
+        resolve,
+      };
+      gpuDialogRef.current = session;
+      setGpuDialog(session);
+    });
+  }
+
+  async function finishGpuSelection(result: GpuSelectionResult | null) {
+    const session = gpuDialogRef.current;
+    if (!session) return;
+    if (result?.remember) {
+      try {
+        await setGpuSettings({ defaultGpu: result.selection, askOnMultipleGpus: false });
+      } catch (error) {
+        store.setError(messageOf(error));
+        gpuDialogRef.current = null;
+        setGpuDialog(null);
+        session.resolve(null);
+        return;
+      }
+    }
+    gpuDialogRef.current = null;
+    setGpuDialog(null);
+    session.resolve(result?.selection ?? null);
   }
 
   function showQueueInputIssue(issue: NonNullable<ReturnType<typeof firstQueueInputIssue>>) {
@@ -1650,6 +1708,18 @@ export function App() {
       if (autoRunNextRef.current) setAutoQueueEnabled(false);
       return;
     }
+    let gpuSelection: GpuSelection | null;
+    try {
+      gpuSelection = await chooseGenerationGpu();
+    } catch (error) {
+      updateDraft(draft.id, { error: messageOf(error) });
+      gpuSelection = null;
+    }
+    if (!gpuSelection) {
+      releaseRunGate();
+      if (autoRunNextRef.current) setAutoQueueEnabled(false);
+      return;
+    }
     if (!draft?.inputPath || !draft.plan) { releaseRunGate(); return; }
     clearCancellationFeedback();
     runElapsedOffset.current = 0;
@@ -1674,7 +1744,7 @@ export function App() {
     let nextIndex = 0;
     try {
       const options=draft.kind==='reshoot'?{condition:preflightAnswers[`${draft.id}:reshootCondition`] as import('../types/pipeline').ReshootCondition,allowFallback:draft.autoRetryEnabled,sourceIdentity:draft.reshootSource!.sourceIdentity!,inputIdentity:JSON.stringify(Object.values(draft.inputAnalyses??{}).map(a=>a.identity)),projection:'perspective' as const,imageMatchingStrategy:'exhaustive' as const}:undefined;
-      const result = draft.inputs?await startInputsPipeline(confirmedInputs(draft,preflightAnswers),draft.quality,store.projectsRoot,draft.id,draftGenerationPolicy(draft),draft.sourceProjectId,options):await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, true, draft.id, resolvedProjection(taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft), draft.projectionDetection?.sourceIdentity, imageMatchingStrategy(draft, preflightAnswers), draftGenerationPolicy(draft));
+      const result = draft.inputs?await startInputsPipeline(confirmedInputs(draft,preflightAnswers),draft.quality,store.projectsRoot,draft.id,draftGenerationPolicy(draft),draft.sourceProjectId,options,gpuSelection):await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, true, draft.id, resolvedProjection(taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft), draft.projectionDetection?.sourceIdentity, imageMatchingStrategy(draft, preflightAnswers), draftGenerationPolicy(draft),gpuSelection);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -1744,6 +1814,12 @@ export function App() {
     setAutoQueueEnabled(false);
     queueIssueDraftIdRef.current = null;
     setQueueInputNotice(null);
+    const savedTask = Object.values(sharedTasks)
+      .find(task => task.project_id === project.id && !task.project_deleted);
+    let gpuSelection: GpuSelection | null = null;
+    try { gpuSelection = await chooseGenerationGpu(savedTask?.gpu_selection); }
+    catch (error) { setProjectActionError({ projectId: project.id, message: messageOf(error), occurredAt: Date.now() }); }
+    if (!gpuSelection) { releaseRunGate(); return; }
     // Bind the displayed execution before any asynchronous refresh. Only old
     // catalog-only projects without a task record use the project-ID adapter.
     const boundRunId = expectedRunId ?? Object.values(sharedTasks)
@@ -1765,8 +1841,8 @@ export function App() {
     let completedProject: ProjectSummary | null = null;
     try {
       const result = boundRunId
-        ? await resumePipeline(project.id, boundRunId)
-        : await resumePipeline(project.id);
+        ? await resumePipeline(project.id, boundRunId, gpuSelection)
+        : await resumePipeline(project.id, undefined, gpuSelection);
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -1928,6 +2004,7 @@ export function App() {
     if (!claimRunGate()) return;
     let preflightPassed = false;
     let reshootAnswers: PreflightAnswers | null = null;
+    let gpuSelection: GpuSelection | null = null;
     let confirmedDraft = draft;
     try {
       const source = await inspectReshootSource(draft.sourceProjectId);
@@ -1952,6 +2029,8 @@ export function App() {
       if (latestSource.sourceIdentity !== source.sourceIdentity || latestPlan.sourceIdentity !== finalPlan.sourceIdentity) throw new Error(t('preflight.changed'));
       const current = taskWorkspaceRef.current.drafts.find(item => item.id === draft.id);
       if (!current || current.inputChecking || preflightSnapshot(current) !== preflightSnapshot(confirmedDraft) || useAppStore.getState().projectsRoot !== store.projectsRoot) throw new Error(t('preflight.changed'));
+      gpuSelection = await chooseGenerationGpu();
+      if (!gpuSelection) { if (autoRunNextRef.current) setAutoQueueEnabled(false); return; }
       preflightPassed = true;
     } catch (error) {
       updateDraft(draft.id, { error: messageOf(error) });
@@ -1991,6 +2070,7 @@ export function App() {
           projection: confirmedDraft.reshootSource!.projection ?? 'perspective',
           imageMatchingStrategy: imageMatchingStrategy(confirmedDraft,reshootAnswers!),
         },
+        gpuSelection,
       });
       store.setResult(result);
       store.setPhase("completed");
@@ -2117,9 +2197,17 @@ export function App() {
       setFailureDialog(null);
       mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: 'task', id: failure.taskId! } }));
       clearCancellationFeedback();
+      let gpuSelection: GpuSelection | null = null;
+      try { gpuSelection = await chooseGenerationGpu(sharedTasks[failure.taskId]?.gpu_selection); }
+      catch (error) { store.setError(messageOf(error)); }
+      if (!gpuSelection) {
+        releaseRunGate();
+        setFailureDialogAction(null);
+        return;
+      }
       store.beginRun();
       try {
-        const result = await continueTaskPipeline(failure.taskId, failure.runId);
+        const result = await continueTaskPipeline(failure.taskId, failure.runId, gpuSelection);
         store.setResult(result);
         store.setPhase('completed');
         await Promise.allSettled([refreshProjects(), refreshTasks()]);
@@ -2455,9 +2543,10 @@ export function App() {
     {failureDialog && <FailureGuidanceDialog failure={failureDialog} action={failureDialogAction} canContinue={!runBusy} onClose={closeFailureDialog} onRetry={() => void retryFailedProject()} onOpenLogs={() => void openFailureLogs()} />}
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
     {settingsOpen && <SettingsDialog preferences={telemetryPreferences} telemetryBusy={telemetryBusy} showRuntimePanel={uiPreferences.showRuntimePanel} onTelemetryChange={(enabled) => void changeTelemetryConsent(enabled)} onRuntimePanelChange={changeRuntimePanelPreference} onClose={() => setSettingsOpen(false)} updatePanel={<UpdateSettingsRow result={updates.result} busy={updates.busy} failed={updates.failed} cooldownSeconds={updates.cooldownSeconds} onCheck={() => void checkUpdatesManually()} />} />}
-    {unsupportedInput && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UnsupportedInputDialog reason={unsupportedInput} onClose={() => setUnsupportedInput(null)} />}
-    {preflight && !unsupportedInput && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <GenerationPreflightDialog key={preflight.questions.map(item => item.snapshot).join('|')} session={preflight} onFinish={finishPreflight} />}
-    {updates.dialogRequested && updates.release && !unsupportedInput && !gaussianImportSelectionId && !preflight && !queueChecking && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
+    {unsupportedInput && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !gpuDialog && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UnsupportedInputDialog reason={unsupportedInput} onClose={() => setUnsupportedInput(null)} />}
+    {preflight && !unsupportedInput && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !gpuDialog && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <GenerationPreflightDialog key={preflight.questions.map(item => item.snapshot).join('|')} session={preflight} onFinish={finishPreflight} />}
+    {gpuDialog && !unsupportedInput && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <GpuSelectionDialog inventory={gpuDialog.inventory} initialDeviceId={gpuDialog.initialDeviceId} onFinish={(result) => void finishGpuSelection(result)} />}
+    {updates.dialogRequested && updates.release && !unsupportedInput && !gaussianImportSelectionId && !preflight && !gpuDialog && !queueChecking && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
     {gaussianImportSelectionId && <GaussianImportDialog selectionId={gaussianImportSelectionId} onClose={() => { gaussianSelectionRevision.current += 1; setGaussianImportSelectionId(null); }} onImported={finishGaussianImport} onUnsupportedInput={reason => { if (gaussianImportSelectionRef.current !== gaussianImportSelectionId) return; gaussianSelectionRevision.current += 1; setGaussianImportSelectionId(null); showUnsupportedInput(reason); }} />}
   </main>;
 }

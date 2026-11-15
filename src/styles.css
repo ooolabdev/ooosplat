@@ -479,9 +479,11 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .preflight-accept input { accent-color: var(--blue); flex-shrink: 0; }
 .preflight-condition { align-items: flex-start; }
 .preflight-condition input { margin-top: 5px; }
-.preflight-condition span { min-width: 0; }
+.preflight-condition-copy { min-width: 0; }
+.preflight-condition-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .preflight-condition strong, .preflight-condition small { display: block; }
 .preflight-condition strong { font-weight: 600; }
+.preflight-condition-title > em { padding: 1px 6px; color: var(--blue); background: #e8efff; border: 1px solid #bfd0fa; font-size: 10px; font-style: normal; font-weight: 700; line-height: 1.5; white-space: nowrap; }
 .preflight-condition small { margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .preflight-dialog footer { border-top: 1px solid var(--line); flex-wrap: wrap; }
 .preflight-dialog footer > div { display: flex; gap: 8px; margin-left: auto; }
@@ -861,6 +863,28 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .settings-content .privacy-setting-row { margin: 0; }
 .settings-content .privacy-summary { margin: 18px 0 0; }
 .settings-unavailable { margin: 18px 0 0; padding: 12px 13px; color: #697489; background: #eef1f5; border: 1px solid var(--line); font-size: 11px; }
+.settings-row-stacked { grid-template-columns: minmax(0, 1fr) minmax(180px, 250px); }
+.settings-row select { min-height: 34px; min-width: 0; padding: 0 30px 0 9px; color: #344158; background: #fff; border: 1px solid #bec7d4; font-size: 11px; }
+.settings-switch:disabled { opacity: .48; cursor: not-allowed; }
+
+.gpu-selection-dialog { width: min(610px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: hidden; color: var(--ink); background: #f8f9fb; border: 1px solid #bfc7d3; box-shadow: 0 28px 80px rgba(9, 17, 31, .28); }
+.gpu-selection-dialog .settings-heading p { margin: 6px 0 0; color: #697489; font-size: 11px; line-height: 1.5; }
+.gpu-device-list { max-height: min(390px, calc(100vh - 260px)); padding: 14px 18px 0; overflow-y: auto; display: grid; gap: 7px; }
+.gpu-device-option { min-height: 68px; padding: 11px 12px; display: grid; grid-template-columns: 18px minmax(0, 1fr) max-content; align-items: center; gap: 10px; color: #354159; background: #f2f4f7; border: 1px solid #cbd2dc; cursor: pointer; }
+.gpu-device-option:hover { border-color: #9aabd0; background: #eef2fa; }
+.gpu-device-option.selected { border-color: var(--blue); box-shadow: inset 3px 0 var(--blue); background: #edf2ff; }
+.gpu-device-option input { accent-color: var(--blue); }
+.gpu-device-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.gpu-device-main strong { overflow: hidden; color: #202c42; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-device-main span, .gpu-device-main small { color: #697489; font-size: 10px; }
+.gpu-device-main small { color: #765a22; }
+.gpu-device-meta { display: flex; align-items: flex-end; flex-direction: column; gap: 7px; color: #687489; font-size: 10px; }
+.gpu-device-meta span { display: flex; align-items: center; gap: 4px; }
+.gpu-device-meta em { padding: 3px 6px; color: #1f55c8; background: #dfe8ff; border: 1px solid #bfd0fb; font-size: 9px; font-style: normal; font-weight: 700; }
+.gpu-order-warning { margin: 10px 18px 0; padding: 8px 10px; color: #75561d; background: #fff7e2; border: 1px solid #e7d2a2; font-size: 10px; line-height: 1.55; }
+.gpu-remember { margin: 14px 18px 0; display: flex; align-items: center; gap: 8px; color: #4d5a70; font-size: 11px; }
+.gpu-remember input { accent-color: var(--blue); }
+.gpu-selection-dialog footer { padding: 15px 18px 18px; display: flex; justify-content: flex-end; gap: 8px; }
 
 @media (max-width: 1240px) {
   .preview-header { grid-template-columns: minmax(155px, 1fr) auto minmax(260px, 1fr); gap: 10px; }

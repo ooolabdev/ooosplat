@@ -46,6 +46,10 @@ it.each(['good','appearance','geometry','unsure'])('reshoot explains each approa
   await act(async () => root.render(<LanguageProvider><GenerationPreflightDialog session={{ questions:collectPreflightQuestions([reshoot]),finalLabel:'开始生成',resolve:finish }} onFinish={finish} /></LanguageProvider>));
   expect(container.querySelector('h2')?.textContent).toBe('原模型目前是什么情况？');
   expect(container.querySelectorAll('input[type="radio"]')).toHaveLength(4);
+  expect(Array.from(container.querySelectorAll<HTMLInputElement>('.preflight-condition input')).map(input => input.value)).toEqual(['appearance','geometry','unsure','good']);
+  expect(Array.from(container.querySelectorAll('.preflight-condition-title > em')).map(tag => tag.textContent)).toEqual(['通常最快','通常最慢']);
+  expect(container.querySelector<HTMLInputElement>('.preflight-condition:first-child input')?.value).toBe('appearance');
+  expect(container.querySelector<HTMLInputElement>('.preflight-condition:last-child input')?.value).toBe('good');
   expect(container.querySelector('input:checked')).toBeNull();
   expect(button().disabled).toBe(true);
   expect(button().textContent).toBe('下一步');
@@ -64,11 +68,11 @@ it.each(['good','appearance','geometry','unsure'])('reshoot explains each approa
   expect(finish.mock.calls[0][0]).toEqual({[`${reshoot.id}:reshootCondition`]:condition,[`${reshoot.id}:reshootCamera`]:'same'});
 });
 
-it('reshoot cancellation submits no partial answer and missing models are explained without promising reuse', async () => {
+it('reshoot cancellation submits no partial answer and explains the full pass from the original model', async () => {
   const reshoot = {...createReshootDraft(1,'source','Original','high'), inputPath:'E:/new.mp4'};
   await act(async () => root.render(<LanguageProvider><GenerationPreflightDialog session={{questions:collectPreflightQuestions([reshoot]),finalLabel:'开始生成',resolve:finish}} onFinish={finish} /></LanguageProvider>));
   await act(async () => container.querySelector<HTMLInputElement>('input[value="good"]')!.click());
-  expect(container.textContent).toContain('原模型不可用时重新生成');
+  expect(container.textContent).toContain('沿用已确定的拍摄位置，以原模型为起点完整生成一轮，能更好地保留原有效果。');
   await act(async () => container.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
   expect(finish).toHaveBeenCalledWith(null);
 });

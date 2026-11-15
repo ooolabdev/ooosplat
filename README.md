@@ -373,6 +373,8 @@ dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
 
 CLI 的 `generate` 每次创建新任务，暂不提供独立的查询、取消或继续命令；已有任务的“继续生成”通过桌面或 MCP 操作。
 
+多显卡设备可先使用 `generate ... --inspect` 查看本机设备 ID，再通过 `--gpu <device-id>` 选择具体显卡。多显卡且没有已保存默认值时，CLI 会列出可选设备并停止，不会自动选择。
+
 ```powershell
 # 检查所有内置引擎
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- health

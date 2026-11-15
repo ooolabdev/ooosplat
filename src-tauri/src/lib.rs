@@ -156,6 +156,8 @@ pub fn run_app() {
             imports::relink_imported_project,
             commands::set_projects_root,
             commands::set_planner_enabled,
+            commands::get_gpu_settings,
+            commands::set_gpu_settings,
             commands::delete_project,
             commands::prepare_gaussian_preview,
             commands::read_gaussian_preview_chunk,

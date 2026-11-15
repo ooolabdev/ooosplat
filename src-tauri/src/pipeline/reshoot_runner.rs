@@ -871,6 +871,7 @@ impl PipelineRunner {
         });
         manager.write_metadata(&paths.metadata, &metadata).await?;
         let mut state = manager.read_state(&paths.state).await?;
+        self.save_hardware_plan(&mut state);
         state.video = probe.video.clone();
         state.image_sequence = probe.image_sequence.clone();
         state.generation_policy = self.policy();

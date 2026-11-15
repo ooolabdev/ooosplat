@@ -1061,6 +1061,79 @@ pub(crate) async fn diagnostic_gpu_devices() -> Vec<GpuDeviceInfo> {
     probe_gpu_devices().await.unwrap_or_default()
 }
 
+/// Local-only NVIDIA identity used to correlate CUDA ordinals with WGPU
+/// adapters. PCI/UUID values must never be serialized into task, diagnostic,
+/// telemetry, MCP, or frontend payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalGpuIdentity {
+    pub index: u32,
+    pub name: String,
+    pub pci_bus_id: Option<String>,
+    pub uuid: Option<String>,
+}
+
+pub(crate) async fn diagnostic_gpu_identities() -> Vec<LocalGpuIdentity> {
+    probe_gpu_identities().await.unwrap_or_default()
+}
+
+async fn probe_gpu_identities() -> std::result::Result<Vec<LocalGpuIdentity>, ProbeError> {
+    let candidate = nvidia_smi_candidates()
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or(ProbeError::NotFound)?;
+    let manager = ProcessManager::new();
+    let run = manager.run(ProcessSpec {
+        executable: candidate,
+        args: vec![
+            OsString::from("--query-gpu=index,name,pci.bus_id,uuid"),
+            OsString::from("--format=csv,noheader,nounits"),
+        ],
+        working_directory: None,
+        log_path: None,
+        observer: None,
+    });
+    tokio::pin!(run);
+    let result = match tokio::time::timeout(NVIDIA_SMI_TIMEOUT, &mut run).await {
+        Ok(Ok(result)) if result.success => result,
+        Ok(Ok(_)) | Ok(Err(_)) => return Err(ProbeError::Failed),
+        Err(_) => {
+            manager.cancel();
+            let _ = run.await;
+            return Err(ProbeError::Timeout);
+        }
+    };
+    parse_nvidia_smi_identity_csv(&result.stdout)
+}
+
+fn parse_nvidia_smi_identity_csv(
+    output: &str,
+) -> std::result::Result<Vec<LocalGpuIdentity>, ProbeError> {
+    let mut devices = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+        if fields.len() < 4 {
+            return Err(ProbeError::InvalidOutput);
+        }
+        let index = fields[0]
+            .parse::<u32>()
+            .map_err(|_| ProbeError::InvalidOutput)?;
+        let pci = fields[fields.len() - 2];
+        let uuid = fields[fields.len() - 1];
+        devices.push(LocalGpuIdentity {
+            index,
+            name: fields[1..fields.len() - 2].join(", "),
+            pci_bus_id: (!pci.is_empty() && !pci.eq_ignore_ascii_case("N/A"))
+                .then(|| pci.to_owned()),
+            uuid: (!uuid.is_empty() && !uuid.eq_ignore_ascii_case("N/A")).then(|| uuid.to_owned()),
+        });
+    }
+    if devices.is_empty() {
+        Err(ProbeError::NoGpu)
+    } else {
+        Ok(devices)
+    }
+}
+
 async fn probe_gpu_devices() -> std::result::Result<Vec<GpuDeviceInfo>, ProbeError> {
     let candidate = nvidia_smi_candidates()
         .into_iter()
@@ -1229,6 +1302,19 @@ pub(crate) fn nvidia_smi_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_local_nvidia_identity_without_exposing_it_in_public_device_info() {
+        let devices = parse_nvidia_smi_identity_csv(
+            "0, NVIDIA RTX 4090, 00000000:01:00.0, GPU-private-a\n\
+             1, NVIDIA RTX, Special, 00000000:02:00.0, GPU-private-b\n",
+        )
+        .unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].pci_bus_id.as_deref(), Some("00000000:01:00.0"));
+        assert_eq!(devices[1].name, "NVIDIA RTX, Special");
+        assert_eq!(devices[1].index, 1);
+    }
 
     fn requirements() -> AccelerationRequirements {
         default_requirements()

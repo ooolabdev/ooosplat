@@ -99,6 +99,8 @@ pub struct TaskRun {
     pub brush_executions: Vec<crate::pipeline::brush_execution::BrushExecutionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_brush_execution: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_hardware: Option<crate::engines::gpu_selection::ResolvedHardwarePlan>,
 }
 
 impl TaskRun {
@@ -180,6 +182,10 @@ pub struct TaskRecord {
     pub generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
     #[serde(default)]
     pub automatically_retried: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_hardware: Option<crate::engines::gpu_selection::ResolvedHardwarePlan>,
     pub projects_root: PathBuf,
     pub configuration: PipelineOptimizationConfig,
     pub actual_configuration: Option<Value>,
@@ -860,6 +866,53 @@ impl TaskService {
         });
         Ok(tasks)
     }
+
+    pub async fn set_gpu_selection(
+        &self,
+        id: Uuid,
+        selection: crate::engines::gpu_selection::GpuSelection,
+    ) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        self.load_locked().await?;
+        {
+            let mut records = self.records();
+            let task = records
+                .tasks
+                .get_mut(&id)
+                .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "Task does not exist"))?;
+            if task.status.active() {
+                return Err(ServiceError::new("TASK_BUSY", "Task is already running"));
+            }
+            task.gpu_selection = Some(selection.clone());
+            let parameters = task
+                .request_parameters
+                .get_or_insert_with(|| serde_json::json!({}));
+            let object = parameters
+                .as_object_mut()
+                .ok_or_else(|| ServiceError::new("INVALID_DATA", "Invalid task parameters"))?;
+            object.insert("gpuSelection".into(), serde_json::to_value(selection)?);
+            task.updated_at = Utc::now();
+            task.revision += 1;
+        }
+        self.persist().await
+    }
+
+    pub async fn set_project_gpu_selection(
+        &self,
+        project: Uuid,
+        selection: crate::engines::gpu_selection::GpuSelection,
+    ) -> Result<()> {
+        self.initialize().await?;
+        let id = self
+            .records()
+            .tasks
+            .values()
+            .filter(|task| task.project_id == Some(project))
+            .max_by_key(|task| task.updated_at)
+            .map(|task| task.task_id)
+            .ok_or_else(|| ServiceError::new("TASK_NOT_FOUND", "Task does not exist"))?;
+        self.set_gpu_selection(id, selection).await
+    }
     pub async fn running(&self) -> Result<Option<TaskRecord>> {
         Ok(self.all().await?.into_iter().find(|t| t.status.active()))
     }
@@ -1094,6 +1147,13 @@ impl TaskService {
                 .map(serde_json::from_value)
                 .transpose()?,
             automatically_retried: false,
+            gpu_selection: parameters
+                .as_ref()
+                .and_then(|p| p.get("gpuSelection"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            resolved_hardware: None,
             actual_configuration: None,
             status: TaskStatus::Created,
             stage: None,
@@ -1249,6 +1309,8 @@ impl TaskService {
                 planner_enabled: checkpoint.planner_enabled,
                 generation_policy: checkpoint.generation_policy,
                 automatically_retried: checkpoint.automatically_retried(),
+                gpu_selection: checkpoint.gpu_selection.clone(),
+                resolved_hardware: checkpoint.resolved_hardware.clone(),
                 projects_root: path.parent().unwrap_or(&path).into(),
                 configuration: checkpoint
                     .configuration
@@ -1298,6 +1360,7 @@ impl TaskService {
                     error: None,
                     brush_executions: Vec::new(),
                     current_brush_execution: None,
+                    resolved_hardware: checkpoint.resolved_hardware.clone(),
                 }],
                 client_request_id: None,
                 request_parameters: None,
@@ -1924,6 +1987,13 @@ impl TaskService {
             .with_invocation_access(self.invocation_access.clone())
             .with_camera_grouping_policy_version(task.camera_grouping_policy_version)
             .with_ordinary_image_preparation_version(task.ordinary_image_preparation_version)
+            .with_gpu_selection(task.gpu_selection.clone().or_else(|| {
+                task.request_parameters
+                    .as_ref()
+                    .and_then(|parameters| parameters.get("gpuSelection"))
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+            }))
             .with_generation_policy(if !continuing || task.project_id.is_none() {
                 policy
             } else {
@@ -1986,6 +2056,7 @@ impl TaskService {
                 t.automatically_retried = false;
             } else {
                 t.automatically_retried = task.automatically_retried;
+                t.gpu_selection = task.gpu_selection.clone();
             }
             t.run_id = Some(run_id);
             t.status = TaskStatus::Starting;
@@ -2028,6 +2099,7 @@ impl TaskService {
                 error: None,
                 brush_executions: Vec::new(),
                 current_brush_execution: None,
+                resolved_hardware: None,
             });
             t.clone()
         };
@@ -2408,6 +2480,7 @@ impl TaskService {
         }
         let _gate = self.gate.lock().await;
         let context = runner.failure_context();
+        let resolved_hardware = runner.resolved_hardware();
         let (executions, current_execution) = {
             let mut registry = self.records();
             let Some(task) = registry
@@ -2484,12 +2557,14 @@ impl TaskService {
             });
             if let Some(r) = t.runs.last_mut() {
                 r.ended_at = Some(Utc::now());
+                r.resolved_hardware = resolved_hardware.clone();
                 for log in r.logs.values_mut() {
                     log.end = std::fs::metadata(&log.path).ok().map(|m| m.len());
                 }
             }
             t.project_id = context.project_id.or(t.project_id);
             t.project_path = context.project_path.or(t.project_path.clone());
+            t.resolved_hardware = resolved_hardware;
             if let Some(actual) = actual {
                 t.actual_configuration = Some(actual_snapshot(actual));
                 if let Some(actual) = &t.actual_configuration {

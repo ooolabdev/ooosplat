@@ -22,6 +22,7 @@ use crate::{
 };
 
 static PROJECT_INDEX_LOCK: Mutex<()> = Mutex::const_new(());
+static SETTINGS_LOCK: Mutex<()> = Mutex::const_new(());
 
 pub async fn runtime_samples() -> Vec<RuntimeSample> {
     let Ok(index) = load_index().await else {
@@ -110,6 +111,56 @@ fn runtime_sample_frame_count(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HardwareSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_gpu: Option<crate::engines::gpu_selection::GpuSelection>,
+    #[serde(default = "default_ask_on_multiple_gpus")]
+    pub ask_on_multiple_gpus: bool,
+}
+
+const fn default_ask_on_multiple_gpus() -> bool {
+    true
+}
+
+impl Default for HardwareSettings {
+    fn default() -> Self {
+        Self {
+            default_gpu: None,
+            ask_on_multiple_gpus: true,
+        }
+    }
+}
+
+pub async fn hardware_settings_for_inventory(
+    inventory: &crate::engines::gpu_selection::GpuInventory,
+) -> Result<HardwareSettings> {
+    let _guard = SETTINGS_LOCK.lock().await;
+    let mut settings = load_settings().await?;
+    let normalized_default = settings
+        .hardware
+        .default_gpu
+        .as_ref()
+        .and_then(|selection| {
+            inventory.devices.iter().find(|device| {
+                device.local_device_id == selection.local_device_id
+                    && device.device_kind == selection.device_kind
+            })
+        })
+        .map(|device| device.selection());
+    let invalid = (settings.hardware.default_gpu.is_some() && normalized_default.is_none())
+        || (!settings.hardware.ask_on_multiple_gpus && normalized_default.is_none());
+    if invalid {
+        settings.hardware = HardwareSettings::default();
+        save_settings_unlocked(&settings).await?;
+    } else if settings.hardware.default_gpu != normalized_default {
+        settings.hardware.default_gpu = normalized_default;
+        save_settings_unlocked(&settings).await?;
+    }
+    Ok(settings.hardware)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default)]
     pub mcp: crate::mcp::McpSettings,
@@ -117,6 +168,8 @@ pub struct AppSettings {
     pub projects_root: PathBuf,
     #[serde(default = "default_planner_enabled")]
     pub planner_enabled: bool,
+    #[serde(default)]
+    pub hardware: HardwareSettings,
 }
 
 const fn default_planner_enabled() -> bool {
@@ -302,10 +355,11 @@ pub async fn load_settings() -> Result<AppSettings> {
         schema_version: 2,
         projects_root: default_projects_root()?,
         planner_enabled: true,
+        hardware: HardwareSettings::default(),
     })
 }
 
-pub(crate) async fn save_settings(settings: &AppSettings) -> Result<()> {
+async fn save_settings_unlocked(settings: &AppSettings) -> Result<()> {
     let path = settings_path()?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -316,17 +370,35 @@ pub(crate) async fn save_settings(settings: &AppSettings) -> Result<()> {
 /// 记住项目根目录。
 pub async fn save_projects_root(root: PathBuf) -> Result<AppSettings> {
     crate::project::ProjectManager::validate_root(&root).await?;
+    let _guard = SETTINGS_LOCK.lock().await;
     let mut settings = load_settings().await?;
     settings.projects_root = root;
-    save_settings(&settings).await?;
+    save_settings_unlocked(&settings).await?;
     Ok(settings)
 }
 
 pub async fn save_planner_enabled(enabled: bool) -> Result<AppSettings> {
+    let _guard = SETTINGS_LOCK.lock().await;
     let mut settings = load_settings().await?;
     settings.schema_version = settings.schema_version.max(2);
     settings.planner_enabled = enabled;
-    save_settings(&settings).await?;
+    save_settings_unlocked(&settings).await?;
+    Ok(settings)
+}
+
+pub async fn save_hardware_settings(hardware: HardwareSettings) -> Result<AppSettings> {
+    let _guard = SETTINGS_LOCK.lock().await;
+    let mut settings = load_settings().await?;
+    settings.hardware = hardware;
+    save_settings_unlocked(&settings).await?;
+    Ok(settings)
+}
+
+pub async fn save_mcp_settings(mcp: crate::mcp::McpSettings) -> Result<AppSettings> {
+    let _guard = SETTINGS_LOCK.lock().await;
+    let mut settings = load_settings().await?;
+    settings.mcp = mcp;
+    save_settings_unlocked(&settings).await?;
     Ok(settings)
 }
 
@@ -830,6 +902,7 @@ mod tests {
             mcp: Default::default(),
             schema_version: 1,
             planner_enabled: true,
+            hardware: HardwareSettings::default(),
             projects_root: PathBuf::from("C:/项目 Root"),
         };
         assert!(serde_json::to_string(&value)

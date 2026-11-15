@@ -826,6 +826,7 @@ async fn task_status_bounds_execution_evidence_and_excludes_local_gps_and_tokens
         error: None,
         brush_executions: vec![execution; 10],
         current_brush_execution: Some(9),
+        resolved_hardware: None,
     });
     let public = public_task(task).unwrap();
     let text = public.to_string();

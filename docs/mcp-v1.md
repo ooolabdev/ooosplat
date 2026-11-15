@@ -43,11 +43,11 @@ All tools have input/output JSON Schemas and structured results. MCP fields use 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `get_app_status` | `{}` | App/engine versions, capabilities, active task, start availability and recommended polling interval |
-| `inspect_generation_input` | `input_path` **or** ordered `inputs`, plus `quality`; optional `generation_policy`, `source_project_id` | Cached per-source analysis, identities, estimated plans, GPS summary and bilingual source-bound questions |
+| `inspect_generation_input` | `input_path` **or** ordered `inputs`, plus `quality`; optional `generation_policy`, `source_project_id` | Cached per-source analysis, identities, estimated plans, GPS summary, concrete GPU options and bilingual source-bound questions |
 | `inspect_reshoot_input` | Required `source_project_id`, authorized `input_path`, `quality` | Read-only source/input analysis, projection, identities, warm-start availability |
-| `create_generation_task` | Required `input_path` **or** `inputs`, `quality`, `client_request_id`; optional preflight identity, answers, policy and reshoot source; legacy `reshoot_options` retained | Persisted task only after all required answers; generation has not started |
-| `start_task` | Required `task_id`; optional `retry_failed_run_id` | Start a created task; the legacy run-ID field aliases the same continuation flow as `resume_task` |
-| `resume_task` | Required `task_id`, `expected_run_id` | Continue failed/cancelled/interrupted work, preserving its saved actual recipe and consumed remedy allowances |
+| `create_generation_task` | Required `input_path` **or** `inputs`, `quality`, `client_request_id`; optional preflight identity, answers, policy, reshoot source and concrete `gpu_selection`; legacy `reshoot_options` retained | Persisted task only after all required answers; generation has not started |
+| `start_task` | Required `task_id`; optional `retry_failed_run_id`, concrete `gpu_selection` | Start a created task; the legacy run-ID field aliases the same continuation flow as `resume_task` |
+| `resume_task` | Required `task_id`, `expected_run_id`; optional concrete `gpu_selection` | Continue failed/cancelled/interrupted work, preserving its saved actual recipe, GPU and consumed remedy allowances |
 | `list_tasks` | Optional `cursor`, `limit` (default 50, maximum 100) | Tasks, `next_cursor`, `has_more` |
 | `get_task_status` | Required `task_id` | State, stage, progress, frozen/actual configuration, time, errors, run identities and local artifacts |
 | `read_task_logs` | Required `task_id`; optional `run_id`, `sources`, `cursor`, `tail_lines`, `max_bytes` | Bounded text chunks, cursor, truncation/reset flags and registered sources |
@@ -84,6 +84,10 @@ Completed results contain only local paths, sizes and model metadata. PLY conten
 ## Input preflight and answers / 素材预检与回答
 
 Call `inspect_generation_input` first. It shares GUI header-only analysis, projection detection and planning caches; changing quality or FPS replans without another metadata scan/FFprobe. `input` contains measured metadata; `plan_is_estimate: true` labels estimated frame counts and duration. `max_splats` is null until the final reconstruction exists. Saved actual parameters, not an estimated cap, describe execution. New ordered-input runs containing ERP training faces use the panorama recipe and the authoritative sparse-point budget in Detailed.
+
+`gpu.devices` lists concrete Brush-compatible hardware adapters and marks one recommendation. There is no automatic-selection value: when more than one adapter is available and no saved default applies, pass the user's explicit `gpu_selection` to task creation or start/resume. A missing answer returns `CONFIRMATION_REQUIRED` without starting work. Selection IDs are local opaque values; PCI addresses and GPU UUIDs are never returned. Continuation and automatic OOM retry retain the task's selected adapter.
+
+`gpu.devices` 会列出可供 Brush 使用的具体硬件适配器，并标记推荐项；不存在“自动选择”选项。多显卡且没有可用默认值时，Agent 必须询问用户，并把明确的 `gpu_selection` 传给创建、启动或继续工具。缺少选择会返回 `CONFIRMATION_REQUIRED`，不会启动任务。设备 ID 仅为本机不透明标识，PCI 地址和 GPU UUID 不会返回；继续生成及 OOM 自动重试沿用任务保存的设备。
 
 先预检，再由 Agent 向用户询问返回的 `questions`，不弹桌面确认框。每题包含稳定的 `key`、`options[].value` 及 `zh-CN`／`en` 文案；没有预选答案。用户已明确给出的答案可复用，缺失答案不能由 Agent 猜测。创建时带回同一 `preflight_id`、`input_source_identity`、配置和答案。
 

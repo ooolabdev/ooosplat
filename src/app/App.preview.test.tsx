@@ -46,6 +46,8 @@ const mocks = vi.hoisted(() => ({
   sendErrorReport: vi.fn(),
   classifyDroppedInput: vi.fn(),
   onInputDragDrop: vi.fn(),
+  getGpuSettings: vi.fn(),
+  setGpuSettings: vi.fn(),
 }));
 
 vi.mock("../lib/updates", () => ({ checkAppUpdate: mocks.checkAppUpdate, copyUpdateText: vi.fn() }));
@@ -91,6 +93,8 @@ vi.mock("../lib/backend", () => ({
   setTelemetryConsent: mocks.setTelemetryConsent,
   startPipeline: mocks.startPipeline,
   startReshootPipeline: mocks.startReshootPipeline,
+  getGpuSettings: mocks.getGpuSettings,
+  setGpuSettings: mocks.setGpuSettings,
 }));
 
 vi.mock("../components/GaussianViewer", () => ({
@@ -155,6 +159,16 @@ describe("App preview workspace", () => {
     mocks.selectGaussianImportSource.mockReset().mockResolvedValue(null);
     mocks.probeGaussianImport.mockReset();
     mocks.onInputDragDrop.mockReset().mockResolvedValue(() => undefined);
+    mocks.getGpuSettings.mockReset().mockResolvedValue({
+      settings: { defaultGpu: null, askOnMultipleGpus: true },
+      inventory: { recommendedDeviceId: "test-gpu", devices: [{
+        localDeviceId: "test-gpu", name: "Test GPU", vendor: "NVIDIA",
+        deviceKind: "discreteGpu", adapterIndex: 0, totalMemoryMb: 8192,
+        driver: "test", colmapCompatible: true, colmapGpuIndex: 0,
+        recommended: true, selectionConfidence: "uniqueModel", duplicateModel: false,
+      }] },
+    });
+    mocks.setGpuSettings.mockReset();
     mocks.cancelPipeline.mockReset().mockResolvedValue(undefined);
     mocks.estimateProjectRuntime.mockReset().mockResolvedValue({
       estimatedMs: 4_000_000,
@@ -354,6 +368,7 @@ describe("App preview workspace", () => {
     expect(tooltip?.getAttribute("role")).toBe("tooltip");
     expect(tooltip?.textContent).toContain("正面、侧面、背面以及高低视角");
     expect(tooltip?.textContent).toContain("60%–80% 重叠");
+    expect(tooltip?.textContent).toContain("不同素材之间拍到部分相同区域");
     expect(tooltip?.textContent).toContain("固定镜头、焦距、分辨率和曝光");
     expect(tooltip?.textContent).toContain("AI 生成图片容易出现");
   });
@@ -1585,7 +1600,7 @@ describe("App preview workspace", () => {
     await act(async () => { resumeButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await flush();
 
-    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id);
+    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id, undefined, expect.any(Object));
     expect(mocks.estimateProjectRuntime).toHaveBeenCalledWith(project.id);
   });
 
@@ -1734,7 +1749,7 @@ describe("App preview workspace", () => {
     }
     await act(async () => action.click());
     await flush();
-    expect(mocks.continueTaskPipeline).toHaveBeenCalledExactlyOnceWith(taskId, 'failed-before-project');
+    expect(mocks.continueTaskPipeline).toHaveBeenCalledExactlyOnceWith(taskId, 'failed-before-project', expect.any(Object));
     expect(mocks.resumePipeline).not.toHaveBeenCalled();
     expect(mocks.startInputsPipeline).toHaveBeenCalledOnce();
     expect(container.querySelector('.queue-toggle')?.getAttribute('aria-checked')).toBe('false');
@@ -2729,7 +2744,7 @@ describe("App preview workspace", () => {
     );
     await act(async () => button.click());
     await flush();
-    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id, 'stopped-run');
+    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id, 'stopped-run', expect.any(Object));
     expect(mocks.startPipeline).not.toHaveBeenCalled();
     expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
     expect(container.querySelector('.preflight-dialog')).toBeNull();
@@ -2744,7 +2759,7 @@ describe("App preview workspace", () => {
     mocks.resumePipeline.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectAdmission = reject; }));
     await act(async () => container.querySelector<HTMLButtonElement>('[data-task-id="shared-1"] .resume-link')!.click());
     await flush();
-    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id, 'old-run');
+    expect(mocks.resumePipeline).toHaveBeenCalledWith(project.id, 'old-run', expect.any(Object));
     await publishTask(sharedTask({ status: 'running', run_id: 'new-run', stage: 'trainingSplats', revision: 2 }));
     await act(async () => rejectAdmission({ code, message: 'The task execution has changed' }));
     await flush();

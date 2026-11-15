@@ -574,6 +574,7 @@ pub async fn start_gui_inputs(
     generation_policy: crate::pipeline::generation_policy::GenerationPolicy,
     source_project_id: Option<Uuid>,
     reshoot_options: Option<crate::pipeline::reshoot::ReshootOptions>,
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
     crate::pipeline::input_admission::ensure_new_inputs_supported(&inputs)?;
     let _admission = imports.admission().await;
@@ -609,7 +610,7 @@ pub async fn start_gui_inputs(
             ));
         }
     }
-    let params = serde_json::json!({"inputs":inputs,"generationPolicy":generation_policy,"source_project_id":source_project_id,"reshootOptions":reshoot_options});
+    let params = serde_json::json!({"inputs":inputs,"generationPolicy":generation_policy,"source_project_id":source_project_id,"reshootOptions":reshoot_options,"gpuSelection":gpu_selection});
     state
         .create(
             Some(workspace_task_id),
@@ -1605,6 +1606,57 @@ pub async fn set_planner_enabled(enabled: bool) -> std::result::Result<AppSettin
     catalog::save_planner_enabled(enabled).await
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareSettingsView {
+    pub settings: crate::project::catalog::HardwareSettings,
+    pub inventory: crate::engines::gpu_selection::GpuInventory,
+}
+
+#[tauri::command]
+pub async fn get_gpu_settings(
+    app: tauri::AppHandle,
+    refresh: Option<bool>,
+) -> std::result::Result<HardwareSettingsView, SplatError> {
+    let inventory =
+        crate::engines::gpu_selection::inventory(&paths_for_app(&app), refresh.unwrap_or(false))
+            .await?;
+    let settings = catalog::hardware_settings_for_inventory(&inventory).await?;
+    Ok(HardwareSettingsView {
+        settings,
+        inventory,
+    })
+}
+
+#[tauri::command]
+pub async fn set_gpu_settings(
+    app: tauri::AppHandle,
+    hardware: crate::project::catalog::HardwareSettings,
+) -> std::result::Result<HardwareSettingsView, SplatError> {
+    if !hardware.ask_on_multiple_gpus && hardware.default_gpu.is_none() {
+        return Err(SplatError::Process(
+            "A default GPU is required when multi-GPU confirmation is disabled".into(),
+        ));
+    }
+    let inventory = crate::engines::gpu_selection::inventory(&paths_for_app(&app), true).await?;
+    let mut hardware = hardware;
+    if let Some(selection) = hardware.default_gpu.as_ref() {
+        let available = inventory.devices.iter().find(|device| {
+            device.local_device_id == selection.local_device_id
+                && device.device_kind == selection.device_kind
+        });
+        let Some(device) = available else {
+            return Err(SplatError::Process("GPU_SELECTION_UNAVAILABLE".into()));
+        };
+        hardware.default_gpu = Some(device.selection());
+    }
+    let settings = catalog::save_hardware_settings(hardware).await?;
+    Ok(HardwareSettingsView {
+        settings: settings.hardware,
+        inventory,
+    })
+}
+
 #[tauri::command]
 pub async fn initialize_telemetry(
     telemetry: State<'_, TelemetryService>,
@@ -1747,6 +1799,7 @@ pub async fn create_gui_task(
     input_source_identity: Option<String>,
     image_matching_strategy: Option<crate::project::ImageMatchingStrategy>,
     generation_policy: Option<crate::pipeline::generation_policy::GenerationPolicy>,
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 ) -> std::result::Result<crate::tasks::TaskRecord, crate::tasks::ServiceError> {
     let video_projection = input_projection.or(video_projection);
     let video_source_identity = input_source_identity.or(video_source_identity);
@@ -1773,7 +1826,7 @@ pub async fn create_gui_task(
             planner_enabled.unwrap_or(true),
             "gui",
             None,
-            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default(), "generationPolicy":generation_policy.unwrap_or_default()})),
+            Some(serde_json::json!({"videoProjection":video_projection.unwrap_or_default(), "videoSourceIdentity":video_source_identity, "imageMatchingStrategy":image_matching_strategy.unwrap_or_default(), "generationPolicy":generation_policy.unwrap_or_default(), "gpuSelection":gpu_selection})),
         )
         .await
 }
@@ -1785,6 +1838,7 @@ pub async fn start_gui_task(
     imports: State<'_, crate::imports::ImportController>,
     task_id: Uuid,
     retry_failed_run_id: Option<Uuid>,
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
     let _admission = imports.admission().await;
     if imports.is_active().await {
@@ -1792,6 +1846,9 @@ pub async fn start_gui_task(
             "TASK_BUSY",
             "已有 Gaussian 导入正在进行，请等待完成后再启动任务",
         ));
+    }
+    if let Some(selection) = gpu_selection {
+        state.set_gpu_selection(task_id, selection).await?;
     }
     if let Some(failed_run) = retry_failed_run_id {
         return state
@@ -1850,6 +1907,7 @@ pub async fn resume_gui_task(
     imports: State<'_, crate::imports::ImportController>,
     project_id: Uuid,
     expected_run_id: Option<Uuid>,
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 ) -> std::result::Result<crate::tasks::StartReceipt, crate::tasks::ServiceError> {
     let _admission = imports.admission().await;
     if imports.is_active().await {
@@ -1860,6 +1918,11 @@ pub async fn resume_gui_task(
     }
     let engines = paths_for_app(&app);
     let telemetry = Some(telemetry.inner().clone());
+    if let Some(selection) = gpu_selection {
+        state
+            .set_project_gpu_selection(project_id, selection)
+            .await?;
+    }
     if let Some(expected_run) = expected_run_id {
         state
             .resume_project_identified(project_id, expected_run, engines, telemetry)
@@ -3654,6 +3717,8 @@ pub struct IncrementalReshootRequest {
     workspace_task_id: Option<String>,
     quality: Option<Quality>,
     planner_enabled: Option<bool>,
+    #[serde(default)]
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 }
 
 #[tauri::command]
@@ -3784,7 +3849,7 @@ pub async fn start_gui_reshoot(
             planner_enabled,
             "gui",
             None,
-            Some(serde_json::json!({"reshootOptions":request.reshoot_options, "generationPolicy":policy})),
+            Some(serde_json::json!({"reshootOptions":request.reshoot_options, "generationPolicy":policy, "gpuSelection":request.gpu_selection})),
         )
         .await?;
     state.mark_reshoot(task.task_id, source).await?;

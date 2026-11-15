@@ -124,5 +124,6 @@ describe("backend browser guards", () => {
       expect.objectContaining({ title: "图片数量较少", kind: "warning", okLabel: "继续生成", cancelLabel: "取消生成" }),
     );
     expect(mocks.confirm.mock.calls[0][0]).toContain("60%–80%");
+    expect(mocks.confirm.mock.calls[0][0]).toContain("不同素材之间拍到部分相同区域");
   });
 });

@@ -269,7 +269,13 @@ async fn run_mapper_with_ceres_fallback(
         selection,
     ))
     .await;
-    attempt.result?;
+    let initial_geometry_failure = match attempt.result {
+        Ok(()) => None,
+        Err(SplatError::EngineProcess(failure)) if failure.is_mapper_geometry_failure() => {
+            Some(*failure)
+        }
+        Err(error) => return Err(error),
+    };
     let used_caspar = attempt.used_caspar;
     let (actual_args, actual_selection) = if selection.gpu_index.is_some() && !used_caspar {
         let mut args = ceres_args.clone();
@@ -291,6 +297,7 @@ async fn run_mapper_with_ceres_fallback(
         manager,
         observer,
         actual_selection,
+        initial_geometry_failure,
     ))
     .await
 }
@@ -435,6 +442,7 @@ async fn recover_mapper_initialization(
     manager: &ProcessManager,
     observer: Option<ProcessObserver>,
     mut selection: super::colmap_ba::BaSelection,
+    initial_geometry_failure: Option<crate::failure::EngineProcessFailure>,
 ) -> Result<()> {
     if !actual_args.first().is_some_and(|arg| arg == "mapper")
         || actual_args.iter().any(|arg| {
@@ -444,24 +452,52 @@ async fn recover_mapper_initialization(
                     .is_some_and(|arg| arg.starts_with("--input_path="))
         })
     {
-        return Ok(());
+        return match initial_geometry_failure {
+            Some(failure) => Err(SplatError::EngineProcess(Box::new(failure))),
+            None => Ok(()),
+        };
     }
-    let output = resolved_path(output, working_directory)?;
+    let output = resolved_path(output, working_directory).map_err(|error| {
+        mapper_outcome::with_previous_geometry_attempts(
+            error,
+            initial_geometry_failure.iter().cloned().collect(),
+        )
+    })?;
     let checked_output = output.clone();
     let cancel = manager.child_token();
     let check_cancel = cancel.clone();
-    let Some(mut best) = crate::presets::spawn_pipeline_blocking(move || {
+    let mut best = crate::presets::spawn_pipeline_blocking(move || {
         initialization::assess_output(&checked_output, &check_cancel)
     })
     .await
-    .map_err(|error| SplatError::Process(format!("Mapper output inspection failed: {error}")))??
-    else {
-        // The ordinary output validator retains its existing missing-model
-        // error. Do not turn a malformed/no-output result into new work here.
-        return Ok(());
-    };
-    if best.valid_intrinsics {
-        return Ok(());
+    .map_err(|error| SplatError::Process(format!("Mapper output inspection failed: {error}")))
+    .and_then(|result| result)
+    .map_err(|error| {
+        mapper_outcome::with_previous_geometry_attempts(
+            error,
+            initial_geometry_failure.iter().cloned().collect(),
+        )
+    })?;
+    let recovering_empty_geometry_failure = initial_geometry_failure.is_some();
+    if recovering_empty_geometry_failure {
+        // This protection is deliberately narrower than accepting any output
+        // left behind by a failed process. The terminal geometry marker says
+        // no sparse model was created, so a partial model is not admissible.
+        if best.is_some() {
+            return Err(SplatError::EngineProcess(Box::new(
+                initial_geometry_failure.expect("checked above"),
+            )));
+        }
+    } else {
+        let Some(existing) = best.as_ref() else {
+            // A successful Mapper that produced no model retains the existing
+            // output-validation failure; no explicit geometric evidence exists
+            // to authorize an alternative initialization here.
+            return Ok(());
+        };
+        if existing.valid_intrinsics {
+            return Ok(());
+        }
     }
     let args = actual_args.clone();
     let working = working_directory.to_path_buf();
@@ -475,23 +511,48 @@ async fn recover_mapper_initialization(
     .await
     .map_err(|error| {
         SplatError::Process(format!("Mapper initialization inspection failed: {error}"))
-    })??
+    })
+    .and_then(|result| result)
+    .map_err(|error| {
+        mapper_outcome::with_previous_geometry_attempts(
+            error,
+            initial_geometry_failure.iter().cloned().collect(),
+        )
+    })?
     else {
-        return Ok(());
+        return match initial_geometry_failure {
+            Some(failure) => Err(SplatError::EngineProcess(Box::new(failure))),
+            None => Ok(()),
+        };
     };
-    if !initialization::should_recover(&best, seeds.input_images) {
+    if !recovering_empty_geometry_failure
+        && !best
+            .as_ref()
+            .is_some_and(|best| initialization::should_recover(best, seeds.input_images))
+    {
         return Ok(());
     }
-    append_explanation(
-        &log_path,
-        &format!(
-            "[OOOSplat] Invalid cold Mapper intrinsics with {}/{} registered images; checking at most {} deterministic first-image initializations. Original images, masks, matches and geometric thresholds are unchanged.\n[OOOSplat] initialization_rejection=invalid_intrinsics\n{}\n",
-            best.registered_images, seeds.input_images, seeds.seeds.len(), best.invalid_camera_parameters.join("\n")
-        ),
-    )
-    .await;
-    let mut rejected_attempts = Vec::new();
-    let mut last_attempt_was_geometry_failure = false;
+    if recovering_empty_geometry_failure {
+        append_explanation(
+            &log_path,
+            &format!(
+                "[OOOSplat] The first unconstrained Mapper attempt ended with an explicit geometric no-model result; checking at most {} deterministic first-image initializations. Original images, masks, matches, camera parameters and geometric thresholds are unchanged.\n[OOOSplat] initialization_rejection=no_sparse_model\n",
+                seeds.seeds.len(),
+            ),
+        )
+        .await;
+    } else if let Some(existing) = best.as_ref() {
+        append_explanation(
+            &log_path,
+            &format!(
+                "[OOOSplat] Invalid cold Mapper intrinsics with {}/{} registered images; checking at most {} deterministic first-image initializations. Original images, masks, matches and geometric thresholds are unchanged.\n[OOOSplat] initialization_rejection=invalid_intrinsics\n{}\n",
+                existing.registered_images, seeds.input_images, seeds.seeds.len(), existing.invalid_camera_parameters.join("\n")
+            ),
+        )
+        .await;
+    }
+    let mut rejected_attempts = initial_geometry_failure.into_iter().collect::<Vec<_>>();
+    let mut last_attempt_was_geometry_failure = recovering_empty_geometry_failure;
     for (index, seed) in seeds.seeds.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(SplatError::Cancelled);
@@ -540,9 +601,14 @@ async fn recover_mapper_initialization(
                 append_explanation(
                     &log_path,
                     &format!(
-                        "[OOOSplat] Initialization check {}/{} rejected geometrically; retaining the previous verified candidate and checking the remaining frozen seeds.\n{error}\n",
+                        "[OOOSplat] Initialization check {}/{} rejected geometrically; {} and checking the remaining frozen seeds.\n{error}\n",
                         index + 1,
                         initialization::MAX_RECOVERY_SEEDS,
+                        if best.as_ref().is_some_and(|candidate| candidate.valid_intrinsics) {
+                            "retaining the previous verified candidate"
+                        } else {
+                            "no verified candidate is available"
+                        },
                     ),
                 )
                 .await;
@@ -581,7 +647,7 @@ async fn recover_mapper_initialization(
             let promoted = crate::presets::spawn_pipeline_blocking(move || {
                 initialization::promote_if_better(
                     &checked_output,
-                    &previous,
+                    previous.as_ref(),
                     &candidate,
                     &check_cancel,
                 )
@@ -593,28 +659,52 @@ async fn recover_mapper_initialization(
                 mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts.clone())
             })?;
             if let Some(promoted) = promoted {
-                best = promoted;
+                best = Some(promoted);
+                let adopted = best.as_ref().expect("assigned above");
                 append_explanation(
                     &log_path,
                     &format!(
                         "[OOOSplat] Valid initialization adopted: {}/{} registered images. Previous model outputs are preserved.\n",
-                        best.registered_images, seeds.input_images
+                        adopted.registered_images, seeds.input_images
                     ),
                 )
                 .await;
             }
         }
-        if best.valid_intrinsics && best.registered_images >= seeds.input_images {
-            return initialization_selection::save(&output, &best, &cancel)
-                .await
-                .map_err(|error| {
-                    mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts)
-                });
+        if best.as_ref().is_some_and(|best| {
+            best.valid_intrinsics && best.registered_images >= seeds.input_images
+        }) {
+            return initialization_selection::save(
+                &output,
+                best.as_ref().expect("checked above"),
+                &cancel,
+            )
+            .await
+            .map_err(|error| {
+                mapper_outcome::with_previous_geometry_attempts(error, rejected_attempts)
+            });
         }
     }
     if cancel.is_cancelled() {
         return Err(SplatError::Cancelled);
     }
+    let Some(best) = best else {
+        if let Some(last) = last_attempt_was_geometry_failure
+            .then(|| rejected_attempts.pop())
+            .flatten()
+        {
+            return Err(mapper_outcome::with_previous_geometry_attempts(
+                SplatError::EngineProcess(Box::new(last)),
+                rejected_attempts,
+            ));
+        }
+        return Err(mapper_outcome::with_previous_geometry_attempts(
+            SplatError::Process(
+                "COLMAP initialization did not produce a valid sparse model during bounded alternative initializations".into(),
+            ),
+            rejected_attempts,
+        ));
+    };
     if !best.valid_intrinsics {
         if let Some(last) = last_attempt_was_geometry_failure
             .then(|| rejected_attempts.pop())

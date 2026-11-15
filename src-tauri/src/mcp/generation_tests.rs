@@ -441,6 +441,15 @@ fn reshoot_question_order_and_retry_authorization_share_existing_options() {
             .collect::<Vec<_>>(),
         vec!["model_condition", "camera_relation", "image_order"]
     );
+    assert_eq!(
+        questions[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["appearance", "geometry", "unsure", "good"]
+    );
     for option in questions[0]["options"].as_array().unwrap() {
         for locale in ["zh-CN", "en"] {
             assert!(!option["description"][locale].as_str().unwrap().is_empty());

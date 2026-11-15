@@ -1081,7 +1081,10 @@ impl PipelineRunner {
                 })
                 .transpose()?
                 .unwrap_or(report.points_3d);
-            let launch = brush::BrushGpuLaunchPolicy::from_acceleration(acceleration);
+            let launch = brush::BrushGpuLaunchPolicy::from_hardware_plan(
+                acceleration,
+                self.resolved_hardware().as_ref(),
+            );
             let memory = if dataset.has_erp {
                 launch.known_training_memory_mb(acceleration)
             } else {

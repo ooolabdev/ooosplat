@@ -872,6 +872,7 @@ mod pagination_regressions {
             error: None,
             brush_executions: Vec::new(),
             current_brush_execution: None,
+            resolved_hardware: None,
         });
         (root, task)
     }

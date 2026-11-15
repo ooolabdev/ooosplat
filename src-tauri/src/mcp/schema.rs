@@ -10,6 +10,9 @@ pub(super) fn output(name: &str) -> Value {
     }});
     task["properties"]["generation_policy"] = json!({"type":["object","null"]});
     task["properties"]["automatically_retried"] = json!({"type":"boolean"});
+    task["properties"]["gpu_selection"] = json!({"type":["object","null"],"properties":{
+        "local_device_id":{"type":"string"},"device_kind":{"type":"string","enum":["discreteGpu","integratedGpu"]},"selection_confidence":{"type":"string","enum":["pciIdentity","uniqueModel","ordered"]}
+    }});
     task["properties"]["substage"] = json!({"type":["string","null"]});
     task["properties"]["operation"] = json!({"type":["object","null"]});
     task["properties"]["runtime"] = json!({"type":["object","null"]});
@@ -24,9 +27,12 @@ pub(super) fn output(name: &str) -> Value {
         "operation":{"type":["object","null"]},"started_at":{"type":"string"},"ended_at":{"type":["string","null"]},"exit_code":{"type":["integer","null"]},
         "backend":{"type":["string","null"]},"device":{"type":["object","null"],"properties":{"name":{"type":"string"},"total_memory_mb":{"type":["integer","null"]},"driver_version":{"type":["string","null"]}}},"configuration":{"type":["object","null"]}
     }}});
+    task["properties"]["runs"]["items"]["properties"]["hardware_plan"] = json!({"type":["object","null"],"properties":{
+        "device_name":{"type":"string"},"device_vendor":{"type":"string"},"brush_device":{"type":"string"},"colmap_backend":{"type":"string"},"colmap_gpu_index":{"type":["integer","null"]},"ba_backend":{"type":"string"},"selection_confidence":{"type":"string"}
+    }});
     let mut success = match name {
         "inspect_generation_input" => {
-            json!({"type":"object","required":["preflight_id","input_source_identity","input","plan","questions","gps"],"properties":{"preflight_id":id,"input_source_identity":{"type":"string"},"input":{"type":"object"},"source":{"type":["object","null"]},"generation_policy":{"type":"object"},"plan":{"type":"object"},"plan_is_estimate":{"const":true},"max_splats":{"type":"null"},"questions":{"type":"array","items":{"type":"object"}},"gps":{"type":"object"}}})
+            json!({"type":"object","required":["preflight_id","input_source_identity","input","plan","questions","gps","gpu"],"properties":{"preflight_id":id,"input_source_identity":{"type":"string"},"input":{"type":"object"},"source":{"type":["object","null"]},"generation_policy":{"type":"object"},"plan":{"type":"object"},"plan_is_estimate":{"const":true},"max_splats":{"type":"null"},"questions":{"type":"array","items":{"type":"object"}},"gps":{"type":"object"},"gpu":{"type":"object","required":["recommended_device_id","devices"],"properties":{"recommended_device_id":{"type":["string","null"]},"devices":{"type":"array","items":{"type":"object"}}}}}})
         }
         "start_model_export"
         | "get_model_export_status"

@@ -371,6 +371,8 @@ The repository also provides the `splatstudio` diagnostic CLI:
 
 Each CLI `generate` call creates a new task. Standalone query, cancel and continue commands are not available; continue existing tasks through the desktop app or MCP.
 
+On multi-GPU systems, use `generate ... --inspect` to list local device IDs, then select a concrete adapter with `--gpu <device-id>`. If no saved default applies, the CLI lists the available adapters and stops instead of choosing automatically.
+
 ```powershell
 # Check all bundled engines
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- health

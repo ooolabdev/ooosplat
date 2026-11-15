@@ -93,6 +93,7 @@ async fn native_invalid_initialization_recovers_without_reextracting_or_changing
         &manager,
         Some(observer),
         super::super::colmap_ba::ceres_selection("Explicit native regression"),
+        None,
     )
     .await
     .unwrap();

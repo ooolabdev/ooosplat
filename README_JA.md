@@ -371,6 +371,8 @@ dist-artifacts\OOOSplat-0.8.0-x64-windows.exe
 
 CLI の `generate` は、呼び出すたびに新しいタスクを作成します。独立した照会、キャンセル、続行のコマンドはまだありません。既存タスクを続行するには、デスクトップアプリか MCP を使ってください。
 
+複数 GPU 環境では、先に `generate ... --inspect` でローカルのデバイス ID を確認し、`--gpu <device-id>` で具体的な GPU を選択できます。保存済みの既定 GPU がない場合、CLI は候補を表示して停止し、自動選択は行いません。
+
 ```powershell
 # Check all bundled engines
 cargo run --manifest-path src-tauri\Cargo.toml --bin splatstudio -- health

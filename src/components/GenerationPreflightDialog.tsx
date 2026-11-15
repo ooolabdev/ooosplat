@@ -4,6 +4,9 @@ import { useI18n } from '../i18n';
 import { answerIsValid, type PreflightAnswers, type PreflightQuestion } from '../app/generationPreflight';
 
 export interface PreflightSession { questions: PreflightQuestion[]; finalLabel: string; resolve: (answers: PreflightAnswers | null) => void }
+
+const RESHOOT_CONDITION_ORDER = ['appearance', 'geometry', 'unsure', 'good'] as const;
+
 export function GenerationPreflightDialog({ session, onFinish }: { session: PreflightSession; onFinish: (answers: PreflightAnswers | null) => void }) {
   const { t } = useI18n();
   const [index, setIndex] = useState(0);
@@ -38,8 +41,11 @@ export function GenerationPreflightDialog({ session, onFinish }: { session: Pref
         <strong className="preflight-source">{question.draft.inputPath?.split(/[\\/]/).at(-1)}</strong>
           <p id="preflight-description">{condition ? t('reshoot.conditionTitle') : camera ? t('reshoot.cameraDescription') : t('dialog.smallSequence', { count: question.draft.imageSequence?.imageCount ?? 0 })}</p>
           {camera && <div className="preflight-choices" role="radiogroup" aria-labelledby="preflight-title">{(['same','different','unsure'] as const).map(value => <label key={value} className="preflight-accept"><input type="radio" name={question.id} value={value} checked={answers[question.id] === value} onChange={() => setAnswers(current => ({...current,[question.id]:value}))} />{t(`reshoot.camera.${value}`)}</label>)}</div>}
-          {condition && <div className="preflight-choices" role="radiogroup" aria-labelledby="preflight-title">{(['good','appearance','geometry','unsure'] as const).map(value => <label key={value} className="preflight-accept preflight-condition"><input type="radio" name={question.id} value={value} checked={answers[question.id] === value} onChange={() => setAnswers(current => ({...current,[question.id]:value}))} /><span><strong>{t(`reshoot.condition.${value}`)}</strong><small>{t(`reshoot.condition.${value}Hint`)}</small></span></label>)}</div>}
-          {question.kind === 'smallImages' && <p className="field-note">{t('captureAdvice.overlap')} {t('captureAdvice.coverage')} {t('captureAdvice.consistency')} {t('captureAdvice.aiWarning')}</p>}
+          {condition && <div className="preflight-choices" role="radiogroup" aria-labelledby="preflight-title">{RESHOOT_CONDITION_ORDER.map(value => {
+            const duration = value === 'appearance' ? 'fastest' : value === 'good' ? 'slowest' : null;
+            return <label key={value} className="preflight-accept preflight-condition"><input type="radio" name={question.id} value={value} checked={answers[question.id] === value} onChange={() => setAnswers(current => ({...current,[question.id]:value}))} /><span className="preflight-condition-copy"><span className="preflight-condition-title"><strong>{t(`reshoot.condition.${value}`)}</strong>{duration && <em>{t(`reshoot.condition.${duration}`)}</em>}</span><small>{t(`reshoot.condition.${value}Hint`)}</small></span></label>;
+          })}</div>}
+          {question.kind === 'smallImages' && <p className="field-note">{t('captureAdvice.overlap')} {t('captureAdvice.coverage')} {t('captureAdvice.multiInput')} {t('captureAdvice.consistency')} {t('captureAdvice.aiWarning')}</p>}
           {question.kind === 'smallImages' ? <label className="preflight-accept"><input type="checkbox" checked={answers[question.id] === 'accepted'} onChange={event => setAnswers(current => ({ ...current, [question.id]: event.target.checked ? 'accepted' : '' }))} />{t('preflight.acceptWarning')}</label> : null}
       </div>
       <footer><button type="button" className="secondary-action" onClick={() => finish(null)}>{t('common.cancel')}</button><div>{index > 0 && <button type="button" className="secondary-action" onClick={() => setIndex(value => value - 1)}>{t('preflight.previous')}</button>}<button type="button" className="primary-action" disabled={!currentValid || (last && !complete)} onClick={() => last ? finish(answers) : setIndex(value => value + 1)}>{last ? session.finalLabel : t('preflight.next')}</button></div></footer>

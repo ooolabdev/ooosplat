@@ -1,4 +1,5 @@
-//! Bounded recovery of a cold Mapper initialization with invalid intrinsics.
+//! Bounded recovery of a cold Mapper initialization with invalid intrinsics or
+//! an explicit geometry-only no-model result.
 //!
 //! The locked engine's parallel initial-pair search can truncate a better
 //! candidate when another worker finishes first. A single supplied first-image
@@ -634,13 +635,15 @@ pub(super) fn create_attempt_output(output: &Path) -> Result<PathBuf> {
 /// Native/current models are never reset, overwritten, or deleted here.
 pub(super) fn promote_if_better(
     output: &Path,
-    previous: &ModelAssessment,
+    previous: Option<&ModelAssessment>,
     candidate: &ModelAssessment,
     cancel: &CancellationToken,
 ) -> Result<Option<ModelAssessment>> {
     check_cancel(cancel)?;
     if !candidate.valid_intrinsics
-        || (previous.valid_intrinsics && candidate.registered_images <= previous.registered_images)
+        || previous.is_some_and(|previous| {
+            previous.valid_intrinsics && candidate.registered_images <= previous.registered_images
+        })
     {
         return Ok(None);
     }
@@ -1021,7 +1024,7 @@ mod tests {
         let attempt = create_attempt_output(&output).unwrap();
         model(&attempt.join("0"), 90, 0.55);
         let candidate = assess_output(&attempt, &cancel).unwrap().unwrap();
-        let adopted = promote_if_better(&output, &before, &candidate, &cancel)
+        let adopted = promote_if_better(&output, Some(&before), &candidate, &cancel)
             .unwrap()
             .unwrap();
         assert_eq!(adopted.model, output.join("1"));
@@ -1039,6 +1042,23 @@ mod tests {
     }
 
     #[test]
+    fn first_valid_candidate_is_admitted_when_the_initial_attempt_has_no_model() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("sparse");
+        std::fs::create_dir(&output).unwrap();
+        let cancel = CancellationToken::new();
+        let attempt = create_attempt_output(&output).unwrap();
+        model(&attempt.join("0"), 2, 0.55);
+        let candidate = assess_recovery_output(&attempt, &cancel).unwrap().unwrap();
+        let adopted = promote_if_better(&output, None, &candidate, &cancel)
+            .unwrap()
+            .unwrap();
+        assert!(adopted.valid_intrinsics);
+        assert_eq!(adopted.registered_images, 2);
+        assert_eq!(adopted.model, output.join("0"));
+    }
+
+    #[test]
     fn invalid_or_smaller_candidates_never_replace_a_valid_original() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("sparse");
@@ -1048,14 +1068,18 @@ mod tests {
         let attempt = create_attempt_output(&output).unwrap();
         model(&attempt.join("0"), 2, 0.55);
         let candidate = assess_output(&attempt, &cancel).unwrap().unwrap();
-        assert!(promote_if_better(&output, &before, &candidate, &cancel)
-            .unwrap()
-            .is_none());
+        assert!(
+            promote_if_better(&output, Some(&before), &candidate, &cancel)
+                .unwrap()
+                .is_none()
+        );
         model(&attempt.join("1"), 90, 1.93);
         let candidate = assess_output(&attempt, &cancel).unwrap().unwrap();
-        assert!(promote_if_better(&output, &before, &candidate, &cancel)
-            .unwrap()
-            .is_none());
+        assert!(
+            promote_if_better(&output, Some(&before), &candidate, &cancel)
+                .unwrap()
+                .is_none()
+        );
         assert!(output.join("0/cameras.bin").is_file());
     }
 
@@ -1070,7 +1094,7 @@ mod tests {
             let attempt = create_attempt_output(&output).unwrap();
             model(&attempt.join("0"), count, 0.55);
             let candidate = assess_output(&attempt, &cancel).unwrap().unwrap();
-            let promoted = promote_if_better(&output, &before, &candidate, &cancel)
+            let promoted = promote_if_better(&output, Some(&before), &candidate, &cancel)
                 .unwrap()
                 .unwrap();
             assert!(promoted.valid_intrinsics);
@@ -1181,7 +1205,7 @@ mod tests {
         let unowned = root.path().join("source-project");
         model(&unowned, 90, 0.5);
         let candidate = assess_output(&unowned, &cancel).unwrap().unwrap();
-        assert!(promote_if_better(&output, &previous, &candidate, &cancel).is_err());
+        assert!(promote_if_better(&output, Some(&previous), &candidate, &cancel).is_err());
         assert!(unowned.join("images.bin").is_file());
         assert!(output.join("0/images.bin").is_file());
     }

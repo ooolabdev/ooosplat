@@ -183,6 +183,7 @@ exit 1
             &ProcessManager::new(),
             None,
             super::super::super::colmap_ba::ceres_selection("synthetic regression"),
+            None,
         )
         .await;
         (root, result)
@@ -269,5 +270,120 @@ exit 1
                 .is_file());
             assert!(root.path().join("sparse/0/cameras.bin").is_file());
         }
+    }
+
+    async fn run_empty_first_attempt_case(mode: &str) -> (tempfile::TempDir, Result<()>) {
+        let root = tempfile::tempdir().unwrap();
+        let sparse = root.path().join("sparse");
+        std::fs::create_dir(&sparse).unwrap();
+        model(&root.path().join("candidate"), 2, 0.55);
+        let db = root.path().join("database.db");
+        database(&db);
+        let images = root.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        let script = root.path().join("mapper");
+        let dir = root.path().to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            r##"#!/bin/sh
+ulimit -c 0
+out=''
+seed=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output_path) shift; out="$1" ;;
+    --Mapper.init_image_id1) shift; seed="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' "$seed" >> '{dir}/seeds'
+if [ '{mode}' = 'recover' ] && [ "$seed" = 1 ]; then
+  mkdir -p "$out/0"
+  cp '{dir}/candidate/cameras.bin' '{dir}/candidate/images.bin' '{dir}/candidate/points3D.bin' "$out/0/"
+  exit 0
+fi
+if [ '{mode}' = 'io' ]; then
+  echo 'Failed to open database: Permission denied' >&2
+fi
+echo 'No good initial image pair found.'
+echo 'Failed to create any sparse model' >&2
+exit 1
+"##
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = mapper_args(&db, &images, None, &sparse, true);
+        let result = run_mapper_with_ceres_fallback(
+            &script,
+            args.clone(),
+            args,
+            &sparse,
+            root.path(),
+            root.path().join("colmap.log"),
+            &ProcessManager::new(),
+            None,
+            &super::super::super::colmap_ba::ceres_selection("synthetic regression"),
+        )
+        .await;
+        (root, result)
+    }
+
+    #[tokio::test]
+    async fn explicit_first_no_model_failure_tries_frozen_seeds_and_adopts_a_valid_model() {
+        let (root, result) = run_empty_first_attempt_case("recover").await;
+        result.unwrap();
+        let output = root.path().join("sparse");
+        let (selected, report) = select_reconstruction_model(&output, 4).unwrap().unwrap();
+        assert_eq!(report.registered_images, 2);
+        assert!(selected.starts_with(&output));
+        assert!(output.join(initialization_selection::RECORD_NAME).is_file());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("seeds"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["", "3", "1", "2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_operational_failure_does_not_start_seed_recovery() {
+        let (root, result) = run_empty_first_attempt_case("io").await;
+        let error = result.unwrap_err();
+        assert!(!is_recoverable_mapper_geometry_failure(&error));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("seeds"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [""]
+        );
+        assert!(!root
+            .path()
+            .join("sparse")
+            .join(initialization_selection::RECORD_NAME)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn first_and_all_seed_geometry_failures_remain_failed_with_bounded_history() {
+        let (root, result) = run_empty_first_attempt_case("all_geometry").await;
+        let error = result.unwrap_err();
+        assert!(is_recoverable_mapper_geometry_failure(&error));
+        let SplatError::EngineProcess(failure) = error else {
+            panic!("expected the last Mapper geometry failure")
+        };
+        assert_eq!(failure.previous_attempts.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("seeds"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["", "3", "1", "2"]
+        );
+        assert!(!root
+            .path()
+            .join("sparse")
+            .join(initialization_selection::RECORD_NAME)
+            .exists());
     }
 }

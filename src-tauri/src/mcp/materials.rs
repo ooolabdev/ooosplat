@@ -388,10 +388,10 @@ fn questions(p: &Preflight, answers: Option<&Answers>) -> Vec<Value> {
             "reshoot.conditionTitle",
             None,
             &[
-                ("good", "reshoot.condition.good"),
                 ("appearance", "reshoot.condition.appearance"),
                 ("geometry", "reshoot.condition.geometry"),
                 ("unsure", "reshoot.condition.unsure"),
+                ("good", "reshoot.condition.good"),
             ],
             0,
         ));
@@ -516,7 +516,7 @@ fn questions(p: &Preflight, answers: Option<&Answers>) -> Vec<Value> {
     }
     questions
 }
-fn public(p: &Preflight) -> Result<Value> {
+async fn public(tools: &McpTools, p: &Preflight) -> Result<Value> {
     let mut analyses = serde_json::to_value(&p.materials)?;
     for a in analyses.as_array_mut().into_iter().flatten() {
         if let Some(plan) = a.get_mut("plan").and_then(Value::as_object_mut) {
@@ -531,11 +531,11 @@ fn public(p: &Preflight) -> Result<Value> {
         }
     }
     Ok(
-        json!({"preflight_id":p.id,"input_source_identity":p.identity,"input":{"inputs":p.inputs,"materials":snake(analyses),"colmap":p.colmap.as_ref().map(|v|snake(serde_json::to_value(v).unwrap()))},"source":p.source.as_ref().map(|v|snake(serde_json::to_value(v).unwrap())),"generation_policy":snake(serde_json::to_value(p.policy)?),"plan":{"estimated_frames":p.colmap.as_ref().map(|c|c.image_count).unwrap_or_else(||p.materials.iter().map(|a|a.plan.as_ref().map_or_else(||a.image_sequence.as_ref().map_or(0,|i|i.image_count),|f|f.estimated_frames)).sum::<u64>())},"estimate":p.estimate,"plan_is_estimate":true,"max_splats":null,"questions":questions(p,None),"gps":{"status":"pending"}}),
+        json!({"preflight_id":p.id,"input_source_identity":p.identity,"input":{"inputs":p.inputs,"materials":snake(analyses),"colmap":p.colmap.as_ref().map(|v|snake(serde_json::to_value(v).unwrap()))},"source":p.source.as_ref().map(|v|snake(serde_json::to_value(v).unwrap())),"generation_policy":snake(serde_json::to_value(p.policy)?),"plan":{"estimated_frames":p.colmap.as_ref().map(|c|c.image_count).unwrap_or_else(||p.materials.iter().map(|a|a.plan.as_ref().map_or_else(||a.image_sequence.as_ref().map_or(0,|i|i.image_count),|f|f.estimated_frames)).sum::<u64>())},"estimate":p.estimate,"plan_is_estimate":true,"max_splats":null,"questions":questions(p,None),"gps":{"status":"pending"},"gpu":gpu_inventory_public(tools).await?}),
     )
 }
 pub(super) async fn inspect(tools: &McpTools, args: Value) -> Result<Value> {
-    public(&preflight(tools, parse(args)?).await?)
+    public(tools, &preflight(tools, parse(args)?).await?).await
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -564,6 +564,8 @@ struct Create {
     input_source_identity: Option<String>,
     #[serde(default)]
     answers: Answers,
+    #[serde(default)]
+    gpu_selection: Option<crate::engines::gpu_selection::GpuSelection>,
 }
 pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
     let mut intent = args.clone();
@@ -595,6 +597,7 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
             "client_request_id already identifies different parameters",
         ));
     }
+    let gpu_selection = resolve_gpu_selection(tools, request.gpu_selection.clone(), None).await?;
     let p = preflight(
         tools,
         Request {
@@ -678,7 +681,7 @@ pub(super) async fn create(tools: &McpTools, args: Value) -> Result<Value> {
         projection: VideoProjection::Perspective,
         image_matching_strategy: ImageMatchingStrategy::Exhaustive,
     });
-    let parameters = json!({"inputs":inputs,"generationPolicy":p.policy,"source_project_id":request.source_project_id,"reshootOptions":options,"mcp_intent":intent});
+    let parameters = json!({"inputs":inputs,"generationPolicy":p.policy,"source_project_id":request.source_project_id,"reshootOptions":options,"mcp_intent":intent,"gpuSelection":gpu_selection});
     let root = crate::project::catalog::load_settings()
         .await?
         .projects_root;

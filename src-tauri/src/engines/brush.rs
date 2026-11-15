@@ -97,6 +97,8 @@ pub(super) const REQUIRED_CLI_FLAGS: &[&str] = &[
 pub struct BrushGpuLaunchPolicy {
     expected_device_name: Option<String>,
     force_first_discrete_gpu: bool,
+    explicit_cubecl_device: Option<String>,
+    known_memory_mb: Option<u64>,
     disable_amd_switchable_graphics: bool,
     selection_reason: &'static str,
 }
@@ -116,10 +118,33 @@ impl BrushGpuLaunchPolicy {
         Self::resolve(cfg!(windows), acceleration)
     }
 
+    pub fn from_hardware_plan(
+        acceleration: &ColmapAccelerationStatus,
+        hardware: Option<&crate::engines::gpu_selection::ResolvedHardwarePlan>,
+    ) -> Self {
+        let Some(hardware) = hardware else {
+            return Self::from_acceleration(acceleration);
+        };
+        Self {
+            expected_device_name: Some(hardware.device_name.clone()),
+            force_first_discrete_gpu: false,
+            explicit_cubecl_device: Some(hardware.brush_device.clone()),
+            known_memory_mb: hardware.brush_total_memory_mb,
+            // Inventory probing does not hide adapters. Preserve that exact
+            // set and ordering for execution; the explicit CubeCL selector
+            // chooses the requested device.
+            disable_amd_switchable_graphics: false,
+            selection_reason: "explicit_user_selection",
+        }
+    }
+
     /// COLMAP's selected GPU is not necessarily Brush's default adapter in a
     /// multi-GPU topology. Do not give panoramas a large VRAM budget when the
     /// launch policy cannot identify the training device.
     pub fn known_training_memory_mb(&self, acceleration: &ColmapAccelerationStatus) -> Option<u64> {
+        if self.explicit_cubecl_device.is_some() {
+            return self.known_memory_mb;
+        }
         self.expected_device_name.as_ref().and_then(|expected| {
             acceleration
                 .device
@@ -152,6 +177,8 @@ impl BrushGpuLaunchPolicy {
                 None
             },
             force_first_discrete_gpu: unambiguous_single_nvidia,
+            explicit_cubecl_device: None,
+            known_memory_mb: None,
             disable_amd_switchable_graphics: unambiguous_single_nvidia,
             selection_reason,
         }
@@ -166,7 +193,12 @@ impl BrushGpuLaunchPolicy {
         existing_rust_log: Option<OsString>,
     ) -> Vec<(OsString, OsString)> {
         let mut environment = Vec::new();
-        if self.force_first_discrete_gpu {
+        if let Some(device) = self.explicit_cubecl_device.as_ref() {
+            environment.push((
+                OsString::from("CUBECL_WGPU_DEFAULT_DEVICE"),
+                OsString::from(device),
+            ));
+        } else if self.force_first_discrete_gpu {
             environment.push((
                 OsString::from("CUBECL_WGPU_DEFAULT_DEVICE"),
                 OsString::from("DiscreteGpu(0)"),
@@ -199,14 +231,44 @@ impl BrushGpuLaunchPolicy {
             "backend=Vulkan selection={} expectedDevice={} cubeclDevice={} amdSwitchableLayerDisabled={}",
             self.selection_reason,
             self.expected_device_name.as_deref().unwrap_or("unverified"),
-            if self.force_first_discrete_gpu {
+            self.explicit_cubecl_device.as_deref().unwrap_or(if self.force_first_discrete_gpu {
                 "DiscreteGpu(0)"
             } else {
                 "automatic"
-            },
+            }),
             self.disable_amd_switchable_graphics
         )
     }
+
+    fn expected_device_name(&self) -> Option<&str> {
+        self.explicit_cubecl_device
+            .as_ref()
+            .and(self.expected_device_name.as_deref())
+    }
+}
+
+fn observed_wgpu_device(line: &str) -> Option<String> {
+    // The locked OOOBrush build emits this only after CubeCL has created the
+    // compute server on the adapter that will actually train. Do not parse a
+    // generic AdapterInfo entry: startup diagnostics may enumerate adapters
+    // that were considered but not selected.
+    if !line.contains("Created wgpu compute server on device AdapterInfo") {
+        return None;
+    }
+    let marker = "AdapterInfo { name: \"";
+    let value = line.split_once(marker)?.1;
+    value.split_once('"').map(|(name, _)| name.to_owned())
+}
+
+fn same_device_name(left: &str, right: &str) -> bool {
+    let normalized = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    normalized(left) == normalized(right)
 }
 
 fn train_args(
@@ -354,6 +416,15 @@ pub async fn train(
     ));
     let live_evidence = evidence.clone();
     let counts = last_splat_count.clone();
+    let observed_device = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let live_device = observed_device.clone();
+    let expected_device = options
+        .gpu_launch_policy
+        .expected_device_name()
+        .map(str::to_owned);
+    let device_mismatch = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let live_mismatch = device_mismatch.clone();
+    let cancellation = manager.clone();
     let observer: ProcessObserver = std::sync::Arc::new(move |update| {
         if let crate::process::ProcessUpdate::Line { line, .. } = &update {
             live_evidence
@@ -363,12 +434,23 @@ pub async fn train(
             if let Some(count) = crate::pipeline::runtime::brush_splat_count(line) {
                 *counts.lock().unwrap_or_else(|p| p.into_inner()) = Some(count);
             }
+            if let Some(name) = observed_wgpu_device(line) {
+                *live_device.lock().unwrap_or_else(|p| p.into_inner()) = Some(name.clone());
+                if let Some(expected) = expected_device.as_deref() {
+                    if !same_device_name(expected, &name) {
+                        *live_mismatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(name);
+                        // Stop before the expensive training loop. The custom
+                        // mismatch below takes precedence over Cancelled.
+                        cancellation.cancel();
+                    }
+                }
+            }
         }
         if let Some(observer) = &observer {
             observer(update);
         }
     });
-    let output = manager
+    let output_result = manager
         .run_with_environment(
             ProcessSpec {
                 executable: executable.to_path_buf(),
@@ -379,9 +461,40 @@ pub async fn train(
             },
             &environment,
         )
-        .await.map_err(|error| error.with_io_diagnostic(
-            "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
-        ))?;
+        .await;
+    if let Some(observed) = device_mismatch
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        let expected = options
+            .gpu_launch_policy
+            .expected_device_name()
+            .unwrap_or("unknown");
+        return Err(SplatError::Process(format!(
+            "Brush started on a different graphics device (expected {expected}, actual {observed})"
+        )));
+    }
+    let output = output_result.map_err(|error| error.with_io_diagnostic(
+        "training_preparation_operation=run_brush\npath_role=brush_process_io\nio_substep=execute_and_capture"
+    ))?;
+    if let Some(expected) = options.gpu_launch_policy.expected_device_name() {
+        let observed = observed_device
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                SplatError::Process(
+                    "Brush did not report the selected graphics device; generation was stopped"
+                        .into(),
+                )
+            })?;
+        if !same_device_name(expected, &observed) {
+            return Err(SplatError::Process(format!(
+                "Brush started on a different graphics device (expected {expected}, actual {observed})"
+            )));
+        }
+    }
     let evidence = evidence.lock().unwrap_or_else(|p| p.into_inner());
     resolve_train_output(&output, candidate, alternate, &evidence).map_err(|mut error| {
         if let SplatError::EngineProcess(failure) = &mut error {
@@ -642,6 +755,50 @@ mod tests {
             environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
             None
         );
+    }
+
+    #[test]
+    fn explicit_selection_uses_exact_cubecl_device_without_reordering_adapters() {
+        let acceleration = acceleration(ColmapBackend::Cpu, 2, None);
+        let hardware = crate::engines::gpu_selection::ResolvedHardwarePlan {
+            selection: crate::engines::gpu_selection::GpuSelection {
+                local_device_id: "opaque".into(),
+                device_kind: crate::engines::gpu_selection::BrushDeviceKind::IntegratedGpu,
+                selection_confidence: crate::engines::gpu_selection::SelectionConfidence::Ordered,
+            },
+            device_name: "AMD Radeon".into(),
+            device_vendor: "AMD".into(),
+            brush_device: "IntegratedGpu(1)".into(),
+            brush_total_memory_mb: None,
+            colmap_backend: ColmapBackend::Cpu,
+            colmap_gpu_index: None,
+            ba_backend: crate::engines::gpu_selection::BaBackendPlan::Ceres,
+            device_summary: "AMD Radeon · AMD · IntegratedGpu(1)".into(),
+            selection_confidence: crate::engines::gpu_selection::SelectionConfidence::Ordered,
+        };
+        let policy = BrushGpuLaunchPolicy::from_hardware_plan(&acceleration, Some(&hardware));
+        let environment = policy.environment_with_rust_log(None);
+        assert_eq!(
+            environment_value(&environment, "CUBECL_WGPU_DEFAULT_DEVICE"),
+            Some("IntegratedGpu(1)")
+        );
+        assert_eq!(
+            environment_value(&environment, "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1"),
+            None
+        );
+        assert_eq!(policy.expected_device_name(), Some("AMD Radeon"));
+        assert_eq!(
+            observed_wgpu_device(
+                "Created wgpu compute server on device AdapterInfo { name: \"AMD Radeon\", vendor: 4098 }"
+            ),
+            Some("AMD Radeon".into())
+        );
+        assert_eq!(
+            observed_wgpu_device("Enumerated AdapterInfo { name: \"AMD Radeon\" }"),
+            None
+        );
+        assert!(same_device_name("AMD Radeon (TM)", "amd-radeon-tm"));
+        assert!(!same_device_name("AMD Radeon", "NVIDIA RTX"));
     }
 
     #[test]

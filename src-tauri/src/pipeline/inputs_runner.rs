@@ -664,6 +664,7 @@ impl PipelineRunner {
         let (paths, mut metadata) = manager.create_collection(quality, inputs).await?;
         metadata.workspace_task_id = self.workspace_task_id;
         let mut state = manager.read_state(&paths.state).await?;
+        self.save_hardware_plan(&mut state);
         state.generation_policy = Some(self.policy().unwrap_or_default());
         state.planner_enabled = true;
         state.camera_grouping_policy_version = self.camera_grouping_policy_version();

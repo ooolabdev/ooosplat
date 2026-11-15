@@ -99,6 +99,10 @@ enum Commands {
         /// Override the remembered projects root (useful for diagnostics).
         #[arg(long)]
         projects_root: Option<PathBuf>,
+        /// Select a concrete Brush-compatible GPU by the opaque device ID
+        /// reported by `generate --inspect`.
+        #[arg(long)]
+        gpu: Option<String>,
         #[arg(long, value_enum, default_value_t = Quality::Balanced)]
         quality: Quality,
         #[arg(long, value_enum, default_value_t = ooo_splat::video::panorama::VideoProjection::Auto)]
@@ -236,6 +240,7 @@ async fn execute(cli: Cli) -> Result<()> {
             model_condition,
             camera_relation,
             inspect,
+            gpu,
         } => {
             use ooo_splat::pipeline::{inputs::*, reshoot::ReshootOptions};
             let policy = policy.policy()?;
@@ -294,6 +299,46 @@ async fn execute(cli: Cli) -> Result<()> {
                     analyses.push(a);
                 }
             }
+            let mut settings = ooo_splat::project::catalog::load_settings().await?;
+            let gpu_inventory =
+                ooo_splat::engines::gpu_selection::inventory(&engines, true).await?;
+            settings.hardware =
+                ooo_splat::project::catalog::hardware_settings_for_inventory(&gpu_inventory)
+                    .await?;
+            let requested_gpu = gpu
+                .as_deref()
+                .map(|device_id| {
+                    gpu_inventory
+                        .devices
+                        .iter()
+                        .find(|device| device.local_device_id == device_id)
+                        .map(|device| device.selection())
+                        .ok_or_else(|| SplatError::Process("GPU_SELECTION_UNAVAILABLE".into()))
+                })
+                .transpose()?;
+            let saved_gpu = settings
+                .hardware
+                .default_gpu
+                .as_ref()
+                .and_then(|selection| {
+                    gpu_inventory
+                        .devices
+                        .iter()
+                        .find(|device| {
+                            device.local_device_id == selection.local_device_id
+                                && device.device_kind == selection.device_kind
+                        })
+                        .map(|device| device.selection())
+                });
+            let gpu_selection = requested_gpu
+                .or_else(|| {
+                    (gpu_inventory.devices.len() == 1).then(|| gpu_inventory.devices[0].selection())
+                })
+                .or_else(|| {
+                    (!settings.hardware.ask_on_multiple_gpus)
+                        .then_some(saved_gpu)
+                        .flatten()
+                });
             if inspect {
                 let mut summaries = serde_json::to_value(&analyses)?;
                 for analysis in summaries.as_array_mut().into_iter().flatten() {
@@ -314,11 +359,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"inputs":inputs,"materials":summaries,"colmap":colmap,"generationPolicy":policy,"planIsEstimate":true})
+                        &serde_json::json!({"inputs":inputs,"materials":summaries,"colmap":colmap,"generationPolicy":policy,"planIsEstimate":true,"gpu":{"devices":gpu_inventory.devices,"recommendedDeviceId":gpu_inventory.recommended_device_id,"selection":gpu_selection}})
                     )?
                 );
                 return Ok(());
             }
+            let gpu_selection = gpu_selection.ok_or_else(|| {
+                let options = gpu_inventory.devices.iter().map(|device| {
+                    format!("{} ({}){}", device.local_device_id, device.name, if device.recommended { " [recommended]" } else { "" })
+                }).collect::<Vec<_>>().join(", ");
+                SplatError::Process(format!(
+                    "CONFIRMATION_REQUIRED: multiple GPUs are available; pass --gpu <device-id>. Options: {options}"
+                ))
+            })?;
             validate(&engines, &inputs, quality, policy).await?;
             if source_project.is_some() {
                 let GenerationInputs::Materials { items } = &inputs else {
@@ -358,18 +411,14 @@ async fn execute(cli: Cli) -> Result<()> {
             };
             let root = match projects_root {
                 Some(root) => root,
-                None => {
-                    ooo_splat::project::catalog::load_settings()
-                        .await?
-                        .projects_root
-                }
+                None => settings.projects_root,
             };
             let registry = root.join(".cli-task-records");
             let _registry_owner = ooo_splat::tasks::cli_guard::claim(&registry)
                 .map_err(|e| SplatError::Process(e.to_string()))?;
             let service = ooo_splat::tasks::TaskService::at(registry)
                 .with_run_lock(ooo_splat::tasks::TaskService::desktop_execution_lock()?);
-            let request = serde_json::json!({"inputs":inputs,"generationPolicy":policy,"source_project_id":source_project,"reshootOptions":options});
+            let request = serde_json::json!({"inputs":inputs,"generationPolicy":policy,"source_project_id":source_project,"reshootOptions":options,"gpuSelection":gpu_selection});
             let task = service
                 .create(
                     None,
