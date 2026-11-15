@@ -229,7 +229,7 @@ async fn scalar_and_ordered_admission_share_inspection_without_repeated_headers(
     })).await.unwrap_err();
     assert!(rejected.message.contains("图片序列分辨率不一致"));
     assert!(tools.tasks.all().await.unwrap().is_empty());
-    image::RgbImage::new(4, 3)
+    image::RgbImage::new(3, 4)
         .save(directory.join("2.png"))
         .unwrap();
     let scalar = inspect(

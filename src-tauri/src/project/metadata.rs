@@ -663,7 +663,10 @@ mod tests {
             Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
         let restored: super::PipelineStateFile =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(restored.camera_grouping_policy_version, Some(1));
+        assert_eq!(
+            restored.camera_grouping_policy_version,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        );
     }
 
     #[test]

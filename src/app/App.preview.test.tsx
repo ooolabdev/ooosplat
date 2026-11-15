@@ -2499,6 +2499,31 @@ describe("App preview workspace", () => {
     expect(mocks.startReshootPipeline).not.toHaveBeenCalled();
   });
 
+  it('accepts one ordinary image set containing orientation-swapped dimensions', async () => {
+    mocks.selectMaterialPaths.mockResolvedValueOnce(['E:/Photos/mixed-orientation']);
+    mocks.inspectMaterialInputs.mockResolvedValueOnce({
+      materials: [{ id: 'source-1', identity: 'mixed-orientation-identity', video: null,
+        imageSequence: { imageCount: 30, width: 600, height: 600, hasAlpha: false, requiresLargeSequenceConfirmation: false },
+        dimensions: [[400, 600], [600, 400]], plan: { estimatedFrames: 30 },
+        projectionDetection: { sourceIdentity: 'mixed-orientation-identity', requiresChoice: false,
+          supportedErp: false, confirmedErp: false, reason: '', previewJpeg: [] } }],
+      colmap: null, errors: {},
+    });
+    mocks.startInputsPipeline.mockImplementationOnce(() => new Promise(() => undefined));
+    await act(async () => container.querySelector<HTMLButtonElement>('.material-input-menu button:first-child')!.click());
+    await flush();
+    expect(container.querySelector('.material-inspector [role="alert"]')).toBeNull();
+    expect(container.querySelector('.material-inspector')?.textContent).toContain('400 × 600 / 600 × 400');
+    expect(container.querySelector<HTMLButtonElement>('.primary-action')!.disabled).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('.primary-action')!.click());
+    await flush();
+    expect(mocks.startInputsPipeline.mock.calls[0][0]).toMatchObject({
+      mode: 'materials', items: [expect.objectContaining({
+        id: 'source-1', identity: 'mixed-orientation-identity', projection: 'perspective',
+      })],
+    });
+  });
+
   it('allows different dimensions across separate internally consistent image sources', async () => {
     mocks.selectMaterialPaths.mockResolvedValueOnce(['E:/Photos/camera-one', 'E:/Photos/camera-two']);
     mocks.inspectMaterialInputs.mockResolvedValueOnce({

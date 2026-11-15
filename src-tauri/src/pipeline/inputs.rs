@@ -20,9 +20,12 @@ use std::{
 
 pub const DUPLICATE: &str = "素材存在重复输入，请移除重复项。";
 pub const INVALID_COLMAP: &str = "COLMAP 数据不完整或与图片不匹配，无法直接训练。";
-/// New sources share intrinsics within a same-sized image set. Missing on old
-/// work orders: their saved per-image camera grouping remains authoritative.
-pub const CAMERA_GROUPING_POLICY_VERSION: u32 = 1;
+/// New sources share intrinsics within each EXIF-oriented pixel-size group.
+/// Version 1 required one exact size for an entire source; version 2 also
+/// accepts a landscape/portrait pair with the same unordered dimensions.
+/// Missing on old work orders: their saved per-image grouping remains authoritative.
+pub const CAMERA_GROUPING_POLICY_VERSION: u32 = 2;
+pub(crate) const CAMERA_GROUPING_POLICY_SHARED_SOURCE: u32 = 1;
 /// Ordinary photo SfM derivatives use precision-preserving premultiplied RGB
 /// and the original soft Alpha mask. Training pixels remain unchanged.
 pub const ORDINARY_IMAGE_PREPARATION_VERSION: u32 = 1;
@@ -678,6 +681,23 @@ pub struct MaterialAnalysis {
     pub frame_sampling_range: Option<FrameSamplingRange>,
 }
 
+pub(crate) fn camera_grouping_policy_supported(version: u32) -> bool {
+    matches!(
+        version,
+        CAMERA_GROUPING_POLICY_SHARED_SOURCE | CAMERA_GROUPING_POLICY_VERSION
+    )
+}
+
+pub(crate) fn orientation_compatible_dimensions(dimensions: &[[u32; 2]]) -> bool {
+    let Some([first_width, first_height]) = dimensions.first().copied() else {
+        return false;
+    };
+    let signature = [first_width.min(first_height), first_width.max(first_height)];
+    dimensions
+        .iter()
+        .all(|[width, height]| [(*width).min(*height), (*width).max(*height)] == signature)
+}
+
 pub async fn inspect_material(
     engines: &EnginePaths,
     item: &MaterialInput,
@@ -800,9 +820,14 @@ pub fn validate_camera_grouping_analysis(
     camera_policy: Option<u32>,
 ) -> Result<()> {
     validate_camera_policy_version(camera_policy)?;
-    if camera_policy != Some(CAMERA_GROUPING_POLICY_VERSION)
-        || analysis.image_sequence.is_none()
-        || analysis.dimensions.len() <= 1
+    let Some(camera_policy) = camera_policy else {
+        return Ok(());
+    };
+    if analysis.image_sequence.is_none() || analysis.dimensions.len() <= 1 {
+        return Ok(());
+    }
+    if camera_policy == CAMERA_GROUPING_POLICY_VERSION
+        && orientation_compatible_dimensions(&analysis.dimensions)
     {
         return Ok(());
     }
@@ -814,9 +839,18 @@ pub fn validate_camera_grouping_analysis(
         .first()
         .ok_or_else(|| SplatError::Process("INPUT_CHANGED".into()))?;
     let expected = crate::video::image_projection::inspect(first)?;
+    let expected_signature = [
+        expected.width.min(expected.height),
+        expected.width.max(expected.height),
+    ];
     for file in files.iter().skip(1) {
         let image = crate::video::image_projection::inspect(file)?;
-        if (image.width, image.height) != (expected.width, expected.height) {
+        let same_group = if camera_policy == CAMERA_GROUPING_POLICY_VERSION {
+            [image.width.min(image.height), image.width.max(image.height)] == expected_signature
+        } else {
+            (image.width, image.height) == (expected.width, expected.height)
+        };
+        if !same_group {
             return Err(SplatError::InvalidVideo(format!(
                 "图片序列分辨率不一致：{} 为 {}×{}，预期 {}×{}",
                 file.display(),
@@ -857,7 +891,7 @@ pub async fn validate_camera_grouping_inputs(
 
 fn validate_camera_policy_version(version: Option<u32>) -> Result<()> {
     if let Some(version) = version {
-        if version != CAMERA_GROUPING_POLICY_VERSION {
+        if !camera_grouping_policy_supported(version) {
             return Err(SplatError::Process(format!(
                 "Unsupported camera grouping policy version: {version}"
             )));
@@ -1093,7 +1127,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn new_image_admission_rejects_mixed_dimensions_but_saved_legacy_policy_remains_valid() {
+    async fn new_image_admission_rejects_unrelated_dimensions_but_saved_legacy_policy_remains_valid(
+    ) {
         let root = tempfile::tempdir().unwrap();
         images(root.path(), 3);
         image::RgbImage::new(48, 64)
@@ -1129,6 +1164,46 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn new_image_admission_accepts_orientation_swapped_folder_and_loose_images() {
+        let root = tempfile::tempdir().unwrap();
+        image::RgbImage::new(32, 24)
+            .save(root.path().join("landscape.png"))
+            .unwrap();
+        image::RgbImage::new(24, 32)
+            .save(root.path().join("portrait.png"))
+            .unwrap();
+        let engines =
+            crate::pipeline::runner::default_engine_paths(Some(root.path().join("missing")));
+        for source in [
+            InputSource::ImageFolder {
+                path: root.path().into(),
+            },
+            InputSource::Images {
+                paths: vec![
+                    root.path().join("landscape.png"),
+                    root.path().join("portrait.png"),
+                ],
+            },
+        ] {
+            let mut input = item(root.path());
+            input.source = source;
+            input.confirmed_small_images = true;
+            let analysis =
+                inspect_new_material(&engines, &input, Quality::Fast, GenerationPolicy::default())
+                    .await
+                    .unwrap();
+            assert_eq!(analysis.dimensions, vec![[24, 32], [32, 24]]);
+            validate(
+                &engines,
+                &GenerationInputs::Materials { items: vec![input] },
+                Quality::Fast,
+                GenerationPolicy::default(),
+            )
+            .await
+            .unwrap();
+        }
     }
     #[tokio::test]
     async fn separate_same_sized_sources_may_have_different_dimensions_without_extra_header_scans()
@@ -1191,7 +1266,8 @@ mod tests {
             new["cameraGroupingPolicyVersion"],
             CAMERA_GROUPING_POLICY_VERSION
         );
-        assert!(validate_camera_policy_version(Some(2)).is_err());
+        assert!(validate_camera_policy_version(Some(CAMERA_GROUPING_POLICY_SHARED_SOURCE)).is_ok());
+        assert!(validate_camera_policy_version(Some(3)).is_err());
     }
     #[test]
     fn image_members_are_natural_sorted_identity_bound_and_overlap_checked() {

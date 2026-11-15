@@ -1198,7 +1198,10 @@ mod tests {
             state.ba_policy_version,
             Some(crate::pipeline::ba_policy::VERSION)
         );
-        assert_eq!(state.camera_grouping_policy_version, Some(1));
+        assert_eq!(
+            state.camera_grouping_policy_version,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        );
         assert_eq!(state.ordinary_image_preparation_version, Some(1));
         assert_eq!(
             state
@@ -1206,7 +1209,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .ordinary_image_preparation_version,
-            Some(1)
+            Some(crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION)
         );
         assert_eq!(
             state
@@ -1214,7 +1217,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .camera_grouping_policy_version,
-            Some(1)
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
         );
     }
 

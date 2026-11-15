@@ -161,15 +161,16 @@ async fn ba_scope_is_frozen_before_project_creation_and_old_reservations_keep_th
 #[tokio::test]
 async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_policy() {
     let (root, service, task) = fixture().await;
-    assert_eq!(task.camera_grouping_policy_version, Some(1));
+    let current = crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION;
+    assert_eq!(task.camera_grouping_policy_version, Some(current));
     assert_eq!(task.ordinary_image_preparation_version, Some(1));
     assert_eq!(
         task.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
-        1
+        crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION
     );
     assert_eq!(
         task.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
-        1
+        current
     );
     let mut request = task.request_parameters.clone().unwrap();
     request["cameraGroupingPolicyVersion"] = Value::from(999);
@@ -188,7 +189,7 @@ async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_p
         .await
         .unwrap();
     assert_eq!(same.task_id, task.task_id);
-    assert_eq!(same.camera_grouping_policy_version, Some(1));
+    assert_eq!(same.camera_grouping_policy_version, Some(current));
     assert_eq!(same.ordinary_image_preparation_version, Some(1));
 
     let new = service
@@ -204,15 +205,15 @@ async fn camera_grouping_policy_is_internal_and_idempotency_preserves_old_task_p
         )
         .await
         .unwrap();
-    assert_eq!(new.camera_grouping_policy_version, Some(1));
+    assert_eq!(new.camera_grouping_policy_version, Some(current));
     assert_eq!(new.ordinary_image_preparation_version, Some(1));
     assert_eq!(
         new.request_parameters.as_ref().unwrap()["ordinaryImagePreparationVersion"],
-        1
+        crate::pipeline::inputs::ORDINARY_IMAGE_PREPARATION_VERSION
     );
     assert_eq!(
         new.request_parameters.as_ref().unwrap()["cameraGroupingPolicyVersion"],
-        1
+        current
     );
 
     let legacy = {
@@ -305,6 +306,52 @@ async fn new_camera_policy_rejects_mixed_image_dimensions_before_registering_a_t
         assert!(error.message.contains("b.png"));
         assert!(error.message.contains("8×3"));
         assert!(service.all().await.unwrap().is_empty());
+        assert!(!root.path().join("projects").exists());
+    }
+}
+
+#[tokio::test]
+async fn new_camera_policy_accepts_orientation_swapped_dimensions_for_all_image_inputs() {
+    use crate::pipeline::inputs::{GenerationInputs, InputSource, MaterialInput};
+    for explicit_inputs in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        image::RgbImage::new(4, 3)
+            .save(images.join("landscape.png"))
+            .unwrap();
+        image::RgbImage::new(3, 4)
+            .save(images.join("portrait.png"))
+            .unwrap();
+        let parameters = explicit_inputs.then(|| serde_json::json!({
+            "inputs": GenerationInputs::Materials { items: vec![MaterialInput {
+                id: "photos".into(), source: InputSource::Images { paths: vec![
+                    images.join("landscape.png"), images.join("portrait.png")
+                ] },
+                identity: None, projection: crate::video::panorama::VideoProjection::Perspective,
+                image_matching_strategy: Default::default(), camera_relation: None,
+                confirmed_small_images: true, confirmed_image_order: true, frame_removal_fps: None,
+            }] }
+        }));
+        let service = TaskService::at(root.path().join("registry"));
+        let task = service
+            .create(
+                None,
+                images,
+                Quality::Fast,
+                root.path().join("projects"),
+                true,
+                "gui",
+                None,
+                parameters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            task.camera_grouping_policy_version,
+            Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        );
+        assert_eq!(service.all().await.unwrap().len(), 1);
         assert!(!root.path().join("projects").exists());
     }
 }

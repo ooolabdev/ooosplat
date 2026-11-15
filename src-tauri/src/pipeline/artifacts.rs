@@ -3015,7 +3015,7 @@ fn validate_collection_camera_policy(
     }
     if checkpoint
         .camera_grouping_policy_version
-        .is_some_and(|version| version != crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION)
+        .is_some_and(|version| !crate::pipeline::inputs::camera_grouping_policy_supported(version))
     {
         return Err(SplatError::Process(
             "Unsupported saved camera grouping policy version".into(),
@@ -3027,8 +3027,14 @@ fn validate_collection_camera_policy(
 fn bind_camera_policy_identity(identity: &str, version: Option<u32>) -> Result<String> {
     match version {
         None => Ok(identity.into()),
-        Some(version) if version == crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION => {
+        Some(version)
+            if version == crate::pipeline::inputs::CAMERA_GROUPING_POLICY_SHARED_SOURCE =>
+        {
             let bytes = serde_json::to_vec(&("camera-grouping-policy-v1", identity, version))?;
+            Ok(format!("{:x}", Sha256::digest(bytes)))
+        }
+        Some(version) if version == crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION => {
+            let bytes = serde_json::to_vec(&("camera-grouping-policy-v2", identity, version))?;
             Ok(format!("{:x}", Sha256::digest(bytes)))
         }
         Some(_) => Err(SplatError::Process(
@@ -3234,11 +3240,25 @@ mod tests {
                 candidate_recipe_identity(&fixture.state).unwrap(),
                 old_candidate
             );
+            let version_one_identity = candidate_recipe_identity(&fixture.state).unwrap();
             let restored: PipelineStateFile =
                 serde_json::from_slice(&serde_json::to_vec(&fixture.state).unwrap()).unwrap();
             assert_eq!(
                 candidate_recipe_identity(&fixture.state).unwrap(),
                 candidate_recipe_identity(&restored).unwrap()
+            );
+            fixture.state.camera_grouping_policy_version =
+                Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
+            fixture
+                .state
+                .inputs
+                .as_mut()
+                .unwrap()
+                .camera_grouping_policy_version =
+                Some(crate::pipeline::inputs::CAMERA_GROUPING_POLICY_VERSION);
+            assert_ne!(
+                candidate_recipe_identity(&fixture.state).unwrap(),
+                version_one_identity
             );
             fixture.state.camera_grouping_policy_version = None;
             fixture
@@ -3261,7 +3281,7 @@ mod tests {
     #[tokio::test]
     async fn contradictory_camera_policies_fail_without_relabelling_or_invalidating_saved_results()
     {
-        for (state_version, input_version) in [(None, Some(1)), (Some(1), None), (Some(2), Some(2))]
+        for (state_version, input_version) in [(None, Some(1)), (Some(1), None), (Some(3), Some(3))]
         {
             let mut fixture = fixture(false);
             fixture.state.camera_grouping_policy_version = state_version;
