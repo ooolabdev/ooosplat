@@ -2,11 +2,8 @@ import { Download, FolderOpen, LoaderCircle, TriangleAlert, X } from "lucide-rea
 import { useEffect, useRef } from "react";
 import { useI18n } from "../../i18n";
 import type { ModelFormat, SpzAdjustment } from "../../lib/modelExportTypes";
+import { formatBinarySize } from "../../lib/fileSize";
 
-const formatBytes = (bytes: number, locale: string) => {
-  const exponent = bytes < 1024 ? 0 : bytes < 1024 ** 2 ? 1 : bytes < 1024 ** 3 ? 2 : 3;
-  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(bytes / 1024 ** exponent)} ${["B", "KiB", "MiB", "GiB"][exponent]}`;
-};
 export type PlyExportDialogState =
   | { phase: "closed" | "preparing" | "encoding" | "validating" | "publishing" | "cancelling" }
   | { phase: "awaitingConfirmation"; exportId: string; confirmationId: number; adjustment: SpzAdjustment }
@@ -52,7 +49,7 @@ export function PlyExportDialog({ state, progress, format = "ply", onClose, onRe
         {["preparing", "encoding"].includes(state.phase) && <div className="gaussian-export-progress" role="status"><progress max={100} value={progress ?? undefined} /><b>{progress == null ? "…" : `${Math.floor(progress)}%`}</b></div>}
         {state.phase === "completed" && <>
           <p>{t("export.plyCompletedDescription")}</p><code className="gaussian-export-path">{state.path}</code>
-          {state.fileSize != null && <p>{formatBytes(state.fileSize, locale)}</p>}
+          {state.fileSize != null && <p>{formatBinarySize(state.fileSize, locale)}</p>}
           {state.coordinateAdjustment && <>
             <p>{t("export.spzAdjustment")}: <code>p' = (p - c) × s</code></p>
             <p>{t("export.spzAdjustmentCenter")}<code className="gaussian-export-path">c = [{state.coordinateAdjustment.center.join(", ")}]</code></p>
