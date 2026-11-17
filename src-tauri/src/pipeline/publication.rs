@@ -183,6 +183,8 @@ pub async fn publish_candidate(
         reconciled_at: None,
     };
     write_transaction(transaction_path, &transaction).await?;
+    #[cfg(feature = "e2e")]
+    crate::testing::publication_checkpoint(transaction_path, "prepared").await?;
     install_and_commit(project_root, transaction_path, &mut transaction, cancel).await?;
     outcome(project_root, transaction)
 }
@@ -453,7 +455,10 @@ async fn commit_installed_output(
     verify_installed_output(project_root, transaction).await?;
     transaction.phase = PublicationPhase::Committed;
     transaction.committed_at.get_or_insert_with(Utc::now);
-    write_transaction(transaction_path, transaction).await
+    write_transaction(transaction_path, transaction).await?;
+    #[cfg(feature = "e2e")]
+    crate::testing::publication_checkpoint(transaction_path, "committed").await?;
+    Ok(())
 }
 
 async fn verify_installed_output(

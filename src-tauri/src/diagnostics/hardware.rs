@@ -119,6 +119,18 @@ pub(super) fn linux_gpus(text: &str, env: &mut Environment) {
 }
 
 pub async fn collect() -> Environment {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return Environment {
+            system: SystemInfo {
+                name: "E2E Windows".into(),
+                version: None,
+                arch: "x86_64".into(),
+            },
+            gpus: vec![],
+            actual_device: None,
+        };
+    }
     let mut env = Environment {
         system: SystemInfo {
             name: std::env::consts::OS.into(),

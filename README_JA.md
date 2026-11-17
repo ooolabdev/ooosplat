@@ -331,6 +331,8 @@ npm run tauri -- dev
 
 ### テストとチェック
 
+Windows の生成レシピ E2E テスト：`npm run test:e2e`。実際のアプリ画面と模擬エンジンを使用し、実際の再構築や学習は実行しません。[実行ガイド](tests/e2e/README.md)を参照してください。
+
 ```powershell
 # Frontend tests
 npm test

@@ -108,6 +108,10 @@ enum Delivery {
 
 impl Delivery {
     fn from_environment() -> Self {
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return Self::Disabled;
+        }
         if std::env::var("OOOSPLAT_TELEMETRY_DEBUG").as_deref() == Ok("1") {
             return Self::Debug;
         }

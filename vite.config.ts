@@ -1,8 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { spzCspPlugin } from "./scripts/spz-csp-plugin.mjs";
+import { fileURLToPath } from "node:url";
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  resolve: command === "serve" && process.env.OOOSPLAT_E2E_FRONTEND === "1" ? {
+    alias: { "@tauri-apps/plugin-dialog": fileURLToPath(new URL("./tests/e2e/fixtures/dialog.ts", import.meta.url)) },
+  } : undefined,
   plugins: [react(), spzCspPlugin()],
   worker: { plugins: () => [spzCspPlugin()] },
   clearScreen: false,
@@ -29,4 +33,4 @@ export default defineConfig({
     minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
   },
-});
+}));

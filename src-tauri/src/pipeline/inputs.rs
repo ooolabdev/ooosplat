@@ -339,6 +339,20 @@ impl InputSource {
         }
     }
     pub fn members(&self) -> Result<Vec<PathBuf>> {
+        #[cfg(feature = "e2e")]
+        {
+            let root = crate::testing::data_root()?.parent().unwrap().to_path_buf();
+            match self {
+                Self::Images { paths } => {
+                    for path in paths {
+                        crate::testing::validate_path(&root, path)?;
+                    }
+                }
+                _ => {
+                    crate::testing::validate_path(&root, self.path())?;
+                }
+            }
+        }
         match self {
             Self::Video { path } => Ok(vec![path.clone()]),
             Self::ImageFolder { path } => {

@@ -414,6 +414,17 @@ impl ProcessManager {
         // Declared before child/job guards: it is released only after their
         // cleanup, including cancellation and an early launch failure.
         let _active = ActiveRunGuard::new(&self.active_runs);
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return crate::testing::execute(
+                spec,
+                environment,
+                self.lifecycle.clone(),
+                self.cancellation.clone(),
+                self.complete_stdout_limit,
+            )
+            .await;
+        }
         if !spec.executable.is_file() {
             return Err(SplatError::EngineMissing(
                 spec.executable.display().to_string(),

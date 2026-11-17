@@ -143,6 +143,10 @@ struct AdapterRecord {
 static INVENTORY_CACHE: OnceLock<Mutex<Option<(Instant, PathBuf, GpuInventory)>>> = OnceLock::new();
 
 pub async fn inventory(paths: &EnginePaths, refresh: bool) -> Result<GpuInventory> {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return crate::testing::inventory();
+    }
     // Pipeline/MCP unit tests intentionally construct engine roots without
     // bundled native binaries. Keep their admission tests independent from
     // host GPU hardware; production builds always probe the pinned Brush.

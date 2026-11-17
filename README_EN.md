@@ -331,6 +331,8 @@ Homebrew supplies source-build prerequisites through `npm run setup:build-deps:m
 
 ### Tests and Checks
 
+Windows recipe E2E: `npm run test:e2e`. Uses the real application window with simulated engines, without real reconstruction or training; see the [test guide](tests/e2e/README.md).
+
 ```powershell
 # Frontend tests
 npm test

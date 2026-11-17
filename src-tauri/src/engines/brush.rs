@@ -19,6 +19,10 @@ const BRUSH_GPU_LOG_FILTER: &str =
 /// Its COLMAP reader and renderer both apply these distortion models. A matching
 /// name/version string is not sufficient: custom runtimes retain conversion.
 pub(crate) fn supports_native_colmap(executable: &Path, model_id: u32) -> bool {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return matches!(model_id, 0 | 1 | 2 | 3 | 4 | 6);
+    }
     let Some(capability) = native_colmap_capability() else {
         return false;
     };

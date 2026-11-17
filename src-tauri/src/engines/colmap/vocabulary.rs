@@ -85,6 +85,10 @@ fn verify(
 }
 
 pub(super) async fn prepare(executable: &Path, cancellation: CancellationToken) -> Result<PathBuf> {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return crate::testing::engines_root().map(|root| root.join("vocabulary.bin"));
+    }
     if cancellation.is_cancelled() {
         return Err(SplatError::Cancelled);
     }

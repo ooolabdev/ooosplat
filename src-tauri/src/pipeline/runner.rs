@@ -6185,6 +6185,12 @@ impl PipelineRunner {
                     events.runtime(stage, engine, tracker.refresh(now));
                 }
                 ProcessUpdate::Started { process_id } => {
+                    #[cfg(feature = "e2e")]
+                    crate::testing::bind_process(
+                        process_id,
+                        run_id,
+                        events.bound_operation.as_ref(),
+                    );
                     if engine == PipelineEngine::Colmap {
                         mode.invalidate_colmap_artifacts(&artifact_recorder);
                     }

@@ -18,6 +18,11 @@ pub mod telemetry;
 pub mod updates;
 pub mod video;
 
+#[cfg(all(feature = "e2e", not(debug_assertions)))]
+compile_error!("The e2e harness must never be included in a release build");
+#[cfg(feature = "e2e")]
+pub mod testing;
+
 #[cfg(all(test, windows, target_env = "msvc"))]
 mod windows_manifest_tests {
     #[test]
@@ -53,7 +58,14 @@ mod windows_manifest_tests {
 }
 
 pub fn run_app() {
-    tauri::Builder::default()
+    #[cfg(feature = "e2e")]
+    testing::initialize().expect("an isolated E2E scenario is required");
+    let builder = tauri::Builder::default();
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    #[cfg(feature = "e2e")]
+    testing::configure_context(&mut context).expect("isolated WebView2 configuration");
+    builder
         // Keep this first so a second process exits before other plugins initialize.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             use tauri::Manager;
@@ -108,6 +120,10 @@ pub fn run_app() {
         })
         .manage(mcp::McpController::default())
         .invoke_handler(tauri::generate_handler![
+            #[cfg(feature = "e2e")]
+            testing::e2e_snapshot,
+            #[cfg(feature = "e2e")]
+            testing::e2e_release,
             commands::classify_material_paths,
             commands::classify_generation_paths,
             commands::inspect_material_inputs,
@@ -185,6 +201,6 @@ pub fn run_app() {
             diagnostics::prepare_error_report,
             diagnostics::send_error_report,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("failed to run OOOSplat");
 }

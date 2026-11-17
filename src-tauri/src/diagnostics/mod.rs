@@ -501,6 +501,10 @@ impl DiagnosticService {
     }
 
     async fn send(&self, draft_id: Uuid) -> Result<ReportReceipt> {
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return Err(error("report_unavailable"));
+        }
         self.send_with(draft_id, |report| async move {
             let endpoint =
                 reqwest::Url::parse(ENDPOINT.trim()).map_err(|_| error("report_unavailable"))?;

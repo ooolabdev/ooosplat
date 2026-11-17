@@ -4590,6 +4590,74 @@ async fn committed_task_fixture() -> CommittedTaskFixture {
     }
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn committed_result_repairs_all_failed_views_while_normal_readers_remain_open() {
+    use std::io::Read;
+
+    let fixture = committed_task_fixture().await;
+    let metadata_path = fixture.project.join("project.json");
+    let state_path = fixture.project.join("state.json");
+    let mut metadata: crate::project::ProjectMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    metadata.status = ProjectStatus::Failed;
+    metadata.output = None;
+    metadata.failure_message = Some("previous post-commit save failure".into());
+    atomic_write_json(&metadata_path, &metadata).await.unwrap();
+    let mut state = crate::project::PipelineStateFile::created(metadata.quality);
+    state.stage = PipelineStage::TrainingSplats;
+    state.brush_complete = false;
+    let training = serde_json::to_value(&state.brush_training).unwrap();
+    atomic_write_json(&state_path, &state).await.unwrap();
+    let original_task = {
+        let mut registry = fixture.service.records();
+        let saved = registry.tasks.get_mut(&fixture.task.task_id).unwrap();
+        saved.status = TaskStatus::Failed;
+        saved.result = None;
+        saved.clone()
+    };
+    fixture.service.persist().await.unwrap();
+    let registry_path = fixture.root.path().join("registry/tasks.json");
+    let mut old_views = [&metadata_path, &state_path, &registry_path].map(|path| {
+        (
+            std::fs::File::open(path).unwrap(),
+            std::fs::read(path).unwrap(),
+        )
+    });
+    let restored = TaskService::at(fixture.root.path().join("registry"));
+    *restored.executor.lock().unwrap() = Some(Arc::new(|_, _| {
+        Box::pin(async { panic!("Committed recovery must not execute generation") })
+    }));
+    let recovered = restored.get(fixture.task.task_id).await.unwrap();
+    assert_eq!(recovered.status, TaskStatus::Completed);
+    assert!(recovered.error.is_none());
+    assert!(recovered.result.is_some());
+    assert_eq!(recovered.run_id, original_task.run_id);
+    assert_eq!(
+        serde_json::to_value(&recovered.runs).unwrap(),
+        serde_json::to_value(&original_task.runs).unwrap()
+    );
+    assert_eq!(recovered.elapsed_ms, original_task.elapsed_ms);
+    assert_eq!(std::fs::read(&fixture.final_ply).unwrap(), fixture.model);
+    let saved: crate::project::PipelineStateFile =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(saved.stage, PipelineStage::Completed);
+    assert!(saved.brush_complete);
+    assert_eq!(
+        serde_json::to_value(saved.brush_training).unwrap(),
+        training
+    );
+    let metadata: crate::project::ProjectMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata.status, ProjectStatus::Completed);
+    assert!(metadata.output.is_some());
+    for (reader, before) in &mut old_views {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(&bytes, before);
+    }
+}
+
 /// A committed project's final.ply deleted outside the app used to make
 /// `load_locked` fail, so the whole task list stayed unloadable until the file
 /// was restored. Only the affected task may report the missing artifact.

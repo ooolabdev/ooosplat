@@ -1,0 +1,36 @@
+name: Native recipe E2E (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-recipe-e2e-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows-recipe-e2e:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Set up locked Rust
+        shell: pwsh
+        run: rustup show active-toolchain
+      - run: npm ci
+      - name: Check test types
+        run: npx tsc -p tests/e2e/tsconfig.json
+      - name: Run native E2E without generation engines
+        run: npm run test:e2e
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-recipe-e2e
+          path: |
+            .cache/e2e/artifacts
+            .cache/e2e/runs/*/app-output.log
+            .cache/e2e/runs/*/invocations.json
+          retention-days: 7

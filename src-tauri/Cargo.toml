@@ -12,6 +12,7 @@ default-run = "ooo-splat"
 [features]
 default = []
 local-colmap = []
+e2e = []
 
 [lib]
 name = "ooo_splat"
@@ -24,6 +25,16 @@ path = "src/main.rs"
 [[bin]]
 name = "splatstudio"
 path = "src/bin/splatstudio.rs"
+
+[[bin]]
+name = "ooo-splat-e2e"
+path = "src/bin/e2e_app.rs"
+required-features = ["e2e"]
+
+[[bin]]
+name = "splatstudio-e2e"
+path = "src/bin/splatstudio_e2e.rs"
+required-features = ["e2e"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -784,9 +784,10 @@ pub(crate) async fn atomic_write_json_for_preparation<T: serde::Serialize>(
     atomic_write_json_with_context(path, value, &AtomicWriteContext::preparation()).await
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AtomicWriteContext {
     preparation: bool,
+    json_role: Option<&'static str>,
     // Per-call injection avoids thread-local/global hooks leaking across async
     // tests or unrelated checkpoint writes.
     #[cfg(test)]
@@ -797,14 +798,35 @@ impl AtomicWriteContext {
     fn preparation() -> Self {
         Self {
             preparation: true,
-            #[cfg(test)]
-            failures: Vec::new(),
+            ..Self::default()
+        }
+    }
+
+    fn for_json(&self, path: &Path) -> Self {
+        let role = match path.file_name().and_then(|name| name.to_str()) {
+            Some("state.json") => "project_state",
+            Some("project.json") => "project_metadata",
+            Some("tasks.json") => "task_records",
+            Some("publish-transaction.json") => "publication_transaction",
+            _ => "json_record",
+        };
+        Self {
+            json_role: Some(role),
+            ..self.clone()
         }
     }
 
     fn error(&self, step: &'static str, error: std::io::Error) -> SplatError {
         let error = SplatError::Io(error);
-        if self.preparation {
+        // Preserve real filesystem failures in the test evidence instead of
+        // retrying or substituting successful state writes in the harness.
+        #[cfg(feature = "e2e")]
+        let error = error.with_io_diagnostic(format!("e2e_save_substep={step}"));
+        if let Some(role) = self.json_role {
+            error.with_io_diagnostic(format!(
+                "io_substep={step}\njson_save_operation=atomic_write_json\npath_role={role}"
+            ))
+        } else if self.preparation {
             error.with_io_diagnostic(format!("io_substep={step}"))
         } else {
             error
@@ -851,7 +873,7 @@ async fn atomic_write_json_with_context<T: serde::Serialize>(
         .unwrap_or("data.json");
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)?;
-    atomic_write_json_to_temporary(path, &temporary, &bytes, context).await
+    atomic_write_json_to_temporary(path, &temporary, &bytes, &context.for_json(path)).await
 }
 
 async fn atomic_write_json_to_temporary(
@@ -907,6 +929,20 @@ async fn write_and_install_json_file(
         ));
     }
     drop(file);
+    #[cfg(feature = "e2e")]
+    let _reader = crate::testing::json_save_reader(path)?;
+    #[cfg(windows)]
+    {
+        let source = temporary.to_path_buf();
+        let destination = path.to_path_buf();
+        let context = context.clone();
+        crate::presets::spawn_pipeline_blocking(move || {
+            atomic_replace_with_context(&source, &destination, &context, ReplacementMode::Json)
+        })
+        .await
+        .map_err(|error| SplatError::Process(format!("JSON replacement task failed: {error}")))?
+    }
+    #[cfg(not(windows))]
     atomic_replace_with_context(temporary, path, context, ReplacementMode::Json)
 }
 
@@ -945,6 +981,16 @@ fn atomic_replace_with_context(
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
+    if mode == ReplacementMode::Json {
+        context.before("replace_state")?;
+        // Rust 1.100's Windows rename has a FileRenameInfoEx compatibility
+        // path for an existing target with ordinary, delete-sharing readers.
+        // Old readers keep their old snapshot; new opens see the new record.
+        // This does not ignore read-only attributes or use copy-overwrite.
+        // Keep large-file publication's existing policy below unchanged.
+        return std::fs::rename(source, destination)
+            .map_err(|error| context.error("replace_state", error));
+    }
     let source_wide = source
         .as_os_str()
         .encode_wide()
@@ -1297,6 +1343,72 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn creation_save_conflict_preserves_owner_and_reuses_project_after_release() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let intent = reserved(root.path());
+        let inputs = crate::pipeline::inputs::GenerationInputs::Materials { items: vec![] };
+        let manager = ProjectManager::for_diagnostics(root.path().into())
+            .with_creation_intent(Some(intent.clone()));
+        let (paths, metadata) = manager
+            .create_collection(Quality::Fast, inputs.clone())
+            .await
+            .unwrap();
+        let mut state = manager.read_state(&paths.state).await.unwrap();
+        let before = std::fs::read(&paths.state).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&paths.state)
+            .unwrap();
+        let error = manager
+            .finish_creation(&paths, &metadata, &mut state)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("path_role=project_state"));
+        assert!(error.to_string().contains("io_substep=replace_state"));
+        assert!(matches!(
+            error.io_error().unwrap().raw_os_error(),
+            Some(5 | 32)
+        ));
+        assert_eq!(std::fs::read(&paths.state).unwrap(), before);
+        assert!(
+            !manager
+                .read_state(&paths.state)
+                .await
+                .unwrap()
+                .creation
+                .unwrap()
+                .ready
+        );
+        drop(held);
+
+        // A fresh manager represents application restart; no new intent or
+        // directory, and no engine/recipe resolution is needed to finish.
+        let restored = ProjectManager::for_diagnostics(root.path().into())
+            .with_creation_intent(Some(intent.clone()));
+        let (again, metadata) = restored
+            .create_collection(Quality::Fast, inputs)
+            .await
+            .unwrap();
+        let mut state = restored.read_state(&again.state).await.unwrap();
+        restored
+            .finish_creation(&again, &metadata, &mut state)
+            .await
+            .unwrap();
+        let saved = restored.read_state(&again.state).await.unwrap();
+        assert_eq!(again.project, paths.project);
+        assert_eq!(again.id, paths.id);
+        assert_eq!(saved.preset, Quality::Fast);
+        let creation = saved.creation.unwrap();
+        assert_eq!(creation.intent, intent);
+        assert!(creation.ready);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
     #[tokio::test]
     async fn creation_failure_preserves_barrier_and_rejects_unknown_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -1373,6 +1485,165 @@ mod tests {
         assert_eq!(value["value"], 2);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn json_replacement_keeps_open_readers_on_their_old_complete_snapshot() {
+        use std::io::{Read, Seek};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let source = directory.path().join("old-api.tmp");
+        let original = br#"{"value":"old"}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(&source, b"new").unwrap();
+        // Rust's normal reader permits delete sharing, yet MoveFileExW alone
+        // still cannot replace this open target. Keep the handle throughout
+        // the real save, rather than hoping a tight polling loop overlaps it.
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let error = atomic_replace(&source, &path).unwrap_err();
+        assert_eq!(error.io_error().unwrap().raw_os_error(), Some(5));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&source).unwrap(), b"new");
+
+        atomic_write_json(&path, &serde_json::json!({"value": "new"}))
+            .await
+            .unwrap();
+        let mut old_snapshot = Vec::new();
+        reader.rewind().unwrap();
+        reader.read_to_end(&mut old_snapshot).unwrap();
+        assert_eq!(old_snapshot, original);
+        let new_snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(new_snapshot["value"], "new");
+    }
+
+    #[tokio::test]
+    async fn concurrent_readers_never_see_partial_or_missing_json_during_5000_saves() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tasks.json");
+        let record =
+            |version: u64| serde_json::json!({"version": version, "padding": "x".repeat(1024)});
+        atomic_write_json(&path, &record(0)).await.unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let reader_path = path.clone();
+        let (ready, started) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0;
+            let mut errors = Vec::new();
+            while stop.load(Ordering::Acquire) {
+                let result = std::fs::read(&reader_path).and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(std::io::Error::other)
+                });
+                match result {
+                    Ok(value)
+                        if value["version"].as_u64().is_some_and(|v| v <= 5000)
+                            && value["padding"].as_str().is_some_and(|p| p.len() == 1024) => {}
+                    other if errors.len() < 10 => errors.push(format!("{other:?}")),
+                    _ => {}
+                }
+                reads += 1;
+                if reads == 1 {
+                    ready.send(()).unwrap();
+                }
+            }
+            (reads, errors)
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut failure = None;
+        for version in 1..=5000 {
+            if let Err(error) = atomic_write_json(&path, &record(version)).await {
+                failure = Some(error);
+                break;
+            }
+        }
+        running.store(false, Ordering::Release);
+        let (reads, errors) = reader.join().unwrap();
+        assert!(failure.is_none(), "save failed: {failure:?}");
+        assert!(reads > 0);
+        assert!(errors.is_empty(), "reader saw invalid records: {errors:?}");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let final_record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(final_record["version"], 5000);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn json_replacement_does_not_bypass_real_sharing_conflicts_or_readonly_targets() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for readonly in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("project.json");
+            let original = br#"{"preserved":true}"#;
+            std::fs::write(&path, original).unwrap();
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            let held = if readonly {
+                let mut read_only = permissions.clone();
+                read_only.set_readonly(true);
+                std::fs::set_permissions(&path, read_only).unwrap();
+                None
+            } else {
+                // Unlike ordinary readers this handle forbids delete/rename.
+                Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(3)
+                        .open(&path)
+                        .unwrap(),
+                )
+            };
+            let result = atomic_write_json(&path, &serde_json::json!({"replacement": true})).await;
+            // Restore only this fixture's attributes so TempDir can remove it.
+            drop(held);
+            if readonly {
+                assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.io_error().unwrap().raw_os_error(),
+                Some(5 | 32)
+            ));
+            assert!(error.to_string().contains("io_substep=replace_state"));
+            assert!(error.to_string().contains("path_role=project_metadata"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn json_diagnostics_use_only_fixed_target_roles_not_private_names() {
+        for (name, expected) in [
+            ("state.json", "project_state"),
+            ("project.json", "project_metadata"),
+            ("tasks.json", "task_records"),
+            ("publish-transaction.json", "publication_transaction"),
+            ("private-name.json", "json_record"),
+        ] {
+            let path = Path::new("private-project").join(name);
+            let error = AtomicWriteContext::default()
+                .for_json(&path)
+                .error("replace_state", std::io::Error::from_raw_os_error(5));
+            let detail = error.to_string();
+            assert!(detail.contains(&format!("path_role={expected}")));
+            assert!(detail.contains("json_save_operation=atomic_write_json"));
+            assert!(detail.contains("io_substep=replace_state"));
+            assert!(!detail.contains(name));
+            assert!(!detail.contains("private-project"));
+            assert_eq!(error.io_error().unwrap().raw_os_error(), Some(5));
+        }
+    }
+
     #[tokio::test]
     async fn json_save_flushes_real_tokio_background_write_errors_before_sync_or_replace() {
         use std::io::Write;
@@ -1394,6 +1665,7 @@ mod tests {
                 // If flush does not surface the real error first, this error
                 // wins instead, or the temporary file is incorrectly installed.
                 failures: vec![("sync_state_temp", 112)],
+                ..Default::default()
             };
             let error = write_and_install_json_file(
                 tokio::fs::File::from_std(read_only),
@@ -1518,6 +1790,7 @@ mod tests {
                 let context = AtomicWriteContext {
                     preparation: true,
                     failures: vec![(step, code)],
+                    ..Default::default()
                 };
                 let error = atomic_write_json_with_context(
                     &path,
@@ -1546,7 +1819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preparation_atomic_write_is_opt_in_for_real_io_failures() {
+    async fn all_json_saves_report_safe_roles_and_preserve_real_io_failures() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("missing").join("state.json");
         let value = serde_json::json!({"value": 1});
@@ -1554,8 +1827,16 @@ mod tests {
         let preparation = atomic_write_json_for_preparation(&path, &value)
             .await
             .unwrap_err();
-        assert!(matches!(&ordinary, SplatError::Io(_)));
-        assert!(!ordinary.to_string().contains("io_substep="));
+        assert!(ordinary
+            .to_string()
+            .contains("io_substep=create_state_temp"));
+        assert!(ordinary.to_string().contains("path_role=project_state"));
+        assert!(ordinary
+            .to_string()
+            .contains("json_save_operation=atomic_write_json"));
+        assert!(!ordinary
+            .to_string()
+            .contains(&path.to_string_lossy().to_string()));
         assert!(preparation
             .to_string()
             .contains("io_substep=create_state_temp"));
@@ -1579,6 +1860,7 @@ mod tests {
         let context = AtomicWriteContext {
             preparation: true,
             failures: vec![("flush_state_temp", 112), ("cleanup_state_temp", 5)],
+            ..Default::default()
         };
         let error = atomic_write_json_with_context(
             &path,
@@ -1661,6 +1943,7 @@ mod tests {
             let context = AtomicWriteContext {
                 preparation: true,
                 failures: vec![(step, 32)],
+                ..Default::default()
             };
             let error =
                 copy_replace_for_encrypted_directory_with_context(&source, &destination, &context)
@@ -1688,6 +1971,7 @@ mod tests {
         let context = AtomicWriteContext {
             preparation: true,
             failures: vec![("sync_state_replacement", 112), ("restore_state_backup", 5)],
+            ..Default::default()
         };
         let error =
             copy_replace_for_encrypted_directory_with_context(&source, &destination, &context)

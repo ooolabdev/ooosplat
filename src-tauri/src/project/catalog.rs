@@ -323,6 +323,9 @@ pub(crate) async fn project_is_durably_completed(root: &Path, metadata: &Project
 }
 
 pub(crate) fn app_data_root() -> Result<PathBuf> {
+    #[cfg(feature = "e2e")]
+    return crate::testing::data_root();
+    #[cfg(not(feature = "e2e"))]
     dirs::data_local_dir()
         .map(|v| v.join("SplatStudio"))
         .ok_or_else(|| SplatError::Process("无法定位本机应用数据目录".into()))
@@ -334,6 +337,9 @@ fn index_path() -> Result<PathBuf> {
     Ok(app_data_root()?.join("project-index.json"))
 }
 pub fn default_projects_root() -> Result<PathBuf> {
+    #[cfg(feature = "e2e")]
+    return crate::testing::data_root().map(|root| root.join("projects"));
+    #[cfg(not(feature = "e2e"))]
     dirs::document_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Documents")))
         .or_else(|| dirs::data_local_dir().map(|data| data.join("Documents")))

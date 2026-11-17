@@ -245,6 +245,16 @@ fn cache_is_fresh(cache: &CachedManifest, now: DateTime<Utc>) -> bool {
 
 impl UpdateService {
     pub async fn check(&self, force: bool) -> Result<UpdateCheckResult, UpdateCheckError> {
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return Ok(UpdateCheckResult {
+                current_version: CURRENT_VERSION.into(),
+                status: UpdateStatus::UpToDate,
+                release: None,
+                checked_at: Utc::now(),
+                from_cache: false,
+            });
+        }
         // Only this service is serialized. No pipeline, preview, or telemetry lock is held.
         // Callers waiting on an in-flight request reuse its result via the cooldown.
         let mut state = self.state.lock().await;

@@ -112,6 +112,8 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "e2e")]
+    ooo_splat::testing::initialize().expect("an isolated E2E scenario is required");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)

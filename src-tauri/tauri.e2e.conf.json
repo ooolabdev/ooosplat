@@ -1,0 +1,10 @@
+{
+  "identifier": "studio.ooo.splat.e2e",
+  "productName": "OOOSplat E2E",
+  "build": {
+    "devUrl": "http://127.0.0.1:1429",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": { "windows": [{ "label": "main", "title": "OOOSplat E2E", "width": 1500, "height": 950 }] },
+  "bundle": { "active": false, "resources": [] }
+}

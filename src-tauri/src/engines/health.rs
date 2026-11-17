@@ -253,6 +253,10 @@ impl EnginePaths {
     }
 
     pub fn discover(resource_dir: Option<&Path>) -> Self {
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return Self::from_root(crate::testing::engines_root().expect("E2E initialization"));
+        }
         if let Some(value) = std::env::var_os("OOOSPLAT_ENGINE_DIR") {
             return Self::from_candidates(value.into());
         }
@@ -308,6 +312,10 @@ impl EnginePaths {
     }
 
     async fn check_all_with_policy(&self, policy: ProbePolicy) -> Vec<EngineStatus> {
+        #[cfg(feature = "e2e")]
+        if crate::testing::enabled() {
+            return crate::testing::health(self).expect("E2E initialization");
+        }
         let (ffmpeg, ffprobe, colmap, brush) = tokio::join!(
             check_basic(EngineKind::Ffmpeg, &self.ffmpeg, &["-version"]),
             check_basic(EngineKind::Ffprobe, &self.ffprobe, &["-version"]),
@@ -688,6 +696,10 @@ fn scan_cuda_runtime(directory: &Path, found: &mut [bool; 2]) {
 }
 
 pub async fn check_colmap_acceleration(paths: &EnginePaths) -> ColmapAccelerationStatus {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return crate::testing::acceleration().expect("E2E initialization");
+    }
     check_colmap(&paths.colmap, &paths.root, ProbePolicy::Refresh)
         .await
         .acceleration
@@ -702,6 +714,10 @@ pub async fn check_colmap_acceleration(paths: &EnginePaths) -> ColmapAcceleratio
 }
 
 pub async fn check_colmap_acceleration_cached(paths: &EnginePaths) -> ColmapAccelerationStatus {
+    #[cfg(feature = "e2e")]
+    if crate::testing::enabled() {
+        return crate::testing::acceleration().expect("E2E initialization");
+    }
     check_colmap(&paths.colmap, &paths.root, ProbePolicy::Cached)
         .await
         .acceleration
