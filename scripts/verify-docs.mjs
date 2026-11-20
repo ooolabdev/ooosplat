@@ -106,6 +106,7 @@ async function exists(file) {
 const sources = [
   ...rootDocuments.map((file) => path.join(root, file)),
   ...(await collectMarkdown(path.join(root, "docs"))),
+  ...(await collectMarkdown(path.join(root, "tests", "e2e"))),
 ];
 const documentCache = new Map();
 

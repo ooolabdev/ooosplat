@@ -9,7 +9,7 @@ test.describe('per-source Bridge', () => {
   test('high overall registration does not hide a weak second source', async ({ app }) => {
     await app.chooseInputs([0, 1]); await app.quality('fast'); await app.generate();
     const s = await app.waitTerminal();
-    const sources = s.projects[0].state.inputs.sources;
+    const sources = app.project(s).state.inputs.sources;
     expect(sources[0].bridgeFrames).toHaveLength(0);
     expect(sources[1].bridgeFrames.length).toBeGreaterThan(0);
     expect(s.calls.filter(c => c.operation === 'extract')).toHaveLength(3);
@@ -31,7 +31,7 @@ test.describe('manual per-source Bridge budget', () => {
       await slider.press('ArrowRight'); await expect(app.page.locator('.frame-sampling-head output')).toHaveText('7 FPS');
     }
     await app.generate(); const s = await app.waitTerminal();
-    const sources = s.projects[0].state.inputs.sources;
+    const sources = app.project(s).state.inputs.sources;
     expect(sources.map((source: any) => source.frames.initialExtractedFrames)).toEqual([35, 35]);
     expect(sources[0].bridgeFrames).toHaveLength(0);
     expect(sources[1].bridgeFrames.length).toBeGreaterThan(0);

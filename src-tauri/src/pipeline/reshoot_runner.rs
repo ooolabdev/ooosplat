@@ -2,6 +2,7 @@
 //! Training, continuation and publication are owned by the shared work order.
 use super::*;
 use crate::pipeline::reshoot::*;
+use crate::project::manager::read_durable_json_bytes_sync;
 use crate::reconstruction::colmap_model::read_cameras;
 use crate::video::panorama::{self, VideoProjection};
 use sha2::{Digest, Sha256};
@@ -336,7 +337,7 @@ fn imported_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Result<So
 
 async fn internal_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Result<SourceAssets> {
     let state: PipelineStateFile =
-        serde_json::from_slice(&tokio::fs::read(root.join("state.json")).await?)?;
+        serde_json::from_slice(&read_durable_json_bytes(root.join("state.json")).await?)?;
     if state.inputs.as_ref().is_some_and(|i| !i.reshoot_eligible) {
         return Err(invalid("外部项目没有可复用的 COLMAP 数据"));
     }
@@ -501,9 +502,13 @@ async fn internal_source_assets(root: PathBuf, metadata: ProjectMetadata) -> Res
 
 pub(super) fn source_identity(source: &SourceAssets) -> Result<String> {
     let mut hash = Sha256::new();
-    hash.update(std::fs::read(source.root.join("project.json"))?);
+    hash.update(read_durable_json_bytes_sync(
+        source.root.join("project.json"),
+    )?);
     if source.state.is_some() {
-        hash.update(std::fs::read(source.root.join("state.json"))?);
+        hash.update(read_durable_json_bytes_sync(
+            source.root.join("state.json"),
+        )?);
     } else {
         hash.update(b"external-colmap-source-v1");
     }

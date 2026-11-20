@@ -35,7 +35,7 @@ use crate::{
     process::ProcessManager,
     project::{
         catalog::{self, AppSettings, ProjectOverview, ProjectSummary},
-        manager::atomic_write_json,
+        manager::{atomic_write_json, read_durable_json_bytes},
         GaussianCrop, GaussianEditing, GaussianTransform, PipelineStateFile, ProjectInputType,
         ProjectStatus,
     },
@@ -1118,7 +1118,7 @@ pub async fn estimate_project_runtime(
     project_id: Uuid,
 ) -> Result<RuntimeEstimate> {
     let (project, metadata) = catalog::load_registered_project(project_id).await?;
-    let state_bytes = tokio::fs::read(project.join("state.json")).await?;
+    let state_bytes = read_durable_json_bytes(project.join("state.json")).await?;
     let state: PipelineStateFile = serde_json::from_slice(&state_bytes)?;
     let saved_plan = state.frames.as_ref().map(|frames| FramePlan {
         retention_ratio: frames.retention_ratio,
@@ -1463,7 +1463,7 @@ pub async fn get_project_task_detail(
     let state = if is_imported {
         None
     } else {
-        let state_bytes = tokio::fs::read(project_root.join("state.json")).await?;
+        let state_bytes = read_durable_json_bytes(project_root.join("state.json")).await?;
         Some(serde_json::from_slice::<PipelineStateFile>(&state_bytes)?)
     };
     let progress = state.as_ref().map(|state| {

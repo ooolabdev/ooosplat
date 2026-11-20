@@ -38,7 +38,7 @@ test.describe('invalid mixed dimensions', () => {
   test.use({ scenario: { name: 'wrong-dimensions', inputs: [{ name: 'photos', kind: 'images', mismatchedDimensions: true }] } });
   test('a non-transposed size blocks generation before task creation', async ({ app }) => {
     await app.chooseInputs();
-    await expect(app.page.getByRole('button', { name: '开始生成', exact: true }).first()).toBeDisabled();
+    await expect(app.page.getByRole('button', { name: '开始生成', exact: true })).toBeDisabled();
     expect((await app.snapshot()).tasks).toHaveLength(0);
     expect((await app.snapshot()).calls.filter(c => c.engine === 'colmap')).toHaveLength(0);
   });
@@ -47,6 +47,6 @@ test.describe('JPEG inputs', () => {
   test.use({ scenario: { name: 'jpeg', inputs: [{ name: 'photos', kind: 'images', jpeg: true }] } });
   test('real JPEG headers pass admission and publication', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate();
-    const s = await app.waitTerminal(); expect(s.projects[0].metadata.output.splatCount).toBe(64);
+    const s = await app.waitTerminal(); expect(app.project(s).metadata.output.splatCount).toBe(64);
   });
 });

@@ -1,5 +1,9 @@
 # Native recipe E2E / 配方端到端测试
 
+**Manual, slow suite.** Use `npm test` for the fast development checks. Start native E2E explicitly with `npm run test:e2e`, or manually dispatch **Native recipe E2E (manual, slow)** in GitHub Actions.
+
+**耗时较长，需主动触发。** 日常开发使用 `npm test` 做快速检查。原生 E2E 通过 `npm run test:e2e` 按需启动，GitHub Actions 仅支持手动触发。
+
 Windows + installed WebView2 + Node.js 22.12+ + the repository's pinned Rust toolchain are required. Run from the repository root after `npm ci`. No generation engines, CUDA, real GPU or Playwright Chromium download are required.
 
 需要 Windows、已安装的 WebView2、Node.js 22.12+ 和仓库锁定的 Rust。先执行 `npm ci`；不需要下载生成引擎、CUDA 或 Playwright 浏览器。
@@ -12,6 +16,8 @@ npm run test:e2e:report
 npx tsc -p tests/e2e/tsconfig.json
 cargo test --manifest-path src-tauri/Cargo.toml --features e2e --lib testing::
 ```
+
+For case discovery without starting the Windows application, run `npx playwright test --list --reporter=list`. Run the selected cases with `npm run test:e2e -- --grep "case name"`.
 
 Use these scripts rather than opening `npx playwright test` directly: they build the debug-only application and own the isolated Vite process. `--list` lists tests without launching the application. One worker is intentional. Port 1429 must be free; CDP gets a separate available loopback port per application. The ordinary OOOSplat client may remain open.
 
@@ -64,6 +70,19 @@ The engine adapter must follow actual arguments (including export filename, sele
 Native scenarios cover ordinary images/videos and ERP at three qualities, mixed ERP recipes, exact frame mapping, manual per-video Bridge budgets, 29.97/VFR/nonzero PTS, short/all-frame inputs, opaque/transparent Alpha, JPEG, orientation groups, incompatible dimensions, 100/101-image questions, selected CUDA/non-CUDA GPUs, four reshoot answers, Warm/Cold fallback and export failures, zero new registration, OOM authorization, cancellation/restart, candidate/Commit recovery, plus representative real MCP/CLI calls.
 
 Additional scenarios cover saved concrete-GPU preferences, durable partial reshoot adoption and geometric versus operational initial-Mapper failures. There are 44 scenarios including one assertion negative-control test.
+
+生命周期扩展保留上述 44 例，总计 268 例。展开清单、公共停点及定向组合见 [LIFECYCLE_MATRIX.md](LIFECYCLE_MATRIX.md)，真实缺陷与复现证据见 [ISSUES.md](ISSUES.md)。新增覆盖取消／重启／强杀继续、真实部分成果、连续补拍、逐来源预算与 PTS、队列及旧运行隔离。
+
+```powershell
+node scripts/verify-e2e-lifecycle.mjs checks
+node scripts/verify-e2e-lifecycle.mjs native-rounds
+```
+
+`checks` 执行前端、普通／E2E Rust 全目标测试、构建、格式、文档与两种 Clippy。`native-rounds` 在相同代码摘要上连续执行三轮完整套件，逐轮保存 JSON/HTML、日志、案例清单、磁盘空间及二进制摘要；失败仍继续收集后续完整轮次，不增加重跑。两者均检查磁盘，空间不足报告阻断，不清理用户缓存。
+
+新增场景 `barriers[]` 声明 operation、boundary、task、source、occurrence；支持 entered、partial、written、checkpoint。账本先同步持久化再暴露命中，释放须同时匹配 hitId/taskId/runId。重启复用本案例目录，已消费屏障和引擎故障不能再次获得。`lateEvent` 只能投递预声明并捕获的真实旧运行回调。全局操作的 sourceId 为 null，具体来源操作记录实际 material ID。所有页面任务操作按实际 taskId，创建前按草稿 ID 定位。
+
+模拟 Brush 每个任务／训练尝试输出不同且确定的合法 64 点 PLY；匹配使用真实 pair 文件，重建维持传入模型固定相机和位姿。未知操作或参数失败，不退回真实进程。`boundary-*.json`、`lifecycle.json` 和 `invocations.json` 连同最终任务／项目文件保留在隔离目录。详尽结果见 [VERIFICATION.md](VERIFICATION.md)；旧版 44 例三轮通过不能代表扩展套件通过。
 
 原有 Rust／前端测试仍负责大量数值边界、旧快照、队列和迟到事件组合。首版并未将所有历史项目、旧策略、队列竞态和多卡设置组合重复成原生窗口用例；继续扩展时添加独立场景，不用模拟测试宣称这些实机验收全部完成。
 

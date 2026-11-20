@@ -1,4 +1,4 @@
-name: Native recipe E2E (manual)
+name: Native recipe E2E (manual, slow)
 on:
   workflow_dispatch:
 permissions:

@@ -36,7 +36,7 @@ fn fixture<'a>(h: &'a Harness, path: &str) -> Result<&'a InputFixture> {
         .find(|i| i.kind == "video" && h.root.join("fixtures").join(&i.name) == path)
         .ok_or_else(|| invalid("undeclared video input"))
 }
-fn operation(spec: &ProcessSpec) -> Result<(String, String)> {
+pub(super) fn operation(spec: &ProcessSpec) -> Result<(String, String)> {
     let name = spec
         .executable
         .file_name()
@@ -88,6 +88,7 @@ fn operation(spec: &ProcessSpec) -> Result<(String, String)> {
     Ok((engine.into(), op))
 }
 fn emit(spec: &ProcessSpec, lifecycle: &Option<ProcessObserver>, event: ProcessUpdate, both: bool) {
+    super::lifecycle::observe_process(spec, &event);
     if both {
         if let Some(o) = lifecycle {
             o(event.clone());
@@ -99,6 +100,77 @@ fn emit(spec: &ProcessSpec, lifecycle: &Option<ProcessObserver>, event: ProcessU
 }
 fn help() -> String {
     format!("COLMAP 4.2.1 (Commit {})\n--FeatureExtraction.use_gpu\n--FeatureExtraction.gpu_index\n--FeatureMatching.use_gpu\n--FeatureMatching.gpu_index\n--Mapper.ba_local_backend\n--Mapper.ba_global_backend\n--Mapper.ba_global_gpu_index\n",crate::engines::colmap::LOCKED_COMMIT)
+}
+
+// Independent adapter grammar. An unmodelled option must never be silently
+// accepted as though the simulated engine had honoured it.
+fn validate_arguments(engine: &str, operation: &str, args: &[String]) -> Result<()> {
+    let allowed = match (engine, operation) {
+        ("colmap", "help") => "-h --help -version",
+        ("colmap", "feature_extractor") => "--database_path --image_path --image_list_path --FeatureExtraction.gpu_index --FeatureExtraction.max_image_size --FeatureExtraction.use_gpu --ImageReader.camera_model --ImageReader.camera_params --ImageReader.existing_camera_id --ImageReader.mask_path --ImageReader.single_camera --SiftExtraction.max_num_features",
+        ("colmap", "mapper" | "pose_prior_mapper") => "--database_path --image_path --input_path --output_path --Mapper.ba_global_backend --Mapper.ba_local_backend --Mapper.ba_global_gpu_index --Mapper.ba_refine_focal_length --Mapper.ba_refine_principal_point --Mapper.ba_refine_extra_params --Mapper.constant_camera_list_path --Mapper.fix_existing_frames --Mapper.image_list_path --Mapper.init_image_id1 --Mapper.init_max_forward_motion --Mapper.init_min_tri_angle --Mapper.multiple_models --Mapper.random_seed --Mapper.tri_ignore_two_view_tracks",
+        ("colmap", "matches_importer") => "--database_path --match_list_path --match_type --FeatureMatching.gpu_index --FeatureMatching.use_gpu",
+        ("colmap", "exhaustive_matcher") => "--database_path --FeatureMatching.gpu_index --FeatureMatching.use_gpu",
+        ("colmap", "sequential_matcher") => "--database_path --FeatureMatching.gpu_index --FeatureMatching.use_gpu --SequentialMatching.loop_detection --SequentialMatching.loop_detection_num_images --SequentialMatching.loop_detection_period --SequentialMatching.overlap --SequentialMatching.vocab_tree_path",
+        ("colmap", "vocab_tree_matcher") => "--database_path --FeatureMatching.gpu_index --FeatureMatching.use_gpu --VocabTreeMatching.vocab_tree_path --VocabTreeMatching.num_images",
+        ("colmap", "vocab_tree_retriever") => "--database_image_list_path --database_path --num_checks --num_images --num_images_after_verification --num_neighbors --query_image_list_path --vocab_tree_path",
+        ("brush", "train") => "--export-every --export-name --export-path --growth-grad-threshold --growth-select-fraction --growth-start-iter --growth-stop-iter --max-resolution --max-splats --refine-every --sh-degree --total-train-iters --max-scene-batch-cache-size --alpha-mode --lr-mean --lr-mean-end --lr-coeffs-dc --lr-opac --lr-scale --lr-rotation --mean-noise-weight",
+        ("ffprobe", "probe" | "timestamps") => "-v -of -select_streams -show_entries -show_frames -show_format -show_streams",
+        ("ffmpeg", "extract" | "preview") => "-filter_script:v -filter_complex_script -fps_mode -hide_banner -i -nostats -nostdin -progress -q:v -start_number -stats_enc_pre -stats_enc_pre_fmt -y -ss -vf -frames:v -map -c:v -pix_fmt",
+        _ => return Err(invalid("unmodelled argument grammar")),
+    };
+    let switches = [
+        "-h",
+        "--help",
+        "-version",
+        "-show_frames",
+        "-show_format",
+        "-show_streams",
+        "-hide_banner",
+        "-nostats",
+        "-nostdin",
+        "-y",
+    ];
+    let mut seen = BTreeSet::new();
+    let mut positionals = 0;
+    let mut index = usize::from(engine == "colmap");
+    // COLMAP's top-level -h has no command prefix.
+    if engine == "colmap" && args.first().is_some_and(|a| a.starts_with('-')) {
+        index = 0;
+    }
+    while index < args.len() {
+        let flag = &args[index];
+        if !flag.starts_with('-') {
+            positionals += 1;
+            // FFmpeg options are scoped to each output (frames and masks).
+            if engine == "ffmpeg" {
+                seen.clear();
+            }
+            index += 1;
+            continue;
+        }
+        if !allowed.split_whitespace().any(|known| known == flag) || !seen.insert(flag) {
+            return Err(invalid(format!(
+                "unknown or duplicate {engine}:{operation} argument {flag}"
+            )));
+        }
+        index += 1;
+        if !switches.contains(&flag.as_str()) {
+            if args.get(index).is_none_or(|value| value.starts_with('-')) {
+                return Err(invalid(format!("missing value for {flag}")));
+            }
+            index += 1;
+        }
+    }
+    let maximum = match engine {
+        "colmap" => 0,
+        "ffmpeg" => 2,
+        _ => 1,
+    };
+    if positionals > maximum {
+        return Err(invalid("unexpected positional engine argument"));
+    }
+    Ok(())
 }
 
 pub async fn execute(
@@ -130,6 +202,7 @@ pub async fn execute(
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    validate_arguments(&engine, &operation, &args)?;
     if !h
         .scenario
         .allowed_operations
@@ -197,18 +270,56 @@ pub async fn execute(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let scope = lifecycle::process_scope(&args, spec.working_directory.as_deref());
+    let mut input_lists = std::collections::BTreeMap::new();
+    for key in [
+        "--image_list_path",
+        "--match_list_path",
+        "--database_image_list_path",
+        "--query_image_list_path",
+        "--Mapper.image_list_path",
+        "--Mapper.constant_camera_list_path",
+    ] {
+        if let Ok(path) = argument(&args, key) {
+            if std::fs::metadata(path)?.len() > 16 * 1024 * 1024 {
+                return Err(invalid("input list exceeds fixture budget"));
+            }
+            input_lists.insert(
+                key.to_owned(),
+                std::fs::read_to_string(path)?
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
+    }
     let (sequence, fault) = {
         let mut calls = h.calls.lock().unwrap();
-        let occurrence = calls
-            .iter()
-            .filter(|c| c.engine == engine && c.operation == operation)
-            .count()
-            + 1;
         let fault = h
             .scenario
             .faults
             .iter()
-            .find(|f| f.operation == format!("{engine}:{operation}") && f.occurrence == occurrence)
+            .find(|f| {
+                f.operation == format!("{engine}:{operation}")
+                    && f.task.is_none_or(|n| n == scope.task_ordinal)
+                    && f.source.as_ref().is_none_or(|s| {
+                        scope.source_name.as_ref() == Some(s) || scope.source_id.as_ref() == Some(s)
+                    })
+                    && f.occurrence
+                        == calls
+                            .iter()
+                            .filter(|c| {
+                                c.engine == engine
+                                    && c.operation == operation
+                                    && f.task.is_none_or(|n| c.scope.task_ordinal == n)
+                                    && f.source.as_ref().is_none_or(|s| {
+                                        c.scope.source_name.as_ref() == Some(s)
+                                            || c.scope.source_id.as_ref() == Some(s)
+                                    })
+                            })
+                            .count()
+                            + 1
+            })
             .cloned();
         let sequence = calls.len() + 1;
         if sequence > 4096 {
@@ -246,11 +357,10 @@ pub async fn execute(
             dataset_init_sha256: init_sha256,
             run_id: None,
             pipeline_operation: None,
+            scope: scope.clone(),
+            input_lists,
         });
-        std::fs::write(
-            h.root.join("invocations.json"),
-            serde_json::to_vec_pretty(&*calls)?,
-        )?;
+        save_evidence(&h.root.join("invocations.json"), &*calls)?;
         (sequence, fault)
     };
     emit(
@@ -261,6 +371,25 @@ pub async fn execute(
         },
         false,
     );
+    save_evidence(&h.root.join("invocations.json"), &*h.calls.lock().unwrap())?;
+    // The real Started observer supplies the current operation and source.
+    let scope = h.calls.lock().unwrap()[sequence - 1].scope.clone();
+    lifecycle::at_scope(
+        scope.clone(),
+        &format!("{engine}:{operation}"),
+        "entered",
+        json!({"sequence":sequence}),
+    )
+    .await?;
+    let gaussian_tag = scope.task_ordinal as u32 * 1000
+        + h.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.engine == "brush" && c.operation == "train" && c.scope.task_id == scope.task_id
+            })
+            .count() as u32;
     emit(
         &spec,
         &lifecycle,
@@ -321,9 +450,10 @@ pub async fn execute(
                 safe_path(&h.root,&path)?;artifacts::gaussian(&path,0)?;String::new()
             },
             "crash"=>{code = 0xC0000005_u32 as i32;stderr="engine process terminated abnormally\n".into();String::new()},
-            "success"=>success(h,&engine,&operation,&args,fault.as_ref().and_then(|f|f.registered),&device_name)?,
+            "success"=>success(h,&engine,&operation,&args,fault.as_ref(),(&scope,gaussian_tag),&device_name)?,
             _=>return Err(invalid(format!("unknown fault outcome {outcome}"))),
         };
+        lifecycle::at_scope(scope.clone(), &format!("{engine}:{operation}"), "written", json!({"sequence":sequence})).await?;
         if engine=="brush" && outcome!="success" {
             stdout=format!("Created wgpu compute server on device AdapterInfo {{ name: \"{device_name}\" }}\n{stdout}");
         }
@@ -350,10 +480,7 @@ pub async fn execute(
     {
         let mut calls = h.calls.lock().unwrap();
         calls[sequence - 1].outcome = status.into();
-        std::fs::write(
-            h.root.join("invocations.json"),
-            serde_json::to_vec_pretty(&*calls)?,
-        )?;
+        save_evidence(&h.root.join("invocations.json"), &*calls)?;
     }
     if let Some(mut file) = log {
         writeln!(file, "E2E execution {status}")?;
@@ -391,82 +518,90 @@ fn success(
     engine: &str,
     op: &str,
     args: &[String],
-    registered: Option<usize>,
+    fault: Option<&Fault>,
+    initialization: (&lifecycle::Scope, u32),
     device_name: &str,
 ) -> Result<String> {
-    if engine == "colmap" && op == "help" {
-        return Ok(help());
-    }
-    match (engine, op) {
-        ("colmap", "feature_extractor") => artifacts::features(args),
-        ("colmap", "vocab_tree_retriever") => {
-            let candidates =
-                std::fs::read_to_string(argument(args, "--database_image_list_path")?)?;
-            let queries = std::fs::read_to_string(argument(args, "--query_image_list_path")?)?;
-            let limit = argument(args, "--num_images")?
-                .parse::<usize>()
-                .map_err(invalid)?;
-            Ok(queries
-                .lines()
-                .enumerate()
-                .map(|(n, query)| {
-                    format!(
-                        "Querying for image {query} [{n}]\n{}",
-                        candidates
-                            .lines()
-                            .filter(|name| *name != query)
-                            .take(limit)
-                            .map(|name| format!("image_name={name}, score=1.0\n"))
-                            .collect::<String>()
-                    )
-                })
-                .collect())
+    lifecycle::with_process_writer(initialization.0, || {
+        let (scope, gaussian_tag) = initialization;
+        if engine == "colmap" && op == "help" {
+            return Ok(help());
         }
-        (
-            "colmap",
-            "sequential_matcher" | "exhaustive_matcher" | "matches_importer" | "vocab_tree_matcher",
-        ) => artifacts::matches(args),
-        ("colmap", "mapper" | "pose_prior_mapper") => artifacts::mapper(args, registered),
-        ("brush", "train") => {
-            let output = PathBuf::from(argument(args, "--export-path")?);
-            let output = output.join(argument(args, "--export-name")?);
-            safe_path(&h.root, &output)?;
-            artifacts::gaussian(&output, 64)?;
-            let device = device_name;
-            // Deliberately differs from the 64-point published PLY: publication
-            // must count the validated file, not borrow a progress-log count.
-            Ok(format!("Created wgpu compute server on device AdapterInfo {{ name: \"{device}\", vendor: 4318 }}\nInitial splats initialized in 1ms: 64\nRefine iter {}, 128 splats.\n",argument(args,"--total-train-iters")?))
-        }
-        ("ffprobe", "probe" | "timestamps") => {
-            let i = fixture(
-                h,
-                args.last().ok_or_else(|| invalid("probe input missing"))?,
-            )?;
-            let count = (i.fps * i.duration).round() as usize;
-            if op == "timestamps" {
-                return Ok((0..count)
-                    .map(|n| {
+        match (engine, op) {
+            ("colmap", "feature_extractor") => artifacts::features(args),
+            ("colmap", "vocab_tree_retriever") => {
+                let candidates =
+                    std::fs::read_to_string(argument(args, "--database_image_list_path")?)?;
+                let queries = std::fs::read_to_string(argument(args, "--query_image_list_path")?)?;
+                let limit = argument(args, "--num_images")?
+                    .parse::<usize>()
+                    .map_err(invalid)?;
+                Ok(queries
+                    .lines()
+                    .enumerate()
+                    .map(|(n, query)| {
                         format!(
-                            "best_effort_timestamp={}|best_effort_timestamp_time={:.12}\n",
-                            (i.timestamps.get(n).copied().unwrap_or(n as f64 / i.fps) * 1_000_000.)
-                                .round() as i64,
-                            i.timestamps.get(n).copied().unwrap_or(n as f64 / i.fps)
+                            "Querying for image {query} [{n}]\n{}",
+                            candidates
+                                .lines()
+                                .filter(|name| *name != query)
+                                .take(limit)
+                                .map(|name| format!("image_name={name}, score=1.0\n"))
+                                .collect::<String>()
                         )
                     })
-                    .collect());
+                    .collect())
             }
-            Ok(json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":i.width,"height":i.height,"time_base":"1/1000000","r_frame_rate":format!("{}/1000",(i.fps*1000.).round()),"avg_frame_rate":format!("{}/1000",(i.fps*1000.).round()),"duration":i.duration.to_string(),"nb_frames":count.to_string(),"pix_fmt":if i.alpha{"rgba"}else{"yuv420p"},"side_data_list":if i.erp{vec![json!({"side_data_type":"Spherical Mapping","projection":"equirectangular"})]}else{vec![]}}],"format":{"duration":i.duration.to_string(),"format_name":"mov,mp4"}}).to_string())
+            (
+                "colmap",
+                "sequential_matcher" | "exhaustive_matcher" | "matches_importer"
+                | "vocab_tree_matcher",
+            ) => artifacts::matches(args),
+            ("colmap", "mapper" | "pose_prior_mapper") => {
+                artifacts::mapper_scoped(args, fault, scope)
+            }
+            ("brush", "train") => {
+                let output = PathBuf::from(argument(args, "--export-path")?);
+                let output = output.join(argument(args, "--export-name")?);
+                safe_path(&h.root, &output)?;
+                artifacts::gaussian_tagged(&output, 64, gaussian_tag)?;
+                let device = device_name;
+                // Deliberately differs from the 64-point published PLY: publication
+                // must count the validated file, not borrow a progress-log count.
+                Ok(format!("Created wgpu compute server on device AdapterInfo {{ name: \"{device}\", vendor: 4318 }}\nInitial splats initialized in 1ms: 64\nRefine iter {}, 128 splats.\n",argument(args,"--total-train-iters")?))
+            }
+            ("ffprobe", "probe" | "timestamps") => {
+                let i = fixture(
+                    h,
+                    args.last().ok_or_else(|| invalid("probe input missing"))?,
+                )?;
+                let count = (i.fps * i.duration).round() as usize;
+                if op == "timestamps" {
+                    return Ok((0..count)
+                        .map(|n| {
+                            format!(
+                                "best_effort_timestamp={}|best_effort_timestamp_time={:.12}\n",
+                                (i.timestamps.get(n).copied().unwrap_or(n as f64 / i.fps)
+                                    * 1_000_000.)
+                                    .round() as i64,
+                                i.timestamps.get(n).copied().unwrap_or(n as f64 / i.fps)
+                            )
+                        })
+                        .collect());
+                }
+                Ok(json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":i.width,"height":i.height,"time_base":"1/1000000","r_frame_rate":format!("{}/1000",(i.fps*1000.).round()),"avg_frame_rate":format!("{}/1000",(i.fps*1000.).round()),"duration":i.duration.to_string(),"nb_frames":count.to_string(),"pix_fmt":if i.alpha{"rgba"}else{"yuv420p"},"side_data_list":if i.erp{vec![json!({"side_data_type":"Spherical Mapping","projection":"equirectangular"})]}else{vec![]}}],"format":{"duration":i.duration.to_string(),"format_name":"mov,mp4"}}).to_string())
+            }
+            ("ffmpeg", "preview") => {
+                let i = fixture(h, argument(args, "-i")?)?;
+                let path = PathBuf::from(args.last().unwrap());
+                safe_path(&h.root, &path)?;
+                artifacts::write_image(&path, i.width, i.height, false, false)?;
+                Ok(String::new())
+            }
+            ("ffmpeg", "extract") => extract_scoped(h, args, scope),
+            _ => Err(invalid(format!("no fixture adapter for {engine}:{op}"))),
         }
-        ("ffmpeg", "preview") => {
-            let i = fixture(h, argument(args, "-i")?)?;
-            let path = PathBuf::from(args.last().unwrap());
-            safe_path(&h.root, &path)?;
-            artifacts::write_image(&path, i.width, i.height, false, false)?;
-            Ok(String::new())
-        }
-        ("ffmpeg", "extract") => extract(h, args),
-        _ => Err(invalid(format!("no fixture adapter for {engine}:{op}"))),
-    }
+    })
 }
 fn environment_device_name(environment: &[(OsString, OsString)]) -> Result<String> {
     let device = environment
@@ -479,7 +614,11 @@ fn environment_device_name(environment: &[(OsString, OsString)]) -> Result<Strin
         _ => Err(invalid("missing or undeclared Brush device binding")),
     }
 }
+#[cfg(test)]
 fn extract(h: &Harness, args: &[String]) -> Result<String> {
+    extract_scoped(h, args, &lifecycle::Scope::default())
+}
+fn extract_scoped(h: &Harness, args: &[String], scope: &lifecycle::Scope) -> Result<String> {
     let i = fixture(h, argument(args, "-i")?)?;
     let script =
         argument(args, "-filter_script:v").or_else(|_| argument(args, "-filter_complex_script"))?;
@@ -530,7 +669,7 @@ fn extract(h: &Harness, args: &[String]) -> Result<String> {
         .filter(|w| w[0] == "-stats_enc_pre")
         .map(|w| w[1].as_str())
         .collect::<Vec<_>>();
-    for pattern in patterns {
+    for (pattern_index, pattern) in patterns.into_iter().enumerate() {
         let mask = pattern.ends_with(".png.png");
         for (n, _) in indices.iter().enumerate() {
             let path = PathBuf::from(pattern.replace("%06d", &format!("{:06}", n + 1)));
@@ -544,10 +683,25 @@ fn extract(h: &Harness, args: &[String]) -> Result<String> {
                         255
                     }])
                 })
-                .save(path)
+                .save(&path)
                 .map_err(invalid)?;
             } else {
-                artifacts::write_image(&path, width, height, i.alpha, i.transparent)?;
+                artifacts::write_image_tagged(
+                    &path,
+                    width,
+                    height,
+                    i.alpha,
+                    i.transparent,
+                    i.name.bytes().fold(indices[n] as u8, u8::wrapping_add),
+                )?;
+            }
+            if pattern_index == 0 && n == 0 {
+                lifecycle::boundary(
+                    scope,
+                    "extract",
+                    "partial",
+                    json!({"written":n+1,"total":indices.len(),"path":path}),
+                )?;
             }
         }
     }
@@ -578,10 +732,26 @@ fn extract(h: &Harness, args: &[String]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_rejects_unknown_duplicate_and_missing_arguments() {
+        let args = ["mapper", "--database_path", "owned.db"].map(String::from);
+        assert!(validate_arguments("colmap", "mapper", &args).is_ok());
+        for tail in [
+            vec!["--unmodelled", "1"],
+            vec!["unexpected-positional"],
+            vec!["--database_path", "other.db"],
+            vec!["--output_path"],
+        ] {
+            let mut broken = args.to_vec();
+            broken.extend(tail.into_iter().map(String::from));
+            assert!(validate_arguments("colmap", "mapper", &broken).is_err());
+        }
+    }
     #[test]
     fn source_identity_is_full_path_and_extraction_never_invents_missing_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let h=Harness{root:dir.path().into(),scenario:serde_json::from_value(json!({"name":"bounds","inputs":[{"name":"one/clip.mp4","kind":"video","fps":30},{"name":"two/clip.mp4","kind":"video","fps":60}],"allowedOperations":["ffmpeg:extract"]})).unwrap(),calls:Mutex::default(),released:Mutex::default(),pending:Mutex::default(),changed:Notify::new()};
+        let h=Harness{root:dir.path().into(),scenario:serde_json::from_value(json!({"name":"bounds","inputs":[{"name":"one/clip.mp4","kind":"video","fps":30},{"name":"two/clip.mp4","kind":"video","fps":60}],"allowedOperations":["ffmpeg:extract"]})).unwrap(),calls:Mutex::default(),released:Mutex::default(),pending:Mutex::default(),changed:Notify::new(),lifecycle:lifecycle::Lifecycle::default(),deferred:Mutex::default()};
         let input = h.root.join("fixtures/two/clip.mp4");
         assert_eq!(fixture(&h, &input.display().to_string()).unwrap().fps, 60.);
         let script = h.root.join("select.txt");

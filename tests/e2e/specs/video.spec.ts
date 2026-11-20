@@ -10,7 +10,7 @@ for (const quality of ['fast', 'balanced', 'high'] as const) {
       await app.page.getByRole('button', { name: '更多设置', exact: true }).click();
       await expect(app.page.locator('.frame-sampling-head output')).toHaveText(`${{ fast: 6, balanced: 8, high: 12 }[quality]} FPS`);
       await app.generate(); const snapshot = await app.waitTerminal();
-      const source = snapshot.projects[0].state.inputs.sources[0];
+      const source = app.project(snapshot).state.inputs.sources[0];
       assertSampling(source.frames, { fast: 6, balanced: 8, high: 12 }[quality], { fast: 60, balanced: 80, high: 120 }[quality]);
       expect(source.frames.initialExtractedFrames).toBe({ fast: 60, balanced: 80, high: 120 }[quality]);
       const calls = snapshot.calls.filter(c => c.operation === 'train');
@@ -33,7 +33,7 @@ for (const quality of ['fast', 'balanced', 'high'] as const) {
       expect(Number(actual['--growth-grad-threshold'])).toBeCloseTo(expected.gradient, 10);
       expect(Number(actual['--growth-select-fraction'])).toBeCloseTo(expected.fraction, 10);
       expect(Number(actual['--growth-stop-iter'])).toBe(expected.stop);
-      expect(snapshot.projects[0].state.inputs.sources[0].names).toHaveLength(30);
+      expect(app.project(snapshot).state.inputs.sources[0].names).toHaveLength(30);
       if (quality === 'high') expect(Number(actual['--max-splats'])).toBe(32 * 40);
       expect(snapshot.calls.filter(c => c.operation === 'mapper').every(c => flags(c.args)['--Mapper.ba_global_backend'] === 'CERES')).toBe(true);
     });
@@ -44,7 +44,7 @@ test.describe('short video', () => {
   test('source below 30 frames retains every frame and cannot backfill', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate();
     const s = await app.waitTerminal();
-    expect(s.projects[0].state.inputs.sources[0].names).toHaveLength(15);
+    expect(app.project(s).state.inputs.sources[0].names).toHaveLength(15);
     expect(s.calls.filter(c => c.operation === 'extract')).toHaveLength(1);
   });
 });
@@ -58,7 +58,7 @@ test.describe('29.97 FPS with nonzero VFR timestamps', () => {
     await expect(app.page.locator('.frame-sampling-head output')).toHaveText('8 FPS');
     await expect(app.page.locator('.frame-sampling-track-row > span').last()).toHaveText('29.97 FPS');
     await app.generate(); const s = await app.waitTerminal();
-    expect(s.projects[0].state.inputs.sources[0].frames.initialExtractedFrames).toBe(80);
+    expect(app.project(s).state.inputs.sources[0].frames.initialExtractedFrames).toBe(80);
     const extraction = s.calls.find(c => c.operation === 'extract')!;
     expect(extraction.args.filter(arg => arg === 'passthrough')).toHaveLength(1);
     expect(extraction.args).toContain('-stats_enc_pre');
@@ -74,7 +74,7 @@ test.describe('all frames', () => {
     await expect(app.page.locator('.frame-sampling-head output')).toHaveText('30 FPS');
     await expect(app.page.locator('.frame-sampling-foot')).toContainText('保留 100% 帧');
     await app.generate(); const s = await app.waitTerminal();
-    expect(s.projects[0].state.inputs.request.items[0].frameRemovalFps).toBe(0);
-    expect(s.projects[0].state.inputs.sources[0].names).toHaveLength(300);
+    expect(app.project(s).state.inputs.request.items[0].frameRemovalFps).toBe(0);
+    expect(app.project(s).state.inputs.sources[0].names).toHaveLength(300);
   });
 });

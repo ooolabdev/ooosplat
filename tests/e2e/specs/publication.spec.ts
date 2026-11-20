@@ -11,19 +11,19 @@ for (const phase of ['prepared', 'committed'] as const) {
       await app.chooseInputs(); await app.quality('fast'); await app.generate();
       await expect.poll(async () => (await app.snapshot()).pending).toContain('publish-boundary');
       const before = await app.snapshot();
-      expect(before.tasks[0].status).not.toBe('completed');
-      const transaction = JSON.parse(await readFile(path.join(before.projects[0].path, 'work/publish-transaction.json'), 'utf8'));
+      expect(app.task(before).status).not.toBe('completed');
+      const transaction = JSON.parse(await readFile(path.join(app.project(before).path, 'work/publish-transaction.json'), 'utf8'));
       expect(transaction.phase).toBe(phase);
       await app.release('publish-boundary');
       await app.waitTerminal('failed');
       await app.stop(); await app.start();
       let s = await app.snapshot();
-      if (s.tasks[0].status !== 'completed') {
-        await app.page.getByRole('button', { name: '继续生成', exact: true }).first().click();
+      if (app.task(s).status !== 'completed') {
+        await app.continueTask();
         s = await app.waitTerminal();
       }
       expect(s.calls.filter(c => c.engine !== 'publication')).toEqual(before.calls.filter(c => c.engine !== 'publication'));
-      expect(s.projects[0].metadata.output.splatCount).toBe(64);
+      expect(app.project(s).metadata.output.splatCount).toBe(64);
     });
   });
 }

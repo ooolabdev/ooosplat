@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
+    future::Future,
+    io,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -198,24 +201,15 @@ impl ReshootSnapshotBuilder {
             }
         };
 
-        if self.ready_root.exists() {
-            let existing = load_snapshot(&self.ready_root)?;
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            if existing.content_identity != manifest.content_identity
-                || existing.coordinate_frame_id != manifest.coordinate_frame_id
-                || existing.source_project_id != manifest.source_project_id
-            {
-                return Err(SplatError::Process(
-                    "Reshoot snapshot already exists with different source content".into(),
-                ));
-            }
-            make_snapshot_read_only(&self.ready_root).await?;
-            return Ok(existing);
-        }
-
-        tokio::fs::rename(&staging, &self.ready_root).await?;
-        make_snapshot_read_only(&self.ready_root).await?;
-        Ok(manifest)
+        publish_staged_snapshot(
+            &staging,
+            &self.ready_root,
+            manifest,
+            cancel,
+            || rename_staged_snapshot(&staging, &self.ready_root),
+            tokio::time::sleep,
+        )
+        .await
     }
 
     async fn build_in(
@@ -329,6 +323,153 @@ impl ReshootSnapshotBuilder {
         atomic_write_json(&staging.join(RESHOOT_SNAPSHOT_MANIFEST), &manifest).await?;
         Ok(manifest)
     }
+}
+
+async fn publish_staged_snapshot<R: Future<Output = io::Result<()>>, W: Future<Output = ()>>(
+    staging: &Path,
+    ready: &Path,
+    manifest: ReshootSnapshotV3,
+    cancel: &CancellationToken,
+    mut rename: impl FnMut() -> R,
+    mut wait: impl FnMut(Duration) -> W,
+) -> Result<ReshootSnapshotV3> {
+    let mut delays = [50, 150, 350].into_iter();
+    let mut attempts = 0;
+    let existing = loop {
+        if cancel.is_cancelled() {
+            return Err(SplatError::Cancelled);
+        }
+        if let Some(existing) = matching_ready_snapshot(ready, &manifest).await? {
+            break Some(existing);
+        }
+        if !snapshot_directory_exists(staging).await? {
+            return Err(SplatError::Io(io::ErrorKind::NotFound.into()));
+        }
+        attempts += 1;
+        let error = match rename().await {
+            Ok(()) => break None,
+            Err(error) => error,
+        };
+        // A concurrent publisher can install a snapshot after the initial check.
+        if let Some(existing) = matching_ready_snapshot(ready, &manifest).await? {
+            break Some(existing);
+        }
+        let retryable = cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33));
+        let Some(delay) = delays.next().filter(|_| retryable) else {
+            return Err(SplatError::Io(error).with_io_diagnostic(format!(
+                "io_substep=publish_reshoot_snapshot\npath_role=reshoot_snapshot\nattempts={attempts}"
+            )));
+        };
+        tracing::debug!(
+            operation = "publish_reshoot_snapshot",
+            attempts,
+            os_error = error.raw_os_error(),
+            wait_ms = delay,
+            "Waiting to rename the staged reshoot snapshot"
+        );
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(SplatError::Cancelled),
+            _ = wait(Duration::from_millis(delay)) => {}
+        }
+    };
+    if existing.is_some() {
+        let _ = tokio::fs::remove_dir_all(staging).await;
+    }
+    // A completed rename is already visible. Finish sealing even if cancellation
+    // arrived during the syscall, so the caller can record the installed snapshot.
+    make_snapshot_read_only(ready).await?;
+    Ok(existing.unwrap_or(manifest))
+}
+
+async fn snapshot_directory_exists(path: &Path) -> Result<bool> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SplatError::InvalidPath(path.to_path_buf()));
+        }
+    }
+    if !metadata.is_dir() {
+        return Err(SplatError::InvalidPath(path.to_path_buf()));
+    }
+    Ok(true)
+}
+
+async fn matching_ready_snapshot(
+    ready: &Path,
+    manifest: &ReshootSnapshotV3,
+) -> Result<Option<ReshootSnapshotV3>> {
+    if !snapshot_directory_exists(ready).await? {
+        return Ok(None);
+    }
+    let existing = load_snapshot(ready)?;
+    if existing.content_identity != manifest.content_identity
+        || existing.coordinate_frame_id != manifest.coordinate_frame_id
+        || existing.source_project_id != manifest.source_project_id
+    {
+        return Err(SplatError::Process(
+            "Reshoot snapshot already exists with different source content".into(),
+        ));
+    }
+    Ok(Some(existing))
+}
+
+#[cfg(windows)]
+async fn rename_staged_snapshot(staging: &Path, ready: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid snapshot directory name",
+        )
+    };
+    let parent = staging.parent().ok_or_else(invalid)?;
+    if ready.parent() != Some(parent) {
+        return Err(invalid());
+    }
+    let staging_name = staging.file_name().ok_or_else(invalid)?.to_owned();
+    let ready_name = ready.file_name().ok_or_else(invalid)?.to_owned();
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    }
+    .to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let parent = std::fs::canonicalize(parent)?;
+        let wide = |name| -> io::Result<Vec<u16>> {
+            let path = parent.join(name);
+            let mut units: Vec<_> = path.as_os_str().encode_wide().collect();
+            if units.contains(&0) {
+                return Err(invalid());
+            }
+            units.push(0);
+            Ok(units)
+        };
+        let source = wide(staging_name)?;
+        let destination = wide(ready_name)?;
+        // SAFETY: Both paths are live NUL-terminated buffers. No replace or copy flags.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+#[cfg(not(windows))]
+async fn rename_staged_snapshot(staging: &Path, ready: &Path) -> io::Result<()> {
+    tokio::fs::rename(staging, ready).await
 }
 
 pub fn load_snapshot(root: &Path) -> Result<ReshootSnapshotV3> {
@@ -773,6 +914,197 @@ mod tests {
         std::fs::write(&image, b"other").unwrap();
         let error = build().build(&CancellationToken::new()).await.unwrap_err();
         assert!(error.to_string().contains("different source content"));
+    }
+
+    async fn prepare_staging(root: &Path) -> (PathBuf, PathBuf, ReshootSnapshotV3) {
+        let model = root.join("source/sparse");
+        write_model(&model, 1);
+        let source_image = root.join("source/frame.jpg");
+        std::fs::write(&source_image, b"snapshot image").unwrap();
+        let staging = root.join(".reshoot-snapshot-test.staging");
+        let ready = root.join("reshoot-snapshot-v3");
+        std::fs::create_dir(&staging).unwrap();
+        let manifest = ReshootSnapshotBuilder::new(&ready)
+            .source_project_id(Uuid::new_v4())
+            .model(model)
+            .image(source_image, "frame.jpg")
+            .build_in(&staging, &CancellationToken::new(), None)
+            .await
+            .unwrap();
+        (staging, ready, manifest)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn snapshot_publication_waits_for_real_child_reader_and_installs_same_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, ready, manifest) = prepare_staging(temp.path()).await;
+        // Rust's default read handle allows delete sharing, but it still blocks
+        // a directory rename while a descendant is open.
+        let child = std::fs::File::open(staging.join("images/frame.jpg")).unwrap();
+        let cancel = CancellationToken::new();
+        let (hit, mut observed) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut first_wait = Some((hit, gate));
+        let publish = publish_staged_snapshot(
+            &staging,
+            &ready,
+            manifest.clone(),
+            &cancel,
+            || rename_staged_snapshot(&staging, &ready),
+            |_| {
+                let (hit, gate) = first_wait.take().expect("one wait should suffice");
+                async move {
+                    hit.send(()).unwrap();
+                    gate.await.unwrap();
+                }
+            },
+        );
+        tokio::pin!(publish);
+        tokio::select! {
+            hit = &mut observed => hit.unwrap(),
+            result = &mut publish => panic!("publication did not wait for the reader: {result:?}"),
+        }
+        assert!(!ready.exists());
+        assert_eq!(verify_snapshot(&staging).unwrap(), manifest);
+        drop(child);
+        release.send(()).unwrap();
+        assert_eq!(publish.await.unwrap(), manifest);
+        assert!(!staging.exists());
+        assert_eq!(verify_snapshot(&ready).unwrap(), manifest);
+        assert!(std::fs::metadata(ready.join("images/frame.jpg"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        let source = temp.path().join("source/frame.jpg");
+        assert_eq!(std::fs::read(&source).unwrap(), b"snapshot image");
+        assert!(!std::fs::metadata(source).unwrap().permissions().readonly());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn snapshot_publication_preserves_staging_when_real_child_reader_keeps_directory_locked()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, ready, manifest) = prepare_staging(temp.path()).await;
+        let _child = std::fs::File::open(staging.join("images/frame.jpg")).unwrap();
+        let mut waits = Vec::new();
+        let error = publish_staged_snapshot(
+            &staging,
+            &ready,
+            manifest.clone(),
+            &CancellationToken::new(),
+            || rename_staged_snapshot(&staging, &ready),
+            |delay| {
+                waits.push(delay.as_millis());
+                std::future::ready(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(waits, [50, 150, 350]);
+        assert!(matches!(
+            error.io_error().unwrap().raw_os_error(),
+            Some(5 | 32 | 33)
+        ));
+        assert!(error
+            .to_string()
+            .contains("io_substep=publish_reshoot_snapshot"));
+        assert!(error.to_string().contains("attempts=4"));
+        assert_eq!(verify_snapshot(&staging).unwrap(), manifest);
+        assert!(!ready.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn snapshot_publication_cancellation_interrupts_rename_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, ready, manifest) = prepare_staging(temp.path()).await;
+        let _child = std::fs::File::open(staging.join("images/frame.jpg")).unwrap();
+        let cancel = CancellationToken::new();
+        let mut attempts = 0;
+        let error = publish_staged_snapshot(
+            &staging,
+            &ready,
+            manifest.clone(),
+            &cancel,
+            || {
+                attempts += 1;
+                rename_staged_snapshot(&staging, &ready)
+            },
+            |_| {
+                cancel.cancel();
+                std::future::pending::<()>()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SplatError::Cancelled));
+        assert_eq!(attempts, 1);
+        assert_eq!(verify_snapshot(&staging).unwrap(), manifest);
+        assert!(!ready.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn snapshot_publication_does_not_overwrite_target_created_during_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, ready, manifest) = prepare_staging(temp.path()).await;
+        let existing_bytes = {
+            let mut other = manifest.clone();
+            other.source_project_id = Some(Uuid::new_v4());
+            serde_json::to_vec(&other).unwrap()
+        };
+        let error = publish_staged_snapshot(
+            &staging,
+            &ready,
+            manifest.clone(),
+            &CancellationToken::new(),
+            || async {
+                // Install a competing manifest after the pre-rename check.
+                std::fs::create_dir(&ready).unwrap();
+                std::fs::write(ready.join(RESHOOT_SNAPSHOT_MANIFEST), &existing_bytes).unwrap();
+                rename_staged_snapshot(&staging, &ready).await
+            },
+            |_| async { panic!("a conflicting destination must not schedule a retry") },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different source content"));
+        assert_eq!(
+            std::fs::read(ready.join(RESHOOT_SNAPSHOT_MANIFEST)).unwrap(),
+            existing_bytes
+        );
+        assert_eq!(verify_snapshot(&staging).unwrap(), manifest);
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_seals_already_renamed_directory_after_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, ready, manifest) = prepare_staging(temp.path()).await;
+        let cancel = CancellationToken::new();
+        let installed = publish_staged_snapshot(
+            &staging,
+            &ready,
+            manifest.clone(),
+            &cancel,
+            || async {
+                rename_staged_snapshot(&staging, &ready).await?;
+                cancel.cancel();
+                Ok(())
+            },
+            |_| async { panic!("uncontended directory should publish without a wait") },
+        )
+        .await
+        .unwrap();
+        assert!(cancel.is_cancelled());
+        assert!(!staging.exists());
+        assert_eq!(verify_snapshot(&ready).unwrap(), manifest);
+        assert_eq!(installed, manifest);
+        assert!(std::fs::metadata(ready.join(RESHOOT_SNAPSHOT_MANIFEST))
+            .unwrap()
+            .permissions()
+            .readonly());
     }
 
     #[tokio::test]

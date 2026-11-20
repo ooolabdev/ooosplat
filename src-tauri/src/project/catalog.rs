@@ -15,8 +15,8 @@ use crate::{
         PipelineStage,
     },
     project::{
-        manager::atomic_write_json, PipelineStateFile, ProjectMetadata, ProjectStatus,
-        PROJECT_APP_ID,
+        manager::{atomic_write_json, read_durable_json_bytes},
+        PipelineStateFile, ProjectMetadata, ProjectStatus, PROJECT_APP_ID,
     },
     reconstruction::ply::inspect_gaussian_ply,
 };
@@ -30,7 +30,8 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
     };
     let mut samples = Vec::new();
     for item in index.projects.into_iter().rev() {
-        let Ok(metadata_bytes) = tokio::fs::read(item.path.join("project.json")).await else {
+        let Ok(metadata_bytes) = read_durable_json_bytes(item.path.join("project.json")).await
+        else {
             continue;
         };
         let Ok(metadata) = serde_json::from_slice::<ProjectMetadata>(&metadata_bytes) else {
@@ -42,7 +43,9 @@ pub async fn runtime_samples() -> Vec<RuntimeSample> {
         else {
             continue;
         };
-        let state_bytes = tokio::fs::read(item.path.join("state.json")).await.ok();
+        let state_bytes = read_durable_json_bytes(item.path.join("state.json"))
+            .await
+            .ok();
         let state = state_bytes
             .as_deref()
             .and_then(|bytes| serde_json::from_slice::<PipelineStateFile>(bytes).ok());
@@ -260,7 +263,7 @@ async fn completion_snapshot(root: &Path, metadata: &ProjectMetadata) -> Complet
             }
             _ => true,
         });
-    let state = tokio::fs::read(root.join("state.json"))
+    let state = read_durable_json_bytes(root.join("state.json"))
         .await
         .ok()
         .and_then(|bytes| serde_json::from_slice::<crate::project::PipelineStateFile>(&bytes).ok());
@@ -310,22 +313,26 @@ pub fn project_model_path(root: &Path, metadata: &ProjectMetadata) -> Option<Pat
 }
 
 pub(crate) async fn project_is_durably_completed(root: &Path, metadata: &ProjectMetadata) -> bool {
-    let transaction = root
-        .join("work")
-        .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
-    if transaction.is_file() {
-        return crate::pipeline::publication::committed_publication(root, &transaction)
-            .await
-            .is_ok_and(|publication| publication.is_some());
+    use crate::pipeline::publication::{self, CommittedPublicationStatus};
+    let transaction = root.join("work").join(publication::TRANSACTION_FILE_NAME);
+    match publication::load_transaction(root, &transaction).await {
+        Ok(Some(transaction)) => {
+            return matches!(
+                publication::committed_transaction_status(root, transaction).await,
+                Ok(CommittedPublicationStatus::Available(_))
+            );
+        }
+        Ok(None) => {}
+        Err(_) => return false,
     }
     let snapshot = completion_snapshot(root, metadata).await;
     snapshot.marked_complete && snapshot.info.is_some()
 }
 
 pub(crate) fn app_data_root() -> Result<PathBuf> {
-    #[cfg(feature = "e2e")]
+    #[cfg(all(feature = "e2e", not(test)))]
     return crate::testing::data_root();
-    #[cfg(not(feature = "e2e"))]
+    #[cfg(any(not(feature = "e2e"), test))]
     dirs::data_local_dir()
         .map(|v| v.join("SplatStudio"))
         .ok_or_else(|| SplatError::Process("无法定位本机应用数据目录".into()))
@@ -337,9 +344,9 @@ fn index_path() -> Result<PathBuf> {
     Ok(app_data_root()?.join("project-index.json"))
 }
 pub fn default_projects_root() -> Result<PathBuf> {
-    #[cfg(feature = "e2e")]
+    #[cfg(all(feature = "e2e", not(test)))]
     return crate::testing::data_root().map(|root| root.join("projects"));
-    #[cfg(not(feature = "e2e"))]
+    #[cfg(any(not(feature = "e2e"), test))]
     dirs::document_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Documents")))
         .or_else(|| dirs::data_local_dir().map(|data| data.join("Documents")))
@@ -409,11 +416,9 @@ pub async fn save_mcp_settings(mcp: crate::mcp::McpSettings) -> Result<AppSettin
 }
 
 async fn load_index_from(path: &Path) -> Result<ProjectIndex> {
-    if path.is_file() {
-        if let Ok(bytes) = tokio::fs::read(path).await {
-            if let Ok(value) = serde_json::from_slice(&bytes) {
-                return Ok(value);
-            }
+    if let Ok(bytes) = read_durable_json_bytes(path).await {
+        if let Ok(value) = serde_json::from_slice(&bytes) {
+            return Ok(value);
         }
     }
     Ok(ProjectIndex {
@@ -500,7 +505,7 @@ pub(crate) async fn registered_project_path_from(index_path: &Path, id: Uuid) ->
     let _guard = PROJECT_INDEX_LOCK.lock().await;
     // Unlike background catalog scans, an explicit continuation must surface a
     // broken/unreadable index instead of treating it as an empty registry.
-    let bytes = match tokio::fs::read(index_path).await {
+    let bytes = match read_durable_json_bytes(index_path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(SplatError::Process("项目索引中不存在该项目".into()));
@@ -519,7 +524,7 @@ pub(crate) async fn registered_project_path_from(index_path: &Path, id: Uuid) ->
 /// Identical metadata/ownership validation for already-bound tasks and catalog
 /// continuations. Callers attach preparation diagnostics around this read.
 pub(crate) async fn read_project_metadata_at(path: &Path, id: Uuid) -> Result<ProjectMetadata> {
-    let bytes = tokio::fs::read(path.join("project.json")).await?;
+    let bytes = read_durable_json_bytes(path.join("project.json")).await?;
     let metadata: ProjectMetadata = serde_json::from_slice(&bytes)?;
     if !has_project_ownership(&metadata, path, id) {
         return Err(SplatError::Process(
@@ -651,7 +656,7 @@ pub async fn get_overview() -> Result<ProjectOverview> {
 }
 
 async fn summarize_project(project: &Path) -> Result<ProjectSummary> {
-    let bytes = tokio::fs::read(project.join("project.json")).await?;
+    let bytes = read_durable_json_bytes(project.join("project.json")).await?;
     let metadata: ProjectMetadata = serde_json::from_slice(&bytes)?;
     summarize_project_metadata(project, metadata).await
 }
@@ -769,7 +774,7 @@ pub async fn delete_project(id: Uuid) -> Result<()> {
         .find(|item| item.id == id)
         .cloned()
         .ok_or_else(|| SplatError::Process("项目索引中不存在该项目".into()))?;
-    let bytes = tokio::fs::read(item.path.join("project.json")).await?;
+    let bytes = read_durable_json_bytes(item.path.join("project.json")).await?;
     let metadata: ProjectMetadata = serde_json::from_slice(&bytes)?;
     if metadata.id != id {
         return Err(SplatError::Process("项目身份校验失败，拒绝删除".into()));

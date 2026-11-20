@@ -1,6 +1,9 @@
 use std::{
+    fs::File,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use chrono::{Local, Utc};
@@ -124,7 +127,8 @@ impl ProjectManager {
             .await?
             .is_some_and(|s| s.creation.as_ref().is_some_and(|c| c.ready))
         {
-            let metadata = serde_json::from_slice(&tokio::fs::read(&paths.metadata).await?)?;
+            let metadata =
+                serde_json::from_slice(&read_durable_json_bytes(&paths.metadata).await?)?;
             return Ok((paths, metadata));
         }
         for dir in [
@@ -260,27 +264,37 @@ impl ProjectManager {
             if canonical.parent() != Some(root.as_path()) {
                 return Err(SplatError::InvalidPath(paths.project.clone()));
             }
-            if paths.state.exists() {
-                let saved = self.read_state(&paths.state).await?;
+            let state_bytes = match read_durable_json_bytes(&paths.state).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(bytes) = state_bytes {
+                let saved: PipelineStateFile = serde_json::from_slice(&bytes)?;
                 if saved.creation.as_ref().map(|s| &s.intent) != Some(intent) {
                     return Err(SplatError::Process(
                         "Project creation identity mismatch".into(),
                     ));
                 }
-                if paths.metadata.exists() {
-                    let metadata: ProjectMetadata =
-                        serde_json::from_slice(&tokio::fs::read(&paths.metadata).await?)?;
-                    if metadata.id != intent.project_id
-                        || metadata.workspace_task_id != Some(intent.task_id)
-                    {
-                        return Err(SplatError::Process(
-                            "Project creation binding mismatch".into(),
-                        ));
+                match read_durable_json_bytes(&paths.metadata).await {
+                    Ok(bytes) => {
+                        let metadata: ProjectMetadata = serde_json::from_slice(&bytes)?;
+                        if metadata.id != intent.project_id
+                            || metadata.workspace_task_id != Some(intent.task_id)
+                        {
+                            return Err(SplatError::Process(
+                                "Project creation binding mismatch".into(),
+                            ));
+                        }
                     }
-                } else if saved.creation.as_ref().is_some_and(|c| c.ready) {
-                    return Err(SplatError::Process(
-                        "Completed creation is missing project metadata".into(),
-                    ));
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if saved.creation.as_ref().is_some_and(|c| c.ready) {
+                            return Err(SplatError::Process(
+                                "Completed creation is missing project metadata".into(),
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 return Ok(Some(saved));
             }
@@ -509,7 +523,7 @@ impl ProjectManager {
             .is_some_and(|s| s.creation.as_ref().is_some_and(|c| c.ready))
         {
             let metadata =
-                serde_json::from_slice(&tokio::fs::read(&reserved_paths.metadata).await?)?;
+                serde_json::from_slice(&read_durable_json_bytes(&reserved_paths.metadata).await?)?;
             return Ok((reserved_paths, metadata));
         }
         let source = project.join("source");
@@ -683,7 +697,11 @@ impl ProjectManager {
     }
 
     pub async fn write_state(&self, path: &Path, state: &PipelineStateFile) -> Result<()> {
+        #[cfg(feature = "e2e")]
+        let transitions = crate::testing::lifecycle::before_state(path, state).await?;
         atomic_write_json(path, state).await?;
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::after_state(transitions).await?;
         if let Some(observer) = &self.checkpoint_observer {
             observer(state);
         }
@@ -696,7 +714,11 @@ impl ProjectManager {
         path: &Path,
         state: &PipelineStateFile,
     ) -> Result<()> {
+        #[cfg(feature = "e2e")]
+        let transitions = crate::testing::lifecycle::before_state(path, state).await?;
         atomic_write_json_for_preparation(path, state).await?;
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::after_state(transitions).await?;
         if let Some(observer) = &self.checkpoint_observer {
             observer(state);
         }
@@ -718,10 +740,24 @@ impl ProjectManager {
             })
     }
     pub async fn read_state(&self, path: &Path) -> Result<PipelineStateFile> {
-        Ok(serde_json::from_slice(&tokio::fs::read(path).await?)?)
+        Ok(serde_json::from_slice(
+            &read_durable_json_bytes(path).await?,
+        )?)
     }
     pub async fn write_metadata(&self, path: &Path, metadata: &ProjectMetadata) -> Result<()> {
-        atomic_write_json(path, metadata).await
+        atomic_write_json(path, metadata).await?;
+        #[cfg(feature = "e2e")]
+        if metadata.status == ProjectStatus::Completed {
+            crate::testing::lifecycle::at(
+                path,
+                None,
+                "projectMetadata",
+                "checkpoint",
+                serde_json::json!({"projectId":metadata.id}),
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 
@@ -775,6 +811,45 @@ fn validate_video_path(path: &Path) -> Result<()> {
 
 pub async fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write_json_with_context(path, value, &AtomicWriteContext::default()).await
+}
+
+pub(crate) async fn read_durable_json_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let path = path.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || read_durable_json_bytes_sync(path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+pub(crate) fn read_durable_json_bytes_sync(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let mut file = open_durable_json_file(path.as_ref())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn open_durable_json_file(path: &Path) -> io::Result<File> {
+    open_durable_json(cfg!(windows), || File::open(path), std::thread::sleep)
+}
+
+fn open_durable_json(
+    windows: bool,
+    mut open: impl FnMut() -> io::Result<File>,
+    mut wait: impl FnMut(Duration),
+) -> io::Result<File> {
+    // A concurrent Windows replacement can briefly make the name unavailable.
+    // Once open succeeds, read the snapshot from that handle.
+    let first_error = match open() {
+        Err(error) if windows && error.raw_os_error() == Some(2) => error,
+        result => return result,
+    };
+    for delay in [5, 20, 75, 200] {
+        wait(Duration::from_millis(delay));
+        match open() {
+            Err(error) if error.raw_os_error() == Some(2) => {}
+            result => return result,
+        }
+    }
+    Err(first_error)
 }
 
 pub(crate) async fn atomic_write_json_for_preparation<T: serde::Serialize>(
@@ -1517,6 +1592,76 @@ mod tests {
         assert_eq!(new_snapshot["value"], "new");
     }
 
+    #[test]
+    fn durable_json_open_recovers_after_windows_name_visibility_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tasks.json");
+        let contents = br#"{"tasks":{}}"#;
+        std::fs::write(&path, contents).unwrap();
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let mut file = open_durable_json(
+            true,
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(io::Error::from_raw_os_error(2))
+                } else {
+                    File::open(&path)
+                }
+            },
+            |delay| waits.push(delay.as_millis()),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, [5, 20]);
+        assert_eq!(bytes, contents);
+    }
+
+    #[test]
+    fn durable_json_open_preserves_absence_after_bounded_windows_waits() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let error = open_durable_json(
+            true,
+            || {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(2))
+            },
+            |delay| waits.push(delay.as_millis()),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 5);
+        assert_eq!(waits, [5, 20, 75, 200]);
+        assert_eq!(error.raw_os_error(), Some(2));
+    }
+
+    #[test]
+    fn durable_json_open_returns_other_errors_immediately() {
+        for (windows, code) in [(false, 2), (true, 3), (true, 5), (true, 32)] {
+            let error = open_durable_json(
+                windows,
+                || Err(io::Error::from_raw_os_error(code)),
+                |_| panic!("unexpected JSON open retry"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+
+        let mut failures = [2, 5].into_iter();
+        let mut waits = Vec::new();
+        let error = open_durable_json(
+            true,
+            || Err(io::Error::from_raw_os_error(failures.next().unwrap())),
+            |delay| waits.push(delay.as_millis()),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(waits, [5]);
+    }
+
     #[tokio::test]
     async fn concurrent_readers_never_see_partial_or_missing_json_during_5000_saves() {
         use std::sync::{
@@ -1537,7 +1682,7 @@ mod tests {
             let mut reads = 0;
             let mut errors = Vec::new();
             while stop.load(Ordering::Acquire) {
-                let result = std::fs::read(&reader_path).and_then(|bytes| {
+                let result = read_durable_json_bytes_sync(&reader_path).and_then(|bytes| {
                     serde_json::from_slice::<serde_json::Value>(&bytes)
                         .map_err(std::io::Error::other)
                 });

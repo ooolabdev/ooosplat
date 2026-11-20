@@ -2,6 +2,7 @@
 //! are unchanged. Only external facts and process execution are substituted.
 mod artifacts;
 mod engine;
+pub mod lifecycle;
 
 use crate::{
     engines::gpu_selection::{BrushDeviceKind, GpuDeviceOption, GpuInventory, SelectionConfidence},
@@ -18,7 +19,9 @@ use std::{
 use tokio::sync::Notify;
 
 pub fn enabled() -> bool {
-    true
+    // Native E2E binaries always fail closed, even before initialize(). Rust
+    // unit tests retain their existing temp-directory/process fixtures.
+    !cfg!(test) || HARNESS.get().is_some()
 }
 pub(super) fn invalid(message: impl std::fmt::Display) -> SplatError {
     SplatError::Process(format!("E2E harness: {message}"))
@@ -80,6 +83,12 @@ pub struct Fault {
     pub gate: Option<String>,
     #[serde(default)]
     pub registered: Option<usize>,
+    #[serde(default)]
+    pub task: Option<usize>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub registered_by_source: std::collections::BTreeMap<String, usize>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -95,6 +104,10 @@ pub struct Scenario {
     pub cpu_colmap: bool,
     #[serde(default)]
     pub shared_json_readers: bool,
+    #[serde(default)]
+    pub barriers: Vec<lifecycle::Barrier>,
+    #[serde(default)]
+    pub late_event: Option<lifecycle::LateRule>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,6 +127,10 @@ pub struct Invocation {
     pub run_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub pipeline_operation: Option<crate::pipeline::event::PipelineOperation>,
+    #[serde(default)]
+    pub scope: lifecycle::Scope,
+    #[serde(default)]
+    pub input_lists: std::collections::BTreeMap<String, Vec<String>>,
 }
 pub(super) struct Harness {
     pub root: PathBuf,
@@ -122,8 +139,27 @@ pub(super) struct Harness {
     pub released: Mutex<BTreeSet<String>>,
     pub pending: Mutex<BTreeSet<String>>,
     pub changed: Notify,
+    pub lifecycle: lifecycle::Lifecycle,
+    pub deferred: Mutex<std::collections::BTreeMap<String, lifecycle::Deferred>>,
 }
 static HARNESS: OnceLock<Harness> = OnceLock::new();
+
+/// Durable test evidence, using same-directory staging and Windows-compatible rename.
+pub(super) fn save_evidence(path: &Path, value: &impl Serialize) -> Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
 
 /// A deterministic read-only observer, not a replacement writer or an I/O
 /// retry. Holding this ordinary handle reproduces the Windows overlap that
@@ -150,6 +186,19 @@ pub fn bind_process(
         if let Some(call) = h.calls.lock().unwrap().get_mut(index as usize) {
             call.run_id = run_id;
             call.pipeline_operation = operation.cloned();
+            if let Some(op) = operation {
+                call.scope.operation_id = Some(op.id);
+                if op.source_id.is_some() {
+                    call.scope.source_id = op.source_id.clone();
+                    if let Some(bound) = call
+                        .working_directory
+                        .as_ref()
+                        .and_then(|path| lifecycle::scope(path, op.source_id.as_deref()))
+                    {
+                        call.scope.source_name = bound.source_name;
+                    }
+                }
+            }
         }
     }
 }
@@ -157,8 +206,12 @@ pub fn bind_process(
 /// Fault injection after a *real*, durable publication transition. Never
 /// manufactures a candidate or marks any task complete.
 pub async fn publication_checkpoint(path: &Path, phase: &str) -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
     let h = host()?;
     safe_path(&h.root, path)?;
+    lifecycle::at(path, None, &format!("publication:{phase}"), "checkpoint", json!({"transaction":std::fs::read(path).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok())})).await?;
     let key = format!("publication:{phase}");
     if !h.scenario.faults.iter().any(|f| f.operation == key) {
         return Ok(());
@@ -190,11 +243,10 @@ pub async fn publication_checkpoint(path: &Path, phase: &str) -> Result<()> {
             dataset_init_sha256: vec![],
             run_id: None,
             pipeline_operation: None,
+            scope: lifecycle::scope(path, None).unwrap_or_default(),
+            input_lists: Default::default(),
         });
-        std::fs::write(
-            h.root.join("invocations.json"),
-            serde_json::to_vec_pretty(&*calls)?,
-        )?;
+        save_evidence(&h.root.join("invocations.json"), &*calls)?;
         (sequence, fault)
     };
     if let Some(gate) = fault.as_ref().and_then(|f| f.gate.as_ref()) {
@@ -212,10 +264,7 @@ pub async fn publication_checkpoint(path: &Path, phase: &str) -> Result<()> {
     {
         let mut calls = h.calls.lock().unwrap();
         calls[sequence - 1].outcome = if fail { "error" } else { "success" }.into();
-        std::fs::write(
-            h.root.join("invocations.json"),
-            serde_json::to_vec_pretty(&*calls)?,
-        )?;
+        save_evidence(&h.root.join("invocations.json"), &*calls)?;
     }
     if fail {
         Err(SplatError::Io(std::io::Error::from_raw_os_error(5)))
@@ -332,11 +381,19 @@ pub fn initialize() -> Result<()> {
     {
         return Err(invalid("empty or oversized scenario"));
     }
-    let calls = match std::fs::read(root.join("invocations.json")) {
+    let mut calls: Vec<Invocation> = match std::fs::read(root.join("invocations.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e.into()),
     };
+    if calls.iter().any(|call| call.outcome == "running") {
+        for call in &mut calls {
+            if call.outcome == "running" {
+                call.outcome = "interrupted".into();
+            }
+        }
+        save_evidence(&root.join("invocations.json"), &calls)?;
+    }
     let harness = Harness {
         root,
         scenario,
@@ -344,7 +401,10 @@ pub fn initialize() -> Result<()> {
         released: Mutex::default(),
         pending: Mutex::default(),
         changed: Notify::new(),
+        lifecycle: lifecycle::Lifecycle::default(),
+        deferred: Mutex::default(),
     };
+    lifecycle::initialize(&harness)?;
     artifacts::prepare_inputs(&harness)?;
     HARNESS
         .set(harness)
@@ -446,10 +506,15 @@ pub async fn e2e_snapshot(
     tasks: tauri::State<'_, crate::tasks::TaskService>,
 ) -> std::result::Result<Value, String> {
     let h = host().map_err(|e| e.to_string())?;
-    let tasks = tasks.all().await.map_err(|e| e.to_string())?;
+    let tasks = tasks.e2e_records();
     let mut projects = Vec::new();
     for task in &tasks {
-        if let Some(path) = &task.project_path {
+        if let Some(path) = task
+            .project_path
+            .as_ref()
+            .or_else(|| task.creation_intent.as_ref().map(|i| &i.project_path))
+            .filter(|p| p.join("state.json").exists())
+        {
             safe_path(&h.root, path).map_err(|e| e.to_string())?;
             let read = |name: &str| {
                 let file = path.join(name);
@@ -467,11 +532,15 @@ pub async fn e2e_snapshot(
         }
     }
     Ok(
-        json!({"scenario":h.scenario.name,"root":h.root,"inputs":h.scenario.inputs.iter().map(|i|h.root.join("fixtures").join(&i.name)).collect::<Vec<_>>(),"calls":*h.calls.lock().unwrap(),"pending":*h.pending.lock().unwrap(),"tasks":tasks,"projects":projects}),
+        json!({"scenario":h.scenario.name,"root":h.root,"inputs":h.scenario.inputs.iter().map(|i|h.root.join("fixtures").join(&i.name)).collect::<Vec<_>>(),"calls":*h.calls.lock().unwrap(),"pending":*h.pending.lock().unwrap(),"tasks":tasks,"projects":projects,"lifecycle":lifecycle::snapshot(h)}),
     )
 }
 #[tauri::command]
-pub fn e2e_release(gate: String) -> std::result::Result<(), String> {
+pub fn e2e_release(
+    gate: String,
+    task_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> std::result::Result<(), String> {
     let h = host().map_err(|e| e.to_string())?;
     if !h
         .scenario
@@ -480,6 +549,19 @@ pub fn e2e_release(gate: String) -> std::result::Result<(), String> {
         .any(|f| f.gate.as_ref() == Some(&gate))
     {
         return Err("Unknown execution gate".into());
+    }
+    if !h.pending.lock().unwrap().contains(&gate)
+        || !h.calls.lock().unwrap().iter().any(|call| {
+            call.outcome == "running"
+                && call.scope.task_id == Some(task_id)
+                && call.scope.run_id == Some(run_id)
+                && h.scenario.faults.iter().any(|fault| {
+                    fault.gate.as_ref() == Some(&gate)
+                        && fault.operation == format!("{}:{}", call.engine, call.operation)
+                })
+        })
+    {
+        return Err("Stale or foreign execution gate".into());
     }
     h.released.lock().unwrap().insert(gate);
     h.changed.notify_waiters();

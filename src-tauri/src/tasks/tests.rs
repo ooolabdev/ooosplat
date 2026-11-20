@@ -1477,6 +1477,141 @@ fn notification_event(sequence: u64, kind: crate::pipeline::EventKind) -> Pipeli
 }
 
 #[tokio::test]
+async fn checkpoint_configuration_preserves_saved_generation_policies_in_memory_and_on_disk() {
+    use crate::pipeline::generation_policy::GenerationPolicy;
+
+    let cases = [
+        (
+            Some(GenerationPolicy::default()),
+            serde_json::json!({"version":7,"autoRetryEnabled":true,"frameSamplingRatio":null,"frameSamplingFps":null}),
+        ),
+        (
+            Some(GenerationPolicy {
+                version: 7,
+                auto_retry_enabled: false,
+                frame_sampling_ratio: None,
+                frame_sampling_fps: None,
+            }),
+            serde_json::json!({"version":7,"autoRetryEnabled":false,"frameSamplingRatio":null,"frameSamplingFps":null}),
+        ),
+        (
+            Some(GenerationPolicy {
+                version: 7,
+                auto_retry_enabled: true,
+                frame_sampling_ratio: Some(0.375),
+                frame_sampling_fps: None,
+            }),
+            serde_json::json!({"version":7,"autoRetryEnabled":true,"frameSamplingRatio":0.375,"frameSamplingFps":null}),
+        ),
+        (
+            Some(GenerationPolicy {
+                version: 7,
+                auto_retry_enabled: false,
+                frame_sampling_ratio: None,
+                frame_sampling_fps: Some(7.5),
+            }),
+            serde_json::json!({"version":7,"autoRetryEnabled":false,"frameSamplingRatio":null,"frameSamplingFps":7.5}),
+        ),
+        (
+            Some(GenerationPolicy {
+                version: 5,
+                auto_retry_enabled: false,
+                frame_sampling_ratio: Some(0.4),
+                frame_sampling_fps: None,
+            }),
+            serde_json::json!({"version":5,"autoRetryEnabled":false,"frameSamplingRatio":0.4,"frameSamplingFps":null}),
+        ),
+        (None, Value::Null),
+    ];
+    for (policy, expected) in cases {
+        let (_root, service, task) = fixture().await;
+        let run = notification_run(&service, task.task_id);
+        let mut checkpoint = crate::project::PipelineStateFile::created(Quality::Balanced);
+        checkpoint.generation_policy = policy;
+        let configuration = checkpoint_snapshot(&checkpoint);
+        assert_eq!(configuration.get("generation_policy"), Some(&expected));
+        // Both live checkpoints and state-file recovery expose the same saved
+        // policy. The literal expectation also checks versions and nulls.
+        assert_eq!(
+            actual_snapshot(serde_json::to_value(&checkpoint).unwrap()).get("generation_policy"),
+            Some(&expected)
+        );
+        service.on_runner_update(
+            task.task_id,
+            run,
+            RunnerUpdate::Configuration(configuration),
+        );
+        let saved = service.get(task.task_id).await.unwrap();
+        assert_eq!(saved.generation_policy, policy);
+        assert_eq!(
+            saved.actual_configuration.as_ref().unwrap()["generation_policy"],
+            expected
+        );
+        service.persist().await.unwrap();
+        let disk: Registry =
+            serde_json::from_slice(&std::fs::read(service.root.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.tasks[&task.task_id].generation_policy, policy);
+        assert_eq!(
+            disk.tasks[&task.task_id].actual_configuration,
+            saved.actual_configuration
+        );
+        let restored = TaskService::at(service.root.clone())
+            .get(task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(restored.generation_policy, policy);
+        assert_eq!(restored.actual_configuration, saved.actual_configuration);
+    }
+}
+
+#[tokio::test]
+async fn stale_run_checkpoint_configuration_cannot_replace_current_generation_policy() {
+    let (_root, service, task) = fixture().await;
+    let previous = notification_run(&service, task.task_id);
+    let current = notification_run(&service, task.task_id);
+    let mut checkpoint = crate::project::PipelineStateFile::created(Quality::Balanced);
+    checkpoint.generation_policy = Some(crate::pipeline::generation_policy::GenerationPolicy {
+        version: 5,
+        auto_retry_enabled: false,
+        frame_sampling_ratio: Some(0.4),
+        frame_sampling_fps: None,
+    });
+    service.on_runner_update(
+        task.task_id,
+        current,
+        RunnerUpdate::Configuration(checkpoint_snapshot(&checkpoint)),
+    );
+    let saved = service.get(task.task_id).await.unwrap();
+    assert_eq!(saved.generation_policy, checkpoint.generation_policy);
+    assert_eq!(
+        saved.actual_configuration.as_ref().unwrap()["generation_policy"],
+        serde_json::json!({"version":5,"autoRetryEnabled":false,"frameSamplingRatio":0.4,"frameSamplingFps":null})
+    );
+    // Delayed legacy and current-default snapshots must both be rejected.
+    for policy in [None, Some(Default::default())] {
+        checkpoint.generation_policy = policy;
+        service.on_runner_update(
+            task.task_id,
+            previous,
+            RunnerUpdate::Configuration(checkpoint_snapshot(&checkpoint)),
+        );
+        assert_eq!(
+            serde_json::to_value(service.get(task.task_id).await.unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+    service.persist().await.unwrap();
+    let restored = TaskService::at(service.root.clone())
+        .get(task.task_id)
+        .await
+        .unwrap();
+    assert_eq!(restored.generation_policy, saved.generation_policy);
+    assert_eq!(restored.actual_configuration, saved.actual_configuration);
+    assert_eq!(restored.run_id, Some(current));
+}
+
+#[tokio::test]
 async fn brush_executions_survive_runtime_clear_and_are_isolated_per_attempt_and_run() {
     use crate::pipeline::{
         event::PipelineOperation, runtime::RuntimeTracker, EventKind, PipelineEngine,

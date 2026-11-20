@@ -7,11 +7,11 @@ for (const outcome of ['zero', 'export', 'crash'] as const) {
     } });
     test('only a numerical result may trigger authorized cold fallback', async ({ app }) => {
       await app.chooseInputs(); await app.quality('fast'); await app.generate(); await app.waitTerminal();
-      await app.page.getByRole('button', { name: '补拍', exact: true }).first().click();
+      await app.reshoot();
       await app.chooseInputs([1]); await app.generate(); await app.answerReshoot('good');
       await expect.poll(async () => (await app.snapshot()).tasks.filter(t => ['completed', 'failed'].includes(t.status)).length).toBe(2);
       const s = await app.snapshot();
-      const derived = s.projects.find(p => p.state.reshoot?.recipe)!;
+      const derived = app.project(s);
       const task = s.tasks.find(t => t.task_id === derived.taskId)!;
       const train = s.calls.filter(c => c.operation === 'train');
       expect(train[1].datasetInitFiles).toHaveLength(1);
@@ -34,7 +34,7 @@ test.describe('zero new registration', () => {
   } });
   test('retry authorization disabled cannot publish just the old scene', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate(); await app.waitTerminal();
-    await app.page.getByRole('button', { name: '补拍', exact: true }).first().click();
+    await app.reshoot();
     await app.chooseInputs([1]); await app.page.locator('.planner-switch').click();
     await app.generate(); await app.answerReshoot('appearance');
     await expect.poll(async () => (await app.snapshot()).tasks.some(t => t.status === 'failed')).toBe(true);

@@ -558,6 +558,22 @@ mod input_admission_tests {
 
     #[tokio::test]
     async fn new_colmap_flags_and_manifest_are_rejected_before_engine_or_task_work() {
+        #[cfg(feature = "e2e")]
+        let native_fixture = {
+            let token = uuid::Uuid::new_v4().to_string();
+            let owned = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".cache/e2e/runs")
+                .join(format!("cli-unit-{token}"));
+            std::fs::create_dir_all(&owned).unwrap();
+            std::fs::write(owned.join(".owner"), &token).unwrap();
+            std::fs::write(owned.join("scenario.json"), serde_json::to_vec(&serde_json::json!({"name":"cli-admission-unit","inputs":[{"name":"photos","kind":"images","count":3}],"allowedOperations":["colmap:help"]})).unwrap()).unwrap();
+            std::env::set_var("OOOSPLAT_E2E_ROOT", &owned);
+            std::env::set_var("OOOSPLAT_E2E_TOKEN", token);
+            ooo_splat::testing::initialize().unwrap();
+            owned
+        };
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("missing-model");
         let images = root.path().join("missing-images");
@@ -600,5 +616,7 @@ mod input_admission_tests {
         }
         assert!(!model.exists() && !images.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        #[cfg(feature = "e2e")]
+        assert!(!native_fixture.join("invocations.json").exists());
     }
 }

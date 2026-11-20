@@ -10,10 +10,10 @@ for (const condition of ['appearance', 'geometry', 'unsure', 'good'] as const) {
     test('user answers reach reconstruction and Gaussian initialization without changing the source', async ({ app }) => {
       await app.chooseInputs(); await app.quality('fast'); await app.generate();
       const original = await app.waitTerminal();
-      const source = original.projects[0];
+      const source = app.project(original);
       const digest = async (name: string) => createHash('sha256').update(await readFile(path.join(source.path, name))).digest('hex');
       const before = await Promise.all(['project.json', 'state.json', 'final.ply'].map(digest));
-      await app.page.getByRole('button', { name: '补拍', exact: true }).first().click();
+      await app.reshoot();
       await app.chooseInputs([1]); await app.generate(); await app.answerReshoot(condition, condition === 'good' ? 'same' : condition === 'geometry' ? 'different' : 'unsure');
       const result = await app.waitCompleted(2);
       const training = result.calls.filter(c => c.operation === 'train'); expect(training).toHaveLength(2);
@@ -21,7 +21,7 @@ for (const condition of ['appearance', 'geometry', 'unsure', 'good'] as const) {
       expect(Number(actual['--total-train-iters'])).toBe(ordinary.fast.steps);
       expect(training[1].datasetInitFiles.length).toBe(condition === 'good' ? 1 : 0);
       if (condition === 'good') expect(training[1].datasetInitSha256?.[0]?.[1]).toBe(before[2]);
-      const derived = result.projects.find(p => p.taskId !== source.taskId)!;
+      const derived = app.project(result);
       expect(derived.state.inputs.executionPlan.reconstruction.kind).toBe(condition === 'geometry' ? 'full' : 'incremental');
       expect(derived.state.inputs.executionPlan.trainingSeed.kind).toBe(condition === 'good' ? 'gaussianSnapshot' : 'sparsePoints');
       if (condition === 'good') {

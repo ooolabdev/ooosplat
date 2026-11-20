@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     error::{Result, SplatError},
     project::{
-        manager::{atomic_replace_file, atomic_write_json},
+        manager::{atomic_replace_file, atomic_write_json, read_durable_json_bytes},
         ProjectOutput,
     },
     reconstruction::ply::inspect_gaussian_ply,
@@ -194,7 +194,7 @@ pub async fn load_transaction(
     transaction_path: &Path,
 ) -> Result<Option<PublicationTransaction>> {
     ensure_transaction_path(project_root, transaction_path)?;
-    let bytes = match tokio::fs::read(transaction_path).await {
+    let bytes = match read_durable_json_bytes(transaction_path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -227,6 +227,13 @@ pub(crate) async fn committed_publication_status(
     let Some(transaction) = load_transaction(project_root, transaction_path).await? else {
         return Ok(CommittedPublicationStatus::None);
     };
+    committed_transaction_status(project_root, transaction).await
+}
+
+pub(crate) async fn committed_transaction_status(
+    project_root: &Path,
+    transaction: PublicationTransaction,
+) -> Result<CommittedPublicationStatus> {
     if !matches!(
         transaction.phase,
         PublicationPhase::Committed
@@ -340,6 +347,8 @@ pub async fn mark_reconciled(
     transaction.phase = PublicationPhase::Reconciled;
     transaction.reconciled_at.get_or_insert_with(Utc::now);
     write_transaction(transaction_path, &transaction).await?;
+    #[cfg(feature = "e2e")]
+    crate::testing::publication_checkpoint(transaction_path, "reconciled").await?;
     outcome(project_root, transaction)
 }
 
@@ -375,6 +384,8 @@ pub async fn mark_project_views_reconciled(
             .project_views_reconciled_at
             .get_or_insert_with(Utc::now);
         write_transaction(transaction_path, &transaction).await?;
+        #[cfg(feature = "e2e")]
+        crate::testing::publication_checkpoint(transaction_path, "projectViewsReconciled").await?;
     }
     outcome(project_root, transaction)
 }
@@ -434,6 +445,15 @@ async fn install_and_commit(
         let _ = tokio::fs::remove_file(&temporary).await;
         return install;
     }
+    #[cfg(feature = "e2e")]
+    crate::testing::lifecycle::at(
+        transaction_path,
+        None,
+        "publication:installed",
+        "written",
+        serde_json::json!({"output":destination}),
+    )
+    .await?;
     let output_sha256 = verify_output_against_candidate(
         &destination,
         &transaction.candidate_sha256,
@@ -444,6 +464,8 @@ async fn install_and_commit(
     transaction.output_sha256 = Some(output_sha256);
     transaction.phase = PublicationPhase::OutputInstalled;
     write_transaction(transaction_path, transaction).await?;
+    #[cfg(feature = "e2e")]
+    crate::testing::publication_checkpoint(transaction_path, "outputInstalled").await?;
     commit_installed_output(project_root, transaction_path, transaction).await
 }
 

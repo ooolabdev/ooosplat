@@ -11,14 +11,14 @@ test.describe('OOM retries', () => {
     expect(second['--max-splats']).toBe('800');
     delete first['--max-splats']; delete second['--max-splats'];
     expect(first).toEqual(second);
-    expect(s.tasks[0].automatically_retried).toBe(true);
+    expect(app.task(s).automatically_retried).toBe(true);
   });
   test('disabled automatic retry fails after exactly one launch', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast');
     await app.page.locator('.planner-switch').click(); await app.generate();
     const s = await app.waitTerminal('failed');
     expect(s.calls.filter(c => c.operation === 'train')).toHaveLength(1);
-    expect(s.projects[0].state.brushTraining.oomRetryUsed).toBe(false);
+    expect(app.project(s).state.brushTraining.oomRetryUsed).toBe(false);
   });
 });
 test.describe('cancel and restart', () => {
@@ -27,14 +27,14 @@ test.describe('cancel and restart', () => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate();
     await expect.poll(async () => (await app.snapshot()).pending).toContain('first-training');
     const before = await app.snapshot();
-    await app.page.getByRole('button', { name: '取消任务并终止所有进程', exact: true }).click();
+    await app.cancelTask();
     await app.waitTerminal('cancelled');
     await app.stop(); await app.start();
-    await app.page.getByRole('button', { name: '继续生成', exact: true }).first().click();
+    await app.continueTask();
     const after = await app.waitTerminal();
     expect(after.calls.filter(c => c.operation === 'mapper')).toHaveLength(1);
     const train = after.calls.filter(c => c.operation === 'train'); expect(train).toHaveLength(2);
     expect(flags(train[0].args)).toEqual(flags(train[1].args));
-    expect(after.projects[0].state.generationPolicy).toEqual(before.projects[0].state.generationPolicy);
+    expect(app.project(after).state.generationPolicy).toEqual(app.project(before).state.generationPolicy);
   });
 });

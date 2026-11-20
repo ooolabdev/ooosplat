@@ -276,6 +276,15 @@ impl PipelineRunner {
             self.restore_collection_metrics(c, state.preset, state.generation_policy);
             state.inputs = Some(c.clone());
             manager.write_state(&paths.state, state).await?;
+            #[cfg(feature = "e2e")]
+            crate::testing::lifecycle::at(
+                &paths.state,
+                None,
+                "bridgeDecision",
+                "checkpoint",
+                serde_json::json!({"sources":c.sources}),
+            )
+            .await?;
         }
         if state.bridge_backfill.status != BridgeBackfillStatus::Running
             || c.sources.iter().all(|s| s.bridge_frames.is_empty())
@@ -607,6 +616,15 @@ impl PipelineRunner {
                     additions,
                 };
                 crate::project::manager::atomic_write_json(&publication, &pending).await?;
+                #[cfg(feature = "e2e")]
+                crate::testing::lifecycle::at(
+                    &publication,
+                    None,
+                    "bridgePublication",
+                    "checkpoint",
+                    serde_json::json!({"additions":pending.additions}),
+                )
+                .await?;
                 publish(paths, &pending, &self.process_manager.child_token()).await?;
                 *c = pending.checkpoint;
                 state.bridge_backfill.status = BridgeBackfillStatus::Completed;

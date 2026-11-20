@@ -19,7 +19,7 @@ test('MCP preflight, creation and start use the same final balanced recipe', asy
     gpu_selection: { localDeviceId: 'e2e-gpu-0', deviceKind: 'discreteGpu', selectionConfidence: 'ordered' }, answers: {},
   });
   await client.call('start_task', { task_id: task.task_id });
-  const s = await app.waitTerminal();
+  const s = await app.waitTerminal('completed', task.task_id);
   expect(Number(flags(s.calls.find(c => c.operation === 'train')!.args)['--max-splats'])).toBe(ordinary.balanced.photoCap);
   expect(Number(flags(s.calls.find(c => c.operation === 'train')!.args)['--total-train-iters'])).toBe(ordinary.balanced.steps);
 });

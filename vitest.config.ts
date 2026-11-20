@@ -5,7 +5,7 @@ export default defineConfig({
   clearScreen: false,
   envPrefix: ["VITE_", "TAURI_ENV_"],
   test: {
-    // Only run the current application's tests, not archived worktrees or artifacts.
+    // The development test run includes frontend unit tests. Native Windows E2E is opt-in via npm run test:e2e.
     include: ["src/**/*.test.{ts,tsx}", "html-viewer/**/*.test.{ts,tsx}"],
   },
 });

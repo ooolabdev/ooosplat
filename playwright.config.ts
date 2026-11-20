@@ -12,6 +12,6 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 30_000 },
   outputDir: `${output}/results`,
-  reporter: [['list'], ['html', { outputFolder: `${output}/report`, open: 'never' }]],
+  reporter: [['list'], ['json', { outputFile: `${output}/report.json` }], ['html', { outputFolder: `${output}/report`, open: 'never' }]],
   use: { trace: 'retain-on-failure', screenshot: 'only-on-failure' },
 });

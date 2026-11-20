@@ -26,14 +26,14 @@ for (const quality of ['fast', 'balanced', 'high'] as const) {
     expect(Number(extract['--FeatureExtraction.max_image_size'])).toBe(expected.sfmSize);
     expect(Number(extract['--SiftExtraction.max_num_features'])).toBe(expected.features);
     expect(training[0].datasetInitFiles).toEqual([]);
-    expect(training[0].runId).toBe(snapshot.tasks[0].run_id);
+    expect(training[0].runId).toBe(app.task(snapshot).run_id);
     expect(training[0].pipelineOperation?.id).toBeGreaterThan(0);
     expect(Object.fromEntries(training[0].environment).CUBECL_WGPU_DEFAULT_DEVICE).toBe('DiscreteGpu(0)');
-    const state = snapshot.projects[0].state;
+    const state = app.project(snapshot).state;
     expect(state.stage).toBe('completed');
     expect(state.brushTraining.resolved.preset.totalSteps).toBe(expected.steps);
     expect(Number(actual['--max-splats'])).toBe(state.brushTraining.resolved.preset.maxSplats);
-    expect(snapshot.projects[0].metadata.output.splatCount).toBe(64);
+    expect(app.project(snapshot).metadata.output.splatCount).toBe(64);
   });
 }
 

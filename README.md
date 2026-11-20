@@ -333,7 +333,7 @@ Homebrew 用于源码构建前的 `npm run setup:build-deps:macos`，之后执�
 
 ### 测试与检查
 
-Windows 配方端到端测试：`npm run test:e2e`。使用真实窗口和模拟引擎，不执行实际重建或训练；[运行说明](tests/e2e/README.md)。
+日常开发快速检查用 `npm test`。耗时较长的 Windows 原生 E2E 需要主动运行 `npm run test:e2e`，也可以通过 `--grep` 选取案例。它使用真实窗口和模拟引擎。 [原生 E2E 运行说明](tests/e2e/README.md)
 
 ```powershell
 # 前端测试

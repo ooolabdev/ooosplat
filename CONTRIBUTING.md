@@ -83,6 +83,8 @@ docs/update-readme
 
 ### 测试
 
+日常开发用 `npm test` 运行快速前端检查。Windows 原生 E2E 耗时较长，需主动执行 `npm run test:e2e`，或从 GitHub Actions 手动触发。 [原生 E2E 运行说明](tests/e2e/README.md)
+
 请根据改动范围运行相关检查：
 
 ```powershell
@@ -242,6 +244,8 @@ Try to keep each pull request focused on one feature or problem. Avoid mixing un
 Small, focused pull requests are easier to review, test, and merge.
 
 ### Testing
+
+Use `npm test` for fast frontend checks during development. The slower Windows native E2E suite runs on demand via `npm run test:e2e` or a manual GitHub Actions dispatch. [Native E2E instructions](tests/e2e/README.md)
 
 Run the checks relevant to your change:
 

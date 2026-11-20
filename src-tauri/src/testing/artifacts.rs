@@ -46,6 +46,7 @@ pub(super) fn prepare_inputs(h: &Harness) -> Result<()> {
             return Err(invalid("invalid fixture timestamps"));
         }
         let path = safe_path(&h.root, &h.root.join("fixtures").join(&i.name))?;
+        std::fs::create_dir_all(path.parent().ok_or_else(|| invalid("fixture parent"))?)?;
         if i.kind == "video" {
             if !path.exists() {
                 std::fs::write(
@@ -69,7 +70,14 @@ pub(super) fn prepare_inputs(h: &Harness) -> Result<()> {
                     if i.jpeg { "jpg" } else { "png" }
                 ));
                 if !p.exists() {
-                    write_image(&p, w, h, i.alpha, i.transparent)?;
+                    write_image_tagged(
+                        &p,
+                        w,
+                        h,
+                        i.alpha,
+                        i.transparent,
+                        i.name.bytes().fold(n as u8, u8::wrapping_add),
+                    )?;
                 }
             }
         } else {
@@ -85,6 +93,16 @@ pub(super) fn write_image(
     alpha: bool,
     transparent: bool,
 ) -> Result<()> {
+    write_image_tagged(path, width, height, alpha, transparent, 100)
+}
+pub(super) fn write_image_tagged(
+    path: &Path,
+    width: u32,
+    height: u32,
+    alpha: bool,
+    transparent: bool,
+    tag: u8,
+) -> Result<()> {
     std::fs::create_dir_all(
         path.parent()
             .ok_or_else(|| invalid("image without parent"))?,
@@ -93,7 +111,7 @@ pub(super) fn write_image(
         image::Rgba([
             (x % 255) as u8,
             (y % 255) as u8,
-            100,
+            tag,
             if transparent && x < width / 4 { 0 } else { 255 },
         ])
     });
@@ -108,6 +126,7 @@ fn sql<T>(value: rusqlite::Result<T>) -> Result<T> {
     value.map_err(invalid)
 }
 fn schema(db: &Connection) -> Result<()> {
+    sql(db.execute_batch("CREATE TABLE IF NOT EXISTS rigs(rig_id INTEGER PRIMARY KEY,ref_sensor_type INTEGER NOT NULL,ref_sensor_id INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS rig_sensors(rig_id INTEGER,sensor_type INTEGER,sensor_id INTEGER); CREATE TABLE IF NOT EXISTS frames(frame_id INTEGER PRIMARY KEY,rig_id INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS frame_data(frame_id INTEGER NOT NULL,sensor_id INTEGER NOT NULL,sensor_type INTEGER NOT NULL,data_id INTEGER PRIMARY KEY);"))?;
     sql(db.execute_batch("CREATE TABLE IF NOT EXISTS cameras(camera_id INTEGER PRIMARY KEY,model INTEGER NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,params BLOB NOT NULL,prior_focal_length INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS images(image_id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,camera_id INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS keypoints(image_id INTEGER PRIMARY KEY,rows INTEGER NOT NULL,cols INTEGER NOT NULL,data BLOB); CREATE TABLE IF NOT EXISTS descriptors(image_id INTEGER PRIMARY KEY,type INTEGER DEFAULT 0,rows INTEGER NOT NULL,cols INTEGER NOT NULL,data BLOB); CREATE TABLE IF NOT EXISTS matches(pair_id INTEGER PRIMARY KEY,rows INTEGER,cols INTEGER,data BLOB); CREATE TABLE IF NOT EXISTS two_view_geometries(pair_id INTEGER PRIMARY KEY,rows INTEGER,cols INTEGER,data BLOB,config INTEGER DEFAULT 2);"))?;
     Ok(())
 }
@@ -196,6 +215,12 @@ pub(super) fn features(args: &[String]) -> Result<String> {
             "INSERT INTO images VALUES(?1,?2,?3)",
             params![id, name, camera],
         ))?;
+        sql(db.execute("INSERT OR IGNORE INTO rigs VALUES(?1,0,?1)", [camera]))?;
+        sql(db.execute("INSERT INTO frames VALUES(?1,?2)", params![id, camera]))?;
+        sql(db.execute(
+            "INSERT INTO frame_data VALUES(?1,?2,0,?1)",
+            params![id, camera],
+        ))?;
         let keypoints = (0..POINTS)
             .flat_map(|n| {
                 let (x, y) = xy(n);
@@ -211,6 +236,12 @@ pub(super) fn features(args: &[String]) -> Result<String> {
             "INSERT INTO descriptors(image_id,rows,cols,data) VALUES(?1,?2,128,?3)",
             params![id, POINTS, vec![0_u8; POINTS * 128]],
         ))?;
+        lifecycle::partial(
+            Path::new(database),
+            "features",
+            names.iter().position(|n| n == name).unwrap() + 1,
+            names.len(),
+        )?;
     }
     Ok(names
         .iter()
@@ -219,14 +250,58 @@ pub(super) fn features(args: &[String]) -> Result<String> {
         .collect())
 }
 pub(super) fn matches(args: &[String]) -> Result<String> {
-    let db = sql(Connection::open(engine::argument(args, "--database_path")?))?;
-    let mut q = sql(db.prepare("SELECT image_id FROM images ORDER BY image_id"))?;
-    let ids = sql(q.query_map([], |r| r.get::<_, u32>(0)))?
+    let database = PathBuf::from(engine::argument(args, "--database_path")?);
+    let db = sql(Connection::open(&database))?;
+    let mut q = sql(db.prepare("SELECT image_id,name FROM images ORDER BY image_id"))?;
+    let rows = sql(q.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?))))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(invalid)?;
-    // Synthetic verified geometry is a fixture, not a simulation of matching quality.
-    for pair in ids.windows(2) {
-        let pair_id = pair[0] as u64 * 2_147_483_647 + pair[1] as u64;
+    let lookup = rows
+        .iter()
+        .map(|(id, name)| (name.as_str(), *id))
+        .collect::<BTreeMap<_, _>>();
+    let mut pairs = std::collections::BTreeSet::new();
+    if args.first().is_some_and(|op| op == "matches_importer") {
+        let text = std::fs::read_to_string(engine::argument(args, "--match_list_path")?)?;
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let names = line.split_whitespace().collect::<Vec<_>>();
+            if names.len() != 2 || names[0] == names[1] {
+                return Err(invalid("invalid requested match pair"));
+            }
+            let a = *lookup
+                .get(names[0])
+                .ok_or_else(|| invalid("unknown pair image"))?;
+            let b = *lookup
+                .get(names[1])
+                .ok_or_else(|| invalid("unknown pair image"))?;
+            pairs.insert((a.min(b), a.max(b)));
+        }
+    } else if args.first().is_some_and(|op| op == "sequential_matcher") {
+        let mut ordered = rows.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, name)| name);
+        for (index, (a, _)) in ordered.iter().enumerate() {
+            for exponent in 0..10 {
+                if let Some((b, _)) = ordered.get(index + (1 << exponent)) {
+                    pairs.insert(((*a).min(*b), (*a).max(*b)));
+                }
+            }
+        }
+    } else {
+        for (index, (a, _)) in rows.iter().enumerate() {
+            for (b, _) in rows.iter().skip(index + 1) {
+                pairs.insert(((*a).min(*b), (*a).max(*b)));
+            }
+        }
+    }
+    let total = pairs.len();
+    let mut transaction = false;
+    let mut observed = std::collections::BTreeSet::new();
+    for (index, (a, b)) in pairs.into_iter().enumerate() {
+        if !transaction {
+            sql(db.execute_batch("BEGIN"))?;
+            transaction = true;
+        }
+        let pair_id = a as u64 * 2_147_483_647 + b as u64;
         let bytes = (0..POINTS as u32)
             .flat_map(|n| [n, n])
             .flat_map(u32::to_le_bytes)
@@ -236,10 +311,54 @@ pub(super) fn matches(args: &[String]) -> Result<String> {
             params![pair_id, POINTS, bytes],
         ))?;
         sql(db.execute("INSERT OR REPLACE INTO two_view_geometries(pair_id,rows,cols,data,config) VALUES(?1,?2,2,?3,2)",params![pair_id,POINTS,bytes]))?;
+        let first = rows.iter().find(|r| r.0 == a).unwrap().1.as_str();
+        let second = rows.iter().find(|r| r.0 == b).unwrap().1.as_str();
+        let batch = |name: &str| {
+            name.find("_s")
+                .map(|n| name[..(n + 7).min(name.len())].to_owned())
+        };
+        let op = if batch(first) == batch(second) {
+            "matchingIntra"
+        } else {
+            "matchingCross"
+        };
+        if observed.insert(op) || index % 64 == 63 || index + 1 == total {
+            sql(db.execute_batch("COMMIT"))?;
+            transaction = false;
+            lifecycle::partial(&database, op, index + 1, total)?;
+        }
     }
-    Ok("Matching block [1/1]\n".into())
+    Ok(format!("Matching block [1/1] ({total} requested pairs)\n"))
 }
+#[cfg(test)]
 pub(super) fn mapper(args: &[String], registered: Option<usize>) -> Result<String> {
+    mapper_impl(
+        args,
+        registered,
+        &std::collections::BTreeMap::new(),
+        &lifecycle::Scope::default(),
+    )
+}
+pub(super) fn mapper_scoped(
+    args: &[String],
+    fault: Option<&Fault>,
+    scope: &lifecycle::Scope,
+) -> Result<String> {
+    mapper_impl(
+        args,
+        fault.and_then(|f| f.registered),
+        &fault
+            .map(|f| f.registered_by_source.clone())
+            .unwrap_or_default(),
+        scope,
+    )
+}
+fn mapper_impl(
+    args: &[String],
+    registered: Option<usize>,
+    limits: &BTreeMap<String, usize>,
+    scope: &lifecycle::Scope,
+) -> Result<String> {
     let db = sql(Connection::open(engine::argument(args, "--database_path")?))?;
     let mut q = sql(db.prepare("SELECT image_id,name,camera_id FROM images ORDER BY image_id"))?;
     let mut rows = sql(q.query_map([], |r| {
@@ -253,6 +372,22 @@ pub(super) fn mapper(args: &[String], registered: Option<usize>) -> Result<Strin
     .map_err(invalid)?;
     if let Some(count) = registered {
         rows.truncate(count);
+    }
+    for (name, members) in lifecycle::source_members(scope) {
+        if let Some(&limit) = limits.get(&name) {
+            let mut seen = 0;
+            let prefix = members
+                .first()
+                .and_then(|n| n.find("_s").map(|i| &n[..(i + 7).min(n.len())]));
+            rows.retain(|(_, n, _)| {
+                if members.contains(n) || prefix.is_some_and(|p| n.starts_with(p)) {
+                    seen += 1;
+                    seen <= limit
+                } else {
+                    true
+                }
+            });
+        }
     }
     let mut cameras = BTreeMap::new();
     for (_, _, id) in &rows {
@@ -290,7 +425,7 @@ pub(super) fn mapper(args: &[String], registered: Option<usize>) -> Result<Strin
             },
         );
     }
-    let model = Model {
+    let mut model = Model {
         cameras: cameras.into_values().collect(),
         images: rows
             .iter()
@@ -325,6 +460,23 @@ pub(super) fn mapper(args: &[String], registered: Option<usize>) -> Result<Strin
             })
             .collect(),
     };
+    if let Ok(input) = engine::argument(args, "--input_path") {
+        let fixed = crate::reconstruction::direct_input::read_model(Path::new(input))?;
+        for image in &mut model.images {
+            if let Some(saved) = fixed
+                .images
+                .iter()
+                .find(|i| i.pose.id == image.pose.id && i.pose.name == image.pose.name)
+            {
+                image.pose = saved.pose.clone();
+            }
+        }
+        for camera in &mut model.cameras {
+            if let Some(saved) = fixed.cameras.iter().find(|c| c.id == camera.id) {
+                *camera = saved.clone();
+            }
+        }
+    }
     model.validate()?;
     let out = PathBuf::from(engine::argument(args, "--output_path")?);
     model.write(&out.join("0"))?;
@@ -335,6 +487,9 @@ pub(super) fn mapper(args: &[String], registered: Option<usize>) -> Result<Strin
     ))
 }
 pub(super) fn gaussian(path: &Path, count: usize) -> Result<()> {
+    gaussian_tagged(path, count, 0)
+}
+pub(super) fn gaussian_tagged(path: &Path, count: usize, tag: u32) -> Result<()> {
     std::fs::create_dir_all(path.parent().ok_or_else(|| invalid("PLY parent"))?)?;
     let mut file = std::fs::File::create(path)?;
     write!(
@@ -350,7 +505,7 @@ pub(super) fn gaussian(path: &Path, count: usize) -> Result<()> {
     writeln!(file, "end_header")?;
     for n in 0..count {
         for v in [
-            n as f32 * 0.01,
+            n as f32 * 0.01 + tag as f32 * 0.00001,
             0.,
             1.,
             0.5,
@@ -367,6 +522,11 @@ pub(super) fn gaussian(path: &Path, count: usize) -> Result<()> {
         ] {
             file.write_all(&v.to_le_bytes())?;
         }
+        if n == count / 2 {
+            file.flush()?;
+            file.sync_all()?;
+            lifecycle::partial(path, "training", n + 1, count)?;
+        }
     }
     file.flush()?;
     file.sync_all()?;
@@ -376,6 +536,26 @@ pub(super) fn gaussian(path: &Path, count: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn round_specific_gaussians_are_deterministic_distinct_and_valid() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = directory.path().join("a.ply");
+        let b = directory.path().join("b.ply");
+        let again = directory.path().join("again.ply");
+        gaussian_tagged(&a, 64, 1001).unwrap();
+        gaussian_tagged(&b, 64, 2001).unwrap();
+        gaussian_tagged(&again, 64, 1001).unwrap();
+        assert_ne!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&again).unwrap());
+        for file in [a, b] {
+            assert_eq!(
+                crate::reconstruction::ply::inspect_gaussian_ply(&file)
+                    .unwrap()
+                    .splat_count,
+                64
+            );
+        }
+    }
     #[test]
     fn generated_results_pass_production_model_and_ply_validation() {
         let dir = tempfile::tempdir().unwrap();
@@ -403,6 +583,18 @@ mod tests {
         assert_eq!(model.images.len(), 3);
         assert_eq!(model.points.len(), POINTS);
         assert_eq!(model.cameras.len(), 1);
+        let inspection =
+            crate::reconstruction::direct_input::inspect(&crate::pipeline::inputs::ColmapInput {
+                model: output.join("0"),
+                images: frames,
+                database: Some(db),
+                identity: None,
+            })
+            .unwrap();
+        assert!(
+            inspection.reshoot_eligible,
+            "Simulated COLMAP output must pass the real rig/feature/model binding validator"
+        );
         let ply = dir.path().join("final.ply");
         gaussian(&ply, 64).unwrap();
         assert_eq!(

@@ -12,6 +12,76 @@ mod gps_resume_validation;
 #[path = "inputs_runner_tests.rs"]
 mod tests;
 
+async fn copy_frozen_reshoot_mask(
+    paths: &ProjectPaths,
+    source: &Path,
+    target: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let unsafe_target = || {
+        SplatError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Unsafe reshoot mask destination",
+        ))
+    };
+    if cancel.is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
+    let relative = target
+        .strip_prefix(&paths.masks)
+        .map_err(|_| unsafe_target())?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(unsafe_target());
+    }
+    let parent = target.parent().ok_or_else(unsafe_target)?;
+    let mut directory = paths.project.clone();
+    for part in parent
+        .strip_prefix(&paths.project)
+        .map_err(|_| unsafe_target())?
+        .components()
+    {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err(unsafe_target());
+        }
+        directory.push(part);
+        match tokio::fs::symlink_metadata(&directory).await {
+            Ok(metadata) if !metadata.is_dir() => return Err(unsafe_target()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&directory).await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        crate::pipeline::artifacts::validate_recovery_path(&paths.project, &directory)?;
+    }
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(unsafe_target());
+            }
+            crate::pipeline::artifacts::validate_recovery_path(&paths.project, target)?;
+            if cancel.is_cancelled() {
+                return Err(SplatError::Cancelled);
+            }
+            // Detach the owned entry, including old read-only masks and hard
+            // links, without changing the source file's bytes or attributes.
+            tokio::fs::remove_file(target).await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if cancel.is_cancelled() {
+        return Err(SplatError::Cancelled);
+    }
+    // Copy bytes rather than permissions from the immutable snapshot. A
+    // cancelled partial copy remains untrusted under the existing checkpoint.
+    super::reshoot_runner::copy_reshoot_file(source, target, cancel).await
+}
+
 /// Match the 0.7.1 per-projection feature limits. ERP preparation has its own
 /// width budget; applying the ordinary-photo limit a second time would discard
 /// spherical detail before matching. Native-resolution High ERP inputs keep the
@@ -622,6 +692,8 @@ impl PipelineRunner {
             ));
         }
         let manager = manager.with_creation_intent(self.creation_intent.clone());
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::run(self.execution_run_id, "analysis", "entered").await?;
         crate::pipeline::inputs::validate_for_camera_policy(
             &self.engines,
             &inputs,
@@ -631,6 +703,8 @@ impl PipelineRunner {
         )
         .await?;
         inputs.authorized_paths()?;
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::run(self.execution_run_id, "analysis", "written").await?;
         match &mut inputs {
             GenerationInputs::Materials { items } => {
                 for item in items {
@@ -1064,8 +1138,13 @@ impl PipelineRunner {
                                     let mask = frozen.masks.join(format!("{name}.png"));
                                     if mask.is_file() {
                                         let target = paths.masks.join(format!("{name}.png"));
-                                        tokio::fs::create_dir_all(target.parent().unwrap()).await?;
-                                        tokio::fs::copy(mask, target).await?;
+                                        copy_frozen_reshoot_mask(
+                                            paths,
+                                            &mask,
+                                            &target,
+                                            &self.process_manager.child_token(),
+                                        )
+                                        .await?;
                                     }
                                     progress.update((i + 1) as u64, old_names.len() as u64);
                                 }
@@ -1364,6 +1443,8 @@ impl PipelineRunner {
                                     let quality = metadata.quality;
                                     let preparation_version =
                                         checkpoint.ordinary_image_preparation_version;
+                                    #[cfg(feature = "e2e")]
+                                    let e2e_source_id = item.id.clone();
                                     self.events
                                         .panorama_phase
                                         .store(u64::from(erp), Ordering::Relaxed);
@@ -1390,6 +1471,8 @@ impl PipelineRunner {
                                                 &cancel,
                                                 Some(&progress),
                                                 preparation_version,
+                                                #[cfg(feature = "e2e")]
+                                                Some(&e2e_source_id),
                                             )
                                         })
                                         .await
@@ -3426,7 +3509,18 @@ fn prepare_images(
     progress: Option<&super::reshoot_runner::ReshootProgress>,
 ) -> Result<Vec<String>> {
     prepare_images_with_preparation(
-        files, prefix, frames, rgb, masks, erp, quality, cancel, progress, None,
+        files,
+        prefix,
+        frames,
+        rgb,
+        masks,
+        erp,
+        quality,
+        cancel,
+        progress,
+        None,
+        #[cfg(feature = "e2e")]
+        None,
     )
 }
 
@@ -3442,8 +3536,23 @@ fn prepare_images_with_preparation(
     cancel: &tokio_util::sync::CancellationToken,
     progress: Option<&super::reshoot_runner::ReshootProgress>,
     preparation_version: Option<u32>,
+    #[cfg(feature = "e2e")] source_id: Option<&str>,
 ) -> Result<Vec<String>> {
     use image::ImageDecoder;
+    #[cfg(feature = "e2e")]
+    let e2e_partial = |written: usize| -> Result<()> {
+        if let Some(scope) = crate::testing::lifecycle::scope(frames, source_id) {
+            for (operation, directory) in [("images", frames), ("masks", masks)] {
+                crate::testing::lifecycle::boundary(
+                    &scope,
+                    operation,
+                    "partial",
+                    serde_json::json!({"written":written,"total":files.len(),"path":directory}),
+                )?;
+            }
+        }
+        Ok(())
+    };
     let mut names = vec![];
     for (i, path) in files.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -3468,6 +3577,8 @@ fn prepare_images_with_preparation(
                     .map_err(|e| SplatError::Process(e.to_string()))?;
             }
             names.push(name);
+            #[cfg(feature = "e2e")]
+            e2e_partial(i + 1)?;
             if let Some(progress) = progress {
                 progress.update((i + 1) as u64, files.len() as u64);
             }
@@ -3522,6 +3633,8 @@ fn prepare_images_with_preparation(
         mask.save(masks.join(format!("{name}.png")))
             .map_err(|e| SplatError::Process(e.to_string()))?;
         names.push(name);
+        #[cfg(feature = "e2e")]
+        e2e_partial(i + 1)?;
         if let Some(progress) = progress {
             progress.update((i + 1) as u64, files.len() as u64);
         }

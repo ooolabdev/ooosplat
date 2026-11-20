@@ -844,6 +844,13 @@ pub fn prepare_reshoot_training_cache_for_policy(
                     render_face(&rgba, None, *q, size, cancel)?
                         .save(staging.join(format!("{name}.png")))
                         .map_err(|e| process_error(e.to_string()))?;
+                    #[cfg(feature = "e2e")]
+                    crate::testing::lifecycle::partial(
+                        &staging,
+                        "erpFaces",
+                        index * 6 + face_index + 1,
+                        ordered.len() * 6,
+                    )?;
                     progress(TrainingCacheUpdate::Faces {
                         completed: (index * 6 + face_index + 1) as u64,
                         total: ordered.len() as u64 * 6,
@@ -1149,6 +1156,13 @@ pub fn prepare_training_cache(
                     )?;
                     face.save(staging.join(format!("{name}.png")))
                         .map_err(|e| process_error(e.to_string()))?;
+                    #[cfg(feature = "e2e")]
+                    crate::testing::lifecycle::partial(
+                        &staging,
+                        "erpFaces",
+                        index * 6 + face_index + 1,
+                        poses.len() * 6,
+                    )?;
                     progress(TrainingCacheUpdate::Faces {
                         completed: (index * 6 + face_index + 1) as u64,
                         total: (poses.len() * 6) as u64,

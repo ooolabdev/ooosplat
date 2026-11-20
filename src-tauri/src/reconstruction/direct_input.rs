@@ -638,6 +638,8 @@ impl Model {
             }
         }
         w.flush()?;
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::model_partial(path)?;
         let mut w = BufWriter::new(File::create(path.join("images.bin"))?);
         w.write_all(&(self.images.len() as u64).to_le_bytes())?;
         for i in &self.images {

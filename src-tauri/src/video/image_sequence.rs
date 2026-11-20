@@ -295,6 +295,8 @@ pub fn prepare_scanned_image_sequence_with_preparation(
             link_or_copy(&image.path, &colmap_frames_dir.join(&name))?;
         }
         names.push(name);
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::partial(frames_dir, "images", index + 1, scan.images.len())?;
         reporter.report(ImagePreparationProgress {
             phase: ImagePreparationPhase::LinkingFrames,
             current: index as u64 + 1,
@@ -327,6 +329,13 @@ pub fn prepare_scanned_image_sequence_with_preparation(
             }
             has_transparency |= transparent;
             completed += 1;
+            #[cfg(feature = "e2e")]
+            crate::testing::lifecycle::partial(
+                masks_dir,
+                "masks",
+                completed as usize,
+                alpha_images as usize,
+            )?;
             reporter.report(ImagePreparationProgress {
                 phase: ImagePreparationPhase::InspectingAlpha,
                 current: completed,

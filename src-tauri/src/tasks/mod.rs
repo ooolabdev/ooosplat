@@ -19,7 +19,11 @@ use crate::{
         PipelineEvent, PipelineStage,
     },
     presets::{PipelineOptimizationConfig, Quality},
-    project::{catalog, manager::atomic_write_json, ProjectStatus},
+    project::{
+        catalog,
+        manager::{atomic_write_json, read_durable_json_bytes},
+        ProjectStatus,
+    },
     telemetry::{PipelineTelemetrySession, TelemetryInputType, TelemetryRunKind, TelemetryService},
 };
 use chrono::{DateTime, Utc};
@@ -733,19 +737,19 @@ impl TaskService {
         }
         let metadata_path = project_root.join("project.json");
         let mut metadata: crate::project::ProjectMetadata =
-            serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)?;
+            serde_json::from_slice(&read_durable_json_bytes(&metadata_path).await?)?;
         let state_path = project_root.join("state.json");
-        let mut state: crate::project::PipelineStateFile = match tokio::fs::read(&state_path).await
-        {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::project::PipelineStateFile::created_for(
-                    metadata.quality,
-                    metadata.input_type,
-                )
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let mut state: crate::project::PipelineStateFile =
+            match read_durable_json_bytes(&state_path).await {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::project::PipelineStateFile::created_for(
+                        metadata.quality,
+                        metadata.input_type,
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            };
         let completed_at = publication
             .transaction
             .committed_at
@@ -800,7 +804,7 @@ impl TaskService {
             return Ok(());
         }
         let path = self.root.join("tasks.json");
-        let mut registry = match tokio::fs::read(&path).await {
+        let mut registry = match read_durable_json_bytes(&path).await {
             Ok(bytes) => serde_json::from_slice::<Registry>(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Registry::default(),
             Err(e) => return Err(e.into()),
@@ -835,7 +839,7 @@ impl TaskService {
                     run.ended_at = None;
                 }
                 if let Some(project) = &task.project_path {
-                    if let Ok(bytes) = tokio::fs::read(project.join("project.json")).await {
+                    if let Ok(bytes) = read_durable_json_bytes(project.join("project.json")).await {
                         if let Ok(mut metadata) =
                             serde_json::from_slice::<crate::project::ProjectMetadata>(&bytes)
                         {
@@ -900,6 +904,13 @@ impl TaskService {
                 .then_with(|| b.task_id.cmp(&a.task_id))
         });
         Ok(tasks)
+    }
+
+    /// Read the real registry without entering the lifecycle gate. Test-only
+    /// publication barriers may deliberately hold that gate after persistence.
+    #[cfg(feature = "e2e")]
+    pub fn e2e_records(&self) -> Vec<TaskRecord> {
+        self.records().tasks.values().cloned().collect()
     }
 
     pub async fn set_gpu_selection(
@@ -1241,7 +1252,7 @@ impl TaskService {
                 Err(_) => continue,
             };
             let checkpoint: crate::project::PipelineStateFile =
-                match tokio::fs::read(path.join("state.json"))
+                match read_durable_json_bytes(path.join("state.json"))
                     .await
                     .ok()
                     .and_then(|b| serde_json::from_slice(&b).ok())
@@ -1631,7 +1642,7 @@ impl TaskService {
                 "project_state",
                 None,
                 async {
-                    let bytes = tokio::fs::read(root.join("state.json")).await?;
+                    let bytes = read_durable_json_bytes(root.join("state.json")).await?;
                     serde_json::from_slice::<Box<crate::project::PipelineStateFile>>(&bytes)
                         .map_err(crate::error::SplatError::from)
                 },
@@ -1733,7 +1744,7 @@ impl TaskService {
                     "project_state",
                     None,
                     async {
-                        let bytes = tokio::fs::read(root.join("state.json")).await?;
+                        let bytes = read_durable_json_bytes(root.join("state.json")).await?;
                         Ok(serde_json::from_slice::<
                             Box<crate::project::PipelineStateFile>,
                         >(&bytes)?)
@@ -2147,6 +2158,8 @@ impl TaskService {
         *self.run_lock.lock().unwrap_or_else(|p| p.into_inner()) = Some((run_id, run_lock));
         self.notify(id);
         let service = self.clone();
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::bind_task(&starting)?;
         tokio::spawn(async move {
             let _cleanup = ExecutionCleanup {
                 service: service.clone(),
@@ -2161,9 +2174,11 @@ impl TaskService {
             let execution = task.clone();
             #[cfg(test)]
             let test_executor = service.executor.lock().unwrap().clone();
-            let worker = tokio::spawn(Box::pin(crate::presets::with_pipeline_config(
-                task.configuration.clone(),
-                async move {
+            let execute =
+                crate::presets::with_pipeline_config(task.configuration.clone(), async move {
+                    #[cfg(feature = "e2e")]
+                    crate::testing::lifecycle::run(Some(run_id), "creationIntent", "checkpoint")
+                        .await?;
                     #[cfg(test)]
                     if let Some(executor) = test_executor {
                         return executor(execution, execute_runner).await;
@@ -2191,8 +2206,10 @@ impl TaskService {
                         ))
                         .await
                     }
-                },
-            )));
+                });
+            #[cfg(feature = "e2e")]
+            let execute = crate::testing::lifecycle::with_run(run_id, execute);
+            let worker = tokio::spawn(Box::pin(execute));
             let result = worker.await.unwrap_or_else(|e| {
                 runner.cancel();
                 Err(crate::error::SplatError::Process(format!(
@@ -2661,6 +2678,16 @@ impl TaskService {
         };
         if terminal_persisted && task.status == TaskStatus::Completed {
             if let Some(project_root) = task.project_path.as_ref() {
+                #[cfg(feature = "e2e")]
+                crate::testing::lifecycle::at(
+                    project_root,
+                    None,
+                    "taskView",
+                    "checkpoint",
+                    serde_json::json!({"taskId":id,"runId":run}),
+                )
+                .await
+                .expect("E2E task-view barrier");
                 let transaction_path = project_root
                     .join("work")
                     .join(crate::pipeline::publication::TRANSACTION_FILE_NAME);
@@ -2726,6 +2753,8 @@ impl TaskService {
                 return Err(e);
             }
             service.notify(id);
+            #[cfg(feature = "e2e")]
+            crate::testing::lifecycle::cancel(run);
             if let Some(runner) = service.active.lock().await.as_ref() {
                 runner.cancel();
             }
@@ -3112,6 +3141,8 @@ impl Drop for ExecutionCleanup {
 
 pub(crate) fn checkpoint_snapshot(state: &crate::project::PipelineStateFile) -> Value {
     let mut result = serde_json::json!({"quality":state.preset,"planner_enabled":state.planner_enabled,"resolution_policy_version":state.resolution_policy_version,"resolution_plan":state.resolution_plan,"brush_training":state.brush_training,"reshoot_recipe":state.reshoot.as_ref().and_then(|r|r.recipe.as_ref()),"frame_plan":{"sampling_fps":state.frames.as_ref().map(|f|f.sampling_fps),"estimated_frames":state.frames.as_ref().map(|f|f.estimated_frames),"extracted_frames":state.frames.as_ref().and_then(|f|f.extracted_frames),"mask_count":state.frames.as_ref().and_then(|f|f.mask_count)}});
+    // Configuration updates replace the task policy, including legacy absence.
+    result["generation_policy"] = serde_json::json!(state.generation_policy);
     if let Ok(value) = serde_json::to_value(state) {
         extend_actual_summary(&mut result, &value);
     }

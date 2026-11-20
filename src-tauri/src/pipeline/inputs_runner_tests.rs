@@ -1,5 +1,235 @@
 use super::*;
 
+fn frozen_reshoot_mask_fixture() -> (tempfile::TempDir, ProjectPaths, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+    let source = paths.work.join("reshoot-snapshot-v3/masks/frozen.png");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir(&paths.masks).unwrap();
+    image::GrayImage::from_raw(4, 1, vec![0, 64, 128, 255])
+        .unwrap()
+        .save(&source)
+        .unwrap();
+    let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&source, permissions).unwrap();
+    let target = paths.masks.join("nested/working.png");
+    (root, paths, source, target)
+}
+
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_is_writable_and_repeatable_without_changing_source() {
+    let (_root, paths, source, target) = frozen_reshoot_mask_fixture();
+    let bytes = std::fs::read(&source).unwrap();
+    for _ in 0..2 {
+        copy_frozen_reshoot_mask(
+            &paths,
+            &source,
+            &target,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(
+            image::open(&target).unwrap().to_luma8().as_raw(),
+            &[0, 64, 128, 255]
+        );
+        assert!(!std::fs::metadata(&target).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+    }
+}
+
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_recovers_an_existing_legacy_readonly_target() {
+    let (_root, paths, source, target) = frozen_reshoot_mask_fixture();
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"old incomplete mask").unwrap();
+    let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&target, permissions).unwrap();
+    copy_frozen_reshoot_mask(
+        &paths,
+        &source,
+        &target,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(!std::fs::metadata(&target).unwrap().permissions().readonly());
+    assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+}
+
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_detaches_a_readonly_hardlink_without_mutating_ancestor() {
+    let (root, paths, source, target) = frozen_reshoot_mask_fixture();
+    let ancestor = root.path().join("ancestor.png");
+    std::fs::write(&ancestor, b"ancestor mask must remain unchanged").unwrap();
+    let mut permissions = std::fs::metadata(&ancestor).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&ancestor, permissions).unwrap();
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::hard_link(&ancestor, &target).unwrap();
+    copy_frozen_reshoot_mask(
+        &paths,
+        &source,
+        &target,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&ancestor).unwrap(),
+        b"ancestor mask must remain unchanged"
+    );
+    assert!(std::fs::metadata(&ancestor)
+        .unwrap()
+        .permissions()
+        .readonly());
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(!std::fs::metadata(&target).unwrap().permissions().readonly());
+    assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+}
+
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_precancellation_preserves_existing_target() {
+    let (_root, paths, source, target) = frozen_reshoot_mask_fixture();
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::copy(&source, &target).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        copy_frozen_reshoot_mask(&paths, &source, &target, &cancel).await,
+        Err(SplatError::Cancelled)
+    ));
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(std::fs::metadata(&target).unwrap().permissions().readonly());
+}
+
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_rejects_unowned_paths_and_non_file_targets() {
+    let (root, paths, source, _) = frozen_reshoot_mask_fixture();
+    let outside = root.path().join("outside.png");
+    std::fs::write(&outside, b"outside").unwrap();
+    let sibling = paths.work.join("sibling.png");
+    std::fs::write(&sibling, b"sibling").unwrap();
+    let directory = paths.masks.join("directory.png");
+    std::fs::create_dir(&directory).unwrap();
+    let parent_file = paths.masks.join("parent-file");
+    std::fs::write(&parent_file, b"parent").unwrap();
+    for target in [
+        outside.clone(),
+        paths.masks.join("../sibling.png"),
+        paths.masks.clone(),
+        directory.clone(),
+        parent_file.join("mask.png"),
+    ] {
+        let error = copy_frozen_reshoot_mask(
+            &paths,
+            &source,
+            &target,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling");
+    assert_eq!(std::fs::read(&parent_file).unwrap(), b"parent");
+    assert!(directory.is_dir());
+}
+
+#[cfg(any(windows, unix))]
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_rejects_redirected_target_and_parent() {
+    for redirect_parent in [false, true] {
+        let (root, paths, source, _) = frozen_reshoot_mask_fixture();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let original = outside.join("mask.png");
+        std::fs::write(&original, b"external mask").unwrap();
+        let target = if redirect_parent {
+            let redirected = paths.masks.join("redirected");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(&outside, &redirected).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &redirected).unwrap();
+            redirected.join("new/mask.png")
+        } else {
+            let redirected = paths.masks.join("mask.png");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&original, &redirected).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&original, &redirected).unwrap();
+            redirected
+        };
+        assert!(copy_frozen_reshoot_mask(
+            &paths,
+            &source,
+            &target,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), b"external mask");
+        assert!(!outside.join("new").exists());
+        assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn frozen_reshoot_mask_copy_reports_real_sharing_conflict_without_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (_root, paths, source, target) = frozen_reshoot_mask_fixture();
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"locked mask").unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&target)
+        .unwrap();
+    let error = copy_frozen_reshoot_mask(
+        &paths,
+        &source,
+        &target,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.io_error().unwrap().raw_os_error(), Some(32));
+    assert_eq!(std::fs::read(&target).unwrap(), b"locked mask");
+    assert!(std::fs::metadata(&source).unwrap().permissions().readonly());
+    drop(held);
+    copy_frozen_reshoot_mask(
+        &paths,
+        &source,
+        &target,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn database_recovery_keeps_abandoned_gps_visual_only_without_reopening_source() {
     let root = tempfile::tempdir().unwrap();

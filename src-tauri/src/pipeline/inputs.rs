@@ -340,7 +340,7 @@ impl InputSource {
     }
     pub fn members(&self) -> Result<Vec<PathBuf>> {
         #[cfg(feature = "e2e")]
-        {
+        if crate::testing::enabled() {
             let root = crate::testing::data_root()?.parent().unwrap().to_path_buf();
             match self {
                 Self::Images { paths } => {

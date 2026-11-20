@@ -7,7 +7,7 @@ test.describe('saved concrete GPU', () => {
   test('remembered choice is reused by the next task without asking again', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate();
     const dialog = app.page.getByRole('dialog', { name: '选择生成使用的显卡' });
-    await dialog.locator('input[type=radio]').nth(1).check();
+    await dialog.locator('.gpu-device-option').filter({hasText:'E2E GPU 1'}).locator('input[type=radio]').check();
     await dialog.locator('input[type=checkbox]').check();
     await dialog.getByRole('button', { name: '开始生成', exact: true }).click();
     await app.waitTerminal();
@@ -28,7 +28,7 @@ test.describe('partial reshoot adoption', () => {
   } });
   test('one connected source can finish while the omitted source remains recorded after restart', async ({ app }) => {
     await app.chooseInputs(); await app.quality('fast'); await app.generate(); await app.waitTerminal();
-    await app.page.getByRole('button', { name: '补拍', exact: true }).first().click();
+    await app.reshoot();
     await app.chooseInputs([1, 2]); await app.generate();
     const dialog = app.page.locator('.preflight-dialog');
     await dialog.locator('input[value=appearance]').check(); await dialog.locator('button.primary-action').click();
@@ -38,7 +38,7 @@ test.describe('partial reshoot adoption', () => {
       await dialog.locator('input[value=unsure]').check(); await dialog.locator('button.primary-action').click();
     }
     const s = await app.waitCompleted(2);
-    const derived = s.projects.find(p => p.state.reshoot?.recipe)!;
+    const derived = app.project(s);
     const adoption = derived.state.inputs.sourceAdoption;
     expect(adoption.map((source: any) => source.registeredFrames)).toEqual([30, 0]);
     expect(adoption.map((source: any) => source.adopted)).toEqual([true, false]);
@@ -57,7 +57,7 @@ for (const outcome of ['geometry', 'io'] as const) {
       if (outcome === 'geometry') {
         expect(mappers.length).toBeGreaterThan(1); expect(mappers.length).toBeLessThanOrEqual(4);
         expect(mappers[1].args).toContain('--Mapper.init_image_id1');
-        expect(s.tasks[0].automatically_retried).toBe(false);
+        expect(app.task(s).automatically_retried).toBe(false);
       } else {
         expect(mappers).toHaveLength(1);
         expect(s.calls.filter(c => c.operation === 'train')).toHaveLength(0);

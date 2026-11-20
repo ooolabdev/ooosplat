@@ -385,6 +385,15 @@ impl PipelineRunner {
                     }
                     reuse_prepared_image(&source, &root.join("images").join(&image.pose.name))
                         .await?;
+                    #[cfg(feature = "e2e")]
+                    crate::testing::lifecycle::at(
+                        &root,
+                        None,
+                        "trainingDataset",
+                        "partial",
+                        serde_json::json!({"written":index+1,"total":normal.images.len()}),
+                    )
+                    .await?;
                     references.insert(image.pose.name.clone(), image.pose.name.clone());
                     progress.update((index + 1) as u64);
                 }
@@ -643,6 +652,15 @@ impl PipelineRunner {
             derivation_version: DATASET_DERIVATION_VERSION,
         };
         crate::project::manager::atomic_write_json(&signature, &(&key, &dataset)).await?;
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::at(
+            &signature,
+            None,
+            "trainingDatasetFiles",
+            "written",
+            serde_json::json!({"dataset":dataset.path}),
+        )
+        .await?;
         Ok(dataset)
     }
 }

@@ -105,9 +105,9 @@ use crate::{
     },
     process::{ProcessManager, ProcessObserver, ProcessUpdate},
     project::{
-        catalog, FrameState, PipelineStateFile, ProjectImportObserver, ProjectInputType,
-        ProjectManager, ProjectMetadata, ProjectOutput, ProjectPaths, ProjectStatus,
-        ReshootProvenance, ReshootState, COLMAP_INPUT_VERSION,
+        catalog, manager::read_durable_json_bytes, FrameState, PipelineStateFile,
+        ProjectImportObserver, ProjectInputType, ProjectManager, ProjectMetadata, ProjectOutput,
+        ProjectPaths, ProjectStatus, ReshootProvenance, ReshootState, COLMAP_INPUT_VERSION,
     },
     reconstruction::{
         colmap_model::{
@@ -1805,6 +1805,15 @@ impl PipelineRunner {
                 "FFmpeg 开始提取画面"
             },
         );
+        #[cfg(feature = "e2e")]
+        crate::testing::lifecycle::at(
+            output,
+            None,
+            "sourcePlan",
+            "written",
+            serde_json::to_value(&plan)?,
+        )
+        .await?;
         let observer = self.process_observer(
             PipelineStage::ExtractingFrames,
             PipelineEngine::Ffmpeg,
@@ -2255,7 +2264,7 @@ impl PipelineRunner {
             return Ok(info);
         }
         let source_state: PipelineStateFile =
-            serde_json::from_slice(&tokio::fs::read(project.join("state.json")).await?)?;
+            serde_json::from_slice(&read_durable_json_bytes(project.join("state.json")).await?)?;
         info.planner_enabled = source_state.planner_enabled;
         if source_state.panorama.is_some() {
             info.reason = Some("全景项目暂不支持高清补拍。".into());
@@ -2504,7 +2513,7 @@ impl PipelineRunner {
             state.planner_enabled = self.planner_enabled;
             state
         } else {
-            serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?
+            serde_json::from_slice(&read_durable_json_bytes(source_root.join("state.json")).await?)?
         };
         let quality = if source_metadata.imported.is_some() {
             requested_quality
@@ -3089,7 +3098,7 @@ impl PipelineRunner {
         // reshoot connectivity before reconciliation can install or commit;
         // committed historical output remains authoritative and unchanged.
         let mut was_pending = false;
-        match tokio::fs::read(&transaction_path).await {
+        match read_durable_json_bytes(&transaction_path).await {
             Ok(bytes) => {
                 let transaction: crate::pipeline::publication::PublicationTransaction =
                     serde_json::from_slice(&bytes)?;
@@ -3718,8 +3727,9 @@ impl PipelineRunner {
             .await?;
         let mut checkpoint = state.reshoot.clone().unwrap_or_default();
         let source_root = &provenance.source_project_path;
-        let source_metadata: ProjectMetadata =
-            serde_json::from_slice(&tokio::fs::read(source_root.join("project.json")).await?)?;
+        let source_metadata: ProjectMetadata = serde_json::from_slice(
+            &read_durable_json_bytes(source_root.join("project.json")).await?,
+        )?;
         if !catalog::project_is_durably_completed(source_root, &source_metadata).await {
             return Err(SplatError::Process(
                 "只有已完成且结果完整的项目可以进行高清补拍".into(),
@@ -3761,8 +3771,9 @@ impl PipelineRunner {
                 None,
             )
         } else {
-            let state: PipelineStateFile =
-                serde_json::from_slice(&tokio::fs::read(source_root.join("state.json")).await?)?;
+            let state: PipelineStateFile = serde_json::from_slice(
+                &read_durable_json_bytes(source_root.join("state.json")).await?,
+            )?;
             let frames = source_root.join("work/frames");
             let database = source_root.join("work/colmap/database.db");
             let reconstruction =

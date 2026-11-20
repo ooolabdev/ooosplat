@@ -124,6 +124,10 @@ pub fn run_app() {
             testing::e2e_snapshot,
             #[cfg(feature = "e2e")]
             testing::e2e_release,
+            #[cfg(feature = "e2e")]
+            testing::lifecycle::e2e_release_hit,
+            #[cfg(feature = "e2e")]
+            testing::lifecycle::e2e_deliver_late,
             commands::classify_material_paths,
             commands::classify_generation_paths,
             commands::inspect_material_inputs,

@@ -9,7 +9,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SplatError};
+use crate::{
+    error::{Result, SplatError},
+    project::manager::open_durable_json_file,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -408,24 +411,29 @@ struct PanoramaFace {
 }
 
 fn load(root: &Path) -> Result<TrainingReferenceView> {
-    if root.join("state.json").is_file() {
-        let state: serde_json::Value =
-            serde_json::from_reader(bounded_file(&root.join("state.json"), 16 * 1024 * 1024)?)?;
-        if let Some(reference) = state
-            .pointer("/inputs/referenceImage")
-            .and_then(|v| v.as_str())
-        {
-            return read_view(&root.join("work/brush/dataset"), Some(reference));
+    let state: Option<serde_json::Value> = match open_durable_json_file(&root.join("state.json")) {
+        Ok(file) => {
+            if file.metadata()?.len() > 16 * 1024 * 1024 {
+                return Err(invalid());
+            }
+            Some(serde_json::from_reader(file)?)
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(reference) = state
+        .as_ref()
+        .and_then(|state| state.pointer("/inputs/referenceImage"))
+        .and_then(|v| v.as_str())
+    {
+        return read_view(&root.join("work/brush/dataset"), Some(reference));
     }
     // Projection is persisted in state.json, never re-detected from mutable source media.
-    let panorama = if root.join("state.json").is_file() {
-        let state: serde_json::Value =
-            serde_json::from_reader(bounded_file(&root.join("state.json"), 16 * 1024 * 1024)?)?;
-        state.get("videoProjection").and_then(|v| v.as_str()) == Some("equirectangular")
-    } else {
-        false
-    };
+    let panorama = state
+        .as_ref()
+        .and_then(|state| state.get("videoProjection"))
+        .and_then(|v| v.as_str())
+        == Some("equirectangular");
     if panorama {
         let dataset = root.join("work/panorama-training");
         let manifest: PanoramaManifest = serde_json::from_reader(bounded_file(

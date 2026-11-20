@@ -105,11 +105,11 @@ pub(super) fn spawn(pid: u32, observer: ProcessObserver) -> SamplingTask {
         else {
             return;
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(test)))]
         let smi = crate::engines::health::nvidia_smi_candidates()
             .into_iter()
             .find(|path| path.is_file());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", test))]
         let smi: Option<PathBuf> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

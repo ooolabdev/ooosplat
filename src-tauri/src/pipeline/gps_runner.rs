@@ -1,7 +1,7 @@
 //! GPS is a separate, validated refinement. The original visual reconstruction
 //! remains the authoritative fallback and is never modified by a GPS attempt.
 use super::*;
-use crate::project::manager::atomic_write_json;
+use crate::project::manager::{atomic_write_json, read_durable_json_bytes_sync};
 use crate::reconstruction::gps::{self, Checkpoint, Manifest, Record, Similarity};
 use std::ffi::OsString;
 
@@ -48,7 +48,7 @@ pub(super) fn reshoot_records(
     let mut origin = None;
     if let Some(source) = &metadata.reshoot {
         let previous = source.source_project_path.join("work/gps/manifest.json");
-        let state = std::fs::read(source.source_project_path.join("state.json"))
+        let state = read_durable_json_bytes_sync(source.source_project_path.join("state.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<PipelineStateFile>(&b).ok());
         if let (Some(checkpoint), Ok(bytes)) = (state.and_then(|s| s.gps), std::fs::read(previous))
